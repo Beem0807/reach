@@ -19,6 +19,7 @@ services:
     build: .
     environment:
       TOKEN_PEPPER: ${TOKEN_PEPPER:-localtest}
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-localadmin}
       DATABASE_URL: postgresql://reach:reach@db:5432/reach
     depends_on:
       db:

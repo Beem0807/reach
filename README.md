@@ -34,11 +34,14 @@ Reach is self-hosted — you deploy your own backend. Choose one:
 
 **AWS Lambda + DynamoDB** (low cost, AWS-native):
 ```bash
-export TOKEN_PEPPER=$(openssl rand -hex 32) && echo $TOKEN_PEPPER
+export TOKEN_PEPPER=$(openssl rand -hex 32)
+export ADMIN_TOKEN=$(openssl rand -hex 32)
 aws cloudformation create-stack \
   --stack-name reach-platform \
   --template-url https://reach-releases.s3.amazonaws.com/lambda/latest/template.yaml \
-  --parameters ParameterKey=TokenPepper,ParameterValue="$TOKEN_PEPPER" \
+  --parameters \
+    ParameterKey=TokenPepper,ParameterValue="$TOKEN_PEPPER" \
+    ParameterKey=AdminToken,ParameterValue="$ADMIN_TOKEN" \
   --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND
 ```
 
@@ -46,6 +49,7 @@ aws cloudformation create-stack \
 ```bash
 docker run -d -p 8000:8000 \
   -e TOKEN_PEPPER="<your-pepper>" \
+  -e ADMIN_TOKEN="<your-admin-token>" \
   -e DATABASE_URL="postgresql://user:pass@host:5432/reach" \
   nabeemdev/reach:latest
 ```
@@ -54,7 +58,7 @@ Once deployed, run bootstrap to get your API URL and install commands:
 
 ```bash
 curl -s -X POST "$API_URL/admin/bootstrap" \
-  -H "Authorization: Bearer $TOKEN_PEPPER" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"hostname": "my-machine"}' | python3 -m json.tool
 ```

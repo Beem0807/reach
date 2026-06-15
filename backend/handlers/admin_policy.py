@@ -8,18 +8,18 @@ from shared.store import agents_repo
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-TOKEN_PEPPER = os.environ["TOKEN_PEPPER"]
+ADMIN_TOKEN = os.environ["ADMIN_TOKEN"]
 
 VALID_MODES = ("wild", "readonly", "approved")
 
 
-def _verify_pepper(raw: str) -> bool:
+def _verify_admin(raw: str) -> bool:
     import hmac
-    return hmac.compare_digest(raw, TOKEN_PEPPER)
+    return hmac.compare_digest(raw, ADMIN_TOKEN)
 
 
 def handle_get_policy(agent_id: str, raw_token: str) -> dict:
-    if not _verify_pepper(raw_token):
+    if not _verify_admin(raw_token):
         return _err("unauthorized", 401)
     agent = agents_repo.get(agent_id)
     if not agent:
@@ -32,7 +32,7 @@ def handle_get_policy(agent_id: str, raw_token: str) -> dict:
 
 
 def handle_set_mode(agent_id: str, body: dict, raw_token: str) -> dict:
-    if not _verify_pepper(raw_token):
+    if not _verify_admin(raw_token):
         return _err("unauthorized", 401)
     mode = body.get("mode", "").strip()
     if mode not in VALID_MODES:
@@ -47,7 +47,7 @@ def handle_set_mode(agent_id: str, body: dict, raw_token: str) -> dict:
 
 
 def handle_add_command(agent_id: str, body: dict, raw_token: str) -> dict:
-    if not _verify_pepper(raw_token):
+    if not _verify_admin(raw_token):
         return _err("unauthorized", 401)
     commands = body.get("commands", [])
     if isinstance(commands, str):
@@ -74,7 +74,7 @@ def handle_add_command(agent_id: str, body: dict, raw_token: str) -> dict:
 
 
 def handle_remove_command(agent_id: str, body: dict, raw_token: str) -> dict:
-    if not _verify_pepper(raw_token):
+    if not _verify_admin(raw_token):
         return _err("unauthorized", 401)
     commands = body.get("commands", [])
     if isinstance(commands, str):

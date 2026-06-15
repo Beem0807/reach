@@ -29,11 +29,13 @@ Lambda + PostgreSQL is deliberately not supported. Lambda's ephemeral connection
 
 ### Deploy
 
-**1. Generate a TOKEN_PEPPER — save this, you need it for future upgrades:**
+**1. Generate secrets — save both, you need them for future upgrades:**
 
 ```bash
 export TOKEN_PEPPER=$(openssl rand -hex 32)
-echo $TOKEN_PEPPER
+export ADMIN_TOKEN=$(openssl rand -hex 32)
+echo "TOKEN_PEPPER=$TOKEN_PEPPER"
+echo "ADMIN_TOKEN=$ADMIN_TOKEN"
 ```
 
 **2. Deploy:**
@@ -42,7 +44,9 @@ echo $TOKEN_PEPPER
 aws cloudformation create-stack \
   --stack-name reach-platform \
   --template-url https://reach-releases.s3.amazonaws.com/lambda/latest/template.yaml \
-  --parameters ParameterKey=TokenPepper,ParameterValue="$TOKEN_PEPPER" \
+  --parameters \
+    ParameterKey=TokenPepper,ParameterValue="$TOKEN_PEPPER" \
+    ParameterKey=AdminToken,ParameterValue="$ADMIN_TOKEN" \
   --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND
 ```
 
@@ -62,7 +66,9 @@ echo $API_URL
 aws cloudformation update-stack \
   --stack-name reach-platform \
   --template-url https://reach-releases.s3.amazonaws.com/lambda/v1.1.0/template.yaml \
-  --parameters ParameterKey=TokenPepper,UsePreviousValue=true \
+  --parameters \
+    ParameterKey=TokenPepper,UsePreviousValue=true \
+    ParameterKey=AdminToken,UsePreviousValue=true \
   --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND
 ```
 
@@ -85,6 +91,7 @@ Replace `v1.1.0` with the target version. DynamoDB tables are retained across up
 docker run -d \
   -p 8000:8000 \
   -e TOKEN_PEPPER="<your-pepper>" \
+  -e ADMIN_TOKEN="<your-admin-token>" \
   -e DATABASE_URL="postgresql://user:pass@host:5432/reach" \
   nabeemdev/reach:latest
 ```
@@ -101,7 +108,7 @@ After deploying, call the bootstrap endpoint to create your first tenant token a
 
 ```bash
 curl -s -X POST "$API_URL/admin/bootstrap" \
-  -H "Authorization: Bearer $TOKEN_PEPPER" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"hostname": "my-machine"}' | python3 -m json.tool
 ```
@@ -130,7 +137,7 @@ Response:
 
 ```bash
 curl -s -X POST "$API_URL/admin/bootstrap" \
-  -H "Authorization: Bearer $TOKEN_PEPPER" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"hostname": "second-machine", "tenant_id": "tenant_xxxxx"}' | python3 -m json.tool
 ```
@@ -147,14 +154,14 @@ Policies are managed via the admin API, authenticated with your `TOKEN_PEPPER`.
 
 ```bash
 curl -s "$API_URL/admin/agents/agent_xxxxx/policy" \
-  -H "Authorization: Bearer $TOKEN_PEPPER" | python3 -m json.tool
+  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
 ```
 
 **Set mode** (`wild` / `readonly` / `approved`):
 
 ```bash
 curl -s -X PUT "$API_URL/admin/agents/agent_xxxxx/policy/mode" \
-  -H "Authorization: Bearer $TOKEN_PEPPER" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"mode": "approved"}'
 ```
@@ -163,7 +170,7 @@ curl -s -X PUT "$API_URL/admin/agents/agent_xxxxx/policy/mode" \
 
 ```bash
 curl -s -X POST "$API_URL/admin/agents/agent_xxxxx/policy/commands" \
-  -H "Authorization: Bearer $TOKEN_PEPPER" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"commands": ["docker ps", "git status"]}'
 ```
@@ -172,7 +179,7 @@ curl -s -X POST "$API_URL/admin/agents/agent_xxxxx/policy/commands" \
 
 ```bash
 curl -s -X DELETE "$API_URL/admin/agents/agent_xxxxx/policy/commands" \
-  -H "Authorization: Bearer $TOKEN_PEPPER" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"commands": ["git status"]}'
 ```

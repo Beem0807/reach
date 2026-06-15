@@ -9,19 +9,19 @@ from shared.store import agents_repo, tokens_repo
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-TOKEN_PEPPER = os.environ["TOKEN_PEPPER"]
+ADMIN_TOKEN = os.environ["ADMIN_TOKEN"]
 S3_BASE = os.environ.get("RELEASES_S3_BASE", "https://reach-releases.s3.amazonaws.com")
 
 INSTALL_TOKEN_TTL = 86400  # 24 hours
 
 
-def _verify_pepper(raw: str) -> bool:
+def _verify_admin(raw: str) -> bool:
     import hmac
-    return hmac.compare_digest(raw, TOKEN_PEPPER)
+    return hmac.compare_digest(raw, ADMIN_TOKEN)
 
 
 def handle_admin_bootstrap(body: dict, raw_token: str, api_url: str) -> dict:
-    if not _verify_pepper(raw_token):
+    if not _verify_admin(raw_token):
         return _err("unauthorized", 401)
 
     tenant_id = body.get("tenant_id", "").strip()
