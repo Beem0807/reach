@@ -11,7 +11,9 @@ dist/
 *.egg-info/
 
 # AWS SAM
+.aws-sam/
 backend/.aws-sam/
+packaged-template.yaml
 
 # CLI config (contains secrets)
 .vpsctl/

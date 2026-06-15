@@ -5,7 +5,7 @@ stack_name = "reach-platform"
 resolve_s3 = true
 s3_prefix = "reach-platform"
 region = "us-east-1"
-capabilities = "CAPABILITY_IAM"
+capabilities = "CAPABILITY_IAM CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND"
 image_repositories = []
 
 [default.global.parameters]

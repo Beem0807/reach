@@ -19,12 +19,47 @@ Reach gives any AI agent — Claude Code, Cursor, custom LLM workflows, or your 
 
 ## How it works
 
-1. You install the Reach agent on a machine.
-2. The agent makes outbound HTTPS requests to the Reach API.
-3. Commands are queued by the CLI or any HTTP client.
-4. The agent polls for pending jobs.
-5. The command runs locally on the machine.
-6. stdout, stderr, exit code, and duration are sent back to the caller.
+1. You deploy the Reach backend (Lambda or Docker).
+2. You run bootstrap to get your API URL, tenant token, and agent install commands.
+3. You install the CLI on your local machine.
+4. You install the agent on each remote machine.
+5. The agent makes outbound HTTPS requests to your backend — no inbound ports needed.
+6. Commands are queued via the CLI, the agent polls and runs them, results come back.
+
+---
+
+## Getting started
+
+Reach is self-hosted — you deploy your own backend. Choose one:
+
+**AWS Lambda + DynamoDB** (low cost, AWS-native):
+```bash
+export TOKEN_PEPPER=$(openssl rand -hex 32) && echo $TOKEN_PEPPER
+aws cloudformation create-stack \
+  --stack-name reach-platform \
+  --template-url https://reach-releases.s3.amazonaws.com/lambda/latest/template.yaml \
+  --parameters ParameterKey=TokenPepper,ParameterValue="$TOKEN_PEPPER" \
+  --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND
+```
+
+**Docker + PostgreSQL** (any cloud):
+```bash
+docker run -d -p 8000:8000 \
+  -e TOKEN_PEPPER="<your-pepper>" \
+  -e DATABASE_URL="postgresql://user:pass@host:5432/reach" \
+  nabeemdev/reach:latest
+```
+
+Once deployed, run bootstrap to get your API URL and install commands:
+
+```bash
+curl -s -X POST "$API_URL/admin/bootstrap" \
+  -H "Authorization: Bearer $TOKEN_PEPPER" \
+  -H "Content-Type: application/json" \
+  -d '{"hostname": "my-machine"}' | python3 -m json.tool
+```
+
+Bootstrap returns ready-to-paste commands for the CLI and agent. See [SELF_HOSTING.md](SELF_HOSTING.md) for the full setup guide.
 
 ---
 
@@ -34,26 +69,28 @@ Reach gives any AI agent — Claude Code, Cursor, custom LLM workflows, or your 
 pip install https://reach-releases.s3.amazonaws.com/reach-0.1.0-py3-none-any.whl
 ```
 
-Log in with your tenant token:
+Log in with the values from bootstrap:
 
 ```bash
-reach login --api-url <url> --token <tenant_token>
+reach login --api-url "<your-api-url>" --token "<tenant_token>"
 ```
 
 ---
 
 ## Add a machine
 
+Use the install commands from bootstrap output directly. Or manually:
+
 **Linux:**
 
 ```bash
 curl -fsSL https://reach-releases.s3.amazonaws.com/install.sh | sudo bash -s -- \
-  --api-url       "<url>" \
+  --api-url       "<your-api-url>" \
   --agent-id      "agent_xxx" \
   --install-token "install_xxx"
 ```
 
-**Mac:**
+**Mac (Apple Silicon):**
 
 ```bash
 mkdir -p /tmp/reach-agent
@@ -61,7 +98,7 @@ curl -fsSL https://reach-releases.s3.amazonaws.com/reach-agent-darwin-arm64 \
   -o /tmp/reach-agent/reach-agent
 chmod +x /tmp/reach-agent/reach-agent
 cat > /tmp/reach-agent/config.json <<'EOF'
-{"api_url":"<url>","agent_id":"agent_xxx","install_token":"install_xxx"}
+{"api_url":"<your-api-url>","agent_id":"agent_xxx","install_token":"install_xxx"}
 EOF
 REACH_CONFIG_PATH=/tmp/reach-agent/config.json /tmp/reach-agent/reach-agent
 ```
@@ -136,9 +173,7 @@ reach agent-init --for system-prompt # paste into any agent or API call
 
 ## Policies
 
-Policies are configured from the Reach dashboard.
-
-Each machine can run in one of three modes:
+Each machine runs in one of three modes, configured via the admin API:
 
 - **Wild** — allow all commands
 - **Readonly** — block write and destructive commands
@@ -162,14 +197,23 @@ Reach is designed for controlled command execution:
 - Agents only make outbound HTTPS requests
 - Commands have a default timeout of 60 seconds
 - Job history is recorded for 7 days
-- Policies are configured from the Reach dashboard
-- The CLI can view policies but cannot change them
+- Policies are configured server-side — the CLI can view them but cannot change them
+
+**Always blocked — regardless of mode:**
+
+Destructive filesystem operations (`rm -rf /`, `mkfs`, `dd if=`), shutdown/reboot/poweroff, and fork bombs are rejected by the server before the agent ever sees them.
+
+**Blocked in readonly mode:**
+
+File writes and deletes, process kills, service restarts, package installs, container mutations (`docker run/stop/rm`), firewall changes, user management, and privilege escalation (`sudo`).
+
+See [SELF_HOSTING.md](SELF_HOSTING.md) for the full blocked command reference.
 
 ---
 
 ## Production usage
 
-For production machines, use the **Approved** policy mode from the Reach dashboard.
+For production machines, use the **Approved** policy mode — set it via the admin API after bootstrap.
 
 Avoid running production agents in Wild mode unless you fully trust the environment and understand the risk.
 
@@ -201,8 +245,6 @@ Avoid running production agents in Wild mode unless you fully trust the environm
 
 ---
 
-> Running your own backend? See [SELF_HOSTING.md](SELF_HOSTING.md).
+## License
 
----
-
-**License:** MIT — See [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE).

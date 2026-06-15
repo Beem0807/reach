@@ -1,0 +1,42 @@
+import logging
+
+from shared.auth import _bearer, _verify_tenant_token
+from shared.response import _err, _ok
+from shared.store import agents_repo
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+
+def handle_get_agent(agent_id: str, raw_token: str) -> dict:
+    tenant = _verify_tenant_token(raw_token)
+    if not tenant:
+        return _err("unauthorized", 401)
+
+    agent = agents_repo.get(agent_id)
+    if not agent:
+        return _err("agent not found", 404)
+    if agent.get("tenant_id") != tenant.get("tenant_id"):
+        return _err("not found", 404)
+
+    return _ok({
+        "agent_id": agent["agent_id"],
+        "status": agent["status"],
+        "hostname": agent.get("hostname"),
+        "agent_version": agent.get("agent_version"),
+        "machine_fingerprint": agent.get("machine_fingerprint"),
+        "claimed_at": agent.get("claimed_at"),
+        "last_heartbeat_at": agent.get("last_heartbeat_at"),
+        "active_until": agent.get("active_until"),
+        "mode": agent.get("mode", "wild"),
+        "approved_commands": agent.get("approved_commands") or [],
+    })
+
+
+def get_agent_handler(event, context):
+    agent_id = (event.get("pathParameters") or {}).get("agent_id", "")
+    logger.info("GET /agents/%s", agent_id)
+    token = _bearer(event)
+    if not token:
+        return _err("missing Authorization header", 401)
+    return handle_get_agent(agent_id, token)
