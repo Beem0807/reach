@@ -1,0 +1,20 @@
+# Go
+agent/reach-agent
+agent/reach-agent-*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+dist/
+*.egg-info/
+
+# AWS SAM
+backend/.aws-sam/
+
+# CLI config (contains secrets)
+.vpsctl/
+
+# Editor
+.DS_Store

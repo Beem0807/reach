@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "reach"
+version = "0.1.0"
+description = "CLI for remote machine agents"
+requires-python = ">=3.9"
+dependencies = [
+    "typer>=0.12",
+    "requests>=2.31",
+    "rich>=13",
+]
+
+[project.scripts]
+reach = "reach.main:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["reach"]
