@@ -373,23 +373,31 @@ def policy_show(
 
 
 # ---------------------------------------------------------------------------
-# reach claude-init
+# reach agent-init
 # ---------------------------------------------------------------------------
-@app.command("claude-init")
-def claude_init():
-    """Interactively create or append CLAUDE.md with remote machine context."""
-    claude_md = Path("CLAUDE.md")
-
-    if claude_md.exists() and "## Remote Access" in claude_md.read_text():
-        if not Confirm.ask("[yellow]CLAUDE.md already has a Remote Access section. Overwrite it?[/yellow]"):
-            raise typer.Exit(0)
+@app.command("agent-init")
+def agent_init(
+    for_agent: Optional[str] = typer.Option(None, "--for", help="Target agent: claude, cursor, system-prompt"),
+):
+    """Generate remote machine context for your AI agent."""
+    VALID = ("claude", "cursor", "system-prompt")
+    if for_agent is None:
+        console.print("\n[bold]Select your agent:[/bold]")
+        console.print("  [cyan]1[/cyan]  claude        — writes CLAUDE.md")
+        console.print("  [cyan]2[/cyan]  cursor        — writes .cursor/rules/reach.mdc")
+        console.print("  [cyan]3[/cyan]  system-prompt — prints to stdout, paste anywhere")
+        choice = Prompt.ask("\nChoice", choices=["1", "2", "3"])
+        for_agent = {"1": "claude", "2": "cursor", "3": "system-prompt"}[choice]
+    elif for_agent not in VALID:
+        console.print(f"[red]Error:[/red] --for must be one of: {', '.join(VALID)}")
+        raise typer.Exit(1)
 
     cfg = cfg_module.load()
     api_url = cfg.get("api_url")
     tenant_token = cfg.get("tenant_token")
     default_agent_id = cfg.get("default_agent_id", "")
 
-    console.print("\n[bold cyan]reach claude-init[/bold cyan] — configure remote machine context for Claude\n")
+    console.print(f"\n[bold cyan]reach agent-init --for {for_agent}[/bold cyan]\n")
 
     # Fetch agents from API
     fetched: list[dict] = []
@@ -408,8 +416,7 @@ def claude_init():
     if fetched:
         console.print(f"Found [bold]{len(fetched)}[/bold] agent(s) in your tenant:\n")
         for a in fetched:
-            status_str = _status_color(a.get("status", ""))
-            console.print(f"  [cyan]{a['agent_id']}[/cyan]  {a.get('hostname') or 'unknown'}  {status_str}")
+            console.print(f"  [cyan]{a['agent_id']}[/cyan]  {a.get('hostname') or 'unknown'}  {_status_color(a.get('status', ''))}")
         console.print()
 
         for a in fetched:
@@ -418,34 +425,36 @@ def claude_init():
             console.print(f"[bold]─── {agent_id}[/bold] ({hostname})")
             role = Prompt.ask("  Role / notes (e.g. production, staging, home lab)", default="")
             app_name = Prompt.ask("  Main app name (e.g. my-api)", default="")
-            agents_config.append({
-                "agent_id": agent_id,
-                "hostname": hostname,
-                "role": role,
-                "app_name": app_name,
-            })
+            agents_config.append({"agent_id": agent_id, "hostname": hostname, "role": role, "app_name": app_name})
             console.print()
 
         stack = Prompt.ask("Shared tech stack (e.g. docker, nginx)", default="")
-        extra_notes = Prompt.ask("Extra notes for Claude", default="")
-
+        extra_notes = Prompt.ask("Extra notes for your agent", default="")
     else:
-        # Fallback: no API connection or no agents — manual entry
         console.print("[dim]Could not fetch agents from API — entering manually.[/dim]\n")
         hostname = Prompt.ask("Hostname or IP", default="")
         role = Prompt.ask("Role / notes", default="")
         app_name = Prompt.ask("Main app name", default="")
         stack = Prompt.ask("Tech stack", default="")
         extra_notes = ""
-        agents_config.append({
-            "agent_id": default_agent_id,
-            "hostname": hostname,
-            "role": role,
-            "app_name": app_name,
-        })
+        agents_config.append({"agent_id": default_agent_id, "hostname": hostname, "role": role, "app_name": app_name})
 
-    content = _build_claude_md(agents_config, default_agent_id, stack, extra_notes if fetched else "")
+    content = _build_agent_context(agents_config, default_agent_id, stack, extra_notes if fetched else "")
 
+    if for_agent == "claude":
+        _write_claude_md(content)
+    elif for_agent == "cursor":
+        _write_cursor_rules(content)
+    elif for_agent == "system-prompt":
+        console.print("\n[bold]── System prompt ──────────────────────────────────────[/bold]")
+        console.print(content)
+
+
+def _write_claude_md(content: str):
+    claude_md = Path("CLAUDE.md")
+    if claude_md.exists() and "## Remote Access" in claude_md.read_text():
+        if not Confirm.ask("[yellow]CLAUDE.md already has a Remote Access section. Overwrite it?[/yellow]"):
+            raise typer.Exit(0)
     if claude_md.exists():
         existing = claude_md.read_text()
         if "## Remote Access" in existing:
@@ -455,15 +464,24 @@ def claude_init():
     else:
         claude_md.write_text(content)
         console.print("\n[green]Created CLAUDE.md[/green]")
-
     console.print(f"[dim]{claude_md.resolve()}[/dim]")
 
 
+def _write_cursor_rules(content: str):
+    rules_dir = Path(".cursor/rules")
+    rules_dir.mkdir(parents=True, exist_ok=True)
+    rules_file = rules_dir / "reach.mdc"
+    frontmatter = "---\ndescription: Remote machine access via reach\nalwaysApply: true\n---\n\n"
+    rules_file.write_text(frontmatter + content)
+    console.print(f"\n[green]Created {rules_file}[/green]")
+    console.print(f"[dim]{rules_file.resolve()}[/dim]")
+
+
 # ---------------------------------------------------------------------------
-# CLAUDE.md builder
+# Context builder (shared across all agent formats)
 # ---------------------------------------------------------------------------
 
-def _build_claude_md(
+def _build_agent_context(
     agents_config: list[dict],
     default_agent_id: str,
     stack: str,
@@ -471,10 +489,8 @@ def _build_claude_md(
 ) -> str:
     multi = len(agents_config) > 1
     saved_aliases = cfg_module.list_aliases()
-    # Build reverse map: agent_id → alias (first one found)
     id_to_alias = {v: k for k, v in saved_aliases.items()}
 
-    # Agent table
     agent_rows = ""
     exec_examples = ""
     app_examples = ""
@@ -485,7 +501,6 @@ def _build_claude_md(
         host = a.get("hostname") or "-"
         role = a.get("role") or "-"
         app = a.get("app_name") or ""
-        # Prefer alias in examples when available
         target = alias or aid
         flag = f"--agent {target} " if multi else ""
 
@@ -514,7 +529,6 @@ def _build_claude_md(
     stack_section = f"\n### Stack\n\n{stack}\n" if stack else ""
     notes_section = f"\n### Notes\n\n{extra_notes}\n" if extra_notes else ""
 
-    exec_flag_note = "--agent <id> " if multi else ""
     rule_agent = (
         f"* Use `reach exec --agent <id> -- <command>` to target a specific machine.\n"
         f"* Default agent (no --agent flag): `{default_agent_id}`.\n"
@@ -522,9 +536,7 @@ def _build_claude_md(
         f"* Always use `reach exec -- <command>` to run commands on the remote machine.\n"
     )
 
-    all_examples = exec_examples
-    if app_examples:
-        all_examples += app_examples
+    all_examples = exec_examples + (app_examples if app_examples else "")
 
     return f"""## Remote Access
 

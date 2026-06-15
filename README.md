@@ -1,6 +1,6 @@
 # reach
 
-Give Claude Code controlled access to every machine you own — without SSH, VPNs, or open ports.
+Give your AI agents controlled access to every machine you own — without SSH, VPNs, or open ports.
 
 ```bash
 reach exec -- hostname
@@ -11,9 +11,9 @@ reach exec --agent prod -- docker ps
 
 ## Why Reach?
 
-Claude Code can edit and reason about your project, but it cannot safely operate your remote machines by default.
+AI agents can reason about your code, but they cannot safely operate your remote machines by default.
 
-Reach gives Claude Code a controlled command bridge to your machines without requiring SSH, VPNs, public IPs, or inbound firewall rules.
+Reach gives any AI agent — Claude Code, Cursor, custom LLM workflows, or your own automation — a controlled command bridge to your machines without requiring SSH, VPNs, public IPs, or inbound firewall rules.
 
 ---
 
@@ -21,10 +21,10 @@ Reach gives Claude Code a controlled command bridge to your machines without req
 
 1. You install the Reach agent on a machine.
 2. The agent makes outbound HTTPS requests to the Reach API.
-3. Commands are queued by the CLI.
+3. Commands are queued by the CLI or any HTTP client.
 4. The agent polls for pending jobs.
 5. The command runs locally on the machine.
-6. stdout, stderr, exit code, and duration are sent back to the CLI.
+6. stdout, stderr, exit code, and duration are sent back to the caller.
 
 ---
 
@@ -109,6 +109,31 @@ reach exec --agent k8s -- kubectl get pods -A
 
 ---
 
+## AI agent integration
+
+Run `reach agent-init` inside any project to generate context for your AI agent. It fetches your machines, prompts for a role for each, and writes a file that tells the agent to use `reach exec` automatically.
+
+```bash
+reach agent-init
+```
+
+```
+Select your agent:
+  1  claude        — writes CLAUDE.md
+  2  cursor        — writes .cursor/rules/reach.mdc
+  3  system-prompt — prints to stdout, paste anywhere
+```
+
+Or pass `--for` directly to skip the prompt:
+
+```bash
+reach agent-init --for claude        # CLAUDE.md for Claude Code
+reach agent-init --for cursor        # .cursor/rules/reach.mdc for Cursor
+reach agent-init --for system-prompt # paste into any agent or API call
+```
+
+---
+
 ## Policies
 
 Policies are configured from the Reach dashboard.
@@ -150,18 +175,6 @@ Avoid running production agents in Wild mode unless you fully trust the environm
 
 ---
 
-## Claude Code integration
-
-Run inside any project:
-
-```bash
-reach claude-init
-```
-
-Fetches your machines, prompts for a role for each, then writes a `CLAUDE.md` that tells Claude Code to use `reach exec` automatically — no SSH, no manual instruction needed each session.
-
----
-
 ## Commands
 
 | Command | Description |
@@ -181,8 +194,15 @@ Fetches your machines, prompts for a role for each, then writes a `CLAUDE.md` th
 | `reach alias set <name> <id>` | Create alias |
 | `reach alias list` | List aliases |
 | `reach alias remove <name>` | Remove alias |
-| `reach claude-init` | Write CLAUDE.md for Claude Code |
+| `reach agent-init` | Interactively generate context for your AI agent |
+| `reach agent-init --for claude` | Write CLAUDE.md for Claude Code |
+| `reach agent-init --for cursor` | Write .cursor/rules/reach.mdc for Cursor |
+| `reach agent-init --for system-prompt` | Print system prompt snippet to stdout |
 
 ---
 
 > Running your own backend? See [SELF_HOSTING.md](SELF_HOSTING.md).
+
+---
+
+**License:** MIT — See [LICENSE](LICENSE).
