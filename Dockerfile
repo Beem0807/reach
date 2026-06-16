@@ -14,4 +14,4 @@ ENV RELEASES_S3_BASE=https://reach-releases.s3.amazonaws.com
 
 EXPOSE 8000
 
-CMD ["uvicorn", "adapters.fastapi.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["sh", "-c", "alembic upgrade head && uvicorn adapters.fastapi.main:app --host 0.0.0.0 --port 8000"]

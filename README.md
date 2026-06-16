@@ -1,6 +1,6 @@
 # reach
 
-Give your AI agents controlled access to every machine you own — without SSH, VPNs, or open ports.
+Give your AI agents controlled access to every machine you own - without SSH, VPNs, or open ports.
 
 ```bash
 reach exec -- hostname
@@ -13,7 +13,7 @@ reach exec --agent prod -- docker ps
 
 AI agents can reason about your code, but they cannot safely operate your remote machines by default.
 
-Reach gives any AI agent — Claude Code, Cursor, custom LLM workflows, or your own automation — a controlled command bridge to your machines without requiring SSH, VPNs, public IPs, or inbound firewall rules.
+Reach gives any AI agent - Claude Code, Cursor, custom LLM workflows, or your own automation - a controlled command bridge to your machines without requiring SSH, VPNs, public IPs, or inbound firewall rules.
 
 ---
 
@@ -23,14 +23,14 @@ Reach gives any AI agent — Claude Code, Cursor, custom LLM workflows, or your 
 2. You run bootstrap to get your API URL, tenant token, and agent install commands.
 3. You install the CLI on your local machine.
 4. You install the agent on each remote machine.
-5. The agent makes outbound HTTPS requests to your backend — no inbound ports needed.
+5. The agent makes outbound HTTPS requests to your backend - no inbound ports needed.
 6. Commands are queued via the CLI, the agent polls and runs them, results come back.
 
 ---
 
 ## Getting started
 
-Reach is self-hosted — you deploy your own backend. Choose one:
+Reach is self-hosted - you deploy your own backend. Choose one:
 
 **AWS Lambda + DynamoDB** (low cost, AWS-native):
 ```bash
@@ -160,9 +160,9 @@ reach agent-init
 
 ```
 Select your agent:
-  1  claude        — writes CLAUDE.md
-  2  cursor        — writes .cursor/rules/reach.mdc
-  3  system-prompt — prints to stdout, paste anywhere
+  1  claude        - writes CLAUDE.md
+  2  cursor        - writes .cursor/rules/reach.mdc
+  3  system-prompt - prints to stdout, paste anywhere
 ```
 
 Or pass `--for` directly to skip the prompt:
@@ -179,9 +179,9 @@ reach agent-init --for system-prompt # paste into any agent or API call
 
 Each machine runs in one of three modes, configured via the admin API:
 
-- **Wild** — allow all commands
-- **Readonly** — block write and destructive commands
-- **Approved** — only approved command patterns can run
+- **Wild** - allow all commands
+- **Readonly** - block write and destructive commands
+- **Approved** - only approved command patterns can run
 
 Use the CLI to view the active policy:
 
@@ -201,9 +201,9 @@ Reach is designed for controlled command execution:
 - Agents only make outbound HTTPS requests
 - Commands have a default timeout of 60 seconds
 - Job history is recorded for 7 days
-- Policies are configured server-side — the CLI can view them but cannot change them
+- Policies are configured server-side - the CLI can view them but cannot change them
 
-**Always blocked — regardless of mode:**
+**Always blocked - regardless of mode:**
 
 Destructive filesystem operations (`rm -rf /`, `mkfs`, `dd if=`), shutdown/reboot/poweroff, and fork bombs are rejected by the server before the agent ever sees them.
 
@@ -217,7 +217,7 @@ See [SELF_HOSTING.md](SELF_HOSTING.md) for the full blocked command reference.
 
 ## Production usage
 
-For production machines, use the **Approved** policy mode — set it via the admin API after bootstrap.
+For production machines, use the **Approved** policy mode - set it via the admin API after bootstrap.
 
 Avoid running production agents in Wild mode unless you fully trust the environment and understand the risk.
 
@@ -251,4 +251,4 @@ Avoid running production agents in Wild mode unless you fully trust the environm
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT - see [LICENSE](LICENSE).

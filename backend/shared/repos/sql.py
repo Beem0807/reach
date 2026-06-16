@@ -58,10 +58,6 @@ class _Job(_Base):
     expires_at = Column(Integer)
 
 
-# Creates tables on first import — use Alembic for production migrations
-_Base.metadata.create_all(engine)
-
-
 def _to_dict(row) -> Optional[dict]:
     if row is None:
         return None

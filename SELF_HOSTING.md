@@ -1,6 +1,6 @@
 # Self-Hosting reach
 
-Deploy and operate your own reach backend. The CLI and agent are separate — they just need your API URL.
+Deploy and operate your own reach backend. The CLI and agent are separate - they just need your API URL.
 
 ---
 
@@ -13,11 +13,11 @@ Deploy and operate your own reach backend. The CLI and agent are separate — th
 
 ### Why DynamoDB with Lambda, and PostgreSQL with Docker?
 
-Lambda functions are stateless and short-lived — each invocation starts fresh with no persistent connections. DynamoDB is a natural fit because it's serverless, has no connection to maintain, and scales to zero when idle. The combination keeps costs near zero for small teams (pay only per request, no always-on database instance).
+Lambda functions are stateless and short-lived - each invocation starts fresh with no persistent connections. DynamoDB is a natural fit because it's serverless, has no connection to maintain, and scales to zero when idle. The combination keeps costs near zero for small teams (pay only per request, no always-on database instance).
 
-PostgreSQL with a persistent server (FastAPI in Docker or k8s) is the right choice when you want to run anywhere — any cloud, a VPS, or on-prem — without being tied to AWS. FastAPI keeps a connection pool open for the lifetime of the process, which PostgreSQL handles well. DynamoDB would require AWS credentials and doesn't make sense outside of AWS.
+PostgreSQL with a persistent server (FastAPI in Docker or k8s) is the right choice when you want to run anywhere - any cloud, a VPS, or on-prem - without being tied to AWS. FastAPI keeps a connection pool open for the lifetime of the process, which PostgreSQL handles well. DynamoDB would require AWS credentials and doesn't make sense outside of AWS.
 
-Lambda + PostgreSQL is deliberately not supported. Lambda's ephemeral connections exhaust PostgreSQL's connection limit quickly at scale, and solving that requires RDS Proxy — adding cost and complexity that defeats the purpose of the low-cost Lambda option.
+Lambda + PostgreSQL is deliberately not supported. Lambda's ephemeral connections exhaust PostgreSQL's connection limit quickly at scale, and solving that requires RDS Proxy - adding cost and complexity that defeats the purpose of the low-cost Lambda option.
 
 ---
 
@@ -29,7 +29,7 @@ Lambda + PostgreSQL is deliberately not supported. Lambda's ephemeral connection
 
 ### Deploy
 
-**1. Generate secrets — save both, you need them for future upgrades:**
+**1. Generate secrets - save both, you need them for future upgrades:**
 
 ```bash
 export TOKEN_PEPPER=$(openssl rand -hex 32)
@@ -96,7 +96,7 @@ docker run -d \
   nabeemdev/reach:latest
 ```
 
-Tables are created automatically on first startup. The image supports `linux/amd64` and `linux/arm64` — works on AWS Graviton, Raspberry Pi, and Apple Silicon without extra flags.
+On first startup, Alembic runs `alembic upgrade head` automatically and creates all tables. Subsequent restarts apply any pending migrations from new versions. The image supports `linux/amd64` and `linux/arm64` - works on AWS Graviton, Raspberry Pi, and Apple Silicon without extra flags.
 
 **2. Put a reverse proxy in front (nginx, Caddy, ALB, etc.) for TLS.**
 
@@ -142,7 +142,7 @@ curl -s -X POST "$API_URL/admin/bootstrap" \
   -d '{"hostname": "second-machine", "tenant_id": "tenant_xxxxx"}' | python3 -m json.tool
 ```
 
-No new `tenant_token` is issued — the existing tenant's token remains valid.
+No new `tenant_token` is issued - the existing tenant's token remains valid.
 
 ---
 
@@ -188,7 +188,7 @@ curl -s -X DELETE "$API_URL/admin/agents/agent_xxxxx/policy/commands" \
 
 ## How tokens work
 
-Three token types — none stored raw, only `HMAC-SHA256(TOKEN_PEPPER, token)` hashes in the database:
+Three token types - none stored raw, only `HMAC-SHA256(TOKEN_PEPPER, token)` hashes in the database:
 
 | Token | Prefix | Used by | Purpose |
 |---|---|---|---|
@@ -211,8 +211,8 @@ The heartbeat checker runs every 5 minutes (EventBridge on Lambda, APScheduler o
 ### Adaptive polling
 
 The backend tells the agent how fast to poll via `next_poll_seconds`:
-- `5s` — active window (job created in last 120 seconds)
-- `30s` — idle
+- `5s` - active window (job created in last 120 seconds)
+- `30s` - idle
 
 ---
 
@@ -258,11 +258,11 @@ The backend tells the agent how fast to poll via `next_poll_seconds`:
 | `reach-tenant-tokens` | `token_hash` | Tenant credentials |
 | `reach-jobs` | `job_id` | Job queue and results (TTL: 7 days) |
 
-All tables use `DeletionPolicy: Retain` — safe to redeploy the stack without losing data.
+All tables use `DeletionPolicy: Retain` - safe to redeploy the stack without losing data.
 
 ### Docker / FastAPI (PostgreSQL)
 
-Tables (`agents`, `tenant_tokens`, `jobs`) are created automatically on first startup via SQLAlchemy `create_all`.
+Tables (`agents`, `tenant_tokens`, `jobs`) are managed via Alembic migrations. On startup the container runs `alembic upgrade head` automatically - no manual SQL or schema setup needed. Upgrades that include schema changes are applied on the next container restart.
 
 ---
 
@@ -305,16 +305,16 @@ In addition to the always-blocked list, readonly mode also blocks:
 
 Only commands that exactly match (or start with) an entry in the agent's `approved_commands` list are allowed. Everything else is rejected.
 
-Approved commands are managed via the admin API — the CLI can view them but not change them.
+Approved commands are managed via the admin API - the CLI can view them but not change them.
 
 ---
 
 ## Security
 
-- Tokens are never stored raw — only `HMAC-SHA256(TOKEN_PEPPER, token)` hashes in the database
+- Tokens are never stored raw - only `HMAC-SHA256(TOKEN_PEPPER, token)` hashes in the database
 - Install token is one-time use and expires after 24 hours
 - Install token is cleared from disk after successful claim
-- Agent token is bound to a machine fingerprint — replayed tokens from another machine are rejected
+- Agent token is bound to a machine fingerprint - replayed tokens from another machine are rejected
 - Config files written with `0600` permissions
 - Commands are checked against a policy blocklist before execution
 - Command timeout: 60 seconds

@@ -16,14 +16,14 @@ Group=reach-agent
 # Prevent the process from gaining new privileges via setuid/setgid
 NoNewPrivileges=yes
 
-# Isolated /tmp — child processes get their own private temp dir
+# Isolated /tmp - child processes get their own private temp dir
 PrivateTmp=yes
 
 # Protect kernel tunables and control groups from writes
 ProtectKernelTunables=yes
 ProtectControlGroups=yes
 
-# Drop all capabilities — the agent only needs network access
+# Drop all capabilities - the agent only needs network access
 CapabilityBoundingSet=
 
 Environment=REACH_COMMAND_TIMEOUT_SECONDS=60

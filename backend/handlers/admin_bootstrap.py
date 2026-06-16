@@ -41,7 +41,7 @@ def handle_admin_bootstrap(body: dict, raw_token: str, api_url: str) -> dict:
             "created_at": _iso(),
         })
     else:
-        raw_tenant_token = None  # existing tenant — token not re-issued
+        raw_tenant_token = None  # existing tenant - token not re-issued
 
     # Create agent
     agent_id = "agent_" + secrets.token_urlsafe(12)

@@ -386,7 +386,7 @@ func run() error {
 	for {
 		syncResp, err := sync(cfg)
 		if err != nil {
-			log.Printf("Sync error: %v — retrying in %ds", err, pollSeconds)
+			log.Printf("Sync error: %v - retrying in %ds", err, pollSeconds)
 			time.Sleep(time.Duration(pollSeconds) * time.Second)
 			continue
 		}

@@ -226,7 +226,7 @@ def exec_cmd(
         while True:
             if time.monotonic() > deadline:
                 console.print(f"\n[red]Timed out[/red] after {timeout}s waiting for agent to respond.")
-                console.print(f"[dim]Job {job_id} is still queued — use `reach job {job_id}` to check later.[/dim]")
+                console.print(f"[dim]Job {job_id} is still queued - use `reach job {job_id}` to check later.[/dim]")
                 raise typer.Exit(1)
 
             try:
@@ -364,7 +364,7 @@ def policy_show(
             for c in commands:
                 console.print(f"  [dim]•[/dim] {c}")
         else:
-            console.print("\n[yellow]Approved commands: (none — all commands blocked)[/yellow]")
+            console.print("\n[yellow]Approved commands: (none - all commands blocked)[/yellow]")
     elif mode == "readonly":
         console.print("\n[dim]Write and destructive commands are blocked.[/dim]")
     else:
@@ -383,9 +383,9 @@ def agent_init(
     VALID = ("claude", "cursor", "system-prompt")
     if for_agent is None:
         console.print("\n[bold]Select your agent:[/bold]")
-        console.print("  [cyan]1[/cyan]  claude        — writes CLAUDE.md")
-        console.print("  [cyan]2[/cyan]  cursor        — writes .cursor/rules/reach.mdc")
-        console.print("  [cyan]3[/cyan]  system-prompt — prints to stdout, paste anywhere")
+        console.print("  [cyan]1[/cyan]  claude        - writes CLAUDE.md")
+        console.print("  [cyan]2[/cyan]  cursor        - writes .cursor/rules/reach.mdc")
+        console.print("  [cyan]3[/cyan]  system-prompt - prints to stdout, paste anywhere")
         choice = Prompt.ask("\nChoice", choices=["1", "2", "3"])
         for_agent = {"1": "claude", "2": "cursor", "3": "system-prompt"}[choice]
     elif for_agent not in VALID:
@@ -431,7 +431,7 @@ def agent_init(
         stack = Prompt.ask("Shared tech stack (e.g. docker, nginx)", default="")
         extra_notes = Prompt.ask("Extra notes for your agent", default="")
     else:
-        console.print("[dim]Could not fetch agents from API — entering manually.[/dim]\n")
+        console.print("[dim]Could not fetch agents from API - entering manually.[/dim]\n")
         hostname = Prompt.ask("Hostname or IP", default="")
         role = Prompt.ask("Role / notes", default="")
         app_name = Prompt.ask("Main app name", default="")

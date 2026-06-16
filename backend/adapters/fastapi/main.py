@@ -152,7 +152,7 @@ async def get_agent(agent_id: str, request: Request):
 
 
 # ---------------------------------------------------------------------------
-# Admin endpoints — protected by TOKEN_PEPPER
+# Admin endpoints - protected by ADMIN_TOKEN
 # ---------------------------------------------------------------------------
 
 @app.post("/admin/bootstrap", status_code=201)

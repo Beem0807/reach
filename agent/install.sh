@@ -65,7 +65,7 @@ if ! command -v curl &>/dev/null; then
 fi
 
 if ! command -v systemctl &>/dev/null; then
-  echo "Error: systemctl not found — this installer requires systemd"
+  echo "Error: systemctl not found - this installer requires systemd"
   exit 1
 fi
 
@@ -104,7 +104,7 @@ fi
 # ---------------------------------------------------------------------------
 REINSTALL=false
 if [[ -f "$BIN_PATH" ]]; then
-  echo "==> Existing installation detected — upgrading."
+  echo "==> Existing installation detected - upgrading."
   REINSTALL=true
   systemctl stop "$SERVICE_NAME" 2>/dev/null || true
 fi
@@ -169,14 +169,14 @@ Group=$SERVICE_USER
 # Prevent the process from gaining new privileges via setuid/setgid
 NoNewPrivileges=yes
 
-# Isolated /tmp — child processes get their own private temp dir
+# Isolated /tmp - child processes get their own private temp dir
 PrivateTmp=yes
 
 # Protect kernel tunables and control groups from writes
 ProtectKernelTunables=yes
 ProtectControlGroups=yes
 
-# Drop all capabilities — the agent only needs network access
+# Drop all capabilities - the agent only needs network access
 CapabilityBoundingSet=
 
 Environment=REACH_COMMAND_TIMEOUT_SECONDS=60

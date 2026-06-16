@@ -114,7 +114,7 @@ Resources:
         Enabled: true
 
   # -----------------------------------------------------------------------
-  # Shared IAM role — all Lambda functions use this
+  # Shared IAM role - all Lambda functions use this
   # -----------------------------------------------------------------------
   LambdaRole:
     Type: AWS::IAM::Role
@@ -254,7 +254,7 @@ Resources:
             Method: GET
 
   # -----------------------------------------------------------------------
-  # Admin endpoints — protected by TOKEN_PEPPER
+  # Admin endpoints - protected by TOKEN_PEPPER
   # -----------------------------------------------------------------------
   AdminBootstrapFunction:
     Type: AWS::Serverless::Function
@@ -322,7 +322,7 @@ Resources:
             Method: DELETE
 
   # -----------------------------------------------------------------------
-  # Heartbeat checker — runs every 5 minutes
+  # Heartbeat checker - runs every 5 minutes
   # -----------------------------------------------------------------------
   HeartbeatCheckerFunction:
     Type: AWS::Serverless::Function
