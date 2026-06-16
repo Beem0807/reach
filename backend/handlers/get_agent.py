@@ -26,6 +26,7 @@ def handle_get_agent(agent_id: str, raw_token: str) -> dict:
         "agent_version": agent.get("agent_version"),
         "machine_fingerprint": agent.get("machine_fingerprint"),
         "claimed_at": agent.get("claimed_at"),
+        "token_issued_at": agent.get("token_issued_at"),
         "last_heartbeat_at": agent.get("last_heartbeat_at"),
         "active_until": agent.get("active_until"),
         "mode": agent.get("mode", "wild"),

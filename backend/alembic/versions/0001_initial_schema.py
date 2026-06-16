@@ -1,8 +1,8 @@
-"""initial
+"""initial schema
 
-Revision ID: f62bf08970e4
+Revision ID: 0001_initial_schema
 Revises:
-Create Date: 2026-06-16 05:31:00.085245
+Create Date: 2026-06-17 00:00:00.000000
 
 """
 from typing import Sequence, Union
@@ -10,13 +10,33 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = 'f62bf08970e4'
+revision: str = '0001_initial_schema'
 down_revision: Union[str, Sequence[str], None] = None
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
+    op.create_table(
+        'tenants',
+        sa.Column('tenant_id', sa.String(), nullable=False),
+        sa.Column('name', sa.String(), nullable=True),
+        sa.Column('created_at', sa.String(), nullable=True),
+        sa.PrimaryKeyConstraint('tenant_id'),
+    )
+
+    op.create_table(
+        'users',
+        sa.Column('user_id', sa.String(), nullable=False),
+        sa.Column('tenant_id', sa.String(), nullable=False),
+        sa.Column('token_hash', sa.String(), nullable=False),
+        sa.Column('name', sa.String(), nullable=True),
+        sa.Column('created_at', sa.String(), nullable=True),
+        sa.PrimaryKeyConstraint('user_id'),
+    )
+    op.create_index('ix_users_tenant_id', 'users', ['tenant_id'])
+    op.create_index('ix_users_token_hash', 'users', ['token_hash'], unique=True)
+
     op.create_table(
         'agents',
         sa.Column('agent_id', sa.String(), nullable=False),
@@ -33,24 +53,18 @@ def upgrade() -> None:
         sa.Column('claimed_at', sa.String(), nullable=True),
         sa.Column('last_heartbeat_at', sa.String(), nullable=True),
         sa.Column('active_until', sa.Integer(), nullable=True),
+        sa.Column('token_issued_at', sa.String(), nullable=True),
         sa.Column('created_at', sa.String(), nullable=True),
         sa.PrimaryKeyConstraint('agent_id'),
     )
     op.create_index('ix_agents_tenant_id', 'agents', ['tenant_id'])
 
     op.create_table(
-        'tenant_tokens',
-        sa.Column('token_hash', sa.String(), nullable=False),
-        sa.Column('tenant_id', sa.String(), nullable=False),
-        sa.Column('created_at', sa.String(), nullable=True),
-        sa.PrimaryKeyConstraint('token_hash'),
-    )
-
-    op.create_table(
         'jobs',
         sa.Column('job_id', sa.String(), nullable=False),
         sa.Column('tenant_id', sa.String(), nullable=False),
         sa.Column('agent_id', sa.String(), nullable=False),
+        sa.Column('created_by', sa.String(), nullable=True),
         sa.Column('command', sa.Text(), nullable=False),
         sa.Column('status', sa.String(), nullable=False),
         sa.Column('mode', sa.String(), nullable=True),
@@ -67,9 +81,11 @@ def upgrade() -> None:
     op.create_index('ix_jobs_tenant_id', 'jobs', ['tenant_id'])
     op.create_index('ix_jobs_agent_id', 'jobs', ['agent_id'])
     op.create_index('ix_jobs_created_at', 'jobs', ['created_at'])
+    op.create_index('ix_jobs_created_by', 'jobs', ['created_by'])
 
 
 def downgrade() -> None:
     op.drop_table('jobs')
-    op.drop_table('tenant_tokens')
     op.drop_table('agents')
+    op.drop_table('users')
+    op.drop_table('tenants')

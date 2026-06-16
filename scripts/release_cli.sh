@@ -17,7 +17,11 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 DIST_DIR="$(mktemp -d)"
 
 echo "==> Building wheel..."
-pip wheel "$ROOT_DIR/cli" --no-deps -w "$DIST_DIR" -q
+if command -v uv &>/dev/null; then
+  uv build "$ROOT_DIR/cli" --wheel --out-dir "$DIST_DIR" -q
+else
+  pip wheel "$ROOT_DIR/cli" --no-deps -w "$DIST_DIR" -q
+fi
 
 WHEEL=$(ls "$DIST_DIR"/*.whl | head -1)
 WHEEL_FILE=$(basename "$WHEEL")
@@ -27,6 +31,7 @@ aws s3 cp "$WHEEL" "s3://$BUCKET/$WHEEL_FILE"
 
 echo ""
 echo "==> Done."
+echo "    uv tool install https://$BUCKET.s3.amazonaws.com/$WHEEL_FILE"
 echo "    pip install https://$BUCKET.s3.amazonaws.com/$WHEEL_FILE"
 
 rm -rf "$DIST_DIR"

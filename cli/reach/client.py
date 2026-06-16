@@ -39,10 +39,17 @@ class ReachClient:
         resp.raise_for_status()
         return resp.json()
 
-    def list_jobs(self, agent_id: Optional[str] = None, limit: int = 20) -> dict:
+    def get_me(self) -> dict:
+        resp = self.session.get(self._url("/me"), timeout=15)
+        resp.raise_for_status()
+        return resp.json()
+
+    def list_jobs(self, agent_id: Optional[str] = None, limit: int = 20, cursor: Optional[str] = None) -> dict:
         params: dict = {"limit": limit}
         if agent_id:
             params["agent_id"] = agent_id
+        if cursor:
+            params["cursor"] = cursor
         resp = self.session.get(self._url("/jobs"), params=params, timeout=15)
         resp.raise_for_status()
         return resp.json()

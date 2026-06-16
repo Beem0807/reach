@@ -1,6 +1,6 @@
 import json
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 
@@ -33,3 +33,7 @@ def _now() -> int:
 
 def _iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _iso_offset(seconds: int) -> str:
+    return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat()

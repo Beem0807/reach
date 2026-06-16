@@ -28,7 +28,7 @@ def handle_agent_claim(body: dict) -> dict:
         return _err("agent already claimed or disabled", 403)
     if _now() > int(agent.get("install_token_expires_at") or 0):
         return _err("install token expired", 403)
-    if not hmac.compare_digest(_hmac_token(install_token), agent.get("install_token_hash", "")):
+    if not hmac.compare_digest(_hmac_token(install_token), agent.get("install_token_hash") or ""):
         return _err("invalid install token", 403)
 
     raw_agent_token = AGENT_TOKEN_PREFIX + secrets.token_urlsafe(32)
@@ -41,6 +41,7 @@ def handle_agent_claim(body: dict) -> dict:
         "agent_version": agent_version,
         "claimed_at": now_iso,
         "active_until": _now() + 120,
+        "token_issued_at": now_iso,
     })
 
     return _ok({"agent_token": raw_agent_token, "mode": agent.get("mode", "wild")})

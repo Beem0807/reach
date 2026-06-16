@@ -57,19 +57,50 @@ Resources:
           Projection:
             ProjectionType: ALL
 
-  TenantTokensTable:
+  TenantsTable:
     Type: AWS::DynamoDB::Table
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:
-      TableName: reach-tenant-tokens
+      TableName: reach-tenants
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
-        - AttributeName: token_hash
+        - AttributeName: tenant_id
           AttributeType: S
       KeySchema:
-        - AttributeName: token_hash
+        - AttributeName: tenant_id
           KeyType: HASH
+
+  UsersTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: reach-users
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: user_id
+          AttributeType: S
+        - AttributeName: token_hash
+          AttributeType: S
+        - AttributeName: tenant_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: user_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: token-hash-index
+          KeySchema:
+            - AttributeName: token_hash
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+        - IndexName: tenant-index
+          KeySchema:
+            - AttributeName: tenant_id
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
 
   JobsTable:
     Type: AWS::DynamoDB::Table
@@ -138,9 +169,11 @@ Resources:
                 Action: dynamodb:*
                 Resource:
                   - !GetAtt AgentsTable.Arn
-                  - !GetAtt TenantTokensTable.Arn
+                  - !GetAtt TenantsTable.Arn
+                  - !GetAtt UsersTable.Arn
                   - !GetAtt JobsTable.Arn
                   - !Sub "${AgentsTable.Arn}/index/*"
+                  - !Sub "${UsersTable.Arn}/index/*"
                   - !Sub "${JobsTable.Arn}/index/*"
 
   # -----------------------------------------------------------------------
@@ -185,9 +218,35 @@ Resources:
             Path: /agent/jobs/{job_id}/result
             Method: POST
 
+  AgentRotateTokenFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-agent-rotate-token
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.agent_rotate_token.agent_rotate_token_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /agent/rotate-token
+            Method: POST
+
   # -----------------------------------------------------------------------
   # Tenant (CLI) endpoints
   # -----------------------------------------------------------------------
+  MeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-me
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.me.me_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /me
+            Method: GET
+
   CreateJobFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -254,19 +313,149 @@ Resources:
             Method: GET
 
   # -----------------------------------------------------------------------
-  # Admin endpoints - protected by TOKEN_PEPPER
+  # Admin endpoints - protected by ADMIN_TOKEN
   # -----------------------------------------------------------------------
-  AdminBootstrapFunction:
+  AdminCreateTenantFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: reach-admin-bootstrap
+      FunctionName: reach-admin-create-tenant
       Role: !GetAtt LambdaRole.Arn
-      Handler: handlers.admin_bootstrap.admin_bootstrap_handler
+      Handler: handlers.admin_tenants.create_tenant_handler
       Events:
         Api:
           Type: HttpApi
           Properties:
-            Path: /admin/bootstrap
+            Path: /admin/tenants
+            Method: POST
+
+  AdminListTenantsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-admin-list-tenants
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.admin_tenants.list_tenants_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /admin/tenants
+            Method: GET
+
+  AdminCreateUserFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-admin-create-user
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.admin_users.create_user_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /admin/tenants/{tenant_id}/users
+            Method: POST
+
+  AdminListUsersFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-admin-list-users
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.admin_users.list_users_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /admin/tenants/{tenant_id}/users
+            Method: GET
+
+  AdminDeleteUserFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-admin-delete-user
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.admin_users.delete_user_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /admin/tenants/{tenant_id}/users/{user_id}
+            Method: DELETE
+
+  AdminRotateUserTokenFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-admin-rotate-user-token
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.admin_users.rotate_user_token_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /admin/tenants/{tenant_id}/users/{user_id}/rotate-token
+            Method: POST
+
+  AdminListJobsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-admin-list-jobs
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.admin_jobs.list_jobs_admin_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /admin/jobs
+            Method: GET
+
+  AdminListAgentsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-admin-list-agents
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.admin_agents.list_agents_admin_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /admin/agents
+            Method: GET
+
+  AdminCreateAgentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-admin-create-agent
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.admin_agents.create_agent_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /admin/agents
+            Method: POST
+
+  AdminDeleteAgentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-admin-delete-agent
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.admin_agents.delete_agent_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /admin/agents/{agent_id}
+            Method: DELETE
+
+  AdminReissueInstallTokenFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-admin-reissue-install-token
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.admin_agents.reissue_install_token_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /admin/agents/{agent_id}/reissue-install-token
             Method: POST
 
   AdminGetPolicyFunction:

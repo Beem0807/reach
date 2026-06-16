@@ -26,6 +26,7 @@ def handle_get_job(job_id: str, raw_token: str) -> dict:
     return _ok({
         "job_id": job["job_id"],
         "agent_id": job["agent_id"],
+        "created_by": job.get("created_by"),
         "command": job["command"],
         "status": job["status"],
         "exit_code": job.get("exit_code"),

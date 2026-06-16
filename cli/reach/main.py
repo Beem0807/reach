@@ -23,6 +23,54 @@ POLL_INTERVAL_SECONDS = 2
 
 
 # ---------------------------------------------------------------------------
+# reach version
+# ---------------------------------------------------------------------------
+@app.command()
+def version():
+    """Show the CLI version."""
+    try:
+        from importlib.metadata import version as _pkg_version
+        v = _pkg_version("reach")
+    except Exception:
+        from reach import __version__
+        v = __version__
+    console.print(f"reach {v}")
+
+
+# ---------------------------------------------------------------------------
+# reach config
+# ---------------------------------------------------------------------------
+config_app = typer.Typer(help="Inspect local CLI configuration.")
+app.add_typer(config_app, name="config")
+
+
+@config_app.command("show")
+def config_show():
+    """Show current CLI configuration (API URL, default agent, aliases)."""
+    cfg = cfg_module.load()
+    if not cfg:
+        console.print("[yellow]No configuration found. Run `reach login` first.[/yellow]")
+        raise typer.Exit(1)
+
+    table = Table(show_header=False, box=None)
+    table.add_column("Key", style="bold cyan", width=20)
+    table.add_column("Value")
+
+    table.add_row("Config file", str(cfg_module.CONFIG_FILE))
+    table.add_row("API URL", cfg.get("api_url") or "[dim]—[/dim]")
+    table.add_row("Default agent", cfg.get("default_agent_id") or "[dim]—[/dim]")
+
+    aliases = cfg.get("aliases") or {}
+    if aliases:
+        alias_str = ", ".join(f"[cyan]{k}[/cyan]={v}" for k, v in sorted(aliases.items()))
+        table.add_row("Aliases", alias_str)
+    else:
+        table.add_row("Aliases", "[dim]none[/dim]")
+
+    console.print(table)
+
+
+# ---------------------------------------------------------------------------
 # reach login
 # ---------------------------------------------------------------------------
 @app.command()
@@ -49,6 +97,28 @@ def use(agent_id: str = typer.Argument(..., help="Agent ID or alias to set as de
     data["default_agent_id"] = resolved
     cfg_module.save(data)
     console.print(f"[green]Default agent set to:[/green] {resolved}")
+
+
+# ---------------------------------------------------------------------------
+# reach whoami
+# ---------------------------------------------------------------------------
+@app.command()
+def whoami():
+    """Show the currently authenticated user."""
+    api_url = cfg_module.require("api_url")
+    tenant_token = cfg_module.require("tenant_token")
+
+    client = ReachClient(api_url, tenant_token)
+    try:
+        data = client.get_me()
+    except requests.HTTPError as e:
+        console.print(f"[red]Error:[/red] {e.response.status_code} {e.response.text}")
+        raise typer.Exit(1)
+
+    console.print(f"[bold]User ID:[/bold]   {data.get('user_id')}")
+    console.print(f"[bold]Tenant ID:[/bold] {data.get('tenant_id')}")
+    console.print(f"[bold]Name:[/bold]      {data.get('name') or '—'}")
+    console.print(f"[bold]Created:[/bold]   {data.get('created_at') or '—'}")
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +266,7 @@ def exec_cmd(
     ctx: typer.Context,
     agent: Optional[str] = typer.Option(None, "--agent", "-a", help="Agent ID to target (overrides default)"),
     timeout: int = typer.Option(60, "--timeout", "-t", help="Seconds to wait for a result before giving up"),
+    no_wait: bool = typer.Option(False, "--no-wait", help="Submit the job and exit without waiting for the result"),
 ):
     """Execute a command on a remote agent."""
     args = ctx.args
@@ -220,6 +291,10 @@ def exec_cmd(
 
     job_id = job["job_id"]
     console.print(f"[dim]Job ID:[/dim] {job_id}  [dim]Agent:[/dim] {agent_id}")
+
+    if no_wait:
+        console.print(f"[dim]Use `reach job {job_id}` to check the result.[/dim]")
+        return
 
     deadline = time.monotonic() + timeout
     with console.status("[bold green]Waiting for result...[/bold green]", spinner="dots"):
@@ -275,8 +350,9 @@ def job_cmd(job_id: str = typer.Argument(..., help="Job ID to fetch")):
 def history(
     agent: Optional[str] = typer.Option(None, "--agent", "-a", help="Filter by agent ID or alias"),
     limit: int = typer.Option(20, "--limit", "-n", help="Number of jobs to show (max 100)"),
+    cursor: Optional[str] = typer.Option(None, "--cursor", help="Pagination cursor from a previous response"),
 ):
-    """Show recent jobs run by your tenant."""
+    """Show your recent jobs."""
     api_url = cfg_module.require("api_url")
     tenant_token = cfg_module.require("tenant_token")
 
@@ -284,7 +360,7 @@ def history(
 
     client = ReachClient(api_url, tenant_token)
     try:
-        data = client.list_jobs(agent_id=agent_id, limit=limit)
+        data = client.list_jobs(agent_id=agent_id, limit=limit, cursor=cursor)
     except requests.HTTPError as e:
         console.print(f"[red]Error:[/red] {e.response.status_code} {e.response.text}")
         raise typer.Exit(1)
@@ -320,6 +396,10 @@ def history(
         )
 
     console.print(table)
+
+    next_cursor = data.get("next_cursor")
+    if next_cursor:
+        console.print(f"\n[dim]More results available. Run with --cursor {next_cursor} to see the next page.[/dim]")
 
 
 # ---------------------------------------------------------------------------

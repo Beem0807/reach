@@ -17,6 +17,8 @@ def handle_create_job(body: dict, raw_token: str) -> dict:
 
     if not agent_id or not command:
         return _err("agent_id and command required")
+    if len(command) > 4096:
+        return _err("command too long (max 4096 characters)", 400)
 
     tenant = _verify_tenant_token(raw_token)
     if not tenant:
@@ -46,6 +48,7 @@ def handle_create_job(body: dict, raw_token: str) -> dict:
         "job_id": job_id,
         "tenant_id": tenant["tenant_id"],
         "agent_id": agent_id,
+        "created_by": tenant["user_id"],
         "command": command,
         "status": "PENDING",
         "stdout": None,

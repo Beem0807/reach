@@ -1,7 +1,7 @@
 import os
 from typing import Optional
 
-from sqlalchemy import JSON, Column, Integer, String, Text, create_engine, select, update
+from sqlalchemy import JSON, Column, Integer, String, Text, create_engine, delete as sa_delete, select, update
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 DATABASE_URL = os.environ["DATABASE_URL"]
@@ -30,13 +30,23 @@ class _Agent(_Base):
     claimed_at = Column(String)
     last_heartbeat_at = Column(String)
     active_until = Column(Integer)
+    token_issued_at = Column(String)
     created_at = Column(String)
 
 
-class _Token(_Base):
-    __tablename__ = "tenant_tokens"
-    token_hash = Column(String, primary_key=True)
-    tenant_id = Column(String, nullable=False)
+class _Tenant(_Base):
+    __tablename__ = "tenants"
+    tenant_id = Column(String, primary_key=True)
+    name = Column(String)
+    created_at = Column(String)
+
+
+class _User(_Base):
+    __tablename__ = "users"
+    user_id = Column(String, primary_key=True)
+    tenant_id = Column(String, nullable=False, index=True)
+    token_hash = Column(String, nullable=False, unique=True, index=True)
+    name = Column(String)
     created_at = Column(String)
 
 
@@ -52,6 +62,7 @@ class _Job(_Base):
     stdout = Column(Text)
     stderr = Column(Text)
     duration_ms = Column(Integer)
+    created_by = Column(String)
     created_at = Column(String, index=True)
     started_at = Column(String)
     completed_at = Column(String)
@@ -83,14 +94,17 @@ class AgentRepo:
                     claimed_at=fields["claimed_at"],
                     active_until=fields["active_until"],
                     last_heartbeat_at=fields["claimed_at"],
+                    token_issued_at=fields["token_issued_at"],
                 )
             )
             db.commit()
 
-    def update_heartbeat(self, agent_id: str, reactivate: bool, now_iso: str) -> None:
+    def update_heartbeat(self, agent_id: str, reactivate: bool, now_iso: str, agent_version: Optional[str] = None) -> None:
         values: dict = {"last_heartbeat_at": now_iso}
         if reactivate:
             values["status"] = "ACTIVE"
+        if agent_version:
+            values["agent_version"] = agent_version
         with SessionLocal() as db:
             db.execute(update(_Agent).where(_Agent.agent_id == agent_id).values(**values))
             db.commit()
@@ -142,6 +156,37 @@ class AgentRepo:
             ).scalars().all()
             return [_to_dict(r) for r in rows]
 
+    def reissue_install_token(self, agent_id: str, install_token_hash: str, expires_at: int) -> None:
+        with SessionLocal() as db:
+            db.execute(
+                update(_Agent)
+                .where(_Agent.agent_id == agent_id)
+                .values(
+                    status="CREATED",
+                    install_token_hash=install_token_hash,
+                    install_token_expires_at=expires_at,
+                    agent_token_hash=None,
+                    machine_fingerprint=None,
+                    claimed_at=None,
+                )
+            )
+            db.commit()
+
+    def update_agent_token_hash(self, agent_id: str, token_hash: str, token_issued_at: str) -> None:
+        with SessionLocal() as db:
+            db.execute(
+                update(_Agent).where(_Agent.agent_id == agent_id).values(
+                    agent_token_hash=token_hash,
+                    token_issued_at=token_issued_at,
+                )
+            )
+            db.commit()
+
+    def delete(self, agent_id: str) -> None:
+        with SessionLocal() as db:
+            db.execute(sa_delete(_Agent).where(_Agent.agent_id == agent_id))
+            db.commit()
+
 
 class JobRepo:
     def create(self, job: dict) -> None:
@@ -173,6 +218,16 @@ class JobRepo:
             db.execute(update(_Job).where(_Job.job_id == job_id).values(status="EXPIRED"))
             db.commit()
 
+    def expire_stale(self, pending_cutoff_iso: str) -> int:
+        with SessionLocal() as db:
+            result = db.execute(
+                update(_Job)
+                .where(_Job.status == "PENDING", _Job.created_at < pending_cutoff_iso)
+                .values(status="EXPIRED")
+            )
+            db.commit()
+            return result.rowcount
+
     def get_pending_for_agent(self, agent_id: str) -> list:
         with SessionLocal() as db:
             rows = db.execute(
@@ -183,7 +238,21 @@ class JobRepo:
             ).scalars().all()
             return [_to_dict(r) for r in rows]
 
-    def list_by_tenant(self, tenant_id: str, agent_id: Optional[str], limit: int) -> list:
+    def list_admin(self, agent_id: Optional[str], tenant_id: Optional[str], created_by: Optional[str], limit: int, cursor: Optional[str] = None) -> list:
+        with SessionLocal() as db:
+            stmt = select(_Job).order_by(_Job.created_at.desc()).limit(limit)
+            if tenant_id:
+                stmt = stmt.where(_Job.tenant_id == tenant_id)
+            if agent_id:
+                stmt = stmt.where(_Job.agent_id == agent_id)
+            if created_by:
+                stmt = stmt.where(_Job.created_by == created_by)
+            if cursor:
+                stmt = stmt.where(_Job.created_at < cursor)
+            rows = db.execute(stmt).scalars().all()
+            return [_to_dict(r) for r in rows]
+
+    def list_by_tenant(self, tenant_id: str, agent_id: Optional[str], limit: int, created_by: Optional[str] = None, cursor: Optional[str] = None) -> list:
         with SessionLocal() as db:
             stmt = (
                 select(_Job)
@@ -193,16 +262,56 @@ class JobRepo:
             )
             if agent_id:
                 stmt = stmt.where(_Job.agent_id == agent_id)
+            if created_by:
+                stmt = stmt.where(_Job.created_by == created_by)
+            if cursor:
+                stmt = stmt.where(_Job.created_at < cursor)
             rows = db.execute(stmt).scalars().all()
             return [_to_dict(r) for r in rows]
 
 
-class TokenRepo:
+class TenantRepo:
+    def get(self, tenant_id: str) -> Optional[dict]:
+        with SessionLocal() as db:
+            return _to_dict(db.get(_Tenant, tenant_id))
+
+    def create(self, tenant: dict) -> None:
+        with SessionLocal() as db:
+            db.add(_Tenant(**tenant))
+            db.commit()
+
+    def list_all(self) -> list:
+        with SessionLocal() as db:
+            rows = db.execute(select(_Tenant)).scalars().all()
+            return [_to_dict(r) for r in rows]
+
+
+class UserRepo:
+    def get(self, user_id: str) -> Optional[dict]:
+        with SessionLocal() as db:
+            return _to_dict(db.get(_User, user_id))
+
     def get_by_hash(self, token_hash: str) -> Optional[dict]:
         with SessionLocal() as db:
-            return _to_dict(db.get(_Token, token_hash))
+            row = db.execute(select(_User).where(_User.token_hash == token_hash)).scalar_one_or_none()
+            return _to_dict(row)
 
-    def create(self, token: dict) -> None:
+    def create(self, user: dict) -> None:
         with SessionLocal() as db:
-            db.add(_Token(**token))
+            db.add(_User(**user))
+            db.commit()
+
+    def list_by_tenant(self, tenant_id: str) -> list:
+        with SessionLocal() as db:
+            rows = db.execute(select(_User).where(_User.tenant_id == tenant_id)).scalars().all()
+            return [_to_dict(r) for r in rows]
+
+    def update_token_hash(self, user_id: str, token_hash: str) -> None:
+        with SessionLocal() as db:
+            db.execute(update(_User).where(_User.user_id == user_id).values(token_hash=token_hash))
+            db.commit()
+
+    def delete(self, user_id: str) -> None:
+        with SessionLocal() as db:
+            db.execute(sa_delete(_User).where(_User.user_id == user_id))
             db.commit()

@@ -20,7 +20,7 @@ Reach gives any AI agent - Claude Code, Cursor, custom LLM workflows, or your ow
 ## How it works
 
 1. You deploy the Reach backend (Lambda or Docker).
-2. You run bootstrap to get your API URL, tenant token, and agent install commands.
+2. You create a tenant, a user (for the CLI), and an agent (per machine) via the admin API.
 3. You install the CLI on your local machine.
 4. You install the agent on each remote machine.
 5. The agent makes outbound HTTPS requests to your backend - no inbound ports needed.
@@ -54,36 +54,52 @@ docker run -d -p 8000:8000 \
   nabeemdev/reach:latest
 ```
 
-Once deployed, run bootstrap to get your API URL and install commands:
+Once deployed, create a tenant, a user under it, and an agent under it:
 
 ```bash
-curl -s -X POST "$API_URL/admin/bootstrap" \
+curl -s -X POST "$API_URL/admin/tenants" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
+
+curl -s -X POST "$API_URL/admin/tenants/tenant_xxxxx/users" \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"hostname": "my-machine"}' | python3 -m json.tool
+  -d '{"name": "alice"}' | python3 -m json.tool
+
+curl -s -X POST "$API_URL/admin/agents" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"tenant_id": "tenant_xxxxx"}' | python3 -m json.tool
 ```
 
-Bootstrap returns ready-to-paste commands for the CLI and agent. See [SELF_HOSTING.md](SELF_HOSTING.md) for the full setup guide.
+Each returns ready-to-paste commands for the CLI and agent. Repeat the user step for each person who needs access - everyone gets their own token. See [SELF_HOSTING.md](SELF_HOSTING.md) for the full setup guide.
 
 ---
 
 ## Install the CLI
 
+**With uv (recommended):**
+
+```bash
+uv tool install https://reach-releases.s3.amazonaws.com/reach-0.1.0-py3-none-any.whl
+```
+
+**With pip:**
+
 ```bash
 pip install https://reach-releases.s3.amazonaws.com/reach-0.1.0-py3-none-any.whl
 ```
 
-Log in with the values from bootstrap:
+Log in with the token from `/admin/tenants/{id}/users`:
 
 ```bash
-reach login --api-url "<your-api-url>" --token "<tenant_token>"
+reach login --api-url "<your-api-url>" --token "<your-token>"
 ```
 
 ---
 
 ## Add a machine
 
-Use the install commands from bootstrap output directly. Or manually:
+Use the install commands from the `/admin/agents` response directly. Or manually:
 
 **Linux:**
 
@@ -122,6 +138,7 @@ reach agents                                # list all your machines
 reach status                                # show default agent status
 reach exec -- <command>                     # run on default machine
 reach exec --agent <id|alias> -- <command>  # run on specific machine
+reach exec --no-wait -- <command>           # fire-and-forget; check with `reach job <id>`
 ```
 
 ### Aliases
@@ -136,6 +153,39 @@ reach exec --agent prod -- docker ps
 reach exec --agent staging -- uptime
 reach alias list
 ```
+
+---
+
+## Admin operations
+
+The admin API (authenticated with `ADMIN_TOKEN`) gives you visibility across all tenants.
+
+**List agents for a tenant:**
+
+```bash
+curl -s "$API_URL/admin/agents?tenant_id=tenant_xxxxx" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
+```
+
+**View job history** — filter by tenant, agent, or the user (`created_by`) who ran the command:
+
+```bash
+# All jobs for a tenant
+curl -s "$API_URL/admin/jobs?tenant_id=tenant_xxxxx" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
+
+# All jobs by a specific user
+curl -s "$API_URL/admin/jobs?created_by=user_xxxxx" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
+
+# Paginate with cursor from previous response
+curl -s "$API_URL/admin/jobs?tenant_id=tenant_xxxxx&cursor=<next_cursor>" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
+```
+
+Every job record includes `created_by` (the `user_id` of whoever submitted it), so you can see who ran what and when.
+
+See [SELF_HOSTING.md](SELF_HOSTING.md) for the full admin API reference.
 
 ---
 
@@ -217,7 +267,7 @@ See [SELF_HOSTING.md](SELF_HOSTING.md) for the full blocked command reference.
 
 ## Production usage
 
-For production machines, use the **Approved** policy mode - set it via the admin API after bootstrap.
+For production machines, use the **Approved** policy mode - set it via the admin API after creating the agent.
 
 Avoid running production agents in Wild mode unless you fully trust the environment and understand the risk.
 
@@ -227,16 +277,22 @@ Avoid running production agents in Wild mode unless you fully trust the environm
 
 | Command | Description |
 |---|---|
-| `reach login` | Store API URL and tenant token |
+| `reach login` | Store API URL and user token |
+| `reach config show` | Show current configuration (API URL, default agent, aliases) |
+| `reach version` | Show CLI version |
+| `reach whoami` | Show current user identity (user_id, tenant_id, name) |
 | `reach agents` | List all machines |
 | `reach use <id\|alias>` | Set default machine |
 | `reach status` | Show default machine status |
 | `reach exec -- <cmd>` | Run command on default machine |
 | `reach exec --agent <id\|alias> -- <cmd>` | Run command on specific machine |
 | `reach exec --timeout <s> -- <cmd>` | Override wait timeout (default 60s) |
+| `reach exec --no-wait -- <cmd>` | Submit job and exit immediately; use `reach job <id>` to check later |
 | `reach job <job_id>` | Re-view stdout/stderr of a past job |
-| `reach history` | Show recent jobs across all machines |
-| `reach history --agent <id\|alias>` | Filter history by machine |
+| `reach history` | Show your recent jobs |
+| `reach history --agent <id\|alias>` | Filter your history by machine |
+| `reach history --limit <n>` | Show up to N jobs (max 100, default 20) |
+| `reach history --cursor <cursor>` | Fetch the next page (cursor from previous response) |
 | `reach policy show` | Show mode and approved commands for default agent |
 | `reach policy show --agent <id\|alias>` | Show policy for a specific machine |
 | `reach alias set <name> <id>` | Create alias |

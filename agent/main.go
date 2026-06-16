@@ -7,23 +7,39 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 	"time"
 )
 
+// ErrUnauthorized is returned when the server rejects the agent's token -
+// retrying won't fix this, the agent needs a new token.
+var ErrUnauthorized = errors.New("unauthorized")
+
+// ErrTokenExpired is returned when the server rejects the token due to age.
+// The agent should rotate and retry rather than going dormant.
+var ErrTokenExpired = errors.New("token expired")
+
+// ErrPermanent marks failures where retrying - even via a process
+// restart - will never succeed without the user fixing config on disk.
+var ErrPermanent = errors.New("permanent failure")
+
 const (
-	machineIDPath   = "/etc/machine-id"
-	agentVersion    = "0.1.0"
-	idlePollSeconds = 30
-	maxOutputBytes  = 50_000
+	machineIDPath     = "/etc/machine-id"
+	agentVersion      = "0.1.0"
+	idlePollSeconds   = 30
+	maxOutputBytes    = 50_000
+	tokenRotationDays = 30
 )
 
 // configPath and installIDPath are overridable via REACH_CONFIG_PATH for local dev.
@@ -49,6 +65,7 @@ type Config struct {
 	AgentToken         string `json:"agent_token,omitempty"`
 	InstallToken       string `json:"install_token,omitempty"`
 	MachineFingerprint string `json:"machine_fingerprint,omitempty"`
+	TokenIssuedAt      string `json:"token_issued_at,omitempty"`
 }
 
 func loadConfig() (*Config, error) {
@@ -194,12 +211,15 @@ func claim(cfg *Config, fp string) error {
 	if err != nil {
 		return fmt.Errorf("claim request: %w", err)
 	}
+	if status >= 400 && status < 500 {
+		return fmt.Errorf("claim failed (%d): %s: %w", status, result.Error, ErrPermanent)
+	}
 	if status != 200 {
 		return fmt.Errorf("claim failed (%d): %s", status, result.Error)
 	}
 	cfg.AgentToken = result.AgentToken
 	cfg.MachineFingerprint = fp
-	// Clear install token from disk after successful claim
+	cfg.TokenIssuedAt = time.Now().UTC().Format(time.RFC3339)
 	cfg.InstallToken = ""
 	if err := saveConfig(cfg); err != nil {
 		return fmt.Errorf("save config after claim: %w", err)
@@ -215,6 +235,7 @@ func claim(cfg *Config, fp string) error {
 type SyncRequest struct {
 	AgentID            string `json:"agent_id"`
 	MachineFingerprint string `json:"machine_fingerprint"`
+	AgentVersion       string `json:"agent_version"`
 }
 
 type Job struct {
@@ -224,25 +245,79 @@ type Job struct {
 }
 
 type SyncResponse struct {
-	Jobs           []Job  `json:"jobs"`
-	NextPollSeconds int   `json:"next_poll_seconds"`
-	Error          string `json:"error"`
+	Jobs            []Job  `json:"jobs"`
+	NextPollSeconds int    `json:"next_poll_seconds"`
+	Error           string `json:"error"`
 }
 
 func sync(cfg *Config) (*SyncResponse, error) {
 	payload := SyncRequest{
 		AgentID:            cfg.AgentID,
 		MachineFingerprint: cfg.MachineFingerprint,
+		AgentVersion:       agentVersion,
 	}
 	var result SyncResponse
 	status, err := apiPost(cfg.APIURL, "/agent/sync", cfg.AgentToken, payload, &result)
 	if err != nil {
 		return nil, fmt.Errorf("sync request: %w", err)
 	}
+	if status == 401 {
+		return nil, fmt.Errorf("sync failed (401): %s: %w: %w", result.Error, ErrUnauthorized, ErrPermanent)
+	}
+	if status == 403 {
+		if result.Error == "token_expired" {
+			return nil, fmt.Errorf("sync failed: %w", ErrTokenExpired)
+		}
+		// "agent not active" or "fingerprint mismatch" - both require
+		// re-claiming with a fresh install token, retrying won't help.
+		return nil, fmt.Errorf("sync failed (403): %s: %w", result.Error, ErrPermanent)
+	}
 	if status != 200 {
 		return nil, fmt.Errorf("sync failed (%d): %s", status, result.Error)
 	}
 	return &result, nil
+}
+
+// ---------------------------------------------------------------------------
+// Rotate token
+// ---------------------------------------------------------------------------
+
+type RotateTokenRequest struct {
+	AgentID            string `json:"agent_id"`
+	MachineFingerprint string `json:"machine_fingerprint"`
+}
+
+type RotateTokenResponse struct {
+	AgentToken string `json:"agent_token"`
+	Error      string `json:"error"`
+}
+
+func rotateToken(cfg *Config) error {
+	payload := RotateTokenRequest{
+		AgentID:            cfg.AgentID,
+		MachineFingerprint: cfg.MachineFingerprint,
+	}
+	var result RotateTokenResponse
+	status, err := apiPost(cfg.APIURL, "/agent/rotate-token", cfg.AgentToken, payload, &result)
+	if err != nil {
+		return fmt.Errorf("rotate token request: %w", err)
+	}
+	if status == 401 {
+		return fmt.Errorf("rotate token failed (401): %s: %w: %w", result.Error, ErrUnauthorized, ErrPermanent)
+	}
+	if status != 200 {
+		return fmt.Errorf("rotate token failed (%d): %s", status, result.Error)
+	}
+	cfg.AgentToken = result.AgentToken
+	cfg.TokenIssuedAt = time.Now().UTC().Format(time.RFC3339)
+	if err := saveConfig(cfg); err != nil {
+		// Token rotated on server but config write failed. New token is in memory
+		// for this session but will be lost on restart - agent will need manual reclaim.
+		log.Printf("WARNING: token rotated but config save failed: %v - manual reclaim required on restart", err)
+		return nil
+	}
+	log.Printf("Agent token rotated successfully")
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -358,7 +433,16 @@ func postResult(cfg *Config, jobID string, res CommandResult) error {
 // Main loop
 // ---------------------------------------------------------------------------
 
-func run() error {
+func sleep(ctx context.Context, d time.Duration) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(d):
+		return true
+	}
+}
+
+func run(ctx context.Context) error {
 	cfg, err := loadConfig()
 	if err != nil {
 		return err
@@ -384,10 +468,42 @@ func run() error {
 	pollSeconds := idlePollSeconds
 
 	for {
+		if cfg.TokenIssuedAt != "" {
+			if issuedAt, err := time.Parse(time.RFC3339, cfg.TokenIssuedAt); err == nil {
+				if time.Since(issuedAt) >= time.Duration(tokenRotationDays)*24*time.Hour {
+					log.Printf("Agent token is %d+ days old, rotating...", tokenRotationDays)
+					if err := rotateToken(cfg); err != nil {
+						if errors.Is(err, ErrPermanent) {
+							return fmt.Errorf("token rotation failed permanently: %w", err)
+						}
+						log.Printf("Token rotation failed (will retry next poll): %v", err)
+					}
+				}
+			}
+		}
+
 		syncResp, err := sync(cfg)
 		if err != nil {
+			if errors.Is(err, ErrTokenExpired) {
+				log.Printf("Agent token expired server-side, rotating...")
+				if rotErr := rotateToken(cfg); rotErr != nil {
+					if errors.Is(rotErr, ErrPermanent) {
+						return fmt.Errorf("token rotation after server expiry failed permanently: %w", rotErr)
+					}
+					log.Printf("Token rotation failed (will retry next poll): %v", rotErr)
+				}
+				if !sleep(ctx, time.Duration(pollSeconds)*time.Second) {
+					return nil
+				}
+				continue
+			}
+			if errors.Is(err, ErrPermanent) {
+				return fmt.Errorf("re-claim required: %w", err)
+			}
 			log.Printf("Sync error: %v - retrying in %ds", err, pollSeconds)
-			time.Sleep(time.Duration(pollSeconds) * time.Second)
+			if !sleep(ctx, time.Duration(pollSeconds)*time.Second) {
+				return nil
+			}
 			continue
 		}
 
@@ -397,6 +513,11 @@ func run() error {
 		}
 
 		for _, job := range syncResp.Jobs {
+			if ctx.Err() != nil {
+				log.Printf("Shutdown requested, skipping job %s", job.JobID)
+				return nil
+			}
+
 			log.Printf("Received job %s: %q", job.JobID, job.Command)
 
 			if isBlocked(job.Command) {
@@ -417,13 +538,38 @@ func run() error {
 			}
 		}
 
-		time.Sleep(time.Duration(pollSeconds) * time.Second)
+		if !sleep(ctx, time.Duration(pollSeconds)*time.Second) {
+			return nil
+		}
 	}
 }
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
-	if err := run(); err != nil {
-		log.Fatalf("Fatal: %v", err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGTERM, syscall.SIGINT)
+	go func() {
+		sig := <-quit
+		log.Printf("Signal %v received, shutting down gracefully...", sig)
+		cancel()
+	}()
+
+	err := run(ctx)
+	if err == nil {
+		return
 	}
+	if errors.Is(err, ErrPermanent) {
+		// Don't exit - under Restart=always, any exit code respawns us and
+		// we'd hammer the API with the same doomed request forever. Report
+		// the error and idle instead; fix the config and restart manually
+		// (e.g. systemctl restart reach-agent) once it's corrected.
+		log.Printf("Permanent failure, not retrying: %v", err)
+		log.Printf("Fix the agent config and restart the service manually")
+		for {
+			time.Sleep(1 * time.Hour)
+		}
+	}
+	log.Fatalf("Fatal: %v", err)
 }

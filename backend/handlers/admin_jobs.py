@@ -1,13 +1,20 @@
 import base64
 import logging
+import os
 from typing import Optional
 
-from shared.auth import _bearer, _verify_tenant_token
 from shared.response import _err, _ok
 from shared.store import jobs_repo
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
+
+ADMIN_TOKEN = os.environ["ADMIN_TOKEN"]
+
+
+def _verify_admin(raw: str) -> bool:
+    import hmac
+    return hmac.compare_digest(raw, ADMIN_TOKEN)
 
 
 def _decode_cursor(s: str) -> Optional[str]:
@@ -21,13 +28,15 @@ def _encode_cursor(s: str) -> str:
     return base64.urlsafe_b64encode(s.encode()).decode()
 
 
-def handle_list_jobs(raw_token: str, agent_id: Optional[str], limit: int, cursor: Optional[str] = None) -> dict:
-    tenant = _verify_tenant_token(raw_token)
-    if not tenant:
+def handle_list_jobs_admin(raw_token: str, agent_id: str, tenant_id: str, created_by: str, limit: int, cursor: Optional[str] = None) -> dict:
+    if not _verify_admin(raw_token):
         return _err("unauthorized", 401)
 
+    if not any([agent_id, tenant_id, created_by]):
+        return _err("at least one filter required: agent_id, tenant_id, or created_by", 400)
+
     decoded_cursor = _decode_cursor(cursor) if cursor else None
-    rows = jobs_repo.list_by_tenant(tenant["tenant_id"], agent_id, limit, created_by=tenant["user_id"], cursor=decoded_cursor)
+    rows = jobs_repo.list_admin(agent_id or None, tenant_id or None, created_by or None, limit, cursor=decoded_cursor)
 
     jobs = [
         {
@@ -50,16 +59,21 @@ def handle_list_jobs(raw_token: str, agent_id: Optional[str], limit: int, cursor
     return _ok(result)
 
 
-def list_jobs_handler(event, context):
-    logger.info("GET /jobs")
-    token = _bearer(event)
+def list_jobs_admin_handler(event, context):
+    logger.info("GET /admin/jobs")
+    headers = event.get("headers") or {}
+    token = headers.get("authorization", "")
+    if token.lower().startswith("bearer "):
+        token = token[7:].strip()
     if not token:
         return _err("missing Authorization header", 401)
     qs = event.get("queryStringParameters") or {}
-    agent_filter = qs.get("agent_id")
+    agent_id = qs.get("agent_id", "")
+    tenant_id = qs.get("tenant_id", "")
+    created_by = qs.get("created_by", "")
     cursor = qs.get("cursor")
     try:
         limit = max(1, min(int(qs.get("limit", 20)), 100))
     except (ValueError, TypeError):
         limit = 20
-    return handle_list_jobs(token, agent_filter, limit, cursor)
+    return handle_list_jobs_admin(token, agent_id, tenant_id, created_by, limit, cursor)
