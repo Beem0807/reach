@@ -511,7 +511,7 @@ Resources:
             Method: DELETE
 
   # -----------------------------------------------------------------------
-  # Heartbeat checker - runs every 5 minutes
+  # Heartbeat checker - runs every minute
   # -----------------------------------------------------------------------
   HeartbeatCheckerFunction:
     Type: AWS::Serverless::Function
@@ -523,9 +523,9 @@ Resources:
         Schedule:
           Type: Schedule
           Properties:
-            Schedule: rate(5 minutes)
+            Schedule: rate(1 minute)
             Name: reach-heartbeat-check
-            Description: Mark agents INACTIVE if no heartbeat in last 5 minutes
+            Description: Mark agents INACTIVE if no heartbeat in last 90 seconds
 
 Outputs:
   ApiUrl:

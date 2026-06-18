@@ -447,7 +447,7 @@ CREATED → ACTIVE → INACTIVE (heartbeat timeout) → ACTIVE (auto-reactivates
 
 An agent starts as `CREATED`. On first run it calls `POST /agent/claim` with the install token, transitions to `ACTIVE`, and receives a permanent `agent_token`. The install token is then cleared from disk.
 
-The heartbeat checker runs every 5 minutes (EventBridge on Lambda, APScheduler on FastAPI) and marks agents `INACTIVE` if no sync has been received in the last 5 minutes. The agent auto-reactivates on its next successful sync. The same check also sweeps PENDING jobs older than 1 hour and marks them `EXPIRED` - so if an agent goes offline after a job is submitted, the job status resolves within an hour rather than lingering indefinitely.
+The heartbeat checker runs every minute (EventBridge on Lambda, APScheduler on FastAPI) and marks agents `INACTIVE` if no sync has been received in the last 90 seconds. The agent auto-reactivates on its next successful sync. The same check also sweeps PENDING jobs older than 1 hour and marks them `EXPIRED` - so if an agent goes offline after a job is submitted, the job status resolves within an hour rather than lingering indefinitely.
 
 ### Adaptive polling
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Build and push the reach backend Docker image.
-# Usage: ./scripts/release_backend.sh [--image nabeemdev/reach] [--push]
+# Build and publish the reach backend: Docker image + Lambda package.
+# Usage: ./scripts/release_backend.sh [--image nabeemdev/reach] [--bucket reach-releases] [--push]
 
 set -euo pipefail
 
@@ -26,6 +26,9 @@ if [[ -z "$VERSION" ]]; then
 fi
 echo "==> Version: $VERSION"
 
+# ---------------------------------------------------------------------------
+# Docker image
+# ---------------------------------------------------------------------------
 echo "==> Building $IMAGE:$VERSION and $IMAGE:latest..."
 docker build \
   --platform linux/amd64,linux/arm64 \
@@ -33,9 +36,32 @@ docker build \
   -t "$IMAGE:latest" \
   "$ROOT_DIR"
 
-echo "==> Uploading local-setup.sh to s3://$BUCKET/..."
+# ---------------------------------------------------------------------------
+# Lambda package
+# ---------------------------------------------------------------------------
+PACKAGED_TEMPLATE="/tmp/reach-lambda-packaged.yaml"
+
+echo "==> Packaging Lambda (sam package)..."
+sam package \
+  --template-file "$ROOT_DIR/deploy/lambda/template.yaml" \
+  --s3-bucket "$BUCKET" \
+  --s3-prefix "lambda/code" \
+  --output-template-file "$PACKAGED_TEMPLATE" \
+  --no-progressbar
+
+echo "==> Uploading Lambda template..."
+aws s3 cp "$PACKAGED_TEMPLATE" "s3://$BUCKET/lambda/v${VERSION}/template.yaml"
+aws s3 cp "$PACKAGED_TEMPLATE" "s3://$BUCKET/lambda/latest/template.yaml"
+
+# ---------------------------------------------------------------------------
+# local-setup.sh
+# ---------------------------------------------------------------------------
+echo "==> Uploading local-setup.sh..."
 aws s3 cp "$ROOT_DIR/scripts/local-setup.sh" "s3://$BUCKET/local-setup.sh"
 
+# ---------------------------------------------------------------------------
+# Docker push
+# ---------------------------------------------------------------------------
 if [[ "$PUSH" == true ]]; then
   echo "==> Pushing $IMAGE:$VERSION..."
   docker push "$IMAGE:$VERSION"
@@ -45,9 +71,15 @@ if [[ "$PUSH" == true ]]; then
   echo "==> Done. Published:"
   echo "    $IMAGE:$VERSION"
   echo "    $IMAGE:latest"
+  echo "    s3://$BUCKET/lambda/v${VERSION}/template.yaml"
+  echo "    s3://$BUCKET/lambda/latest/template.yaml"
+  echo "    s3://$BUCKET/lambda/code/ (function zips)"
 else
   echo ""
-  echo "==> Built locally (pass --push to publish):"
+  echo "==> Built locally (pass --push to publish Docker image):"
   echo "    $IMAGE:$VERSION"
   echo "    $IMAGE:latest"
+  echo "    s3://$BUCKET/lambda/v${VERSION}/template.yaml (uploaded)"
+  echo "    s3://$BUCKET/lambda/latest/template.yaml (uploaded)"
+  echo "    s3://$BUCKET/lambda/code/ (function zips uploaded)"
 fi

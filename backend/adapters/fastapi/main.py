@@ -75,9 +75,9 @@ scheduler = AsyncIOScheduler()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    scheduler.add_job(handle_heartbeat_check, "interval", minutes=5, id="heartbeat")
+    scheduler.add_job(handle_heartbeat_check, "interval", minutes=1, id="heartbeat")
     scheduler.start()
-    logger.info("Heartbeat scheduler started (every 5 minutes)")
+    logger.info("Heartbeat scheduler started (every 1 minute)")
     yield
     scheduler.shutdown()
 

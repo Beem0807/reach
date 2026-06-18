@@ -11,7 +11,7 @@ logger.setLevel(logging.INFO)
 def handle_heartbeat_check() -> dict:
     now = _now()
 
-    cutoff_iso = datetime.fromtimestamp(now - 300, tz=timezone.utc).isoformat()
+    cutoff_iso = datetime.fromtimestamp(now - 90, tz=timezone.utc).isoformat()
     marked_inactive = 0
     for agent in agents_repo.scan_stale_active(cutoff_iso):
         if agents_repo.mark_inactive(agent["agent_id"]):
