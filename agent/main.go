@@ -37,7 +37,7 @@ var ErrPermanent = errors.New("permanent failure")
 const (
 	machineIDPath     = "/etc/machine-id"
 	agentVersion      = "0.1.0"
-	idlePollSeconds   = 30
+	idlePollSeconds   = 15
 	maxOutputBytes    = 50_000
 	tokenRotationDays = 30
 )

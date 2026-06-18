@@ -38,15 +38,15 @@ class TestHeartbeatCheck:
             result = handle_heartbeat_check()
         assert result["marked_inactive"] == 0
 
-    def test_scan_uses_90s_cutoff(self):
+    def test_scan_uses_45s_cutoff(self):
         with patch("handlers.heartbeat.agents_repo") as ar, \
              patch("handlers.heartbeat.jobs_repo") as jr:
             ar.scan_stale_active.return_value = []
             jr.expire_stale.return_value = 0
             handle_heartbeat_check()
         cutoff_arg = ar.scan_stale_active.call_args[0][0]
-        # Cutoff should be an ISO string roughly 90s in the past
+        # Cutoff should be an ISO string roughly 45s in the past (3 × 15s idle poll)
         from datetime import datetime, timezone
         cutoff_dt = datetime.fromisoformat(cutoff_arg)
         age = (datetime.now(tz=timezone.utc) - cutoff_dt).total_seconds()
-        assert 85 < age < 100
+        assert 40 < age < 55

@@ -87,7 +87,7 @@ The same handler code runs in both deployments. The storage layer is swapped via
 nginx is required in front of uvicorn for the Docker deployment. Long-polling connections from the agent (`POST /agent/sync`) need to be terminated cleanly; uvicorn alone does not handle this correctly under load.
 
 A background scheduler (APScheduler on FastAPI, EventBridge on Lambda) runs every minute to:
-- Mark agents `INACTIVE` if no heartbeat in the last 90 seconds
+- Mark agents `INACTIVE` if no heartbeat in the last 45 seconds
 - Expire `PENDING` jobs older than 1 hour to `EXPIRED`
 
 ### Agent (`agent/`)
@@ -135,10 +135,10 @@ CREATED → ACTIVE → INACTIVE → ACTIVE
 ```
 
 - **CREATED** - registered, never claimed. Install token valid for 24 hours.
-- **ACTIVE** - claimed and syncing. Transitions to INACTIVE after 90 seconds without a heartbeat.
+- **ACTIVE** - claimed and syncing. Transitions to INACTIVE after 45 seconds without a heartbeat.
 - **INACTIVE** - missed heartbeats. Auto-recovers to ACTIVE on next successful sync (no manual intervention needed).
 
-The heartbeat checker runs every minute and scans for ACTIVE agents whose `last_heartbeat_at` is older than 90 seconds.
+The heartbeat checker runs every minute and scans for ACTIVE agents whose `last_heartbeat_at` is older than 45 seconds.
 
 ---
 
@@ -146,8 +146,8 @@ The heartbeat checker runs every minute and scans for ACTIVE agents whose `last_
 
 The backend tells the agent how fast to poll on each sync response via `next_poll_seconds`:
 
-- **5s** - active window: a job was created in the last 120 seconds
-- **30s** - idle
+- **2s** - active window: a job was dispatched or created recently
+- **15s** - idle
 
 This keeps latency low during active use without burning unnecessary requests when idle.
 

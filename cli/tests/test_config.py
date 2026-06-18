@@ -1,5 +1,5 @@
 """
-Tests for reach/config.py — all file I/O is redirected to a tmp directory.
+Tests for reach/config.py - all file I/O is redirected to a tmp directory.
 """
 import json
 import pytest

@@ -37,7 +37,7 @@ def handle_agent_sync(body: dict, raw_token: str) -> dict:
             return _err("token_expired", 403)
 
     now = _now()
-    next_poll = 5 if int(agent.get("active_until") or 0) > now else 30
+    next_poll = 2 if int(agent.get("active_until") or 0) > now else 15
 
     agents_repo.update_heartbeat(
         agent_id,
@@ -55,6 +55,8 @@ def handle_agent_sync(body: dict, raw_token: str) -> dict:
                 "mode": job.get("mode", "wild"),
             })
 
+    if jobs_payload:
+        next_poll = 2
     return _ok({"jobs": jobs_payload, "next_poll_seconds": next_poll})
 
 
