@@ -131,7 +131,7 @@ REACH_CONFIG_PATH=/tmp/reach-agent/config.json /tmp/reach-agent/reach-agent
 Set it as your default:
 
 ```bash
-reach use agent_xxx
+reach agents use agent_xxx
 ```
 
 **To remove an agent from a Linux machine:**
@@ -152,7 +152,7 @@ curl -s -X DELETE "$API_URL/admin/agents/agent_xxx" \
 ## Usage
 
 ```bash
-reach agents                                # list all your machines
+reach agents list                           # list all your machines
 reach status                                # show default agent status
 reach exec -- <command>                     # run on default machine
 reach exec --agent <id|alias> -- <command>  # run on specific machine
@@ -171,6 +171,21 @@ reach exec --agent prod -- docker ps
 reach exec --agent staging -- uptime
 reach alias list
 ```
+
+### Multiple tenants (profiles)
+
+If you access more than one reach deployment (e.g. a home server and a work server), use profiles to hold multiple credentials:
+
+```bash
+reach login --profile home --api-url "<home-url>" --token "<home-token>"
+reach login --profile work --api-url "<work-url>" --token "<work-token>"
+
+reach profile list       # see all profiles, active one is marked
+reach profile use home   # switch to home deployment
+reach profile use work   # switch to work deployment
+```
+
+Each profile has its own API URL, token, default agent, and aliases. All commands (`exec`, `agents list`, `history`, etc.) operate against the active profile.
 
 ---
 
@@ -334,13 +349,24 @@ Avoid running production agents in Wild mode unless you fully trust the environm
 
 | Command | Description |
 |---|---|
-| `reach login` | Store API URL and user token |
-| `reach config show` | Show current configuration (API URL, default agent, aliases) |
-| `reach version` | Show CLI version |
+| **Auth & setup** | |
+| `reach login --api-url <url> --token <token>` | Store credentials (saves to `default` profile) |
+| `reach login --api-url <url> --token <token> --profile <name>` | Store credentials under a named profile |
+| `reach profile list` | List all profiles |
+| `reach profile use <name>` | Switch active profile |
+| `reach profile rename <old> <new>` | Rename a profile |
+| `reach profile delete <name>` | Delete a profile (cannot delete the active profile) |
+| `reach config show` | Show active profile, API URL, default agent, and aliases |
 | `reach whoami` | Show current user identity (user_id, tenant_id, name) |
-| `reach agents` | List all machines |
-| `reach use <id\|alias>` | Set default machine |
+| `reach version` | Show CLI version |
+| **Agents** | |
+| `reach agents list` | List all machines |
+| `reach agents use <id\|alias>` | Set default machine |
 | `reach status` | Show default machine status |
+| `reach alias set <name> <id>` | Create alias |
+| `reach alias list` | List aliases |
+| `reach alias remove <name>` | Remove alias |
+| **Execution** | |
 | `reach exec -- <cmd>` | Run command on default machine |
 | `reach exec --agent <id\|alias> -- <cmd>` | Run command on specific machine |
 | `reach exec --timeout <s> -- <cmd>` | Override wait timeout (default 60s) |
@@ -350,11 +376,10 @@ Avoid running production agents in Wild mode unless you fully trust the environm
 | `reach history --agent <id\|alias>` | Filter your history by machine |
 | `reach history --limit <n>` | Show up to N jobs (max 100, default 20) |
 | `reach history --cursor <cursor>` | Fetch the next page (cursor from previous response) |
+| **Policy** | |
 | `reach policy show` | Show mode and approved commands for default agent |
 | `reach policy show --agent <id\|alias>` | Show policy for a specific machine |
-| `reach alias set <name> <id>` | Create alias |
-| `reach alias list` | List aliases |
-| `reach alias remove <name>` | Remove alias |
+| **AI integration** | |
 | `reach agent-init` | Interactively generate context for your AI agent |
 | `reach agent-init --for claude` | Write CLAUDE.md for Claude Code |
 | `reach agent-init --for cursor` | Write .cursor/rules/reach.mdc for Cursor |

@@ -46,8 +46,9 @@ app.add_typer(config_app, name="config")
 
 @config_app.command("show")
 def config_show():
-    """Show current CLI configuration (API URL, default agent, aliases)."""
-    cfg = cfg_module.load()
+    """Show current CLI configuration (active profile, API URL, default agent, aliases)."""
+    active = cfg_module.active_profile_name()
+    cfg = cfg_module.load_profile()
     if not cfg:
         console.print("[yellow]No configuration found. Run `reach login` first.[/yellow]")
         raise typer.Exit(1)
@@ -57,6 +58,7 @@ def config_show():
     table.add_column("Value")
 
     table.add_row("Config file", str(cfg_module.CONFIG_FILE))
+    table.add_row("Active profile", f"[cyan]{active}[/cyan]")
     table.add_row("API URL", cfg.get("api_url") or "[dim]-[/dim]")
     table.add_row("Default agent", cfg.get("default_agent_id") or "[dim]-[/dim]")
 
@@ -77,26 +79,24 @@ def config_show():
 def login(
     api_url: str = typer.Option(..., "--api-url", help="Backend API URL"),
     token: str = typer.Option(..., "--token", help="Tenant token"),
+    profile: str = typer.Option("default", "--profile", "-p", help="Profile name to save under"),
 ):
-    """Store API URL and tenant token locally."""
-    data = cfg_module.load()
-    data["api_url"] = api_url.rstrip("/")
-    data["tenant_token"] = token
-    cfg_module.save(data)
-    console.print(f"[green]Logged in.[/green] API: {api_url}")
+    """Store API URL and tenant token. Use --profile to manage multiple tenants."""
+    full = cfg_module.load()
+    existing = full.get("profiles", {}).get(profile, {})
+    if existing.get("api_url") or existing.get("tenant_token"):
+        console.print(f"[yellow]Profile '{profile}' already exists (API: {existing.get('api_url')}).[/yellow]")
+        if not Confirm.ask("Overwrite?", default=False):
+            raise typer.Exit(0)
+    profile_data = dict(existing)
+    profile_data["api_url"] = api_url.rstrip("/")
+    profile_data["tenant_token"] = token
+    full.setdefault("profiles", {})[profile] = profile_data
+    full["active_profile"] = profile
+    cfg_module.save(full)
+    console.print(f"[green]Logged in[/green] (profile: [cyan]{profile}[/cyan]). API: {api_url}")
 
 
-# ---------------------------------------------------------------------------
-# reach use <agent_id>
-# ---------------------------------------------------------------------------
-@app.command()
-def use(agent_id: str = typer.Argument(..., help="Agent ID or alias to set as default")):
-    """Set the default agent ID."""
-    resolved = cfg_module.resolve_agent(agent_id)
-    data = cfg_module.load()
-    data["default_agent_id"] = resolved
-    cfg_module.save(data)
-    console.print(f"[green]Default agent set to:[/green] {resolved}")
 
 
 # ---------------------------------------------------------------------------
@@ -157,8 +157,12 @@ def status():
 # ---------------------------------------------------------------------------
 # reach agents
 # ---------------------------------------------------------------------------
-@app.command()
-def agents():
+agents_app = typer.Typer(help="Manage and list remote agents.")
+app.add_typer(agents_app, name="agents")
+
+
+@agents_app.command("list")
+def agents_list():
     """List all agents for your tenant."""
     api_url = cfg_module.require("api_url")
     tenant_token = cfg_module.require("tenant_token")
@@ -177,7 +181,7 @@ def agents():
 
     aliases = cfg_module.list_aliases()
     id_to_alias = {v: k for k, v in aliases.items()}
-    default_id = cfg_module.load().get("default_agent_id", "")
+    default_id = cfg_module.load_profile().get("default_agent_id", "")
 
     table = Table(show_header=True, header_style="bold cyan")
     table.add_column("Alias")
@@ -207,6 +211,16 @@ def agents():
         )
 
     console.print(table)
+
+
+@agents_app.command("use")
+def agents_use(agent_id: str = typer.Argument(..., help="Agent ID or alias to set as default")):
+    """Set the default agent for the active profile."""
+    resolved = cfg_module.resolve_agent(agent_id)
+    data = cfg_module.load_profile()
+    data["default_agent_id"] = resolved
+    cfg_module.save_profile(data)
+    console.print(f"[green]Default agent set to:[/green] {resolved}")
 
 
 # ---------------------------------------------------------------------------
@@ -477,7 +491,7 @@ def agent_init(
         _print_mcp_config()
         return
 
-    cfg = cfg_module.load()
+    cfg = cfg_module.load_profile()
     api_url = cfg.get("api_url")
     tenant_token = cfg.get("tenant_token")
     default_agent_id = cfg.get("default_agent_id", "")
@@ -651,7 +665,7 @@ Use `reach` for all remote machine operations. Do not use SSH.
 ### Common commands
 
 ```bash
-reach agents
+reach agents list
 reach status
 {all_examples.rstrip()}
 ```
@@ -704,6 +718,77 @@ def _print_job_result(result: dict) -> None:
         console.print(stderr, highlight=False, end="")
         if not stderr.endswith("\n"):
             console.print()
+
+
+# ---------------------------------------------------------------------------
+# reach profile
+# ---------------------------------------------------------------------------
+profile_app = typer.Typer(help="Manage profiles for multiple tenants.")
+app.add_typer(profile_app, name="profile")
+
+
+@profile_app.command("list")
+def profile_list():
+    """List all configured profiles."""
+    full = cfg_module.load()
+    active = full.get("active_profile", "default")
+    profiles = full.get("profiles", {})
+
+    if not profiles:
+        console.print("[yellow]No profiles configured. Run `reach login` first.[/yellow]")
+        return
+
+    table = Table(show_header=True, header_style="bold cyan")
+    table.add_column("Profile")
+    table.add_column("API URL")
+    table.add_column("Default agent")
+
+    for name, p in profiles.items():
+        label = f"[cyan]{name}[/cyan]" + (" [bold](active)[/bold]" if name == active else "")
+        table.add_row(label, p.get("api_url") or "-", p.get("default_agent_id") or "-")
+
+    console.print(table)
+
+
+@profile_app.command("use")
+def profile_use(name: str = typer.Argument(..., help="Profile name to switch to")):
+    """Switch the active profile."""
+    try:
+        cfg_module.set_active_profile(name)
+    except SystemExit as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1)
+    console.print(f"[green]Switched to profile:[/green] [cyan]{name}[/cyan]")
+
+
+@profile_app.command("delete")
+def profile_delete(name: str = typer.Argument(..., help="Profile name to delete")):
+    """Delete a profile."""
+    full = cfg_module.load()
+    if name not in full.get("profiles", {}):
+        console.print(f"[red]Error:[/red] profile '{name}' not found.")
+        raise typer.Exit(1)
+    if full.get("active_profile") == name:
+        console.print(f"[red]Error:[/red] cannot delete the active profile. Run 'reach profile use <other>' first.")
+        raise typer.Exit(1)
+    if not Confirm.ask(f"Are you sure you want to delete profile '[cyan]{name}[/cyan]'?", default=False):
+        raise typer.Exit(0)
+    cfg_module.delete_profile(name)
+    console.print(f"[green]Deleted profile:[/green] [cyan]{name}[/cyan]")
+
+
+@profile_app.command("rename")
+def profile_rename(
+    old: str = typer.Argument(..., help="Current profile name"),
+    new: str = typer.Argument(..., help="New profile name"),
+):
+    """Rename a profile."""
+    try:
+        cfg_module.rename_profile(old, new)
+    except SystemExit as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1)
+    console.print(f"[green]Renamed profile:[/green] [cyan]{old}[/cyan] → [cyan]{new}[/cyan]")
 
 
 # ---------------------------------------------------------------------------

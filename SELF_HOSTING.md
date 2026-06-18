@@ -203,7 +203,7 @@ Response:
   "install_token_expires_at": "2026-06-17T12:00:00+00:00",
   "mode": "wild",
   "commands": {
-    "cli_use": "reach use agent_xxxxx",
+    "cli_use": "reach agents use agent_xxxxx",
     "agent_linux": "curl -fsSL .../install.sh | sudo bash -s -- ...",
     "agent_mac_arm": "...",
     "agent_mac_intel": "..."

@@ -50,7 +50,7 @@ def _build_install_commands(api_url: str, agent_id: str, raw_install_token: str)
             f"echo '{agent_config}' > /tmp/reach-agent/config.json\n"
             f"REACH_CONFIG_PATH=/tmp/reach-agent/config.json /tmp/reach-agent/reach-agent"
         ),
-        "cli_use": f"reach use {agent_id}",
+        "cli_use": f"reach agents use {agent_id}",
     }
 
 
