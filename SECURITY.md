@@ -60,3 +60,5 @@ A brief summary of the security model. For full detail see [ARCHITECTURE.md](ARC
 **No inbound connections** - agents make outbound HTTPS requests only. No ports are opened on the remote machine.
 
 **Config file permissions** - agent config files are written with `0600` permissions.
+
+**sudo access** - the agent runs as a non-privileged `reach` system user with no sudoers entry by default. `sudo` commands will fail unless you explicitly grant the `reach` user sudo access. Granting it is fine for personal or single-user setups in wild mode. For shared multi-user environments, prefer **approved mode** and allowlist only the specific sudo commands needed. See [Agent sudo access](SELF_HOSTING.md#agent-sudo-access) for setup instructions.

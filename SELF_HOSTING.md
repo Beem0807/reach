@@ -465,6 +465,38 @@ If the config write fails after the server has issued the new token (e.g. disk f
 
 ---
 
+## Agent sudo access
+
+The agent runs as a non-privileged `reach` system user with no sudo access by default. Commands that require elevated privileges (e.g. `sudo systemctl restart nginx`) will fail unless you explicitly grant sudo access.
+
+Add a sudoers file on the remote machine when you need it:
+
+**Service management only (recommended):**
+
+```bash
+echo 'reach ALL=(ALL) NOPASSWD: /bin/systemctl, /usr/sbin/service' \
+  | sudo tee /etc/sudoers.d/reach
+sudo chmod 440 /etc/sudoers.d/reach
+```
+
+**Full sudo (personal machines, fully trusted environments):**
+
+```bash
+echo 'reach ALL=(ALL) NOPASSWD: ALL' \
+  | sudo tee /etc/sudoers.d/reach
+sudo chmod 440 /etc/sudoers.d/reach
+```
+
+For shared multi-user environments where not all token holders should have elevated access, use **approved mode** and allowlist only the specific sudo commands needed rather than granting open sudo access.
+
+To remove sudo access:
+
+```bash
+sudo rm /etc/sudoers.d/reach
+```
+
+---
+
 ## API reference
 
 ### Agent endpoints
