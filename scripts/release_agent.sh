@@ -23,6 +23,12 @@ if [[ -z "$VERSION" ]]; then
 fi
 echo "==> Version: $VERSION"
 
+echo "==> Running tests..."
+(
+  cd "$AGENT_DIR"
+  go test ./... -count=1 -timeout 120s
+)
+
 echo "==> Building linux/amd64..."
 GOOS=linux  GOARCH=amd64 go build -o reach-agent-linux-amd64 .
 

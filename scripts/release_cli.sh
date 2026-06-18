@@ -22,6 +22,12 @@ if [[ -z "$VERSION" ]]; then
 fi
 echo "==> Version: $VERSION"
 
+echo "==> Running tests..."
+(
+  cd "$ROOT_DIR/cli"
+  python3 -m pytest tests/ -q --tb=short
+)
+
 DIST_DIR="$(mktemp -d)"
 
 echo "==> Building wheel..."

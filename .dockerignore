@@ -17,6 +17,8 @@ deploy/
 cli/
 agent/
 scripts/
+backend/tests/
+backend/conftest.py
 docker-compose.yml
 Dockerfile
 *.md

@@ -27,6 +27,17 @@ fi
 echo "==> Version: $VERSION"
 
 # ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+echo "==> Running tests..."
+(
+  cd "$ROOT_DIR/backend"
+  STORAGE_BACKEND=postgres DATABASE_URL="sqlite:///:memory:" \
+    ADMIN_TOKEN=test-admin-token TOKEN_PEPPER=test-pepper \
+    python3 -m pytest tests/ -q --tb=short
+)
+
+# ---------------------------------------------------------------------------
 # Docker image
 # ---------------------------------------------------------------------------
 echo "==> Building $IMAGE:$VERSION and $IMAGE:latest..."

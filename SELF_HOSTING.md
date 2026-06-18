@@ -430,7 +430,7 @@ curl -s "$API_URL/admin/agents?tenant_id=tenant_xxxxx&tag=env:prod" \
 
 ## Agent tags
 
-Tags are `key:value` labels on agents for display and grouping. They are separate from access control — any user who can see an agent can see its tags. Tag keys and values must use lowercase letters, digits, hyphens, or underscores (format: `key:value`).
+Tags are `key:value` labels on agents for display and grouping. They are separate from access control - any user who can see an agent can see its tags. Tag keys and values must use lowercase letters, digits, hyphens, or underscores (format: `key:value`).
 
 **Get tags for an agent:**
 
