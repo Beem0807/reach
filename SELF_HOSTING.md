@@ -248,6 +248,75 @@ That user's token stops working immediately. Everyone else's tokens are unaffect
 
 ---
 
+## Rotating the admin token
+
+The `ADMIN_TOKEN` is just an environment variable - rotating it means setting a new value and restarting. The old token stops working immediately on the next request; there is no grace period. Update any scripts that use the admin API before rotating.
+
+**Local machine (Option 1):**
+
+```bash
+NEW_ADMIN_TOKEN=$(openssl rand -hex 32)
+
+# Update the env file
+sed -i '' "s/^ADMIN_TOKEN=.*/ADMIN_TOKEN=${NEW_ADMIN_TOKEN}/" ~/.reach/local/env
+
+# Restart the backend to pick it up
+docker compose -f ~/.reach/local/docker-compose.yml --env-file ~/.reach/local/env up -d reach
+
+echo "New ADMIN_TOKEN: $NEW_ADMIN_TOKEN"
+```
+
+**AWS Lambda (Option 2):**
+
+```bash
+NEW_ADMIN_TOKEN=$(openssl rand -hex 32)
+
+aws cloudformation update-stack \
+  --stack-name reach-platform \
+  --use-previous-template \
+  --parameters \
+    ParameterKey=TokenPepper,UsePreviousValue=true \
+    ParameterKey=AdminToken,ParameterValue="$NEW_ADMIN_TOKEN" \
+  --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND
+
+echo "New ADMIN_TOKEN: $NEW_ADMIN_TOKEN"
+```
+
+CloudFormation updates each Lambda function's environment in-place. No cold start delay - the new token is active as soon as the update completes (usually under a minute).
+
+**Docker / FastAPI (Option 3):**
+
+Update the `ADMIN_TOKEN` environment variable however your deployment manages it (`.env` file, secrets manager, k8s secret), then restart the container:
+
+```bash
+docker stop reach && docker run -d \
+  -p 8000:8000 \
+  -e TOKEN_PEPPER="<your-pepper>" \
+  -e ADMIN_TOKEN="$NEW_ADMIN_TOKEN" \
+  -e DATABASE_URL="postgresql://user:pass@host:5432/reach" \
+  nabeemdev/reach:latest
+```
+
+`TOKEN_PEPPER` must stay the same across rotations - changing it invalidates every agent token, user token, and install token in the database simultaneously. See [TOKEN_PEPPER is permanent](#token_pepper-is-permanent).
+
+---
+
+## TOKEN_PEPPER is permanent
+
+`TOKEN_PEPPER` is set once at deployment and must never change. It is the HMAC key used to hash every credential before storage - agent tokens, user tokens, and install tokens are all stored as `HMAC-SHA256(TOKEN_PEPPER, raw_token)`. The raw tokens are never stored anywhere.
+
+If `TOKEN_PEPPER` changes, every hash in the database becomes invalid with no recovery path:
+
+- Every agent loses its `agent_token` - all agents stop syncing immediately
+- Every user's `tok_` token stops working - no one can use the CLI
+- Any pending install tokens are invalidated
+
+The only recovery is a full credential reset: reissue install tokens for every agent and reinstall on every machine, then rotate every user token and redistribute credentials to everyone.
+
+**Treat `TOKEN_PEPPER` like a database encryption key: back it up securely and never rotate it.**
+
+---
+
 ## Per-user agent access
 
 By default every user in a tenant has `allowed_agent_ids: ["*"]` - they can see and use all agents. You can restrict a user to a specific subset of agents without touching anyone else's access.
