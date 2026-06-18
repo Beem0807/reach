@@ -31,6 +31,8 @@ class _Agent(_Base):
     last_heartbeat_at = Column(String)
     active_until = Column(Integer)
     token_issued_at = Column(String)
+    type = Column(String, default="manual")
+    fleet_id = Column(String)
     created_at = Column(String)
 
 

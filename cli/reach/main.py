@@ -57,8 +57,8 @@ def config_show():
     table.add_column("Value")
 
     table.add_row("Config file", str(cfg_module.CONFIG_FILE))
-    table.add_row("API URL", cfg.get("api_url") or "[dim]—[/dim]")
-    table.add_row("Default agent", cfg.get("default_agent_id") or "[dim]—[/dim]")
+    table.add_row("API URL", cfg.get("api_url") or "[dim]-[/dim]")
+    table.add_row("Default agent", cfg.get("default_agent_id") or "[dim]-[/dim]")
 
     aliases = cfg.get("aliases") or {}
     if aliases:
@@ -117,8 +117,8 @@ def whoami():
 
     console.print(f"[bold]User ID:[/bold]   {data.get('user_id')}")
     console.print(f"[bold]Tenant ID:[/bold] {data.get('tenant_id')}")
-    console.print(f"[bold]Name:[/bold]      {data.get('name') or '—'}")
-    console.print(f"[bold]Created:[/bold]   {data.get('created_at') or '—'}")
+    console.print(f"[bold]Name:[/bold]      {data.get('name') or '-'}")
+    console.print(f"[bold]Created:[/bold]   {data.get('created_at') or '-'}")
 
 
 # ---------------------------------------------------------------------------
@@ -457,20 +457,25 @@ def policy_show(
 # ---------------------------------------------------------------------------
 @app.command("agent-init")
 def agent_init(
-    for_agent: Optional[str] = typer.Option(None, "--for", help="Target agent: claude, cursor, system-prompt"),
+    for_agent: Optional[str] = typer.Option(None, "--for", help="Target agent: claude, cursor, system-prompt, mcp"),
 ):
     """Generate remote machine context for your AI agent."""
-    VALID = ("claude", "cursor", "system-prompt")
+    VALID = ("claude", "cursor", "system-prompt", "mcp")
     if for_agent is None:
         console.print("\n[bold]Select your agent:[/bold]")
         console.print("  [cyan]1[/cyan]  claude        - writes CLAUDE.md")
         console.print("  [cyan]2[/cyan]  cursor        - writes .cursor/rules/reach.mdc")
         console.print("  [cyan]3[/cyan]  system-prompt - prints to stdout, paste anywhere")
-        choice = Prompt.ask("\nChoice", choices=["1", "2", "3"])
-        for_agent = {"1": "claude", "2": "cursor", "3": "system-prompt"}[choice]
+        console.print("  [cyan]4[/cyan]  mcp           - prints MCP server config to stdout")
+        choice = Prompt.ask("\nChoice", choices=["1", "2", "3", "4"])
+        for_agent = {"1": "claude", "2": "cursor", "3": "system-prompt", "4": "mcp"}[choice]
     elif for_agent not in VALID:
         console.print(f"[red]Error:[/red] --for must be one of: {', '.join(VALID)}")
         raise typer.Exit(1)
+
+    if for_agent == "mcp":
+        _print_mcp_config()
+        return
 
     cfg = cfg_module.load()
     api_url = cfg.get("api_url")
@@ -528,6 +533,26 @@ def agent_init(
     elif for_agent == "system-prompt":
         console.print("\n[bold]── System prompt ──────────────────────────────────────[/bold]")
         console.print(content)
+
+
+def _print_mcp_config():
+    import json
+    config = {
+        "mcpServers": {
+            "reach": {
+                "command": "reach",
+                "args": ["mcp"]
+            }
+        }
+    }
+    console.print("\n[bold]── MCP server config ──────────────────────────────────[/bold]")
+    console.print("\nAdd this to your MCP client settings:\n")
+    console.print(json.dumps(config, indent=2))
+    console.print("\n[dim]Common locations:[/dim]")
+    console.print("  [dim]Claude Code   [/dim] .claude/settings.json  [dim](project)[/dim]  or  ~/.claude.json  [dim](global)[/dim]")
+    console.print("  [dim]Claude Desktop[/dim] ~/Library/Application Support/Claude/claude_desktop_config.json")
+    console.print("  [dim]Cursor        [/dim] .cursor/mcp.json")
+    console.print("\n[dim]Make sure you've run `reach login` first.[/dim]\n")
 
 
 def _write_claude_md(content: str):
@@ -679,6 +704,16 @@ def _print_job_result(result: dict) -> None:
         console.print(stderr, highlight=False, end="")
         if not stderr.endswith("\n"):
             console.print()
+
+
+# ---------------------------------------------------------------------------
+# reach mcp
+# ---------------------------------------------------------------------------
+@app.command()
+def mcp():
+    """Start the reach MCP server (stdio transport for any MCP-compatible client)."""
+    from reach.mcp_server import main as mcp_main
+    mcp_main()
 
 
 if __name__ == "__main__":

@@ -32,6 +32,11 @@ Reach gives any AI agent - Claude Code, Cursor, custom LLM workflows, or your ow
 
 Reach is self-hosted - you deploy your own backend. Choose one:
 
+**Local machine** (no cloud account needed):
+```bash
+curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh | bash
+```
+
 **AWS Lambda + DynamoDB** (low cost, AWS-native):
 ```bash
 export TOKEN_PEPPER=$(openssl rand -hex 32)
@@ -51,7 +56,7 @@ docker run -d -p 8000:8000 \
   -e TOKEN_PEPPER="<your-pepper>" \
   -e ADMIN_TOKEN="<your-admin-token>" \
   -e DATABASE_URL="postgresql://user:pass@host:5432/reach" \
-  nabeemdev/reach:latest
+  nabeemdev/reach:0.1.0
 ```
 
 Once deployed, create a tenant, a user under it, and an agent under it:
@@ -71,7 +76,7 @@ curl -s -X POST "$API_URL/admin/agents" \
   -d '{"tenant_id": "tenant_xxxxx"}' | python3 -m json.tool
 ```
 
-Each returns ready-to-paste commands for the CLI and agent. Repeat the user step for each person who needs access - everyone gets their own token. See [SELF_HOSTING.md](SELF_HOSTING.md) for the full setup guide.
+Each returns ready-to-paste commands for the CLI and agent. Repeat the user step for each person who needs access - everyone gets their own token. See [SELF_HOSTING.md](SELF_HOSTING.md) for the full setup guide for all three deployment options.
 
 ---
 
@@ -80,13 +85,13 @@ Each returns ready-to-paste commands for the CLI and agent. Repeat the user step
 **With uv (recommended):**
 
 ```bash
-uv tool install https://reach-releases.s3.amazonaws.com/reach-0.1.0-py3-none-any.whl
+uv tool install https://reach-releases.s3.amazonaws.com/cli/v0.1.0/reach-0.1.0-py3-none-any.whl
 ```
 
 **With pip:**
 
 ```bash
-pip install https://reach-releases.s3.amazonaws.com/reach-0.1.0-py3-none-any.whl
+pip install https://reach-releases.s3.amazonaws.com/cli/v0.1.0/reach-0.1.0-py3-none-any.whl
 ```
 
 Log in with the token from `/admin/tenants/{id}/users`:
@@ -104,7 +109,7 @@ Use the install commands from the `/admin/agents` response directly. Or manually
 **Linux:**
 
 ```bash
-curl -fsSL https://reach-releases.s3.amazonaws.com/install.sh | sudo bash -s -- \
+curl -fsSL https://reach-releases.s3.amazonaws.com/agent/v0.1.0/install.sh | sudo bash -s -- \
   --api-url       "<your-api-url>" \
   --agent-id      "agent_xxx" \
   --install-token "install_xxx"
@@ -114,7 +119,7 @@ curl -fsSL https://reach-releases.s3.amazonaws.com/install.sh | sudo bash -s -- 
 
 ```bash
 mkdir -p /tmp/reach-agent
-curl -fsSL https://reach-releases.s3.amazonaws.com/reach-agent-darwin-arm64 \
+curl -fsSL https://reach-releases.s3.amazonaws.com/agent/v0.1.0/reach-agent-darwin-arm64 \
   -o /tmp/reach-agent/reach-agent
 chmod +x /tmp/reach-agent/reach-agent
 cat > /tmp/reach-agent/config.json <<'EOF'
@@ -127,6 +132,19 @@ Set it as your default:
 
 ```bash
 reach use agent_xxx
+```
+
+**To remove an agent from a Linux machine:**
+
+```bash
+curl -fsSL https://reach-releases.s3.amazonaws.com/agent/v0.1.0/uninstall.sh | sudo bash
+```
+
+This stops the service, removes the binary, config, and system user. Then delete the agent record via the admin API:
+
+```bash
+curl -s -X DELETE "$API_URL/admin/agents/agent_xxx" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
 ```
 
 ---
@@ -167,7 +185,7 @@ curl -s "$API_URL/admin/agents?tenant_id=tenant_xxxxx" \
   -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
 ```
 
-**View job history** — filter by tenant, agent, or the user (`created_by`) who ran the command:
+**View job history** - filter by tenant, agent, or the user (`created_by`) who ran the command:
 
 ```bash
 # All jobs for a tenant
@@ -222,6 +240,45 @@ reach agent-init --for claude        # CLAUDE.md for Claude Code
 reach agent-init --for cursor        # .cursor/rules/reach.mdc for Cursor
 reach agent-init --for system-prompt # paste into any agent or API call
 ```
+
+---
+
+## MCP server
+
+Reach ships a native [MCP](https://modelcontextprotocol.io) server. Any MCP-compatible client (Claude Code, Claude Desktop, Cursor, or your own tooling) can call reach tools directly - no CLI syntax, no output parsing.
+
+The client launches `reach mcp` as a subprocess and manages its lifecycle automatically. You don't run anything manually.
+
+**Configure your MCP client** - the config block is the same for all clients:
+
+```json
+{
+  "mcpServers": {
+    "reach": {
+      "command": "reach",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+Common locations:
+- **Claude Code** - `.claude/settings.json` (project) or `~/.claude.json` (global)
+- **Claude Desktop** - `~/Library/Application Support/Claude/claude_desktop_config.json`
+- **Cursor** - `.cursor/mcp.json`
+
+The MCP server reads from `~/.reach/config.json` - make sure you've run `reach login` first.
+
+**Available MCP tools:**
+
+| Tool | Description |
+|---|---|
+| `whoami` | Show current authenticated user and tenant |
+| `list_agents` | List all registered machines |
+| `get_agent(agent_id)` | Get status of a specific machine |
+| `exec_command(command, agent_id?, timeout?)` | Run a command and wait for the result |
+| `get_job(job_id)` | Fetch result of a previously submitted job |
+| `list_history(agent_id?, limit?)` | Browse recent job history |
 
 ---
 
@@ -302,6 +359,8 @@ Avoid running production agents in Wild mode unless you fully trust the environm
 | `reach agent-init --for claude` | Write CLAUDE.md for Claude Code |
 | `reach agent-init --for cursor` | Write .cursor/rules/reach.mdc for Cursor |
 | `reach agent-init --for system-prompt` | Print system prompt snippet to stdout |
+| `reach agent-init --for mcp` | Print MCP server config to stdout |
+| `reach mcp` | Start the MCP server (stdio transport for any MCP-compatible client) |
 
 ---
 

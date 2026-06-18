@@ -12,7 +12,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-BINARY_BASE_URL="https://reach-releases.s3.amazonaws.com"
+BINARY_BASE_URL="https://reach-releases.s3.amazonaws.com/__AGENT_VERSION__"
 CONFIG_DIR="/etc/reach-agent"
 CONFIG_FILE="$CONFIG_DIR/config.json"
 BIN_PATH="/usr/local/bin/reach-agent"

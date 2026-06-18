@@ -8,8 +8,9 @@ Deploy and operate your own reach backend. The CLI and agent are separate - they
 
 | Option | Runtime | Database | Best for |
 |---|---|---|---|
-| [AWS Lambda](#option-1-aws-lambda) | Lambda | DynamoDB | Small teams, low cost, AWS-native |
-| [Docker / FastAPI](#option-2-docker--fastapi) | FastAPI | PostgreSQL | Any cloud, self-hosted VMs, k8s |
+| [Local machine](#option-1-local-machine) | FastAPI | PostgreSQL | Home server, spare machine, no cloud account needed |
+| [AWS Lambda](#option-2-aws-lambda) | Lambda | DynamoDB | Small teams, low cost, AWS-native |
+| [Docker / FastAPI](#option-3-docker--fastapi) | FastAPI | PostgreSQL | Any cloud, self-hosted VMs, k8s |
 
 ### Why DynamoDB with Lambda, and PostgreSQL with Docker?
 
@@ -21,7 +22,41 @@ Lambda + PostgreSQL is deliberately not supported. Lambda's ephemeral connection
 
 ---
 
-## Option 1: AWS Lambda
+## Option 1: Local machine
+
+Run the full backend on any machine you already have - no cloud account, no VMs to provision. A good fit for a home server, a spare machine, or a VPS where you want full control without the Lambda setup.
+
+### Prerequisites
+
+- Docker + docker compose
+- `openssl` and `curl`
+- (Optional) [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/) or [ngrok](https://ngrok.com/download) to expose the backend publicly so remote agents can reach it
+
+### Deploy
+
+```bash
+curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh | bash
+```
+
+The script will:
+- Prompt for `TOKEN_PEPPER` and `ADMIN_TOKEN` (or generate them)
+- Start PostgreSQL, the reach backend, and nginx via Docker Compose
+- Optionally start a public tunnel:
+  - **cloudflared** - no account needed, URL changes on restart
+  - **ngrok** - free account required, supports static domains for a stable URL across restarts
+- Print your API URL, tokens, and next steps
+
+The API URL is what you pass to `reach login --api-url` and to the agent installer.
+
+### Tear down
+
+```bash
+curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh | bash -s -- --down
+```
+
+---
+
+## Option 2: AWS Lambda
 
 ### Prerequisites
 
@@ -76,7 +111,7 @@ Replace `v1.1.0` with the target version. DynamoDB tables are retained across up
 
 ---
 
-## Option 2: Docker / FastAPI
+## Option 3: Docker / FastAPI
 
 ### Prerequisites
 
@@ -295,7 +330,7 @@ Response includes `created_by` on every job record - the `user_id` of the CLI us
 }
 ```
 
-Pass `?cursor=<next_cursor>` on the next request to fetch the next page. The cursor encodes the `created_at` of the last returned item — absent when you've reached the last page.
+Pass `?cursor=<next_cursor>` on the next request to fetch the next page. The cursor encodes the `created_at` of the last returned item - absent when you've reached the last page.
 ```
 
 ---
@@ -412,7 +447,7 @@ CREATED → ACTIVE → INACTIVE (heartbeat timeout) → ACTIVE (auto-reactivates
 
 An agent starts as `CREATED`. On first run it calls `POST /agent/claim` with the install token, transitions to `ACTIVE`, and receives a permanent `agent_token`. The install token is then cleared from disk.
 
-The heartbeat checker runs every 5 minutes (EventBridge on Lambda, APScheduler on FastAPI) and marks agents `INACTIVE` if no sync has been received in the last 5 minutes. The agent auto-reactivates on its next successful sync. The same check also sweeps PENDING jobs older than 1 hour and marks them `EXPIRED` — so if an agent goes offline after a job is submitted, the job status resolves within an hour rather than lingering indefinitely.
+The heartbeat checker runs every 5 minutes (EventBridge on Lambda, APScheduler on FastAPI) and marks agents `INACTIVE` if no sync has been received in the last 5 minutes. The agent auto-reactivates on its next successful sync. The same check also sweeps PENDING jobs older than 1 hour and marks them `EXPIRED` - so if an agent goes offline after a job is submitted, the job status resolves within an hour rather than lingering indefinitely.
 
 ### Adaptive polling
 
@@ -447,7 +482,7 @@ If the config write fails after the server has issued the new token (e.g. disk f
 |---|---|---|---|
 | `GET` | `/me` | user token | Get current user identity (user_id, tenant_id, name) |
 | `POST` | `/jobs` | user token | Create a job |
-| `GET` | `/jobs` | user token | List your own jobs (`?agent_id=` `?limit=` `?cursor=`) — scoped to the authenticated user |
+| `GET` | `/jobs` | user token | List your own jobs (`?agent_id=` `?limit=` `?cursor=`) - scoped to the authenticated user |
 | `GET` | `/jobs/{id}` | user token | Get job result and output |
 | `GET` | `/agents` | user token | List all agents for your tenant |
 | `GET` | `/agents/{id}` | user token | Get agent details and policy |
@@ -463,7 +498,7 @@ If the config write fails after the server has issued the new token (e.g. disk f
 | `POST` | `/admin/tenants/{id}/users/{user_id}/rotate-token` | ADMIN_TOKEN | Rotate one user's token (keeps identity, swaps credential) |
 | `DELETE` | `/admin/tenants/{id}/users/{user_id}` | ADMIN_TOKEN | Revoke one user's token |
 | `GET` | `/admin/agents` | ADMIN_TOKEN | List all agents for a tenant (`?tenant_id=` required) |
-| `GET` | `/admin/jobs` | ADMIN_TOKEN | List jobs with filters (`?agent_id=` `?tenant_id=` `?created_by=` `?limit=` `?cursor=`) — at least one filter required |
+| `GET` | `/admin/jobs` | ADMIN_TOKEN | List jobs with filters (`?agent_id=` `?tenant_id=` `?created_by=` `?limit=` `?cursor=`) - at least one filter required |
 | `POST` | `/admin/agents` | ADMIN_TOKEN | Create an agent under a tenant |
 | `DELETE` | `/admin/agents/{id}` | ADMIN_TOKEN | Delete an agent (blocked if ACTIVE unless `force`) |
 | `POST` | `/admin/agents/{id}/reissue-install-token` | ADMIN_TOKEN | Reissue install token for an existing agent (blocked if ACTIVE unless `force`) |

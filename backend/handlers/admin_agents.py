@@ -11,6 +11,8 @@ logger.setLevel(logging.INFO)
 
 ADMIN_TOKEN = os.environ["ADMIN_TOKEN"]
 S3_BASE = os.environ.get("RELEASES_S3_BASE", "https://reach-releases.s3.amazonaws.com")
+_AGENT_VERSION = os.environ.get("AGENT_VERSION", "latest")
+_S3_VERSIONED = f"{S3_BASE}/agent/{_AGENT_VERSION}"
 
 INSTALL_TOKEN_TTL = 86400  # 24 hours
 
@@ -32,18 +34,18 @@ def _build_install_commands(api_url: str, agent_id: str, raw_install_token: str)
     )
     return {
         "agent_linux": (
-            f"curl -fsSL {S3_BASE}/install.sh | sudo bash -s -- {agent_flags}"
+            f"curl -fsSL {_S3_VERSIONED}/install.sh | sudo bash -s -- {agent_flags}"
         ),
         "agent_mac_arm": (
             f"mkdir -p /tmp/reach-agent\n"
-            f"curl -fsSL {S3_BASE}/reach-agent-darwin-arm64 -o /tmp/reach-agent/reach-agent\n"
+            f"curl -fsSL {_S3_VERSIONED}/reach-agent-darwin-arm64 -o /tmp/reach-agent/reach-agent\n"
             f"chmod +x /tmp/reach-agent/reach-agent\n"
             f"echo '{agent_config}' > /tmp/reach-agent/config.json\n"
             f"REACH_CONFIG_PATH=/tmp/reach-agent/config.json /tmp/reach-agent/reach-agent"
         ),
         "agent_mac_intel": (
             f"mkdir -p /tmp/reach-agent\n"
-            f"curl -fsSL {S3_BASE}/reach-agent-darwin-amd64 -o /tmp/reach-agent/reach-agent\n"
+            f"curl -fsSL {_S3_VERSIONED}/reach-agent-darwin-amd64 -o /tmp/reach-agent/reach-agent\n"
             f"chmod +x /tmp/reach-agent/reach-agent\n"
             f"echo '{agent_config}' > /tmp/reach-agent/config.json\n"
             f"REACH_CONFIG_PATH=/tmp/reach-agent/config.json /tmp/reach-agent/reach-agent"
@@ -74,6 +76,8 @@ def handle_create_agent(body: dict, raw_token: str, api_url: str) -> dict:
         "agent_id": agent_id,
         "tenant_id": tenant_id,
         "status": "CREATED",
+        "type": "manual",
+        "fleet_id": None,
         "mode": mode,
         "approved_commands": [],
         "install_token_hash": _hmac_token(raw_install_token),

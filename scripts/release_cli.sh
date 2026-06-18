@@ -14,6 +14,14 @@ while [[ $# -gt 0 ]]; do
 done
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+
+VERSION=$(grep '__version__' "$ROOT_DIR/cli/reach/__init__.py" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+if [[ -z "$VERSION" ]]; then
+  echo "Error: could not read __version__ from cli/reach/__init__.py"
+  exit 1
+fi
+echo "==> Version: $VERSION"
+
 DIST_DIR="$(mktemp -d)"
 
 echo "==> Building wheel..."
@@ -26,12 +34,17 @@ fi
 WHEEL=$(ls "$DIST_DIR"/*.whl | head -1)
 WHEEL_FILE=$(basename "$WHEEL")
 
-echo "==> Uploading $WHEEL_FILE to s3://$BUCKET/..."
-aws s3 cp "$WHEEL" "s3://$BUCKET/$WHEEL_FILE"
+echo "==> Uploading to s3://$BUCKET/cli/v${VERSION}/..."
+aws s3 cp "$WHEEL" "s3://$BUCKET/cli/v${VERSION}/$WHEEL_FILE"
 
-echo ""
-echo "==> Done."
-echo "    uv tool install https://$BUCKET.s3.amazonaws.com/$WHEEL_FILE"
-echo "    pip install https://$BUCKET.s3.amazonaws.com/$WHEEL_FILE"
+echo "==> Uploading to s3://$BUCKET/cli/latest/..."
+aws s3 cp "$WHEEL" "s3://$BUCKET/cli/latest/$WHEEL_FILE"
 
 rm -rf "$DIST_DIR"
+
+echo ""
+echo "==> Done. Published v${VERSION}:"
+echo "    uv tool install https://$BUCKET.s3.amazonaws.com/cli/v${VERSION}/$WHEEL_FILE"
+echo "    pip install https://$BUCKET.s3.amazonaws.com/cli/v${VERSION}/$WHEEL_FILE"
+echo ""
+echo "    cli/latest/ also updated."

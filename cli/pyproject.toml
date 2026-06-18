@@ -11,10 +11,12 @@ dependencies = [
     "typer>=0.12",
     "requests>=2.31",
     "rich>=13",
+    "mcp>=1.0",
 ]
 
 [project.scripts]
 reach = "reach.main:app"
+reach-mcp = "reach.mcp_server:main"
 
 [tool.hatch.version]
 path = "reach/__init__.py"
