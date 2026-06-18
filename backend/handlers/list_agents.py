@@ -1,4 +1,5 @@
 import logging
+from typing import Optional
 
 from shared.access import can_access_agent
 from shared.auth import _bearer, _verify_tenant_token
@@ -9,7 +10,7 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 
-def handle_list_agents(raw_token: str) -> dict:
+def handle_list_agents(raw_token: str, tag: Optional[str] = None) -> dict:
     user = _verify_tenant_token(raw_token)
     if not user:
         return _err("unauthorized", 401)
@@ -24,9 +25,11 @@ def handle_list_agents(raw_token: str) -> dict:
             "agent_version": a.get("agent_version"),
             "claimed_at": a.get("claimed_at"),
             "mode": a.get("mode", "wild"),
+            "tags": a.get("tags") or [],
         }
         for a in rows
         if can_access_agent(user, a)
+        and (tag is None or tag in (a.get("tags") or []))
     ]
 
     return _ok({"agents": agents})
@@ -37,4 +40,5 @@ def list_agents_handler(event, context):
     token = _bearer(event)
     if not token:
         return _err("missing Authorization header", 401)
-    return handle_list_agents(token)
+    tag = (event.get("queryStringParameters") or {}).get("tag")
+    return handle_list_agents(token, tag)

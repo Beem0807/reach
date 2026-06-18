@@ -33,6 +33,7 @@ class _Agent(_Base):
     token_issued_at = Column(String)
     type = Column(String, default="manual")
     fleet_id = Column(String)
+    tags = Column(JSON, default=list)
     created_at = Column(String)
 
 
@@ -189,6 +190,11 @@ class AgentRepo:
     def delete(self, agent_id: str) -> None:
         with SessionLocal() as db:
             db.execute(sa_delete(_Agent).where(_Agent.agent_id == agent_id))
+            db.commit()
+
+    def set_tags(self, agent_id: str, tags: list) -> None:
+        with SessionLocal() as db:
+            db.execute(update(_Agent).where(_Agent.agent_id == agent_id).values(tags=tags))
             db.commit()
 
 

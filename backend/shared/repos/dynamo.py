@@ -121,6 +121,13 @@ class AgentRepo:
     def delete(self, agent_id: str) -> None:
         _TABLE_AGENTS.delete_item(Key={"agent_id": agent_id})
 
+    def set_tags(self, agent_id: str, tags: list) -> None:
+        _TABLE_AGENTS.update_item(
+            Key={"agent_id": agent_id},
+            UpdateExpression="SET tags = :t",
+            ExpressionAttributeValues={":t": tags},
+        )
+
     def scan_stale_active(self, cutoff_iso: str) -> list:
         results = []
         kwargs: dict = {

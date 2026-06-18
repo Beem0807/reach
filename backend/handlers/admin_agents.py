@@ -5,6 +5,7 @@ import secrets
 from shared.auth import INSTALL_TOKEN_PREFIX, _hmac_token
 from shared.response import _err, _iso, _now, _ok
 from shared.store import agents_repo, tenants_repo, users_repo
+from shared.tags import validate_tags
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -128,7 +129,7 @@ def handle_reissue_install_token(agent_id: str, body: dict, raw_token: str, api_
     })
 
 
-def handle_list_agents_admin(tenant_id: str, raw_token: str) -> dict:
+def handle_list_agents_admin(tenant_id: str, raw_token: str, tag: str = None) -> dict:
     if not _verify_admin(raw_token):
         return _err("unauthorized", 401)
 
@@ -148,9 +149,12 @@ def handle_list_agents_admin(tenant_id: str, raw_token: str) -> dict:
                 "hostname": a.get("hostname"),
                 "agent_version": a.get("agent_version"),
                 "claimed_at": a.get("claimed_at"),
+                "token_issued_at": a.get("token_issued_at"),
                 "mode": a.get("mode", "wild"),
+                "tags": a.get("tags") or [],
             }
             for a in rows
+            if tag is None or tag in (a.get("tags") or [])
         ]
     })
 
@@ -179,6 +183,61 @@ def handle_delete_agent(agent_id: str, body: dict, raw_token: str) -> dict:
     return _ok({"agent_id": agent_id, "deleted": True})
 
 
+def handle_get_agent_tags(agent_id: str, raw_token: str) -> dict:
+    if not _verify_admin(raw_token):
+        return _err("unauthorized", 401)
+    agent = agents_repo.get(agent_id)
+    if not agent:
+        return _err("agent not found", 404)
+    return _ok({"agent_id": agent_id, "tags": agent.get("tags") or []})
+
+
+def handle_set_agent_tags(agent_id: str, body: dict, raw_token: str) -> dict:
+    if not _verify_admin(raw_token):
+        return _err("unauthorized", 401)
+    agent = agents_repo.get(agent_id)
+    if not agent:
+        return _err("agent not found", 404)
+    tags = body.get("tags", [])
+    err = validate_tags(tags)
+    if err:
+        return _err(err, 400)
+    agents_repo.set_tags(agent_id, tags)
+    logger.info("Set tags for agent=%s tags=%s", agent_id, tags)
+    return _ok({"agent_id": agent_id, "tags": tags})
+
+
+def handle_add_agent_tags(agent_id: str, body: dict, raw_token: str) -> dict:
+    if not _verify_admin(raw_token):
+        return _err("unauthorized", 401)
+    agent = agents_repo.get(agent_id)
+    if not agent:
+        return _err("agent not found", 404)
+    new_tags = body.get("tags", [])
+    err = validate_tags(new_tags)
+    if err:
+        return _err(err, 400)
+    current = set(agent.get("tags") or [])
+    merged = list(current | set(new_tags))
+    agents_repo.set_tags(agent_id, merged)
+    logger.info("Added tags for agent=%s tags=%s", agent_id, new_tags)
+    return _ok({"agent_id": agent_id, "tags": merged})
+
+
+def handle_remove_agent_tags(agent_id: str, body: dict, raw_token: str) -> dict:
+    if not _verify_admin(raw_token):
+        return _err("unauthorized", 401)
+    agent = agents_repo.get(agent_id)
+    if not agent:
+        return _err("agent not found", 404)
+    remove = set(body.get("tags", []))
+    current = agent.get("tags") or []
+    updated = [t for t in current if t not in remove]
+    agents_repo.set_tags(agent_id, updated)
+    logger.info("Removed tags for agent=%s removed=%s", agent_id, remove)
+    return _ok({"agent_id": agent_id, "tags": updated})
+
+
 def _token_and_api_url(event: dict) -> tuple:
     headers = event.get("headers") or {}
     token = headers.get("authorization", "")
@@ -194,8 +253,10 @@ def list_agents_admin_handler(event, context):
     token, _ = _token_and_api_url(event)
     if not token:
         return _err("missing Authorization header", 401)
-    tenant_id = (event.get("queryStringParameters") or {}).get("tenant_id", "")
-    return handle_list_agents_admin(tenant_id, token)
+    qs = event.get("queryStringParameters") or {}
+    tenant_id = qs.get("tenant_id", "")
+    tag = qs.get("tag") or None
+    return handle_list_agents_admin(tenant_id, token, tag)
 
 
 def create_agent_handler(event, context):
@@ -237,3 +298,54 @@ def delete_agent_handler(event, context):
         return _err("invalid JSON body")
     agent_id = (event.get("pathParameters") or {}).get("agent_id", "")
     return handle_delete_agent(agent_id, body, token)
+
+
+def get_agent_tags_handler(event, context):
+    logger.info("GET /admin/agents/{agent_id}/tags")
+    token, _ = _token_and_api_url(event)
+    if not token:
+        return _err("missing Authorization header", 401)
+    agent_id = (event.get("pathParameters") or {}).get("agent_id", "")
+    return handle_get_agent_tags(agent_id, token)
+
+
+def set_agent_tags_handler(event, context):
+    import json
+    logger.info("PUT /admin/agents/{agent_id}/tags")
+    token, _ = _token_and_api_url(event)
+    if not token:
+        return _err("missing Authorization header", 401)
+    try:
+        body = json.loads(event.get("body") or "{}")
+    except json.JSONDecodeError:
+        return _err("invalid JSON body")
+    agent_id = (event.get("pathParameters") or {}).get("agent_id", "")
+    return handle_set_agent_tags(agent_id, body, token)
+
+
+def add_agent_tags_handler(event, context):
+    import json
+    logger.info("POST /admin/agents/{agent_id}/tags")
+    token, _ = _token_and_api_url(event)
+    if not token:
+        return _err("missing Authorization header", 401)
+    try:
+        body = json.loads(event.get("body") or "{}")
+    except json.JSONDecodeError:
+        return _err("invalid JSON body")
+    agent_id = (event.get("pathParameters") or {}).get("agent_id", "")
+    return handle_add_agent_tags(agent_id, body, token)
+
+
+def remove_agent_tags_handler(event, context):
+    import json
+    logger.info("DELETE /admin/agents/{agent_id}/tags")
+    token, _ = _token_and_api_url(event)
+    if not token:
+        return _err("missing Authorization header", 401)
+    try:
+        body = json.loads(event.get("body") or "{}")
+    except json.JSONDecodeError:
+        return _err("invalid JSON body")
+    agent_id = (event.get("pathParameters") or {}).get("agent_id", "")
+    return handle_remove_agent_tags(agent_id, body, token)

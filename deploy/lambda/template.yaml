@@ -497,6 +497,58 @@ Resources:
             Path: /admin/agents/{agent_id}
             Method: DELETE
 
+  AdminGetAgentTagsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-admin-get-agent-tags
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.admin_agents.get_agent_tags_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /admin/agents/{agent_id}/tags
+            Method: GET
+
+  AdminSetAgentTagsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-admin-set-agent-tags
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.admin_agents.set_agent_tags_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /admin/agents/{agent_id}/tags
+            Method: PUT
+
+  AdminAddAgentTagsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-admin-add-agent-tags
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.admin_agents.add_agent_tags_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /admin/agents/{agent_id}/tags
+            Method: POST
+
+  AdminRemoveAgentTagsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-admin-remove-agent-tags
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.admin_agents.remove_agent_tags_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /admin/agents/{agent_id}/tags
+            Method: DELETE
+
   AdminReissueInstallTokenFunction:
     Type: AWS::Serverless::Function
     Properties:

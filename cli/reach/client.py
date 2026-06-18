@@ -34,8 +34,9 @@ class ReachClient:
         resp.raise_for_status()
         return resp.json()
 
-    def list_agents(self) -> dict:
-        resp = self.session.get(self._url("/agents"), timeout=15)
+    def list_agents(self, tag: Optional[str] = None) -> dict:
+        params = {"tag": tag} if tag else {}
+        resp = self.session.get(self._url("/agents"), params=params, timeout=15)
         resp.raise_for_status()
         return resp.json()
 

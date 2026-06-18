@@ -153,6 +153,7 @@ curl -s -X DELETE "$API_URL/admin/agents/agent_xxx" \
 
 ```bash
 reach agents list                           # list all your machines
+reach agents list --tag env:prod            # filter by tag
 reach status                                # show default agent status
 reach exec -- <command>                     # run on default machine
 reach exec --agent <id|alias> -- <command>  # run on specific machine
@@ -380,7 +381,8 @@ Avoid running production agents in Wild mode unless you fully trust the environm
 | `reach whoami` | Show current user identity (user_id, tenant_id, name) |
 | `reach version` | Show CLI version |
 | **Agents** | |
-| `reach agents list` | List all machines |
+| `reach agents list` | List all machines (Tags column shown automatically when agents have tags) |
+| `reach agents list --tag <key:value>` | Filter machines by tag |
 | `reach agents use <id\|alias>` | Set default machine |
 | `reach status` | Show default machine status |
 | `reach alias set <name> <id>` | Create alias |

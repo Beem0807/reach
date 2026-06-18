@@ -58,6 +58,7 @@ def upgrade() -> None:
         sa.Column('token_issued_at', sa.String(), nullable=True),
         sa.Column('type', sa.String(), nullable=True, server_default='manual'),
         sa.Column('fleet_id', sa.String(), nullable=True),
+        sa.Column('tags', sa.JSON(), nullable=True),
         sa.Column('created_at', sa.String(), nullable=True),
         sa.PrimaryKeyConstraint('agent_id'),
     )

@@ -162,14 +162,16 @@ app.add_typer(agents_app, name="agents")
 
 
 @agents_app.command("list")
-def agents_list():
+def agents_list(
+    tag: Optional[str] = typer.Option(None, "--tag", "-t", help="Filter by tag (e.g. env:prod)"),
+):
     """List all agents for your tenant."""
     api_url = cfg_module.require("api_url")
     tenant_token = cfg_module.require("tenant_token")
 
     client = ReachClient(api_url, tenant_token)
     try:
-        data = client.list_agents()
+        data = client.list_agents(tag=tag)
     except requests.HTTPError as e:
         console.print(f"[red]Error:[/red] {e.response.status_code} {e.response.text}")
         raise typer.Exit(1)
@@ -182,6 +184,7 @@ def agents_list():
     aliases = cfg_module.list_aliases()
     id_to_alias = {v: k for k, v in aliases.items()}
     default_id = cfg_module.load_profile().get("default_agent_id", "")
+    show_tags = any(a.get("tags") for a in items)
 
     table = Table(show_header=True, header_style="bold cyan")
     table.add_column("Alias")
@@ -190,6 +193,8 @@ def agents_list():
     table.add_column("Mode")
     table.add_column("Hostname")
     table.add_column("Version")
+    if show_tags:
+        table.add_column("Tags")
     table.add_column("Claimed at")
 
     for a in items:
@@ -200,15 +205,19 @@ def agents_list():
             alias_label += " [dim](default)[/dim]"
         mode = a.get("mode", "wild")
         mode_colors = {"wild": "[yellow]wild[/yellow]", "readonly": "[cyan]readonly[/cyan]", "approved": "[green]approved[/green]"}
-        table.add_row(
+        row = [
             alias_label,
             aid,
             _status_color(a.get("status", "")),
             mode_colors.get(mode, mode),
             a.get("hostname") or "-",
             a.get("agent_version") or "-",
-            a.get("claimed_at") or "-",
-        )
+        ]
+        if show_tags:
+            tags = a.get("tags") or []
+            row.append(", ".join(f"[dim]{t}[/dim]" for t in tags) if tags else "-")
+        row.append(a.get("claimed_at") or "-")
+        table.add_row(*row)
 
     console.print(table)
 

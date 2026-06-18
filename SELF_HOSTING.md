@@ -408,7 +408,8 @@ Response:
       "agent_version": "0.1.0",
       "claimed_at": "2026-06-17T10:00:00+00:00",
       "token_issued_at": "2026-06-17T10:00:00+00:00",
-      "mode": "readonly"
+      "mode": "readonly",
+      "tags": ["env:prod", "region:us-east-1"]
     }
   ]
 }
@@ -417,6 +418,77 @@ Response:
 Returns 400 if `tenant_id` is missing, 404 if the tenant doesn't exist.
 
 `token_issued_at` shows when the current agent token was last issued (claim or rotation). Useful for auditing which agents are approaching their 30-day rotation window.
+
+Add `?tag=<key:value>` to filter by a specific tag:
+
+```bash
+curl -s "$API_URL/admin/agents?tenant_id=tenant_xxxxx&tag=env:prod" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
+```
+
+---
+
+## Agent tags
+
+Tags are `key:value` labels on agents for display and grouping. They are separate from access control — any user who can see an agent can see its tags. Tag keys and values must use lowercase letters, digits, hyphens, or underscores (format: `key:value`).
+
+**Get tags for an agent:**
+
+```bash
+curl -s "$API_URL/admin/agents/agent_xxxxx/tags" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
+```
+
+**Replace all tags (set exact list):**
+
+```bash
+curl -s -X PUT "$API_URL/admin/agents/agent_xxxxx/tags" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"tags": ["env:prod", "region:us-east-1", "team:infra"]}'
+```
+
+**Add tags (merge, no duplicates):**
+
+```bash
+curl -s -X POST "$API_URL/admin/agents/agent_xxxxx/tags" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"tags": ["owner:alice"]}'
+```
+
+**Remove specific tags:**
+
+```bash
+curl -s -X DELETE "$API_URL/admin/agents/agent_xxxxx/tags" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"tags": ["owner:alice"]}'
+```
+
+**Clear all tags:**
+
+```bash
+curl -s -X PUT "$API_URL/admin/agents/agent_xxxxx/tags" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"tags": []}'
+```
+
+### Filtering agents by tag
+
+Users can filter the agent list to only agents carrying a specific tag:
+
+```bash
+# CLI
+reach agents list --tag env:prod
+
+# API
+curl -s "$API_URL/agents?tag=env:prod" \
+  -H "Authorization: Bearer $USER_TOKEN" | python3 -m json.tool
+```
+
+Access control still applies - users only see agents they are allowed to access. The tag filter is an additional narrowing on top of that. If no agents match, the response is an empty `agents` list (not an error).
 
 ---
 
@@ -655,8 +727,8 @@ sudo rm /etc/sudoers.d/reach
 | `POST` | `/jobs` | user token | Create a job |
 | `GET` | `/jobs` | user token | List your own jobs (`?agent_id=` `?limit=` `?cursor=`) - scoped to the authenticated user |
 | `GET` | `/jobs/{id}` | user token | Get job result and output |
-| `GET` | `/agents` | user token | List all agents for your tenant |
-| `GET` | `/agents/{id}` | user token | Get agent details and policy |
+| `GET` | `/agents` | user token | List accessible agents (`?tag=key:value` to filter by tag) |
+| `GET` | `/agents/{id}` | user token | Get agent details, policy, and tags |
 
 ### Admin endpoints
 
@@ -672,11 +744,15 @@ sudo rm /etc/sudoers.d/reach
 | `PUT` | `/admin/tenants/{id}/users/{user_id}/agents` | ADMIN_TOKEN | Replace user's access list (`["*"]` = unrestricted, `[]` = locked out) |
 | `POST` | `/admin/tenants/{id}/users/{user_id}/agents/{agent_id}` | ADMIN_TOKEN | Grant one agent to a restricted user |
 | `DELETE` | `/admin/tenants/{id}/users/{user_id}/agents/{agent_id}` | ADMIN_TOKEN | Revoke one agent from a restricted user |
-| `GET` | `/admin/agents` | ADMIN_TOKEN | List all agents for a tenant (`?tenant_id=` required) |
+| `GET` | `/admin/agents` | ADMIN_TOKEN | List all agents for a tenant (`?tenant_id=` required, `?tag=` optional filter) |
 | `GET` | `/admin/jobs` | ADMIN_TOKEN | List jobs with filters (`?agent_id=` `?tenant_id=` `?created_by=` `?limit=` `?cursor=`) - at least one filter required |
 | `POST` | `/admin/agents` | ADMIN_TOKEN | Create an agent under a tenant |
 | `DELETE` | `/admin/agents/{id}` | ADMIN_TOKEN | Delete an agent (blocked if ACTIVE unless `force`) |
 | `POST` | `/admin/agents/{id}/reissue-install-token` | ADMIN_TOKEN | Reissue install token for an existing agent (blocked if ACTIVE unless `force`) |
+| `GET` | `/admin/agents/{id}/tags` | ADMIN_TOKEN | Get agent's current tag list |
+| `PUT` | `/admin/agents/{id}/tags` | ADMIN_TOKEN | Replace tag list entirely |
+| `POST` | `/admin/agents/{id}/tags` | ADMIN_TOKEN | Add tags (merge, no duplicates) |
+| `DELETE` | `/admin/agents/{id}/tags` | ADMIN_TOKEN | Remove specific tags |
 | `GET` | `/admin/agents/{id}/policy` | ADMIN_TOKEN | Get agent policy |
 | `PUT` | `/admin/agents/{id}/policy/mode` | ADMIN_TOKEN | Set policy mode |
 | `POST` | `/admin/agents/{id}/policy/commands` | ADMIN_TOKEN | Add approved commands |

@@ -10,7 +10,16 @@ from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
-from handlers.admin_agents import handle_create_agent, handle_delete_agent, handle_list_agents_admin, handle_reissue_install_token
+from handlers.admin_agents import (
+    handle_add_agent_tags,
+    handle_create_agent,
+    handle_delete_agent,
+    handle_get_agent_tags,
+    handle_list_agents_admin,
+    handle_reissue_install_token,
+    handle_remove_agent_tags,
+    handle_set_agent_tags,
+)
 from handlers.admin_jobs import handle_list_jobs_admin
 from handlers.admin_tenants import handle_create_tenant, handle_list_tenants
 from handlers.admin_users import (
@@ -198,7 +207,8 @@ async def list_agents(request: Request):
     token = _token(request)
     if not token:
         return JSONResponse({"error": "missing Authorization header"}, status_code=401)
-    return _resp(handle_list_agents(token))
+    tag = request.query_params.get("tag")
+    return _resp(handle_list_agents(token, tag))
 
 
 @app.get("/agents/{agent_id}")
@@ -330,7 +340,8 @@ async def list_agents_admin(request: Request):
     if not token:
         return JSONResponse({"error": "missing Authorization header"}, status_code=401)
     tenant_id = request.query_params.get("tenant_id", "")
-    return _resp(handle_list_agents_admin(tenant_id, token))
+    tag = request.query_params.get("tag") or None
+    return _resp(handle_list_agents_admin(tenant_id, token, tag))
 
 
 @app.post("/admin/agents", status_code=201)
@@ -357,6 +368,50 @@ async def reissue_install_token(agent_id: str, request: Request):
         body = {}
     api_url = str(request.base_url).rstrip("/")
     return _resp(handle_reissue_install_token(agent_id, body, token, api_url))
+
+
+@app.get("/admin/agents/{agent_id}/tags")
+async def get_agent_tags(agent_id: str, request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    return _resp(handle_get_agent_tags(agent_id, token))
+
+
+@app.put("/admin/agents/{agent_id}/tags")
+async def set_agent_tags(agent_id: str, request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    return _resp(handle_set_agent_tags(agent_id, body, token))
+
+
+@app.post("/admin/agents/{agent_id}/tags")
+async def add_agent_tags(agent_id: str, request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    return _resp(handle_add_agent_tags(agent_id, body, token))
+
+
+@app.delete("/admin/agents/{agent_id}/tags")
+async def remove_agent_tags(agent_id: str, request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    return _resp(handle_remove_agent_tags(agent_id, body, token))
 
 
 @app.delete("/admin/agents/{agent_id}")

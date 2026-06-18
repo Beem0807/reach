@@ -30,6 +30,7 @@ def handle_get_agent(agent_id: str, raw_token: str) -> dict:
         "active_until": agent.get("active_until"),
         "mode": agent.get("mode", "wild"),
         "approved_commands": agent.get("approved_commands") or [],
+        "tags": agent.get("tags") or [],
     })
 
 
