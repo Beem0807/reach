@@ -320,3 +320,25 @@ class UserRepo:
 
     def delete(self, user_id: str) -> None:
         _TABLE_USERS.delete_item(Key={"user_id": user_id})
+
+    def set_allowed_agents(self, user_id: str, agent_ids: list) -> None:
+        _TABLE_USERS.update_item(
+            Key={"user_id": user_id},
+            UpdateExpression="SET allowed_agent_ids = :ids",
+            ExpressionAttributeValues={":ids": agent_ids},
+        )
+
+    def remove_agent_from_all_users(self, agent_id: str, tenant_id: str) -> None:
+        users = _TABLE_USERS.query(
+            IndexName="tenant-index",
+            KeyConditionExpression=DKey("tenant_id").eq(tenant_id),
+        ).get("Items", [])
+        for user in users:
+            current = user.get("allowed_agent_ids") or []
+            if agent_id in current:
+                new_list = [a for a in current if a != agent_id]
+                _TABLE_USERS.update_item(
+                    Key={"user_id": user["user_id"]},
+                    UpdateExpression="SET allowed_agent_ids = :ids",
+                    ExpressionAttributeValues={":ids": new_list},
+                )

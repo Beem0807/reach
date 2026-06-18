@@ -248,6 +248,76 @@ That user's token stops working immediately. Everyone else's tokens are unaffect
 
 ---
 
+## Per-user agent access
+
+By default every user in a tenant has `allowed_agent_ids: ["*"]` - they can see and use all agents. You can restrict a user to a specific subset of agents without touching anyone else's access.
+
+**Check a user's current access:**
+
+```bash
+curl -s "$API_URL/admin/tenants/tenant_xxxxx/users/user_xxxxx/agents" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
+```
+
+```json
+{"user_id": "user_xxxxx", "allowed_agent_ids": ["*"]}
+```
+
+`["*"]` means unrestricted. A list of agent IDs means restricted to exactly those agents.
+
+**Restrict a user to specific agents** - replaces their access list entirely:
+
+```bash
+curl -s -X PUT "$API_URL/admin/tenants/tenant_xxxxx/users/user_xxxxx/agents" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"agent_ids": ["agent_staging1", "agent_staging2"]}' | python3 -m json.tool
+```
+
+The user now sees only those agents. Every other agent returns 404 to them - they can't tell other agents exist.
+
+**Restore full access:**
+
+```bash
+curl -s -X PUT "$API_URL/admin/tenants/tenant_xxxxx/users/user_xxxxx/agents" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"agent_ids": ["*"]}' | python3 -m json.tool
+```
+
+**Lock a user out entirely** (no agent access, but keep the account):
+
+```bash
+curl -s -X PUT "$API_URL/admin/tenants/tenant_xxxxx/users/user_xxxxx/agents" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"agent_ids": []}' | python3 -m json.tool
+```
+
+**Grant access to one more agent** (user must already be restricted, not `["*"]`):
+
+```bash
+curl -s -X POST "$API_URL/admin/tenants/tenant_xxxxx/users/user_xxxxx/agents/agent_prod1" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
+```
+
+Returns `409` if the user is still unrestricted - use `PUT` to set an explicit list first, then `POST`/`DELETE` to fine-tune.
+
+**Revoke one agent:**
+
+```bash
+curl -s -X DELETE "$API_URL/admin/tenants/tenant_xxxxx/users/user_xxxxx/agents/agent_prod1" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
+```
+
+Returns `409` if the user is unrestricted, `404` if the agent isn't in their list.
+
+**When an agent is deleted**, reach automatically removes it from every user's `allowed_agent_ids` in that tenant. No manual cleanup needed.
+
+**Fleet access (coming soon):** a parallel `allowed_fleet_ids` field will let you grant access to all agents in a fleet with a single assignment. Individual `allowed_agent_ids` and fleet access are OR'd - either grants access.
+
+---
+
 ## Managing agents
 
 **List all agents for a tenant** - useful for seeing status, hostnames, and modes without needing a user token:
@@ -435,7 +505,7 @@ Three token types - none stored raw, only `HMAC-SHA256(TOKEN_PEPPER, token)` has
 | `agent_` | agent token | Agent (ongoing) | Poll for jobs, post results, heartbeat |
 | `tok_` | user token | CLI | Create jobs, read results, list agents |
 
-User tokens belong to individuals, not the tenant as a whole - each person under a tenant gets their own, and revoking one doesn't affect anyone else's. All users in a tenant see the same agents and job history; there's no per-user permission split (no RBAC) within a tenant.
+User tokens belong to individuals, not the tenant as a whole - each person under a tenant gets their own, and revoking one doesn't affect anyone else's. By default all users in a tenant see all agents, but access can be restricted per user - see [Per-user agent access](#per-user-agent-access).
 
 ---
 
@@ -529,6 +599,10 @@ sudo rm /etc/sudoers.d/reach
 | `GET` | `/admin/tenants/{id}/users` | ADMIN_TOKEN | List users in a tenant (no raw tokens) |
 | `POST` | `/admin/tenants/{id}/users/{user_id}/rotate-token` | ADMIN_TOKEN | Rotate one user's token (keeps identity, swaps credential) |
 | `DELETE` | `/admin/tenants/{id}/users/{user_id}` | ADMIN_TOKEN | Revoke one user's token |
+| `GET` | `/admin/tenants/{id}/users/{user_id}/agents` | ADMIN_TOKEN | Get user's current agent access list |
+| `PUT` | `/admin/tenants/{id}/users/{user_id}/agents` | ADMIN_TOKEN | Replace user's access list (`["*"]` = unrestricted, `[]` = locked out) |
+| `POST` | `/admin/tenants/{id}/users/{user_id}/agents/{agent_id}` | ADMIN_TOKEN | Grant one agent to a restricted user |
+| `DELETE` | `/admin/tenants/{id}/users/{user_id}/agents/{agent_id}` | ADMIN_TOKEN | Revoke one agent from a restricted user |
 | `GET` | `/admin/agents` | ADMIN_TOKEN | List all agents for a tenant (`?tenant_id=` required) |
 | `GET` | `/admin/jobs` | ADMIN_TOKEN | List jobs with filters (`?agent_id=` `?tenant_id=` `?created_by=` `?limit=` `?cursor=`) - at least one filter required |
 | `POST` | `/admin/agents` | ADMIN_TOKEN | Create an agent under a tenant |
@@ -549,7 +623,7 @@ sudo rm /etc/sudoers.d/reach
 |---|---|---|
 | `reach-agents` | `agent_id` | Agent records, status, token hash, fingerprint |
 | `reach-tenants` | `tenant_id` | Tenant records |
-| `reach-users` | `user_id` | User records and token hashes (per-tenant) |
+| `reach-users` | `user_id` | User records, token hashes, and per-user agent access lists |
 | `reach-jobs` | `job_id` | Job queue and results (TTL: 7 days) |
 
 All tables use `DeletionPolicy: Retain` - safe to redeploy the stack without losing data.

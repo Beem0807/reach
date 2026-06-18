@@ -4,7 +4,7 @@ import secrets
 
 from shared.auth import INSTALL_TOKEN_PREFIX, _hmac_token
 from shared.response import _err, _iso, _now, _ok
-from shared.store import agents_repo, tenants_repo
+from shared.store import agents_repo, tenants_repo, users_repo
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -171,7 +171,9 @@ def handle_delete_agent(agent_id: str, body: dict, raw_token: str) -> dict:
             409,
         )
 
+    tenant_id = agent["tenant_id"]
     agents_repo.delete(agent_id)
+    users_repo.remove_agent_from_all_users(agent_id, tenant_id)
     logger.info("Deleted agent=%s (was status=%s)", agent_id, agent.get("status"))
 
     return _ok({"agent_id": agent_id, "deleted": True})

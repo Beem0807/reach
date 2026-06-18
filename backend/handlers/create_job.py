@@ -2,6 +2,7 @@ import json
 import logging
 import secrets
 
+from shared.access import can_access_agent
 from shared.auth import _bearer, _verify_tenant_token
 from shared.policy import _is_approved, _is_blocked, _is_readonly_blocked
 from shared.response import _err, _iso, _now, _ok
@@ -28,10 +29,8 @@ def handle_create_job(body: dict, raw_token: str) -> dict:
         return _err("command is blocked by safety policy", 403)
 
     agent = agents_repo.get(agent_id)
-    if not agent:
+    if not agent or not can_access_agent(tenant, agent):
         return _err("agent not found", 404)
-    if agent.get("tenant_id") != tenant.get("tenant_id"):
-        return _err("agent does not belong to your tenant", 403)
     if agent.get("status") != "ACTIVE":
         return _err("agent is not active", 409)
 

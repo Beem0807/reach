@@ -218,6 +218,26 @@ curl -s "$API_URL/admin/jobs?tenant_id=tenant_xxxxx&cursor=<next_cursor>" \
 
 Every job record includes `created_by` (the `user_id` of whoever submitted it), so you can see who ran what and when.
 
+**Control which agents a user can see** - by default every user sees all agents. Restrict a user to specific machines:
+
+```bash
+# Restrict alice to staging only
+curl -s -X PUT "$API_URL/admin/tenants/tenant_xxxxx/users/user_alice/agents" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"agent_ids": ["agent_staging1", "agent_staging2"]}'
+
+# Grant one more
+curl -s -X POST "$API_URL/admin/tenants/tenant_xxxxx/users/user_alice/agents/agent_prod1" \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+
+# Restore full access
+curl -s -X PUT "$API_URL/admin/tenants/tenant_xxxxx/users/user_alice/agents" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"agent_ids": ["*"]}'
+```
+
 See [SELF_HOSTING.md](SELF_HOSTING.md) for the full admin API reference.
 
 ---

@@ -1,5 +1,6 @@
 import logging
 
+from shared.access import can_access_agent
 from shared.auth import _bearer, _verify_tenant_token
 from shared.response import _err, _ok
 from shared.store import agents_repo
@@ -9,11 +10,11 @@ logger.setLevel(logging.INFO)
 
 
 def handle_list_agents(raw_token: str) -> dict:
-    tenant = _verify_tenant_token(raw_token)
-    if not tenant:
+    user = _verify_tenant_token(raw_token)
+    if not user:
         return _err("unauthorized", 401)
 
-    rows = agents_repo.list_by_tenant(tenant["tenant_id"])
+    rows = agents_repo.list_by_tenant(user["tenant_id"])
 
     agents = [
         {
@@ -25,6 +26,7 @@ def handle_list_agents(raw_token: str) -> dict:
             "mode": a.get("mode", "wild"),
         }
         for a in rows
+        if can_access_agent(user, a)
     ]
 
     return _ok({"agents": agents})

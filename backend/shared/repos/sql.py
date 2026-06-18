@@ -50,6 +50,8 @@ class _User(_Base):
     token_hash = Column(String, nullable=False, unique=True, index=True)
     name = Column(String)
     created_at = Column(String)
+    allowed_agent_ids = Column(JSON)
+    allowed_fleet_ids = Column(JSON)
 
 
 class _Job(_Base):
@@ -316,4 +318,27 @@ class UserRepo:
     def delete(self, user_id: str) -> None:
         with SessionLocal() as db:
             db.execute(sa_delete(_User).where(_User.user_id == user_id))
+            db.commit()
+
+    def set_allowed_agents(self, user_id: str, agent_ids: list) -> None:
+        with SessionLocal() as db:
+            db.execute(update(_User).where(_User.user_id == user_id).values(allowed_agent_ids=agent_ids))
+            db.commit()
+
+    def remove_agent_from_all_users(self, agent_id: str, tenant_id: str) -> None:
+        with SessionLocal() as db:
+            rows = db.execute(
+                select(_User).where(
+                    _User.tenant_id == tenant_id,
+                    _User.allowed_agent_ids.isnot(None),
+                )
+            ).scalars().all()
+            for row in rows:
+                current = row.allowed_agent_ids or []
+                if agent_id in current:
+                    db.execute(
+                        update(_User)
+                        .where(_User.user_id == row.user_id)
+                        .values(allowed_agent_ids=[a for a in current if a != agent_id])
+                    )
             db.commit()

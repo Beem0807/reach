@@ -393,6 +393,58 @@ Resources:
             Path: /admin/tenants/{tenant_id}/users/{user_id}/rotate-token
             Method: POST
 
+  AdminGetUserAgentsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-admin-get-user-agents
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.admin_users.get_user_agents_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /admin/tenants/{tenant_id}/users/{user_id}/agents
+            Method: GET
+
+  AdminSetUserAgentsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-admin-set-user-agents
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.admin_users.set_user_agents_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /admin/tenants/{tenant_id}/users/{user_id}/agents
+            Method: PUT
+
+  AdminGrantAgentAccessFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-admin-grant-agent-access
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.admin_users.grant_agent_access_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /admin/tenants/{tenant_id}/users/{user_id}/agents/{agent_id}
+            Method: POST
+
+  AdminRevokeAgentAccessFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-admin-revoke-agent-access
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.admin_users.revoke_agent_access_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /admin/tenants/{tenant_id}/users/{user_id}/agents/{agent_id}
+            Method: DELETE
+
   AdminListJobsFunction:
     Type: AWS::Serverless::Function
     Properties:

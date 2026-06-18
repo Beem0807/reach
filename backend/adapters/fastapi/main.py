@@ -16,8 +16,12 @@ from handlers.admin_tenants import handle_create_tenant, handle_list_tenants
 from handlers.admin_users import (
     handle_create_user,
     handle_delete_user,
+    handle_grant_agent_access,
+    handle_get_user_agents,
     handle_list_users,
+    handle_revoke_agent_access,
     handle_rotate_user_token,
+    handle_set_user_agents,
 )
 from handlers.admin_policy import (
     handle_add_command,
@@ -265,6 +269,42 @@ async def rotate_user_token(tenant_id: str, user_id: str, request: Request):
         return JSONResponse({"error": "missing Authorization header"}, status_code=401)
     api_url = str(request.base_url).rstrip("/")
     return _resp(handle_rotate_user_token(tenant_id, user_id, token, api_url))
+
+
+@app.get("/admin/tenants/{tenant_id}/users/{user_id}/agents")
+async def get_user_agents(tenant_id: str, user_id: str, request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    return _resp(handle_get_user_agents(tenant_id, user_id, token))
+
+
+@app.put("/admin/tenants/{tenant_id}/users/{user_id}/agents")
+async def set_user_agents(tenant_id: str, user_id: str, request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    return _resp(handle_set_user_agents(tenant_id, user_id, body, token))
+
+
+@app.post("/admin/tenants/{tenant_id}/users/{user_id}/agents/{agent_id}")
+async def grant_agent_access(tenant_id: str, user_id: str, agent_id: str, request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    return _resp(handle_grant_agent_access(tenant_id, user_id, agent_id, token))
+
+
+@app.delete("/admin/tenants/{tenant_id}/users/{user_id}/agents/{agent_id}")
+async def revoke_agent_access(tenant_id: str, user_id: str, agent_id: str, request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    return _resp(handle_revoke_agent_access(tenant_id, user_id, agent_id, token))
 
 
 @app.get("/admin/jobs")

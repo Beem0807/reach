@@ -32,6 +32,8 @@ def upgrade() -> None:
         sa.Column('token_hash', sa.String(), nullable=False),
         sa.Column('name', sa.String(), nullable=True),
         sa.Column('created_at', sa.String(), nullable=True),
+        sa.Column('allowed_agent_ids', sa.JSON(), nullable=True),
+        sa.Column('allowed_fleet_ids', sa.JSON(), nullable=True),
         sa.PrimaryKeyConstraint('user_id'),
     )
     op.create_index('ix_users_tenant_id', 'users', ['tenant_id'])
