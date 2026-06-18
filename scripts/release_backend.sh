@@ -65,10 +65,13 @@ aws s3 cp "$PACKAGED_TEMPLATE" "s3://$BUCKET/lambda/v${VERSION}/template.yaml"
 aws s3 cp "$PACKAGED_TEMPLATE" "s3://$BUCKET/lambda/latest/template.yaml"
 
 # ---------------------------------------------------------------------------
-# local-setup.sh
+# Setup scripts
 # ---------------------------------------------------------------------------
 echo "==> Uploading local-setup.sh..."
 aws s3 cp "$ROOT_DIR/scripts/local-setup.sh" "s3://$BUCKET/local-setup.sh"
+
+echo "==> Uploading lambda-setup.sh..."
+aws s3 cp "$ROOT_DIR/scripts/lambda-setup.sh" "s3://$BUCKET/lambda-setup.sh"
 
 # ---------------------------------------------------------------------------
 # Docker push
@@ -85,6 +88,8 @@ if [[ "$PUSH" == true ]]; then
   echo "    s3://$BUCKET/lambda/v${VERSION}/template.yaml"
   echo "    s3://$BUCKET/lambda/latest/template.yaml"
   echo "    s3://$BUCKET/lambda/code/ (function zips)"
+  echo "    s3://$BUCKET/local-setup.sh"
+  echo "    s3://$BUCKET/lambda-setup.sh"
 else
   echo ""
   echo "==> Built locally (pass --push to publish Docker image):"
@@ -93,4 +98,6 @@ else
   echo "    s3://$BUCKET/lambda/v${VERSION}/template.yaml (uploaded)"
   echo "    s3://$BUCKET/lambda/latest/template.yaml (uploaded)"
   echo "    s3://$BUCKET/lambda/code/ (function zips uploaded)"
+  echo "    s3://$BUCKET/local-setup.sh (uploaded)"
+  echo "    s3://$BUCKET/lambda-setup.sh (uploaded)"
 fi

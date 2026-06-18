@@ -39,15 +39,7 @@ curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh | bash
 
 **AWS Lambda + DynamoDB** (low cost, AWS-native):
 ```bash
-export TOKEN_PEPPER=$(openssl rand -hex 32)
-export ADMIN_TOKEN=$(openssl rand -hex 32)
-aws cloudformation create-stack \
-  --stack-name reach-platform \
-  --template-url https://reach-releases.s3.amazonaws.com/lambda/latest/template.yaml \
-  --parameters \
-    ParameterKey=TokenPepper,ParameterValue="$TOKEN_PEPPER" \
-    ParameterKey=AdminToken,ParameterValue="$ADMIN_TOKEN" \
-  --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND
+curl -fsSL https://reach-releases.s3.amazonaws.com/lambda-setup.sh | bash
 ```
 
 **Docker + PostgreSQL** (any cloud):

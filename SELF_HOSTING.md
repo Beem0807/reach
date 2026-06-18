@@ -39,6 +39,7 @@ curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh | bash
 ```
 
 The script will:
+- Prompt for release tag (default: `latest`)
 - Prompt for `TOKEN_PEPPER` and `ADMIN_TOKEN` (or generate them)
 - Start PostgreSQL, the reach backend, and nginx via Docker Compose
 - Optionally start a public tunnel:
@@ -60,54 +61,37 @@ curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh | bash -s -- -
 
 ### Prerequisites
 
-- AWS CLI configured (`aws sts get-caller-identity`)
+- AWS CLI installed and configured (`aws sts get-caller-identity`)
 
 ### Deploy
 
-**1. Generate secrets - save both, you need them for future upgrades:**
-
 ```bash
-export TOKEN_PEPPER=$(openssl rand -hex 32)
-export ADMIN_TOKEN=$(openssl rand -hex 32)
-echo "TOKEN_PEPPER=$TOKEN_PEPPER"
-echo "ADMIN_TOKEN=$ADMIN_TOKEN"
+curl -fsSL https://reach-releases.s3.amazonaws.com/lambda-setup.sh | bash
 ```
 
-**2. Deploy:**
-
-```bash
-aws cloudformation create-stack \
-  --stack-name reach-platform \
-  --template-url https://reach-releases.s3.amazonaws.com/lambda/latest/template.yaml \
-  --parameters \
-    ParameterKey=TokenPepper,ParameterValue="$TOKEN_PEPPER" \
-    ParameterKey=AdminToken,ParameterValue="$ADMIN_TOKEN" \
-  --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND
-```
-
-**3. Get your API URL:**
-
-```bash
-export API_URL=$(aws cloudformation describe-stacks \
-  --stack-name reach-platform \
-  --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue" \
-  --output text)
-echo $API_URL
-```
+The script will:
+- Prompt for AWS profile (leave blank to use environment credentials) and region (default: `us-east-1`)
+- Verify credentials before proceeding
+- Prompt for stack name (default: `reach-platform`) and release tag (default: `latest`)
+- Prompt for `TOKEN_PEPPER` and `ADMIN_TOKEN` (or generate them)
+- Deploy the CloudFormation stack and wait for it to complete
+- Print your API URL, tokens, and next steps
 
 ### Upgrade
 
 ```bash
-aws cloudformation update-stack \
-  --stack-name reach-platform \
-  --template-url https://reach-releases.s3.amazonaws.com/lambda/v1.1.0/template.yaml \
-  --parameters \
-    ParameterKey=TokenPepper,UsePreviousValue=true \
-    ParameterKey=AdminToken,UsePreviousValue=true \
-  --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND
+curl -fsSL https://reach-releases.s3.amazonaws.com/lambda-setup.sh | bash -s -- --update
 ```
 
-Replace `v1.1.0` with the target version. DynamoDB tables are retained across upgrades.
+The script lists your existing stacks, prompts for the stack name (default: `reach-platform`) and release tag (default: `latest`), and optionally rotates `ADMIN_TOKEN` (leave blank to keep the existing value). `TOKEN_PEPPER` is always kept - it cannot be changed. See [TOKEN_PEPPER is permanent](#token_pepper-is-permanent).
+
+### Tear down
+
+```bash
+curl -fsSL https://reach-releases.s3.amazonaws.com/lambda-setup.sh | bash -s -- --down
+```
+
+DynamoDB tables use `DeletionPolicy: Retain` - your data is preserved even after the stack is deleted. Remove the tables manually in the AWS console if you want to wipe everything.
 
 ---
 
@@ -285,18 +269,10 @@ echo "New ADMIN_TOKEN: $NEW_ADMIN_TOKEN"
 **AWS Lambda (Option 2):**
 
 ```bash
-NEW_ADMIN_TOKEN=$(openssl rand -hex 32)
-
-aws cloudformation update-stack \
-  --stack-name reach-platform \
-  --use-previous-template \
-  --parameters \
-    ParameterKey=TokenPepper,UsePreviousValue=true \
-    ParameterKey=AdminToken,ParameterValue="$NEW_ADMIN_TOKEN" \
-  --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND
-
-echo "New ADMIN_TOKEN: $NEW_ADMIN_TOKEN"
+curl -fsSL https://reach-releases.s3.amazonaws.com/lambda-setup.sh | bash -s -- --update
 ```
+
+When prompted for a new `ADMIN_TOKEN`, enter the new value (or generate one with `openssl rand -hex 32`). Leave it blank to keep the existing token and only update the release tag.
 
 CloudFormation updates each Lambda function's environment in-place. No cold start delay - the new token is active as soon as the update completes (usually under a minute).
 
