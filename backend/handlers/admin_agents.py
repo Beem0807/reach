@@ -23,33 +23,26 @@ def _verify_admin(raw: str) -> bool:
     return hmac.compare_digest(raw, ADMIN_TOKEN)
 
 
-def _build_install_commands(api_url: str, agent_id: str, raw_install_token: str) -> dict:
+def _build_install_commands(
+    api_url: str,
+    agent_id: str,
+    raw_install_token: str,
+    grant_service_mgmt: bool = True,
+    grant_docker: bool = False,
+) -> dict:
     agent_flags = (
         f"--api-url \"{api_url}\" "
         f"--agent-id \"{agent_id}\" "
-        f"--install-token \"{raw_install_token}\""
+        f"--install-token \"{raw_install_token}\" "
+        f"--yes"
     )
-    agent_config = (
-        f'{{\"api_url\":\"{api_url}\",\"agent_id\":\"{agent_id}\",'
-        f'\"install_token\":\"{raw_install_token}\"}}'
-    )
+    if not grant_service_mgmt:
+        agent_flags += " --no-grant-service-mgmt"
+    if grant_docker:
+        agent_flags += " --grant-docker"
     return {
-        "agent_linux": (
+        "agent": (
             f"curl -fsSL {_S3_VERSIONED}/install.sh | sudo bash -s -- {agent_flags}"
-        ),
-        "agent_mac_arm": (
-            f"mkdir -p /tmp/reach-agent\n"
-            f"curl -fsSL {_S3_VERSIONED}/reach-agent-darwin-arm64 -o /tmp/reach-agent/reach-agent\n"
-            f"chmod +x /tmp/reach-agent/reach-agent\n"
-            f"echo '{agent_config}' > /tmp/reach-agent/config.json\n"
-            f"REACH_CONFIG_PATH=/tmp/reach-agent/config.json /tmp/reach-agent/reach-agent"
-        ),
-        "agent_mac_intel": (
-            f"mkdir -p /tmp/reach-agent\n"
-            f"curl -fsSL {_S3_VERSIONED}/reach-agent-darwin-amd64 -o /tmp/reach-agent/reach-agent\n"
-            f"chmod +x /tmp/reach-agent/reach-agent\n"
-            f"echo '{agent_config}' > /tmp/reach-agent/config.json\n"
-            f"REACH_CONFIG_PATH=/tmp/reach-agent/config.json /tmp/reach-agent/reach-agent"
         ),
         "cli_use": f"reach agents use {agent_id}",
     }
@@ -61,6 +54,8 @@ def handle_create_agent(body: dict, raw_token: str, api_url: str) -> dict:
 
     tenant_id = body.get("tenant_id", "").strip()
     mode = body.get("mode", "wild").strip()
+    grant_service_mgmt = bool(body.get("grant_service_mgmt", True))
+    grant_docker = bool(body.get("grant_docker", False))
 
     if not tenant_id:
         return _err("tenant_id required")
@@ -94,7 +89,9 @@ def handle_create_agent(body: dict, raw_token: str, api_url: str) -> dict:
         "install_token": raw_install_token,
         "install_token_expires_at": _iso(),
         "mode": mode,
-        "commands": _build_install_commands(api_url, agent_id, raw_install_token),
+        "commands": _build_install_commands(
+            api_url, agent_id, raw_install_token, grant_service_mgmt, grant_docker
+        ),
     }, 201)
 
 
@@ -107,6 +104,9 @@ def handle_reissue_install_token(agent_id: str, body: dict, raw_token: str, api_
         return _err("agent not found", 404)
 
     force = bool(body.get("force", False))
+    grant_service_mgmt = bool(body.get("grant_service_mgmt", True))
+    grant_docker = bool(body.get("grant_docker", False))
+
     if agent.get("status") == "ACTIVE" and not force:
         return _err(
             "agent is currently ACTIVE - reissuing will disconnect it immediately "
@@ -125,7 +125,9 @@ def handle_reissue_install_token(agent_id: str, body: dict, raw_token: str, api_
         "agent_id": agent_id,
         "install_token": raw_install_token,
         "install_token_expires_at": _iso(),
-        "commands": _build_install_commands(api_url, agent_id, raw_install_token),
+        "commands": _build_install_commands(
+            api_url, agent_id, raw_install_token, grant_service_mgmt, grant_docker
+        ),
     })
 
 

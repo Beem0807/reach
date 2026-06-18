@@ -34,7 +34,7 @@ Reach is a command bridge between AI agents (or any automation) and remote machi
 │  Remote machine                                                 │
 │                                                                 │
 │   ┌──────────────┐                                             │
-│   │  reach-agent │  (systemd service or foreground process)    │
+│   │  reach-agent │  (systemd / launchd service or foreground)  │
 │   └──────────────┘                                             │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -92,7 +92,7 @@ A background scheduler (APScheduler on FastAPI, EventBridge on Lambda) runs ever
 
 ### Agent (`agent/`)
 
-A Go binary that runs as a systemd service on Linux or a foreground process on Mac. On startup it claims itself using an install token, then enters a poll loop:
+A Go binary installed via `install.sh`. On Linux it runs as a systemd service under a dedicated `reach-agent` system user. On macOS it runs as a foreground process by default (stops when the terminal closes), or with `--background` as a LaunchDaemon under the same dedicated `reach-agent` system user (starts on boot, same security model as Linux). On startup it claims itself using an install token, then enters a poll loop:
 
 1. `POST /agent/sync` - sends heartbeat, receives pending job (if any)
 2. Runs the command in a subprocess with a 60-second timeout
@@ -183,8 +183,7 @@ s3://reach-releases/
     v0.1.0/reach-agent-linux-arm64
     v0.1.0/reach-agent-darwin-arm64
     v0.1.0/reach-agent-darwin-amd64
-    v0.1.0/install.sh
-    v0.1.0/uninstall.sh
+    v0.1.0/install.sh        (handles install + uninstall via --uninstall flag)
     latest/  (same files)
   lambda/
     code/     (SAM-packaged function zips, content-addressed)

@@ -60,9 +60,31 @@ class TestCreateAgent:
     def test_install_commands_included(self):
         r = self._call()
         commands = json.loads(r["body"])["commands"]
-        assert "agent_linux" in commands
-        assert "agent_mac_arm" in commands
+        assert "agent" in commands
         assert "cli_use" in commands
+        assert "install.sh" in commands["agent"]
+
+    def test_default_command_has_yes_only(self):
+        cmd = json.loads(self._call()["body"])["commands"]["agent"]
+        assert "--yes" in cmd
+        assert "--no-grant-service-mgmt" not in cmd
+        assert "--grant-docker" not in cmd
+
+    def test_service_mgmt_off_adds_no_grant_flag(self):
+        cmd = json.loads(self._call({"tenant_id": TENANT, "grant_service_mgmt": False})["body"])["commands"]["agent"]
+        assert "--yes" in cmd
+        assert "--no-grant-service-mgmt" in cmd
+
+    def test_grant_docker_opt_in(self):
+        cmd = json.loads(self._call({"tenant_id": TENANT, "grant_docker": True})["body"])["commands"]["agent"]
+        assert "--yes" in cmd
+        assert "--grant-docker" in cmd
+
+    def test_service_mgmt_off_and_docker_on(self):
+        cmd = json.loads(self._call({"tenant_id": TENANT, "grant_service_mgmt": False, "grant_docker": True})["body"])["commands"]["agent"]
+        assert "--yes" in cmd
+        assert "--no-grant-service-mgmt" in cmd
+        assert "--grant-docker" in cmd
 
     def test_install_token_is_unique(self):
         with patch("handlers.admin_agents.agents_repo"), \

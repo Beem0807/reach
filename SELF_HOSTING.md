@@ -193,6 +193,14 @@ curl -s -X POST "$API_URL/admin/agents" \
   -d '{"tenant_id": "tenant_xxxxx"}' | python3 -m json.tool
 ```
 
+Optional body fields:
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `mode` | string | `"wild"` | Policy mode: `wild`, `readonly`, or `approved` |
+| `grant_service_mgmt` | bool | `true` | When `false`, adds `--no-grant-service-mgmt` to the install command (skips the sudoers entry for `systemctl`/`launchctl`) |
+| `grant_docker` | bool | `false` | When `true`, adds `--grant-docker` to the install command (adds `reach-agent` to the `docker` group) |
+
 Response:
 
 ```json
@@ -204,14 +212,22 @@ Response:
   "mode": "wild",
   "commands": {
     "cli_use": "reach agents use agent_xxxxx",
-    "agent_linux": "curl -fsSL .../install.sh | sudo bash -s -- ...",
-    "agent_mac_arm": "...",
-    "agent_mac_intel": "..."
+    "agent": "curl -fsSL .../install.sh | sudo bash -s -- --api-url ... --agent-id ... --install-token ... --yes"
   }
 }
 ```
 
-Run one of the `agent_*` install commands on the target machine. Any user under the tenant can run `cli_use` on their own machine to set it as the default - all users in a tenant see the same agents.
+Run the `agent` install command on the target machine. The script auto-detects OS and architecture - one command works everywhere:
+
+- **Linux** - installs as a systemd service, starts on boot, runs as a dedicated `reach-agent` user.
+- **macOS (foreground)** - runs in the current terminal. Stops when the terminal closes (Ctrl+C). Good for testing.
+- **macOS (background)** - add `--background` to install as a LaunchDaemon under a dedicated `reach-agent` system user. Same security model as Linux: starts on boot, minimal privileges, hidden from the login screen.
+
+The generated `agent` command always includes `--yes`, which suppresses all optional prompts and applies their defaults (service management granted, docker not granted). See the optional fields table above to control what flags are included.
+
+To uninstall (both platforms): `curl -fsSL .../install.sh | sudo bash -s -- --uninstall`
+
+Any user under the tenant can run `cli_use` on their own machine to set it as the default - all users in a tenant see the same agents.
 
 **Add another agent to the same tenant** - repeat step 3 with the same `tenant_id`.
 
@@ -678,24 +694,81 @@ If the config write fails after the server has issued the new token (e.g. disk f
 
 ## Agent sudo access
 
-The agent runs as a non-privileged `reach` system user with no sudo access by default. Commands that require elevated privileges (e.g. `sudo systemctl restart nginx`) will fail unless you explicitly grant sudo access.
+**Linux and macOS background mode** both run the agent as a dedicated `reach-agent` system user with no sudo access by default. Commands requiring elevated privileges will fail unless you explicitly grant them.
 
-Add a sudoers file on the remote machine when you need it:
+**macOS foreground mode** runs as the logged-in user. That user can do anything without a password prompt - but `sudo` commands that require a password will fail since the agent runs non-interactively with no TTY. Only `NOPASSWD` sudo entries work. Use **approved** or **readonly** policy mode to limit what the agent can do.
 
-**Service management only (recommended):**
+### What the reach-agent user can and cannot do
+
+| | reach-agent system user (Linux / macOS background) |
+|---|---|
+| Read its own config (`/etc/reach-agent/`) | ✅ |
+| Execute world-executable binaries | ✅ |
+| Read world-readable files and directories | ✅ |
+| Write to `/tmp` | ✅ |
+| Make outbound network requests | ✅ |
+| `systemctl status`, `is-active`, `list-units` | ✅ (read-only, no sudo needed) |
+| `systemctl restart/start/stop` | ✅ if granted during install (prompted) / ❌ if skipped |
+| Read another user's home directory | ❌ (protected by 700) |
+| Run `docker` commands | ✅ if granted during install (prompted, default no) / ❌ if skipped |
+| Write to system directories | ❌ |
+| Run `sudo` | ❌ (no sudoers entry by default) |
+| Log in interactively | ❌ (shell is `/usr/bin/false`) |
+
+Commands that require access beyond this - service restarts, docker, package managers - need an explicit grant (sudoers or group membership). This is intentional: the agent can only do what you've decided it should be able to do.
+
+**Service management** (`systemctl`/`launchctl` restart, start, stop) is prompted during interactive install with `[Y/n]` (default **yes**). The script writes `/etc/sudoers.d/reach-agent` automatically if granted.
+
+**Interactive install - pre-answer the service management prompt** without losing the other prompts:
 
 ```bash
-echo 'reach ALL=(ALL) NOPASSWD: /bin/systemctl, /usr/sbin/service' \
-  | sudo tee /etc/sudoers.d/reach
-sudo chmod 440 /etc/sudoers.d/reach
+# Answer yes without being asked
+sudo bash install.sh --grant-service-mgmt
+
+# Answer no without being asked
+sudo bash install.sh --no-grant-service-mgmt
+```
+
+**Non-interactive install** (piped through bash - no TTY, so no prompts fire). Pass `--yes` to apply the interactive defaults (service management on, docker off):
+
+```bash
+curl -fsSL .../install.sh | sudo bash -s -- \
+  --api-url ... --agent-id ... --install-token ... \
+  --yes
+```
+
+To skip service management in a non-interactive install, add `--no-grant-service-mgmt` alongside `--yes`:
+
+```bash
+curl -fsSL .../install.sh | sudo bash -s -- \
+  --api-url ... --agent-id ... --install-token ... \
+  --yes --no-grant-service-mgmt
+```
+
+The install command returned by `POST /admin/agents` always includes `--yes`. Pass `"grant_service_mgmt": false` in the request body to also include `--no-grant-service-mgmt`.
+
+If you skipped it or want to add it after the fact:
+
+**Service management:**
+
+```bash
+# Linux
+echo 'reach-agent ALL=(ALL) NOPASSWD: /bin/systemctl, /usr/sbin/service' \
+  | sudo tee /etc/sudoers.d/reach-agent
+sudo chmod 440 /etc/sudoers.d/reach-agent
+
+# macOS (background mode)
+echo 'reach-agent ALL=(ALL) NOPASSWD: /bin/launchctl' \
+  | sudo tee /etc/sudoers.d/reach-agent
+sudo chmod 440 /etc/sudoers.d/reach-agent
 ```
 
 **Full sudo (personal machines, fully trusted environments):**
 
 ```bash
-echo 'reach ALL=(ALL) NOPASSWD: ALL' \
-  | sudo tee /etc/sudoers.d/reach
-sudo chmod 440 /etc/sudoers.d/reach
+echo 'reach-agent ALL=(ALL) NOPASSWD: ALL' \
+  | sudo tee /etc/sudoers.d/reach-agent
+sudo chmod 440 /etc/sudoers.d/reach-agent
 ```
 
 For shared multi-user environments where not all token holders should have elevated access, use **approved mode** and allowlist only the specific sudo commands needed rather than granting open sudo access.
@@ -703,7 +776,55 @@ For shared multi-user environments where not all token holders should have eleva
 To remove sudo access:
 
 ```bash
-sudo rm /etc/sudoers.d/reach
+sudo rm /etc/sudoers.d/reach-agent
+```
+
+### Docker access
+
+The `reach-agent` user has no docker access by default. Being in the `docker` group is equivalent to root - grant it only if you need the agent to run docker commands.
+
+Docker access is prompted during interactive install with `[y/N]` (default **no**). The agent user is added to the `docker` group if granted.
+
+**Interactive install - pre-answer the docker prompt** without losing the other prompts:
+
+```bash
+# Answer yes without being asked
+sudo bash install.sh --grant-docker
+
+# Answer no without being asked (redundant but explicit)
+sudo bash install.sh --no-grant-docker
+```
+
+**Non-interactive install** - `--yes` applies the default (docker off). To also grant docker, add `--grant-docker`:
+
+```bash
+curl -fsSL .../install.sh | sudo bash -s -- \
+  --api-url ... --agent-id ... --install-token ... \
+  --yes --grant-docker
+```
+
+To include `--grant-docker` in the API-generated install command, pass `"grant_docker": true` when creating the agent:
+
+```bash
+curl -s -X POST "$API_URL/admin/agents" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"tenant_id": "tenant_xxxxx", "grant_docker": true}' | python3 -m json.tool
+```
+
+If you skipped it or Docker wasn't installed yet, add it manually after Docker is installed:
+
+**Linux:**
+```bash
+usermod -aG docker reach-agent
+systemctl restart reach-agent
+```
+
+**macOS (background mode):**
+```bash
+dseditgroup -o edit -a reach-agent -t user docker
+launchctl unload /Library/LaunchDaemons/com.reach-agent.plist
+launchctl load /Library/LaunchDaemons/com.reach-agent.plist
 ```
 
 ---

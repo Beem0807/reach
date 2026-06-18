@@ -53,7 +53,6 @@ aws s3 cp reach-agent-linux-arm64  "s3://$BUCKET/agent/v${VERSION}/reach-agent-l
 aws s3 cp reach-agent-darwin-arm64 "s3://$BUCKET/agent/v${VERSION}/reach-agent-darwin-arm64"
 aws s3 cp reach-agent-darwin-amd64 "s3://$BUCKET/agent/v${VERSION}/reach-agent-darwin-amd64"
 aws s3 cp "$TMP_VERSIONED"         "s3://$BUCKET/agent/v${VERSION}/install.sh"
-aws s3 cp uninstall.sh             "s3://$BUCKET/agent/v${VERSION}/uninstall.sh"
 
 echo "==> Uploading agent/latest/..."
 aws s3 cp reach-agent-linux-amd64  "s3://$BUCKET/agent/latest/reach-agent-linux-amd64"
@@ -61,7 +60,6 @@ aws s3 cp reach-agent-linux-arm64  "s3://$BUCKET/agent/latest/reach-agent-linux-
 aws s3 cp reach-agent-darwin-arm64 "s3://$BUCKET/agent/latest/reach-agent-darwin-arm64"
 aws s3 cp reach-agent-darwin-amd64 "s3://$BUCKET/agent/latest/reach-agent-darwin-amd64"
 aws s3 cp "$TMP_LATEST"            "s3://$BUCKET/agent/latest/install.sh"
-aws s3 cp uninstall.sh             "s3://$BUCKET/agent/latest/uninstall.sh"
 
 rm -f "$TMP_VERSIONED" "$TMP_LATEST"
 
@@ -72,6 +70,5 @@ echo "    https://$BUCKET.s3.amazonaws.com/agent/v${VERSION}/reach-agent-linux-a
 echo "    https://$BUCKET.s3.amazonaws.com/agent/v${VERSION}/reach-agent-darwin-arm64"
 echo "    https://$BUCKET.s3.amazonaws.com/agent/v${VERSION}/reach-agent-darwin-amd64"
 echo "    https://$BUCKET.s3.amazonaws.com/agent/v${VERSION}/install.sh"
-echo "    https://$BUCKET.s3.amazonaws.com/agent/v${VERSION}/uninstall.sh"
 echo ""
 echo "    agent/latest/ also updated."

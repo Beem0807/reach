@@ -9,7 +9,6 @@
 
 set -euo pipefail
 
-IMAGE="nabeemdev/reach:latest"
 WORK_DIR="$HOME/.reach/local"
 COMPOSE_FILE="$WORK_DIR/docker-compose.yml"
 API_PORT=8000
@@ -110,6 +109,11 @@ echo ""
 echo "==> Configuration"
 echo ""
 
+read -rp "  Image tag    [latest]: " IMAGE_TAG < /dev/tty
+IMAGE="nabeemdev/reach:${IMAGE_TAG:-latest}"
+echo "    Using image: $IMAGE"
+
+echo ""
 read -rp "  TOKEN_PEPPER (leave blank to generate): " TOKEN_PEPPER < /dev/tty
 if [[ -z "$TOKEN_PEPPER" ]]; then
   TOKEN_PEPPER=$(openssl rand -hex 32)
@@ -351,6 +355,7 @@ cat > "$WORK_DIR/env" <<EOF
 TOKEN_PEPPER=${TOKEN_PEPPER}
 ADMIN_TOKEN=${ADMIN_TOKEN}
 API_URL=${API_URL}
+IMAGE=${IMAGE}
 EOF
 
 # ---------------------------------------------------------------------------
@@ -362,6 +367,7 @@ echo "│              reach local backend is running                 │"
 echo "└─────────────────────────────────────────────────────────────┘"
 echo ""
 echo "  API URL:      $API_URL"
+echo "  Image:        $IMAGE"
 echo "  ADMIN_TOKEN:  $ADMIN_TOKEN"
 echo "  TOKEN_PEPPER: $TOKEN_PEPPER"
 echo ""

@@ -24,7 +24,7 @@ Reach gives any AI agent - Claude Code, Cursor, custom LLM workflows, or your ow
 3. You install the CLI on your local machine.
 4. You install the agent on each remote machine.
 5. The agent makes outbound HTTPS requests to your backend - no inbound ports needed.
-6. Commands are queued via the CLI, the agent polls and runs them, results come back.
+6. Commands are queued via the CLI, the agent picks them up and runs them, results come back.
 
 ---
 
@@ -104,29 +104,32 @@ reach login --api-url "<your-api-url>" --token "<your-token>"
 
 ## Add a machine
 
-Use the install commands from the `/admin/agents` response directly. Or manually:
-
-**Linux:**
+Use the `agent` install command from the `/admin/agents` response directly. Or manually:
 
 ```bash
-curl -fsSL https://reach-releases.s3.amazonaws.com/agent/v0.1.0/install.sh | sudo bash -s -- \
+curl -fsSL https://reach-releases.s3.amazonaws.com/agent/latest/install.sh | sudo bash -s -- \
   --api-url       "<your-api-url>" \
   --agent-id      "agent_xxx" \
-  --install-token "install_xxx"
+  --install-token "install_xxx" \
+  --yes
 ```
 
-**Mac (Apple Silicon):**
+The script auto-detects your OS and architecture - one command works on Linux and macOS (Intel and Apple Silicon).
 
-```bash
-mkdir -p /tmp/reach-agent
-curl -fsSL https://reach-releases.s3.amazonaws.com/agent/v0.1.0/reach-agent-darwin-arm64 \
-  -o /tmp/reach-agent/reach-agent
-chmod +x /tmp/reach-agent/reach-agent
-cat > /tmp/reach-agent/config.json <<'EOF'
-{"api_url":"<your-api-url>","agent_id":"agent_xxx","install_token":"install_xxx"}
-EOF
-REACH_CONFIG_PATH=/tmp/reach-agent/config.json /tmp/reach-agent/reach-agent
-```
+- **Linux** - installs as a systemd service, starts on boot, survives reboots.
+- **macOS** - runs in the current terminal by default. Add `--background` to install as a LaunchDaemon under a dedicated system user (starts on boot, no terminal needed).
+
+**`--yes`** skips all optional prompts and applies their defaults. Without it, the script prompts interactively for each choice.
+
+| Flag | What it does | Default with `--yes` |
+|---|---|---|
+| `--yes` | Non-interactive mode - skip all prompts | - |
+| `--grant-service-mgmt` | Grant `systemctl`/`launchctl` restart/start/stop via sudoers | ✅ on |
+| `--no-grant-service-mgmt` | Skip the sudoers grant | - |
+| `--grant-docker` | Add `reach-agent` to the `docker` group | ❌ off |
+| `--background` | macOS only - install as a LaunchDaemon (starts on boot) | - |
+
+Flags can be combined with `--yes` to override specific defaults, e.g. `--yes --grant-docker` or `--yes --no-grant-service-mgmt`.
 
 Set it as your default:
 
@@ -134,13 +137,13 @@ Set it as your default:
 reach agents use agent_xxx
 ```
 
-**To remove an agent from a Linux machine:**
+**To remove an agent:**
 
 ```bash
-curl -fsSL https://reach-releases.s3.amazonaws.com/agent/v0.1.0/uninstall.sh | sudo bash
+curl -fsSL https://reach-releases.s3.amazonaws.com/agent/latest/install.sh | sudo bash -s -- --uninstall
 ```
 
-This stops the service, removes the binary, config, and system user. Then delete the agent record via the admin API:
+Then delete the agent record via the admin API:
 
 ```bash
 curl -s -X DELETE "$API_URL/admin/agents/agent_xxx" \
