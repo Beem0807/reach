@@ -4,16 +4,28 @@ import boto3
 from boto3.dynamodb.conditions import Attr, Key as DKey
 from botocore.exceptions import ClientError
 
+from shared.policy import compute_access_level
+from shared.response import _iso
+
 _ddb = boto3.resource("dynamodb")
 _TABLE_AGENTS = _ddb.Table("reach-agents")
 _TABLE_TENANTS = _ddb.Table("reach-tenants")
 _TABLE_USERS = _ddb.Table("reach-users")
 _TABLE_JOBS = _ddb.Table("reach-jobs")
+_TABLE_APPROVALS = _ddb.Table("reach-approvals")
+
+
+def _enrich_agent(d: Optional[dict]) -> Optional[dict]:
+    if d is None:
+        return None
+    root = d.get("running_as_root") == "true"
+    d["access_level"] = compute_access_level(d.get("mode", "wild"), root)
+    return d
 
 
 class AgentRepo:
     def get(self, agent_id: str) -> Optional[dict]:
-        return _TABLE_AGENTS.get_item(Key={"agent_id": agent_id}).get("Item")
+        return _enrich_agent(_TABLE_AGENTS.get_item(Key={"agent_id": agent_id}).get("Item"))
 
     def claim(self, agent_id: str, fields: dict) -> None:
         _TABLE_AGENTS.update_item(
@@ -37,7 +49,7 @@ class AgentRepo:
             },
         )
 
-    def update_heartbeat(self, agent_id: str, reactivate: bool, now_iso: str, agent_version: Optional[str] = None) -> None:
+    def update_heartbeat(self, agent_id: str, reactivate: bool, now_iso: str, agent_version: Optional[str] = None, running_as_root: Optional[bool] = None) -> None:
         sets = ["last_heartbeat_at = :hb"]
         names: dict = {}
         values: dict = {":hb": now_iso}
@@ -48,6 +60,9 @@ class AgentRepo:
         if agent_version:
             sets.append("agent_version = :av")
             values[":av"] = agent_version
+        if running_as_root is not None:
+            sets.append("running_as_root = :rar")
+            values[":rar"] = "true" if running_as_root else "false"
         kwargs: dict = {
             "Key": {"agent_id": agent_id},
             "UpdateExpression": "SET " + ", ".join(sets),
@@ -65,10 +80,11 @@ class AgentRepo:
         )
 
     def list_by_tenant(self, tenant_id: str) -> list:
-        return _TABLE_AGENTS.query(
+        items = _TABLE_AGENTS.query(
             IndexName="tenant-index",
             KeyConditionExpression=DKey("tenant_id").eq(tenant_id),
         ).get("Items", [])
+        return [_enrich_agent(item) for item in items]
 
     def mark_inactive(self, agent_id: str) -> bool:
         try:
@@ -88,12 +104,12 @@ class AgentRepo:
     def create(self, agent: dict) -> None:
         _TABLE_AGENTS.put_item(Item=agent)
 
-    def update_policy(self, agent_id: str, mode: str, approved_commands: list) -> None:
+    def update_policy(self, agent_id: str, mode: str) -> None:
         _TABLE_AGENTS.update_item(
             Key={"agent_id": agent_id},
-            UpdateExpression="SET #m = :m, approved_commands = :ac",
+            UpdateExpression="SET #m = :m",
             ExpressionAttributeNames={"#m": "mode"},
-            ExpressionAttributeValues={":m": mode, ":ac": approved_commands},
+            ExpressionAttributeValues={":m": mode},
         )
 
     def reissue_install_token(self, agent_id: str, install_token_hash: str, expires_at: int) -> None:
@@ -143,7 +159,7 @@ class AgentRepo:
             if "LastEvaluatedKey" not in resp:
                 break
             kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
-        return results
+        return [_enrich_agent(item) for item in results]
 
 
 class JobRepo:
@@ -173,7 +189,7 @@ class JobRepo:
             Key={"job_id": job_id},
             UpdateExpression=(
                 "SET #st = :s, exit_code = :ec, stdout = :out, stderr = :err,"
-                " duration_ms = :dur, completed_at = :ca"
+                " duration_ms = :dur, completed_at = :ca, is_write = :iw"
             ),
             ExpressionAttributeNames={"#st": "status"},
             ExpressionAttributeValues={
@@ -183,6 +199,7 @@ class JobRepo:
                 ":err": fields["stderr"],
                 ":dur": fields["duration_ms"],
                 ":ca": fields["completed_at"],
+                ":iw": fields.get("is_write"),
             },
         )
 
@@ -349,3 +366,103 @@ class UserRepo:
                     UpdateExpression="SET allowed_agent_ids = :ids",
                     ExpressionAttributeValues={":ids": new_list},
                 )
+
+
+class ApprovalRepo:
+    def create(self, approval: dict) -> None:
+        _TABLE_APPROVALS.put_item(Item=approval)
+
+    def get(self, approval_id: str) -> Optional[dict]:
+        return _TABLE_APPROVALS.get_item(Key={"approval_id": approval_id}).get("Item")
+
+    def list_by_agent(self, agent_id: str, status: Optional[str] = None, requested_by: Optional[str] = None, limit: Optional[int] = None, cursor: Optional[str] = None) -> list:
+        kce = DKey("agent_id").eq(agent_id)
+        if cursor:
+            kce = kce & DKey("created_at").lt(cursor)
+        kwargs: dict = {
+            "IndexName": "agent-approvals-index",
+            "KeyConditionExpression": kce,
+            "ScanIndexForward": False,
+        }
+        if status is not None:
+            kwargs["FilterExpression"] = Attr("status").eq(status)
+        results = []
+        while True:
+            resp = _TABLE_APPROVALS.query(**kwargs)
+            results.extend(resp.get("Items", []))
+            if "LastEvaluatedKey" not in resp:
+                break
+            kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+        if status == "approved":
+            now = _iso()
+            results = [r for r in results if not r.get("expires_at") or r["expires_at"] > now]
+        if requested_by is not None:
+            results = [r for r in results if r.get("requested_by") == requested_by]
+        if limit is not None:
+            results = results[:limit]
+        return results
+
+    def list_by_tenant(self, tenant_id: str, agent_id: Optional[str] = None, status: Optional[str] = None, requested_by: Optional[str] = None, limit: Optional[int] = None, cursor: Optional[str] = None) -> list:
+        kce = DKey("tenant_id").eq(tenant_id)
+        if cursor:
+            kce = kce & DKey("created_at").lt(cursor)
+        kwargs: dict = {
+            "IndexName": "tenant-approvals-index",
+            "KeyConditionExpression": kce,
+            "ScanIndexForward": False,
+        }
+        filters = []
+        if agent_id is not None:
+            filters.append(Attr("agent_id").eq(agent_id))
+        if status is not None:
+            filters.append(Attr("status").eq(status))
+        if requested_by is not None:
+            filters.append(Attr("requested_by").eq(requested_by))
+        if filters:
+            expr = filters[0]
+            for f in filters[1:]:
+                expr = expr & f
+            kwargs["FilterExpression"] = expr
+        results = []
+        while True:
+            resp = _TABLE_APPROVALS.query(**kwargs)
+            results.extend(resp.get("Items", []))
+            if "LastEvaluatedKey" not in resp:
+                break
+            kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+        if status == "approved":
+            now = _iso()
+            results = [r for r in results if not r.get("expires_at") or r["expires_at"] > now]
+        if limit is not None:
+            results = results[:limit]
+        return results
+
+    def exists_pending(self, agent_id: str, command: str) -> bool:
+        kwargs: dict = {
+            "IndexName": "agent-approvals-index",
+            "KeyConditionExpression": DKey("agent_id").eq(agent_id),
+            "FilterExpression": Attr("status").eq("pending") & Attr("command").eq(command),
+            "Limit": 1,
+        }
+        resp = _TABLE_APPROVALS.query(**kwargs)
+        return len(resp.get("Items", [])) > 0
+
+    def delete(self, approval_id: str) -> None:
+        _TABLE_APPROVALS.delete_item(Key={"approval_id": approval_id})
+
+    def update_status(self, approval_id: str, status: str, reviewed_at: str, reviewed_by: str, expires_at: Optional[str] = None) -> None:
+        expr = "SET #st = :s, reviewed_at = :ra, reviewed_by = :rb"
+        values: dict = {":s": status, ":ra": reviewed_at, ":rb": reviewed_by}
+        if expires_at is not None:
+            expr += ", expires_at = :exp"
+            values[":exp"] = expires_at
+        else:
+            # expires_at=None means permanent - explicitly remove any existing expiry
+            # so a re-approve-as-permanent actually clears the old timestamp.
+            expr += " REMOVE expires_at"
+        _TABLE_APPROVALS.update_item(
+            Key={"approval_id": approval_id},
+            UpdateExpression=expr,
+            ExpressionAttributeNames={"#st": "status"},
+            ExpressionAttributeValues=values,
+        )

@@ -41,6 +41,12 @@ def test_decimal_float_serialised():
     assert abs(json.loads(r["body"])["n"] - 3.14) < 0.001
 
 
+def test_non_serialisable_type_raises():
+    import pytest
+    with pytest.raises(TypeError):
+        _ok({"n": object()})
+
+
 def test_now_returns_int():
     n = _now()
     assert isinstance(n, int)

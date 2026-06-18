@@ -1,9 +1,10 @@
 import json
 import logging
+import secrets
 
 from shared.auth import _bearer, _verify_agent_token
 from shared.response import _err, _iso, _ok
-from shared.store import jobs_repo
+from shared.store import approvals_repo, jobs_repo, users_repo
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -17,6 +18,8 @@ def handle_agent_job_result(job_id: str, body: dict, raw_token: str) -> dict:
     stdout = body.get("stdout", "")
     stderr = body.get("stderr", "")
     duration_ms = body.get("duration_ms", 0)
+    blocked = body.get("blocked", False)
+    is_write = body.get("is_write", blocked)  # agent corrects to True when blocked
 
     if status not in ("SUCCEEDED", "FAILED", "REJECTED"):
         return _err("status must be SUCCEEDED, FAILED, or REJECTED")
@@ -50,7 +53,24 @@ def handle_agent_job_result(job_id: str, body: dict, raw_token: str) -> dict:
         "stderr": stderr,
         "duration_ms": duration_ms,
         "completed_at": _iso(),
+        "is_write": is_write,
     })
+
+    if blocked and not approvals_repo.exists_pending(agent_id, job.get("command")):
+        user = users_repo.get(job.get("created_by"))
+        approvals_repo.create({
+            "approval_id": "appr_" + secrets.token_urlsafe(12),
+            "tenant_id": job.get("tenant_id"),
+            "agent_id": agent_id,
+            "command": job.get("command"),
+            "requested_by": job.get("created_by"),
+            "requester_name": user.get("name") if user else None,
+            "job_id": job_id,
+            "status": "pending",
+            "created_at": _iso(),
+            "reviewed_at": None,
+            "reviewed_by": None,
+        })
 
     return _ok({"ok": True})
 

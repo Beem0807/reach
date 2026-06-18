@@ -32,10 +32,9 @@ from handlers.admin_users import (
     handle_rotate_user_token,
     handle_set_user_agents,
 )
+from handlers.admin_approvals import handle_delete_approval, handle_list_approvals, handle_pre_approve_command, handle_review_approval
 from handlers.admin_policy import (
-    handle_add_command,
     handle_get_policy,
-    handle_remove_command,
     handle_set_mode,
 )
 from handlers.agent_claim import handle_agent_claim
@@ -49,6 +48,7 @@ from handlers.get_job import handle_get_job
 from handlers.heartbeat import handle_heartbeat_check
 from handlers.list_agents import handle_list_agents
 from handlers.list_jobs import handle_list_jobs
+from handlers.tenant_approvals import handle_list_agent_approved, handle_list_my_pending
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -217,6 +217,24 @@ async def get_agent(agent_id: str, request: Request):
     if not token:
         return JSONResponse({"error": "missing Authorization header"}, status_code=401)
     return _resp(handle_get_agent(agent_id, token))
+
+
+@app.get("/approvals/pending")
+async def list_my_pending(request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    query = dict(request.query_params)
+    return _resp(handle_list_my_pending(query, token))
+
+
+@app.get("/agents/{agent_id}/approved-commands")
+async def list_agent_approved(agent_id: str, request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    status = request.query_params.get("status", "approved")
+    return _resp(handle_list_agent_approved(agent_id, token, status=status))
 
 
 # ---------------------------------------------------------------------------
@@ -446,8 +464,16 @@ async def set_mode(agent_id: str, request: Request):
     return _resp(handle_set_mode(agent_id, body, token))
 
 
-@app.post("/admin/agents/{agent_id}/policy/commands")
-async def add_command(agent_id: str, request: Request):
+@app.get("/admin/approvals")
+async def list_approvals(request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    return _resp(handle_list_approvals(dict(request.query_params), token))
+
+
+@app.post("/admin/approvals", status_code=201)
+async def pre_approve_command(request: Request):
     token = _token(request)
     if not token:
         return JSONResponse({"error": "missing Authorization header"}, status_code=401)
@@ -455,19 +481,39 @@ async def add_command(agent_id: str, request: Request):
         body = await request.json()
     except Exception:
         return JSONResponse({"error": "invalid JSON body"}, status_code=400)
-    return _resp(handle_add_command(agent_id, body, token))
+    return _resp(handle_pre_approve_command(body, token))
 
 
-@app.delete("/admin/agents/{agent_id}/policy/commands")
-async def remove_command(agent_id: str, request: Request):
+@app.put("/admin/approvals/{approval_id}/approve")
+async def approve_approval(approval_id: str, request: Request):
     token = _token(request)
     if not token:
         return JSONResponse({"error": "missing Authorization header"}, status_code=401)
     try:
         body = await request.json()
     except Exception:
-        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
-    return _resp(handle_remove_command(agent_id, body, token))
+        body = {}
+    return _resp(handle_review_approval(approval_id, "approve", token, body))
+
+
+@app.put("/admin/approvals/{approval_id}/deny")
+async def deny_approval(approval_id: str, request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    return _resp(handle_review_approval(approval_id, "deny", token, body))
+
+
+@app.delete("/admin/approvals/{approval_id}")
+async def delete_approval(approval_id: str, request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    return _resp(handle_delete_approval(approval_id, token))
 
 
 # ---------------------------------------------------------------------------

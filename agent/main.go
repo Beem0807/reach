@@ -16,7 +16,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"regexp"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -156,30 +156,6 @@ func apiPost(apiURL, path, token string, payload, result any) (int, error) {
 }
 
 // ---------------------------------------------------------------------------
-// Blocked command patterns
-// ---------------------------------------------------------------------------
-
-var blockedPatterns = []*regexp.Regexp{
-	regexp.MustCompile(`(?i)rm\s+-rf\s+/`),
-	regexp.MustCompile(`(?i)mkfs`),
-	regexp.MustCompile(`(?i)dd\s+if=`),
-	regexp.MustCompile(`:(\(\)){.*:.*\|.*:.*&.*}`),
-	regexp.MustCompile(`(?i)shutdown`),
-	regexp.MustCompile(`(?i)reboot`),
-	regexp.MustCompile(`(?i)poweroff`),
-	regexp.MustCompile(`(?i)init\s+[06]`),
-}
-
-func isBlocked(command string) bool {
-	for _, re := range blockedPatterns {
-		if re.MatchString(command) {
-			return true
-		}
-	}
-	return false
-}
-
-// ---------------------------------------------------------------------------
 // Claim
 // ---------------------------------------------------------------------------
 
@@ -236,12 +212,15 @@ type SyncRequest struct {
 	AgentID            string `json:"agent_id"`
 	MachineFingerprint string `json:"machine_fingerprint"`
 	AgentVersion       string `json:"agent_version"`
+	RunningAsRoot      bool   `json:"running_as_root"`
 }
 
 type Job struct {
-	JobID   string `json:"job_id"`
-	Command string `json:"command"`
-	Mode    string `json:"mode"`
+	JobID            string   `json:"job_id"`
+	Command          string   `json:"command"`
+	Mode             string   `json:"mode"`
+	IsWrite          bool     `json:"is_write"`
+	ApprovedCommands []string `json:"approved_commands"`
 }
 
 type SyncResponse struct {
@@ -255,6 +234,7 @@ func sync(cfg *Config) (*SyncResponse, error) {
 		AgentID:            cfg.AgentID,
 		MachineFingerprint: cfg.MachineFingerprint,
 		AgentVersion:       agentVersion,
+		RunningAsRoot:      os.Getuid() == 0,
 	}
 	var result SyncResponse
 	status, err := apiPost(cfg.APIURL, "/agent/sync", cfg.AgentToken, payload, &result)
@@ -329,6 +309,7 @@ type CommandResult struct {
 	Stderr     string
 	ExitCode   int
 	DurationMS int64
+	Blocked    bool
 }
 
 func commandTimeout() time.Duration {
@@ -359,17 +340,24 @@ func truncate(s string, maxBytes int) string {
 	return string(b[:maxBytes]) + "\n[TRUNCATED]"
 }
 
-func executeCommand(command string) CommandResult {
-	start := time.Now()
-	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout())
-	defer cancel()
+// isApprovedLocally mirrors the server-side _is_approved: exact match or prefix + space boundary.
+func isApprovedLocally(command string, approved []string) bool {
+	cmd := strings.TrimSpace(command)
+	for _, allowed := range approved {
+		allowed = strings.TrimSpace(allowed)
+		if cmd == allowed || strings.HasPrefix(cmd, allowed+" ") {
+			return true
+		}
+	}
+	return false
+}
 
-	cmd := exec.CommandContext(ctx, "/bin/bash", "-lc", command)
+func runCmd(ctx context.Context, args []string) (string, string, int) {
+	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
 	cmd.Dir = "/"
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-
 	exitCode := 0
 	if err := cmd.Run(); err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
@@ -380,11 +368,72 @@ func executeCommand(command string) CommandResult {
 			exitCode = 1
 		}
 	}
+	return stdout.String(), stderr.String(), exitCode
+}
+
+func executeCommand(command, mode string, isWrite bool, approvedCommands []string) CommandResult {
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout())
+	defer cancel()
+
+	// Approved commands bypass the sandbox - writes are explicitly permitted.
+	// Everything else runs under Landlock on Linux: reads pass, unapproved writes
+	// are kernel-blocked and surface as a structured approval error.
+	approvedWrite := mode == "approved" && isApprovedLocally(command, approvedCommands)
+	useSandbox := (mode == "readonly" || mode == "approved") && runtime.GOOS == "linux" && !approvedWrite
+
+	// On non-Linux (macOS): no Landlock available. Block unapproved writes in
+	// approved mode using the is_write flag annotated by the server.
+	if mode == "approved" && runtime.GOOS != "linux" && isWrite && !approvedWrite {
+		richErr := fmt.Sprintf(
+			"Blocked: approval required\n\nCommand:\n  %s\n\nContact your admin to approve this command for this agent.\n",
+			strings.TrimSpace(command),
+		)
+		return CommandResult{
+			Stdout:     "",
+			Stderr:     truncate(richErr, maxOutputSize()),
+			ExitCode:   126,
+			DurationMS: time.Since(start).Milliseconds(),
+			Blocked:    true,
+		}
+	}
+
+	var args []string
+	if useSandbox {
+		args = []string{"/proc/self/exe", "--sandbox", "/bin/bash", "-lc", command}
+	} else {
+		args = []string{"/bin/bash", "-lc", command}
+	}
+
+	stdout, stderr, exitCode := runCmd(ctx, args)
+
+	// If Landlock blocked the command (permission denied), the command tried to
+	// write but was not in the approved list. Return a structured error.
+	// Guard on isWrite to avoid false positives: read commands that fail due to
+	// OS file permissions (e.g. cat /etc/shadow) also produce "permission denied"
+	// but should surface as a normal failure, not a write-approval block.
+	if mode == "approved" && useSandbox && isWrite && exitCode != 0 {
+		stderrLower := strings.ToLower(stderr)
+		if strings.Contains(stderrLower, "permission denied") || strings.Contains(stderrLower, "operation not permitted") {
+			richErr := fmt.Sprintf(
+				"Blocked: approval required\n\nCommand:\n  %s\n\nContact your admin to approve this command for this agent.\n",
+				strings.TrimSpace(command),
+			)
+			limit := maxOutputSize()
+			return CommandResult{
+				Stdout:     "",
+				Stderr:     truncate(richErr, limit),
+				ExitCode:   126,
+				DurationMS: time.Since(start).Milliseconds(),
+				Blocked:    true,
+			}
+		}
+	}
 
 	limit := maxOutputSize()
 	return CommandResult{
-		Stdout:     truncate(stdout.String(), limit),
-		Stderr:     truncate(stderr.String(), limit),
+		Stdout:     truncate(stdout, limit),
+		Stderr:     truncate(stderr, limit),
 		ExitCode:   exitCode,
 		DurationMS: time.Since(start).Milliseconds(),
 	}
@@ -402,6 +451,8 @@ type ResultRequest struct {
 	Stdout             string `json:"stdout"`
 	Stderr             string `json:"stderr"`
 	DurationMS         int64  `json:"duration_ms"`
+	Blocked            bool   `json:"blocked,omitempty"`
+	IsWrite            bool   `json:"is_write,omitempty"`
 }
 
 func postResult(cfg *Config, jobID string, res CommandResult) error {
@@ -417,6 +468,8 @@ func postResult(cfg *Config, jobID string, res CommandResult) error {
 		Stdout:             res.Stdout,
 		Stderr:             res.Stderr,
 		DurationMS:         res.DurationMS,
+		Blocked:            res.Blocked,
+		IsWrite:            res.Blocked, // if blocked, the command was a write by definition
 	}
 	var result map[string]any
 	statusCode, err := apiPost(cfg.APIURL, "/agent/jobs/"+jobID+"/result", cfg.AgentToken, payload, &result)
@@ -520,17 +573,7 @@ func run(ctx context.Context) error {
 
 			log.Printf("Received job %s: %q", job.JobID, job.Command)
 
-			if isBlocked(job.Command) {
-				log.Printf("Job %s blocked by safety policy", job.JobID)
-				_ = postResult(cfg, job.JobID, CommandResult{
-					Stdout:   "",
-					Stderr:   "Command blocked by safety policy",
-					ExitCode: 1,
-				})
-				continue
-			}
-
-			res := executeCommand(job.Command)
+			res := executeCommand(job.Command, job.Mode, job.IsWrite, job.ApprovedCommands)
 			log.Printf("Job %s done: exit=%d duration=%dms", job.JobID, res.ExitCode, res.DurationMS)
 
 			if err := postResult(cfg, job.JobID, res); err != nil {
@@ -546,6 +589,13 @@ func run(ctx context.Context) error {
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
+
+	// Internal re-exec path: apply Landlock sandbox then exec the command.
+	// Invoked as: reach-agent --sandbox /bin/bash -lc <command>
+	if len(os.Args) > 1 && os.Args[1] == "--sandbox" {
+		sandboxExec(os.Args[2:])
+		return
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	quit := make(chan os.Signal, 1)

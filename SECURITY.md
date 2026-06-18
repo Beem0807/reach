@@ -55,7 +55,7 @@ A brief summary of the security model. For full detail see [ARCHITECTURE.md](ARC
 
 **Tenant isolation** - user tokens can only access agents and jobs within their own tenant. The storage layer enforces this; there is no client-side filtering.
 
-**Policy enforcement** - commands are evaluated server-side before being queued. A globally blocked command (fork bombs, `rm -rf /`, raw disk writes, shutdown) is rejected regardless of the agent's policy mode. The agent never sees a blocked command.
+**Policy enforcement** - a global blocklist (fork bombs, `rm -rf /`, raw disk wipes, privileged container escapes, reverse shells) is enforced server-side before a job is queued - regardless of mode. In `readonly` mode the server also blocks writes and destructive operations before they reach the agent. In `approved` mode, the server annotates each job with `is_write: true/false` and queues it to the agent. On Linux the agent enforces via Landlock (kernel sandbox) - unapproved writes are kernel-blocked and surface as a pending approval record. On macOS, where Landlock is unavailable, the agent uses the server-supplied `is_write` flag to block unapproved writes itself and create the same pending approval record. Reads always pass on both platforms.
 
 **No inbound connections** - agents make outbound HTTPS requests only. No ports are opened on the remote machine.
 

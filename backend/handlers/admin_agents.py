@@ -75,7 +75,6 @@ def handle_create_agent(body: dict, raw_token: str, api_url: str) -> dict:
         "type": "manual",
         "fleet_id": None,
         "mode": mode,
-        "approved_commands": [],
         "install_token_hash": _hmac_token(raw_install_token),
         "install_token_expires_at": expires_at,
         "created_at": _iso(),

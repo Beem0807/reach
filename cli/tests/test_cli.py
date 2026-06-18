@@ -607,3 +607,156 @@ class TestPrintJobResult:
             _print_job_result(job_no_out)
         printed = " ".join(str(c) for c in [a for call in mock_print.call_args_list for a in call.args])
         assert "stdout" not in printed
+
+
+# ---------------------------------------------------------------------------
+# reach approvals
+# ---------------------------------------------------------------------------
+
+_APPROVAL = {
+    "approval_id": "appr_1",
+    "command": "docker ps",
+    "requester_name": "Alice",
+    "requested_by": "user_1",
+    "status": "approved",
+    "created_at": "2026-06-01T12:00:00+00:00",
+    "reviewed_at": "2026-06-01T13:00:00+00:00",
+    "expires_at": None,
+}
+
+
+class TestApprovals:
+    def _run(self, args, approvals=None, approved_commands=None):
+        mock_client = MagicMock()
+        mock_client.list_agent_approved.return_value = {
+            "approvals": approvals if approvals is not None else [_APPROVAL],
+            "approved_commands": approved_commands if approved_commands is not None else ["docker ps"],
+        }
+        # Build a fresh profile so mutations from other tests (e.g. TestAgentsUse mutates _PROFILE)
+        # don't bleed in - always start with agent_a as the default.
+        fresh = {"api_url": "https://api.example.com", "tenant_token": "tok_test", "default_agent_id": "agent_a"}
+        with _mock_cfg(profile=fresh), patch("reach.main.ReachClient", return_value=mock_client):
+            result = runner.invoke(app, ["approvals"] + args)
+        return result, mock_client
+
+    def test_default_shows_approved_list(self):
+        result, client = self._run([])
+        assert result.exit_code == 0
+        client.list_agent_approved.assert_called_once_with("agent_a", status="approved")
+        assert "docker ps" in result.output
+
+    def test_pending_flag_calls_pending_status(self):
+        result, client = self._run(["--pending"], approvals=[{**_APPROVAL, "status": "pending"}])
+        assert result.exit_code == 0
+        client.list_agent_approved.assert_called_once_with("agent_a", status="pending")
+
+    def test_denied_flag_calls_denied_status(self):
+        result, client = self._run(["--denied"], approvals=[{**_APPROVAL, "status": "denied"}])
+        assert result.exit_code == 0
+        client.list_agent_approved.assert_called_once_with("agent_a", status="denied")
+
+    def test_expired_flag_calls_expired_status(self):
+        past = "2020-01-01T00:00:00+00:00"
+        result, client = self._run(["--expired"], approvals=[{**_APPROVAL, "expires_at": past}])
+        assert result.exit_code == 0
+        client.list_agent_approved.assert_called_once_with("agent_a", status="expired")
+
+    def test_mutual_exclusion_of_flags(self):
+        result, _ = self._run(["--pending", "--denied"])
+        assert result.exit_code == 1
+        assert "only one" in result.output
+
+    def test_agent_flag_overrides_default(self):
+        result, client = self._run(["--agent", "agent_b"])
+        client.list_agent_approved.assert_called_once_with("agent_b", status="approved")
+
+    def test_empty_approved_prints_no_commands_message(self):
+        result, _ = self._run([], approvals=[], approved_commands=[])
+        assert result.exit_code == 0
+        assert "No approved commands" in result.output
+
+    def test_empty_pending_prints_no_pending_message(self):
+        result, _ = self._run(["--pending"], approvals=[])
+        assert result.exit_code == 0
+        assert "No pending" in result.output
+
+    def test_permanent_expiry_shown_for_null_expires_at(self):
+        result, _ = self._run([], approvals=[{**_APPROVAL, "expires_at": None}])
+        assert "permanent" in result.output
+
+    def test_non_approved_view_shows_status_column(self):
+        result, _ = self._run(["--pending"], approvals=[{**_APPROVAL, "status": "pending"}])
+        assert "pending" in result.output.lower()
+
+    def test_http_error_exits_1(self):
+        import requests as req
+        mock_client = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 401
+        mock_resp.text = "Unauthorized"
+        mock_client.list_agent_approved.side_effect = req.HTTPError(response=mock_resp)
+        with _mock_cfg(), patch("reach.main.ReachClient", return_value=mock_client):
+            result = runner.invoke(app, ["approvals"])
+        assert result.exit_code == 1
+        assert "401" in result.output
+
+
+# ---------------------------------------------------------------------------
+# _expires_label (pure helper)
+# ---------------------------------------------------------------------------
+
+class TestExpiresLabel:
+    def test_approved_null_expires_at_returns_permanent(self):
+        from reach.main import _expires_label
+        assert "permanent" in _expires_label({"expires_at": None, "status": "approved"})
+
+    def test_non_approved_null_expires_at_returns_dash(self):
+        from reach.main import _expires_label
+        assert "-" in _expires_label({"expires_at": None, "status": "pending"})
+        assert "-" in _expires_label({"expires_at": None})
+
+    def test_past_date_shows_expired(self):
+        from reach.main import _expires_label
+        past = "2020-01-01T00:00:00+00:00"
+        assert "(expired)" in _expires_label({"expires_at": past})
+
+    def test_future_days_shows_relative_days(self):
+        from datetime import datetime, timezone, timedelta
+        from reach.main import _expires_label
+        future = (datetime.now(tz=timezone.utc) + timedelta(days=7)).isoformat()
+        label = _expires_label({"expires_at": future})
+        assert "in" in label
+        assert "d" in label
+        assert "(expired)" not in label
+
+    def test_future_hours_shows_relative_hours(self):
+        from datetime import datetime, timezone, timedelta
+        from reach.main import _expires_label
+        future = (datetime.now(tz=timezone.utc) + timedelta(hours=6)).isoformat()
+        label = _expires_label({"expires_at": future})
+        assert "in" in label
+        assert "h" in label
+        assert "d" not in label
+
+    def test_future_minutes_shows_relative_minutes(self):
+        from datetime import datetime, timezone, timedelta
+        from reach.main import _expires_label
+        future = (datetime.now(tz=timezone.utc) + timedelta(minutes=45)).isoformat()
+        label = _expires_label({"expires_at": future})
+        assert "in" in label
+        assert "m" in label
+        assert "h" not in label
+
+    def test_expiring_soon_uses_urgent_markup(self):
+        from datetime import datetime, timezone, timedelta
+        from reach.main import _expires_label
+        future = (datetime.now(tz=timezone.utc) + timedelta(minutes=30)).isoformat()
+        label = _expires_label({"expires_at": future})
+        assert "red" in label
+
+    def test_expiring_within_2h_uses_yellow_markup(self):
+        from datetime import datetime, timezone, timedelta
+        from reach.main import _expires_label
+        future = (datetime.now(tz=timezone.utc) + timedelta(hours=2)).isoformat()
+        label = _expires_label({"expires_at": future})
+        assert "yellow" in label

@@ -150,6 +150,7 @@ def status():
     table.add_row("Claimed at", agent.get("claimed_at") or "-")
     table.add_row("Last heartbeat", agent.get("last_heartbeat_at") or "-")
     table.add_row("Mode", agent.get("mode") or "-")
+    table.add_row("Access level", agent.get("access_level") or "-")
 
     console.print(table)
 
@@ -187,31 +188,38 @@ def agents_list(
     show_tags = any(a.get("tags") for a in items)
 
     table = Table(show_header=True, header_style="bold cyan")
-    table.add_column("Alias")
     table.add_column("Agent ID")
+    table.add_column("Alias")
     table.add_column("Status")
     table.add_column("Mode")
+    table.add_column("Access")
     table.add_column("Hostname")
-    table.add_column("Version")
     if show_tags:
         table.add_column("Tags")
     table.add_column("Claimed at")
+
+    _mode_colors = {"wild": "[yellow]wild[/yellow]", "readonly": "[cyan]readonly[/cyan]", "approved": "[green]approved[/green]"}
+    _access_colors = {
+        "open": "[dim]open[/dim]",
+        "elevated": "[yellow]elevated[/yellow]",
+        "managed": "[cyan]managed[/cyan]",
+        "restricted": "[green]restricted[/green]",
+    }
 
     for a in items:
         aid = a.get("agent_id", "")
         alias = id_to_alias.get(aid, "")
         alias_label = f"[cyan]{alias}[/cyan]" if alias else "-"
-        if aid == default_id:
-            alias_label += " [dim](default)[/dim]"
+        marker = " [dim](default)[/dim]" if aid == default_id else ""
         mode = a.get("mode", "wild")
-        mode_colors = {"wild": "[yellow]wild[/yellow]", "readonly": "[cyan]readonly[/cyan]", "approved": "[green]approved[/green]"}
+        al = a.get("access_level") or "-"
         row = [
+            aid + marker,
             alias_label,
-            aid,
             _status_color(a.get("status", "")),
-            mode_colors.get(mode, mode),
+            _mode_colors.get(mode, mode),
+            _access_colors.get(al, al),
             a.get("hostname") or "-",
-            a.get("agent_version") or "-",
         ]
         if show_tags:
             tags = a.get("tags") or []
@@ -425,54 +433,110 @@ def history(
         console.print(f"\n[dim]More results available. Run with --cursor {next_cursor} to see the next page.[/dim]")
 
 
-# ---------------------------------------------------------------------------
-# reach policy
-# ---------------------------------------------------------------------------
-policy_app = typer.Typer(help="View agent policy (mode and approved commands).")
-app.add_typer(policy_app, name="policy")
 
 
-@policy_app.command("show")
-def policy_show(
+# ---------------------------------------------------------------------------
+# reach approvals
+# ---------------------------------------------------------------------------
+_STATUS_STYLE = {"approved": "green", "denied": "red", "pending": "yellow", "expired": "dim"}
+
+
+def _expires_label(record: dict) -> str:
+    from datetime import datetime, timezone
+    raw = record.get("expires_at")
+    if not raw:
+        return "[dim]permanent[/dim]" if record.get("status") == "approved" else "[dim]-[/dim]"
+    try:
+        exp = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        now = datetime.now(tz=timezone.utc)
+        if exp <= now:
+            return "[dim](expired)[/dim]"
+        total_secs = int((exp - now).total_seconds())
+        if total_secs < 3600:
+            label = f"in {total_secs // 60}m"
+            return f"[red]{label}[/red]"
+        if total_secs < 86400:
+            hours = total_secs // 3600
+            label = f"in {hours}h"
+            return f"[yellow]{label}[/yellow]" if hours <= 2 else label
+        days = total_secs // 86400
+        hours = (total_secs % 86400) // 3600
+        label = f"in {days}d {hours}h" if hours else f"in {days}d"
+        return f"[dim]{label}[/dim]"
+    except ValueError:
+        return f"[dim]{raw[:19].replace('T', ' ')}[/dim]"
+
+
+@app.command()
+def approvals(
     agent: Optional[str] = typer.Option(None, "--agent", "-a", help="Agent ID or alias (default: default agent)"),
+    pending: bool = typer.Option(False, "--pending", help="Show your pending requests for this agent"),
+    denied: bool = typer.Option(False, "--denied", help="Show your denied requests for this agent"),
+    expired: bool = typer.Option(False, "--expired", help="Show your expired approvals for this agent"),
 ):
-    """Show the policy for an agent."""
+    """Show approval records for an agent.
+
+    Default: currently effective approved commands (agent-wide).
+    --pending / --denied / --expired: your own records filtered by status.
+    """
+    flags = [pending, denied, expired]
+    if sum(flags) > 1:
+        console.print("[red]Error:[/red] use only one of --pending, --denied, --expired at a time")
+        raise typer.Exit(1)
+
+    if pending:
+        status = "pending"
+    elif denied:
+        status = "denied"
+    elif expired:
+        status = "expired"
+    else:
+        status = "approved"
+
     api_url = cfg_module.require("api_url")
     tenant_token = cfg_module.require("tenant_token")
     agent_id = cfg_module.resolve_agent(agent) if agent else cfg_module.require("default_agent_id")
 
     client = ReachClient(api_url, tenant_token)
     try:
-        data = client.get_agent(agent_id)
+        data = client.list_agent_approved(agent_id, status=status)
     except requests.HTTPError as e:
         console.print(f"[red]Error:[/red] {e.response.status_code} {e.response.text}")
         raise typer.Exit(1)
 
-    mode = data.get("mode", "wild")
-    commands = data.get("approved_commands", [])
-
-    mode_colors = {
-        "wild": "[yellow]wild[/yellow]",
-        "readonly": "[cyan]readonly[/cyan]",
-        "approved": "[green]approved[/green]",
+    items = data.get("approvals", [])
+    _STATUS_EMPTY = {
+        "approved": "No approved commands for this agent.",
+        "pending":  "No pending requests for this agent.",
+        "denied":   "No denied requests for this agent.",
+        "expired":  "No expired approvals for this agent.",
     }
-    mode_label = mode_colors.get(mode, mode)
+    if not items:
+        console.print(f"[yellow]{_STATUS_EMPTY.get(status, 'No records.')}[/yellow]")
+        return
 
-    console.print(f"\n[bold]Agent:[/bold]  {agent_id}")
-    console.print(f"[bold]Mode:[/bold]   {mode_label}")
+    show_status = status != "approved"
+    table = Table(show_header=True, header_style="bold cyan", box=None, padding=(0, 1))
+    table.add_column("Command")
+    table.add_column("Requested by", style="dim")
+    if show_status:
+        table.add_column("Status")
+    table.add_column("At", style="dim")
+    table.add_column("Expires")
 
-    if mode == "approved":
-        if commands:
-            console.print("\n[bold]Approved commands:[/bold]")
-            for c in commands:
-                console.print(f"  [dim]•[/dim] {c}")
-        else:
-            console.print("\n[yellow]Approved commands: (none - all commands blocked)[/yellow]")
-    elif mode == "readonly":
-        console.print("\n[dim]Write and destructive commands are blocked.[/dim]")
-    else:
-        console.print("\n[dim]All commands permitted (no restrictions).[/dim]")
-    console.print()
+    for a in items:
+        at = (a.get("reviewed_at") or a.get("created_at") or "")[:19].replace("T", " ")
+        row = [
+            a.get("command", ""),
+            a.get("requester_name") or a.get("requested_by") or "-",
+        ]
+        if show_status:
+            st = a.get("status", "")
+            style = _STATUS_STYLE.get(st, "")
+            row.append(f"[{style}]{st}[/{style}]" if style else st)
+        row += [at, _expires_label(a)]
+        table.add_row(*row)
+    console.print(table)
 
 
 # ---------------------------------------------------------------------------
@@ -533,7 +597,14 @@ def agent_init(
             console.print(f"[bold]─── {agent_id}[/bold] ({hostname})")
             role = Prompt.ask("  Role / notes (e.g. production, staging, home lab)", default="")
             app_name = Prompt.ask("  Main app name (e.g. my-api)", default="")
-            agents_config.append({"agent_id": agent_id, "hostname": hostname, "role": role, "app_name": app_name})
+            agents_config.append({
+                "agent_id": agent_id,
+                "hostname": hostname,
+                "role": role,
+                "app_name": app_name,
+                "mode": a.get("mode", "wild"),
+                "access_level": a.get("access_level", ""),
+            })
             console.print()
 
         stack = Prompt.ask("Shared tech stack (e.g. docker, nginx)", default="")
@@ -622,6 +693,7 @@ def _build_agent_context(
     agent_rows = ""
     exec_examples = ""
     app_examples = ""
+    approved_mode_agents = []
 
     for a in agents_config:
         aid = a["agent_id"]
@@ -629,11 +701,14 @@ def _build_agent_context(
         host = a.get("hostname") or "-"
         role = a.get("role") or "-"
         app = a.get("app_name") or ""
+        mode = a.get("mode") or "wild"
+        access_level = a.get("access_level") or ""
         target = alias or aid
         flag = f"--agent {target} " if multi else ""
 
         alias_col = f" (`{alias}`)" if alias else ""
-        agent_rows += f"| `{aid}`{alias_col} | {host} | {role} |\n"
+        mode_col = f"{mode}" + (f" / {access_level}" if access_level else "")
+        agent_rows += f"| `{aid}`{alias_col} | {host} | {role} | {mode_col} |\n"
         exec_examples += f"reach exec {flag}-- hostname\n"
         exec_examples += f"reach exec {flag}-- uptime\n"
         exec_examples += f"reach exec {flag}-- df -h\n"
@@ -641,11 +716,13 @@ def _build_agent_context(
             exec_examples += f"reach exec {flag}-- docker ps\n"
             app_examples += f"reach exec {flag}-- docker logs {app} --tail 100\n"
             app_examples += f"reach exec {flag}-- docker restart {app}\n"
+        if mode == "approved":
+            approved_mode_agents.append(target)
 
     agents_section = (
         "### Agents\n\n"
-        "| Agent ID | Hostname | Role |\n"
-        "|---|---|---|\n"
+        "| Agent ID | Hostname | Role | Mode |\n"
+        "|---|---|---|---|\n"
         f"{agent_rows}"
     )
 
@@ -666,6 +743,24 @@ def _build_agent_context(
 
     all_examples = exec_examples + (app_examples if app_examples else "")
 
+    if approved_mode_agents:
+        targets = ", ".join(f"`{t}`" for t in approved_mode_agents)
+        policy_section = f"""
+### Policy
+
+{targets} {"is" if len(approved_mode_agents) == 1 else "are"} running in **approved mode**. Reads always run. Write commands only execute if pre-approved by an admin - unapproved writes are blocked and create a pending approval record.
+
+```bash
+reach approvals --agent <id>           # see approved write commands for an agent
+reach approvals --agent <id> --pending # see your pending requests for an agent
+reach approvals --agent <id> --expired # see your expired approvals for an agent
+```
+
+If a command is blocked, do not retry it. Check `reach approvals --agent <id> --pending` to confirm the approval record was created, then inform the user that admin approval is required.
+"""
+    else:
+        policy_section = ""
+
     return f"""## Remote Access
 
 Use `reach` for all remote machine operations. Do not use SSH.
@@ -678,7 +773,7 @@ reach agents list
 reach status
 {all_examples.rstrip()}
 ```
-
+{policy_section}
 ### Rules
 
 {rule_agent}* Prefer read-only checks (`status`, `logs`, `ps`) before write/restart commands.
@@ -808,6 +903,84 @@ def mcp():
     """Start the reach MCP server (stdio transport for any MCP-compatible client)."""
     from reach.mcp_server import main as mcp_main
     mcp_main()
+
+
+# ---------------------------------------------------------------------------
+# reach man
+# ---------------------------------------------------------------------------
+@app.command()
+def man():
+    """Show a full command reference for the reach CLI."""
+    from rich.panel import Panel
+    from rich.text import Text
+
+    def section(title: str, rows: list[tuple[str, str]]) -> None:
+        table = Table(box=None, padding=(0, 2), show_header=False)
+        table.add_column("Command", style="cyan", no_wrap=True)
+        table.add_column("Description")
+        for cmd, desc in rows:
+            table.add_row(cmd, desc)
+        console.print(Panel(table, title=f"[bold]{title}[/bold]", title_align="left", border_style="dim"))
+        console.print()
+
+    console.print()
+    console.print("[bold white]reach[/bold white] - remote machine command bridge\n", highlight=False)
+
+    section("Auth & setup", [
+        ("reach login --api-url <url> --token <token>",      "Save credentials (default profile)"),
+        ("reach login --profile <name> ...",                  "Save credentials under a named profile"),
+        ("reach whoami",                                      "Show current user, tenant, and API URL"),
+        ("reach version",                                     "Show CLI version"),
+        ("reach config show",                                 "Show active profile, default agent, and aliases"),
+    ])
+
+    section("Profiles  (multiple tenants / deployments)", [
+        ("reach profile list",                               "List all profiles; active one is marked"),
+        ("reach profile use <name>",                         "Switch active profile"),
+        ("reach profile rename <old> <new>",                 "Rename a profile"),
+        ("reach profile delete <name>",                      "Delete a profile"),
+    ])
+
+    section("Agents", [
+        ("reach agents list",                                "List all machines with mode and access level"),
+        ("reach agents list --tag <key:value>",              "Filter machines by tag"),
+        ("reach agents use <id|alias>",                      "Set default machine"),
+        ("reach status",                                     "Show default machine status and access level"),
+        ("reach alias set <name> <id>",                      "Create a friendly alias for an agent"),
+        ("reach alias list",                                  "List all aliases"),
+        ("reach alias remove <name>",                        "Remove an alias"),
+    ])
+
+    section("Execution", [
+        ("reach exec -- <cmd>",                              "Run command on default machine"),
+        ("reach exec --agent <id|alias> -- <cmd>",           "Run command on a specific machine"),
+        ("reach exec --timeout <s> -- <cmd>",                "Override wait timeout (default 60 s)"),
+        ("reach exec --no-wait -- <cmd>",                    "Submit and exit; poll later with `reach job <id>`"),
+        ("reach job <job_id>",                               "Re-view stdout / stderr of a past job"),
+        ("reach history",                                    "Show your recent jobs (default 20)"),
+        ("reach history --agent <id|alias>",                 "Filter history to one machine"),
+        ("reach history --limit <n>",                        "Show up to N jobs (max 100)"),
+        ("reach history --cursor <cursor>",                  "Fetch the next page"),
+    ])
+
+    section("Approvals  (approved mode)", [
+        ("reach approvals",                                  "Show effective approved commands for the default agent"),
+        ("reach approvals --agent <id|alias>",               "Show effective approved commands for a specific agent"),
+        ("reach approvals --pending",                        "Show your pending requests for the default agent"),
+        ("reach approvals --denied",                         "Show your denied requests for the default agent"),
+        ("reach approvals --expired",                        "Show your expired approvals for the default agent"),
+        ("reach approvals --agent <id|alias> --pending",     "Filter any of the above to a specific agent"),
+    ])
+
+    section("AI integration", [
+        ("reach agent-init",                                 "Interactively generate context for your AI agent"),
+        ("reach agent-init --for claude",                    "Write CLAUDE.md for Claude Code"),
+        ("reach agent-init --for cursor",                    "Write .cursor/rules/reach.mdc for Cursor"),
+        ("reach agent-init --for system-prompt",             "Print system prompt snippet to stdout"),
+        ("reach mcp",                                        "Start the MCP server (stdio, for MCP-compatible clients)"),
+    ])
+
+    console.print("[dim]Tip: every command also accepts --help for full option details.[/dim]\n")
 
 
 if __name__ == "__main__":

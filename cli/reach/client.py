@@ -54,3 +54,8 @@ class ReachClient:
         resp = self.session.get(self._url("/jobs"), params=params, timeout=15)
         resp.raise_for_status()
         return resp.json()
+
+    def list_agent_approved(self, agent_id: str, status: str = "approved") -> dict:
+        resp = self.session.get(self._url(f"/agents/{agent_id}/approved-commands"), params={"status": status}, timeout=15)
+        resp.raise_for_status()
+        return resp.json()

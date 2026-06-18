@@ -25,8 +25,11 @@ _VALID_BODY = {
 class TestAgentJobResult:
     def _call(self, body=None, agent=_AGENT, job=_JOB_RUNNING):
         with patch("handlers.agent_job_result._verify_agent_token", return_value=agent), \
-             patch("handlers.agent_job_result.jobs_repo") as jr:
+             patch("handlers.agent_job_result.jobs_repo") as jr, \
+             patch("handlers.agent_job_result.approvals_repo"), \
+             patch("handlers.agent_job_result.users_repo") as ur:
             jr.get.return_value = job
+            ur.get.return_value = None
             return handle_agent_job_result(JOB_ID, body or _VALID_BODY, "tok")
 
     def test_invalid_status(self):
@@ -73,8 +76,11 @@ class TestAgentJobResult:
 
     def test_saves_result(self):
         with patch("handlers.agent_job_result._verify_agent_token", return_value=_AGENT), \
-             patch("handlers.agent_job_result.jobs_repo") as jr:
+             patch("handlers.agent_job_result.jobs_repo") as jr, \
+             patch("handlers.agent_job_result.approvals_repo"), \
+             patch("handlers.agent_job_result.users_repo") as ur:
             jr.get.return_value = _JOB_RUNNING
+            ur.get.return_value = None
             handle_agent_job_result(JOB_ID, _VALID_BODY, "tok")
         jr.set_result.assert_called_once()
         result_data = jr.set_result.call_args[0][1]
@@ -87,8 +93,11 @@ class TestAgentJobResult:
         r = self._call({**_VALID_BODY, "stdout": large_stdout})
         assert r["statusCode"] == 200
         with patch("handlers.agent_job_result._verify_agent_token", return_value=_AGENT), \
-             patch("handlers.agent_job_result.jobs_repo") as jr:
+             patch("handlers.agent_job_result.jobs_repo") as jr, \
+             patch("handlers.agent_job_result.approvals_repo"), \
+             patch("handlers.agent_job_result.users_repo") as ur:
             jr.get.return_value = _JOB_RUNNING
+            ur.get.return_value = None
             handle_agent_job_result(JOB_ID, {**_VALID_BODY, "stdout": large_stdout}, "tok")
         stored = jr.set_result.call_args[0][1]["stdout"]
         assert "[TRUNCATED]" in stored
@@ -101,8 +110,11 @@ class TestAgentJobResult:
     def test_stderr_truncated_when_too_large(self):
         large_stderr = "e" * 60_000
         with patch("handlers.agent_job_result._verify_agent_token", return_value=_AGENT), \
-             patch("handlers.agent_job_result.jobs_repo") as jr:
+             patch("handlers.agent_job_result.jobs_repo") as jr, \
+             patch("handlers.agent_job_result.approvals_repo"), \
+             patch("handlers.agent_job_result.users_repo") as ur:
             jr.get.return_value = _JOB_RUNNING
+            ur.get.return_value = None
             handle_agent_job_result(JOB_ID, {**_VALID_BODY, "stderr": large_stderr}, "tok")
         stored = jr.set_result.call_args[0][1]["stderr"]
         assert "[TRUNCATED]" in stored
@@ -111,3 +123,67 @@ class TestAgentJobResult:
     def test_rejected_status_accepted(self):
         r = self._call({**_VALID_BODY, "status": "REJECTED"})
         assert r["statusCode"] == 200
+
+    def test_is_write_stored_on_job(self):
+        with patch("handlers.agent_job_result._verify_agent_token", return_value=_AGENT), \
+             patch("handlers.agent_job_result.jobs_repo") as jr, \
+             patch("handlers.agent_job_result.approvals_repo"), \
+             patch("handlers.agent_job_result.users_repo") as ur:
+            jr.get.return_value = _JOB_RUNNING
+            ur.get.return_value = None
+            handle_agent_job_result(JOB_ID, {**_VALID_BODY, "is_write": True}, "tok")
+        stored = jr.set_result.call_args[0][1]
+        assert stored["is_write"] is True
+
+    def test_blocked_true_infers_is_write(self):
+        with patch("handlers.agent_job_result._verify_agent_token", return_value=_AGENT), \
+             patch("handlers.agent_job_result.jobs_repo") as jr, \
+             patch("handlers.agent_job_result.approvals_repo"), \
+             patch("handlers.agent_job_result.users_repo") as ur:
+            jr.get.return_value = _JOB_RUNNING
+            ur.get.return_value = None
+            handle_agent_job_result(JOB_ID, {**_VALID_BODY, "blocked": True}, "tok")
+        stored = jr.set_result.call_args[0][1]
+        assert stored["is_write"] is True
+
+    def test_blocked_creates_approval_record(self):
+        job_with_meta = {**_JOB_RUNNING, "tenant_id": "tenant_1", "command": "rm -rf /tmp/x", "created_by": "user_1"}
+        user = {"user_id": "user_1", "name": "Alice"}
+        with patch("handlers.agent_job_result._verify_agent_token", return_value=_AGENT), \
+             patch("handlers.agent_job_result.jobs_repo") as jr, \
+             patch("handlers.agent_job_result.approvals_repo") as apr, \
+             patch("handlers.agent_job_result.users_repo") as ur:
+            jr.get.return_value = job_with_meta
+            apr.exists_pending.return_value = False
+            ur.get.return_value = user
+            handle_agent_job_result(JOB_ID, {**_VALID_BODY, "blocked": True, "status": "FAILED"}, "tok")
+        apr.create.assert_called_once()
+        record = apr.create.call_args[0][0]
+        assert record["status"] == "pending"
+        assert record["command"] == "rm -rf /tmp/x"
+        assert record["agent_id"] == AGENT_ID
+        assert record["requested_by"] == "user_1"
+        assert record["requester_name"] == "Alice"
+        assert record["job_id"] == JOB_ID
+        assert record["approval_id"].startswith("appr_")
+
+    def test_blocked_skips_create_when_pending_exists(self):
+        job_with_meta = {**_JOB_RUNNING, "tenant_id": "tenant_1", "command": "rm -rf /tmp/x", "created_by": "user_1"}
+        with patch("handlers.agent_job_result._verify_agent_token", return_value=_AGENT), \
+             patch("handlers.agent_job_result.jobs_repo") as jr, \
+             patch("handlers.agent_job_result.approvals_repo") as apr, \
+             patch("handlers.agent_job_result.users_repo"):
+            jr.get.return_value = job_with_meta
+            apr.exists_pending.return_value = True
+            handle_agent_job_result(JOB_ID, {**_VALID_BODY, "blocked": True, "status": "FAILED"}, "tok")
+        apr.create.assert_not_called()
+
+    def test_not_blocked_does_not_create_approval(self):
+        with patch("handlers.agent_job_result._verify_agent_token", return_value=_AGENT), \
+             patch("handlers.agent_job_result.jobs_repo") as jr, \
+             patch("handlers.agent_job_result.approvals_repo") as apr, \
+             patch("handlers.agent_job_result.users_repo") as ur:
+            jr.get.return_value = _JOB_RUNNING
+            ur.get.return_value = None
+            handle_agent_job_result(JOB_ID, _VALID_BODY, "tok")
+        apr.create.assert_not_called()

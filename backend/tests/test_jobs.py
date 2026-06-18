@@ -10,10 +10,11 @@ TENANT = "tenant_1"
 USER = {"user_id": "user_1", "tenant_id": TENANT}
 AGENT_ID = "agent_a"
 
-_AGENT_ACTIVE = {"agent_id": AGENT_ID, "tenant_id": TENANT, "status": "ACTIVE", "mode": "wild", "approved_commands": []}
+_AGENT_ACTIVE = {"agent_id": AGENT_ID, "tenant_id": TENANT, "status": "ACTIVE", "mode": "wild"}
 _AGENT_INACTIVE = {"agent_id": AGENT_ID, "tenant_id": TENANT, "status": "INACTIVE", "mode": "wild"}
-_AGENT_READONLY = {"agent_id": AGENT_ID, "tenant_id": TENANT, "status": "ACTIVE", "mode": "readonly", "approved_commands": []}
-_AGENT_APPROVED = {"agent_id": AGENT_ID, "tenant_id": TENANT, "status": "ACTIVE", "mode": "approved", "approved_commands": ["docker ps"]}
+_AGENT_READONLY = {"agent_id": AGENT_ID, "tenant_id": TENANT, "status": "ACTIVE", "mode": "readonly"}
+_AGENT_APPROVED = {"agent_id": AGENT_ID, "tenant_id": TENANT, "status": "ACTIVE", "mode": "approved"}
+_APPROVED_COMMANDS = [{"approval_id": "appr_1", "command": "docker ps", "status": "approved"}]
 
 _JOB = {
     "job_id": "job_1", "agent_id": AGENT_ID, "tenant_id": TENANT,
@@ -80,12 +81,13 @@ class TestCreateJob:
         r = self._call({"agent_id": AGENT_ID, "command": "docker ps"}, agent=_AGENT_READONLY)
         assert r["statusCode"] == 201
 
-    def test_approved_mode_blocks_unapproved(self):
-        r = self._call({"agent_id": AGENT_ID, "command": "ls -la"}, agent=_AGENT_APPROVED)
-        assert r["statusCode"] == 403
+    def test_approved_mode_queues_write(self):
+        # Server queues in approved mode regardless; agent enforces via Landlock.
+        r = self._call({"agent_id": AGENT_ID, "command": "docker stop myapp"}, agent=_AGENT_APPROVED)
+        assert r["statusCode"] == 201
 
-    def test_approved_mode_allows_approved(self):
-        r = self._call({"agent_id": AGENT_ID, "command": "docker ps -a"}, agent=_AGENT_APPROVED)
+    def test_approved_mode_queues_read(self):
+        r = self._call({"agent_id": AGENT_ID, "command": "ls -la"}, agent=_AGENT_APPROVED)
         assert r["statusCode"] == 201
 
     def test_creates_job(self):
@@ -99,6 +101,24 @@ class TestCreateJob:
         restricted_user = {**USER, "allowed_agent_ids": ["agent_other"]}
         r = self._call({"agent_id": AGENT_ID, "command": "ls"}, user=restricted_user)
         assert r["statusCode"] == 404
+
+    def test_write_command_annotated_is_write_true(self):
+        with patch("handlers.create_job._verify_tenant_token", return_value=USER), \
+             patch("handlers.create_job.agents_repo") as ar, \
+             patch("handlers.create_job.jobs_repo") as jr:
+            ar.get.return_value = _AGENT_ACTIVE
+            handle_create_job({"agent_id": AGENT_ID, "command": "rm -rf /tmp/x"}, "tok")
+        stored = jr.create.call_args[0][0]
+        assert stored["is_write"] is True
+
+    def test_read_command_annotated_is_write_false(self):
+        with patch("handlers.create_job._verify_tenant_token", return_value=USER), \
+             patch("handlers.create_job.agents_repo") as ar, \
+             patch("handlers.create_job.jobs_repo") as jr:
+            ar.get.return_value = _AGENT_ACTIVE
+            handle_create_job({"agent_id": AGENT_ID, "command": "docker ps"}, "tok")
+        stored = jr.create.call_args[0][0]
+        assert stored["is_write"] is False
 
 
 # ---------------------------------------------------------------------------

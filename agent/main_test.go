@@ -14,58 +14,6 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// isBlocked
-// ---------------------------------------------------------------------------
-
-func TestIsBlocked(t *testing.T) {
-	blocked := []string{
-		"rm -rf /",
-		"rm -RF /etc",
-		"sudo rm -rf /",
-		"mkfs.ext4 /dev/sda",
-		"MKFS /dev/sdb",
-		"dd if=/dev/zero of=/dev/sda",
-		"DD IF=/dev/zero",
-		":(){ :|:& };:",
-		"shutdown now",
-		"SHUTDOWN -h now",
-		"reboot",
-		"REBOOT",
-		"poweroff",
-		"POWEROFF",
-		"init 0",
-		"init 6",
-	}
-	for _, cmd := range blocked {
-		cmd := cmd
-		t.Run(cmd, func(t *testing.T) {
-			if !isBlocked(cmd) {
-				t.Errorf("expected %q to be blocked", cmd)
-			}
-		})
-	}
-
-	allowed := []string{
-		"ls -la",
-		"docker ps",
-		"rm -rf ./tmp/mydir",
-		"rm -rf ./build",
-		"echo hello",
-		"cat /etc/hosts",
-		"df -h",
-		"uptime",
-	}
-	for _, cmd := range allowed {
-		cmd := cmd
-		t.Run(cmd, func(t *testing.T) {
-			if isBlocked(cmd) {
-				t.Errorf("expected %q to be allowed", cmd)
-			}
-		})
-	}
-}
-
-// ---------------------------------------------------------------------------
 // truncate
 // ---------------------------------------------------------------------------
 
@@ -166,6 +114,60 @@ func TestMaxOutputSize(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// isApprovedLocally
+// ---------------------------------------------------------------------------
+
+func TestIsApprovedLocally(t *testing.T) {
+	t.Run("exact match", func(t *testing.T) {
+		if !isApprovedLocally("docker ps", []string{"docker ps"}) {
+			t.Error("exact match should be approved")
+		}
+	})
+
+	t.Run("prefix match with space boundary", func(t *testing.T) {
+		if !isApprovedLocally("docker ps -a --format json", []string{"docker ps"}) {
+			t.Error("prefix match with trailing args should be approved")
+		}
+	})
+
+	t.Run("not approved when not in list", func(t *testing.T) {
+		if isApprovedLocally("rm -rf /tmp", []string{"docker ps", "ls"}) {
+			t.Error("unlisted command should not be approved")
+		}
+	})
+
+	t.Run("empty approved list returns false", func(t *testing.T) {
+		if isApprovedLocally("ls", nil) {
+			t.Error("empty approved list should not approve anything")
+		}
+	})
+
+	t.Run("no partial word match - docker-compose is not docker", func(t *testing.T) {
+		if isApprovedLocally("docker-compose up", []string{"docker ps"}) {
+			t.Error("partial word should not match")
+		}
+	})
+
+	t.Run("no partial word prefix - docker ps-malicious is not docker ps", func(t *testing.T) {
+		if isApprovedLocally("docker ps-malicious", []string{"docker ps"}) {
+			t.Error("suffix without space boundary should not match")
+		}
+	})
+
+	t.Run("whitespace trimmed on both sides", func(t *testing.T) {
+		if !isApprovedLocally("  docker ps  ", []string{"  docker ps  "}) {
+			t.Error("whitespace trimming should make this match")
+		}
+	})
+
+	t.Run("multiple allowed entries - first match wins", func(t *testing.T) {
+		if !isApprovedLocally("git status", []string{"docker ps", "git status", "df -h"}) {
+			t.Error("should match second entry in approved list")
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
 // executeCommand
 // ---------------------------------------------------------------------------
 
@@ -173,7 +175,7 @@ func TestExecuteCommand(t *testing.T) {
 	t.Run("successful command", func(t *testing.T) {
 		os.Unsetenv("REACH_COMMAND_TIMEOUT_SECONDS")
 		os.Unsetenv("REACH_MAX_OUTPUT_BYTES")
-		res := executeCommand("echo hello")
+		res := executeCommand("echo hello", "wild", false, nil)
 		if res.ExitCode != 0 {
 			t.Errorf("exit code %d, want 0", res.ExitCode)
 		}
@@ -186,14 +188,14 @@ func TestExecuteCommand(t *testing.T) {
 	})
 
 	t.Run("failed command returns non-zero exit", func(t *testing.T) {
-		res := executeCommand("exit 42")
+		res := executeCommand("exit 42", "wild", false, nil)
 		if res.ExitCode != 42 {
 			t.Errorf("exit code %d, want 42", res.ExitCode)
 		}
 	})
 
 	t.Run("stderr captured separately", func(t *testing.T) {
-		res := executeCommand("echo errline >&2")
+		res := executeCommand("echo errline >&2", "wild", false, nil)
 		if !strings.Contains(res.Stderr, "errline") {
 			t.Errorf("stderr %q does not contain 'errline'", res.Stderr)
 		}
@@ -205,7 +207,7 @@ func TestExecuteCommand(t *testing.T) {
 	t.Run("output truncated when over limit", func(t *testing.T) {
 		t.Setenv("REACH_MAX_OUTPUT_BYTES", "50")
 		// printf '%200s' prints 200 spaces; tr replaces with x → 200 bytes of 'x'
-		res := executeCommand("printf '%200s' | tr ' ' x")
+		res := executeCommand("printf '%200s' | tr ' ' x", "wild", false, nil)
 		if !strings.Contains(res.Stdout, "[TRUNCATED]") {
 			t.Errorf("expected truncated output, got %q", res.Stdout)
 		}
@@ -213,10 +215,29 @@ func TestExecuteCommand(t *testing.T) {
 
 	t.Run("command timeout returns non-zero exit", func(t *testing.T) {
 		t.Setenv("REACH_COMMAND_TIMEOUT_SECONDS", "1")
-		res := executeCommand("sleep 10")
+		res := executeCommand("sleep 10", "wild", false, nil)
 		// 124 on Linux (killed via context deadline), -1 on macOS (SIGKILL via ExitError)
 		if res.ExitCode == 0 {
 			t.Error("expected non-zero exit code for timed-out command")
+		}
+	})
+
+	// Read command fails due to OS file permissions (not a write block).
+	// With isWrite=false the agent must NOT treat it as a Landlock block -
+	// it should fall through as a normal FAILED job with no Blocked flag.
+	t.Run("read permission denied is not treated as write block", func(t *testing.T) {
+		// Create a file readable only by root, then try to cat it as the current user.
+		dir := t.TempDir()
+		secret := filepath.Join(dir, "secret")
+		if err := os.WriteFile(secret, []byte("x"), 0000); err != nil {
+			t.Skipf("cannot create unreadable file: %v", err)
+		}
+		res := executeCommand("cat "+secret, "approved", false /* isWrite=false */, nil)
+		if res.Blocked {
+			t.Error("read permission denied should not set Blocked=true")
+		}
+		if res.ExitCode == 0 {
+			t.Error("expected non-zero exit for unreadable file")
 		}
 	})
 }

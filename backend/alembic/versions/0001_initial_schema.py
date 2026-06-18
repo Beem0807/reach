@@ -48,7 +48,7 @@ def upgrade() -> None:
         sa.Column('agent_version', sa.String(), nullable=True),
         sa.Column('machine_fingerprint', sa.String(), nullable=True),
         sa.Column('mode', sa.String(), nullable=False),
-        sa.Column('approved_commands', sa.JSON(), nullable=True),
+        sa.Column('running_as_root', sa.String(), nullable=True),
         sa.Column('agent_token_hash', sa.String(), nullable=True),
         sa.Column('install_token_hash', sa.String(), nullable=True),
         sa.Column('install_token_expires_at', sa.Integer(), nullable=True),
@@ -73,6 +73,7 @@ def upgrade() -> None:
         sa.Column('command', sa.Text(), nullable=False),
         sa.Column('status', sa.String(), nullable=False),
         sa.Column('mode', sa.String(), nullable=True),
+        sa.Column('is_write', sa.Boolean(), nullable=True),
         sa.Column('exit_code', sa.Integer(), nullable=True),
         sa.Column('stdout', sa.Text(), nullable=True),
         sa.Column('stderr', sa.Text(), nullable=True),
@@ -88,8 +89,29 @@ def upgrade() -> None:
     op.create_index('ix_jobs_created_at', 'jobs', ['created_at'])
     op.create_index('ix_jobs_created_by', 'jobs', ['created_by'])
 
+    op.create_table(
+        'approvals',
+        sa.Column('approval_id', sa.String(), nullable=False),
+        sa.Column('tenant_id', sa.String(), nullable=False),
+        sa.Column('agent_id', sa.String(), nullable=False),
+        sa.Column('command', sa.Text(), nullable=False),
+        sa.Column('requested_by', sa.String(), nullable=False),
+        sa.Column('requester_name', sa.String(), nullable=True),
+        sa.Column('job_id', sa.String(), nullable=True),
+        sa.Column('status', sa.String(), nullable=False),
+        sa.Column('expires_at', sa.String(), nullable=True),
+        sa.Column('created_at', sa.String(), nullable=True),
+        sa.Column('reviewed_at', sa.String(), nullable=True),
+        sa.Column('reviewed_by', sa.String(), nullable=True),
+        sa.PrimaryKeyConstraint('approval_id'),
+    )
+    op.create_index('ix_approvals_tenant_id', 'approvals', ['tenant_id'])
+    op.create_index('ix_approvals_agent_id', 'approvals', ['agent_id'])
+    op.create_index('ix_approvals_created_at', 'approvals', ['created_at'])
+
 
 def downgrade() -> None:
+    op.drop_table('approvals')
     op.drop_table('jobs')
     op.drop_table('agents')
     op.drop_table('users')

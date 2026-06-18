@@ -144,6 +144,43 @@ Resources:
         AttributeName: expires_at
         Enabled: true
 
+  ApprovalsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: reach-approvals
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: approval_id
+          AttributeType: S
+        - AttributeName: agent_id
+          AttributeType: S
+        - AttributeName: tenant_id
+          AttributeType: S
+        - AttributeName: created_at
+          AttributeType: S
+      KeySchema:
+        - AttributeName: approval_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: agent-approvals-index
+          KeySchema:
+            - AttributeName: agent_id
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: tenant-approvals-index
+          KeySchema:
+            - AttributeName: tenant_id
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
   # -----------------------------------------------------------------------
   # Shared IAM role - all Lambda functions use this
   # -----------------------------------------------------------------------
@@ -172,9 +209,11 @@ Resources:
                   - !GetAtt TenantsTable.Arn
                   - !GetAtt UsersTable.Arn
                   - !GetAtt JobsTable.Arn
+                  - !GetAtt ApprovalsTable.Arn
                   - !Sub "${AgentsTable.Arn}/index/*"
                   - !Sub "${UsersTable.Arn}/index/*"
                   - !Sub "${JobsTable.Arn}/index/*"
+                  - !Sub "${ApprovalsTable.Arn}/index/*"
 
   # -----------------------------------------------------------------------
   # Agent endpoints
@@ -310,6 +349,32 @@ Resources:
           Type: HttpApi
           Properties:
             Path: /agents/{agent_id}
+            Method: GET
+
+  ListMyPendingFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-list-my-pending
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.tenant_approvals.list_my_pending_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /approvals/pending
+            Method: GET
+
+  ListAgentApprovedFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-list-agent-approved
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.tenant_approvals.list_agent_approved_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /agents/{agent_id}/approved-commands
             Method: GET
 
   # -----------------------------------------------------------------------
@@ -588,30 +653,56 @@ Resources:
             Path: /admin/agents/{agent_id}/policy/mode
             Method: PUT
 
-  AdminAddCommandFunction:
+  AdminListApprovalsFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: reach-admin-add-command
+      FunctionName: reach-admin-list-approvals
       Role: !GetAtt LambdaRole.Arn
-      Handler: handlers.admin_policy.add_command_handler
+      Handler: handlers.admin_approvals.list_approvals_handler
       Events:
         Api:
           Type: HttpApi
           Properties:
-            Path: /admin/agents/{agent_id}/policy/commands
+            Path: /admin/approvals
+            Method: GET
+
+  AdminReviewApprovalFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-admin-review-approval
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.admin_approvals.review_approval_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /admin/approvals/{approval_id}/{action}
+            Method: PUT
+
+  AdminPreApproveCommandFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-admin-pre-approve-command
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.admin_approvals.pre_approve_command_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /admin/approvals
             Method: POST
 
-  AdminRemoveCommandFunction:
+  AdminDeleteApprovalFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: reach-admin-remove-command
+      FunctionName: reach-admin-delete-approval
       Role: !GetAtt LambdaRole.Arn
-      Handler: handlers.admin_policy.remove_command_handler
+      Handler: handlers.admin_approvals.delete_approval_handler
       Events:
         Api:
           Type: HttpApi
           Properties:
-            Path: /admin/agents/{agent_id}/policy/commands
+            Path: /admin/approvals/{approval_id}
             Method: DELETE
 
   # -----------------------------------------------------------------------

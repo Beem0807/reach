@@ -234,6 +234,52 @@ curl -s -X PUT "$API_URL/admin/tenants/tenant_xxxxx/users/user_alice/agents" \
   -d '{"agent_ids": ["*"]}'
 ```
 
+**Manage agent policy mode:**
+
+```bash
+# Set an agent to approved mode
+curl -s -X PUT "$API_URL/admin/agents/agent_xxx/policy/mode" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"mode": "approved"}'
+
+# Pre-approve a single command
+curl -s -X POST "$API_URL/admin/approvals" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"agent_id": "agent_xxx", "command": "docker restart app", "duration": "8h"}'
+
+# Bulk pre-approve (idempotent — skips any that are already approved)
+curl -s -X POST "$API_URL/admin/approvals" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"agent_id": "agent_xxx", "commands": ["docker ps", "docker logs app", "kubectl get pods -A"]}'
+
+# View pending approval requests (paginated — default 20, max 100; use ?cursor=<next_cursor> for next page)
+curl -s "$API_URL/admin/approvals?agent_id=agent_xxx&status=pending" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
+
+# Approve permanently
+curl -s -X PUT "$API_URL/admin/approvals/appr_xxx/approve" \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+
+# Approve for a limited time (1h / 8h / 24h / 7d / permanent / custom Nh or Nd)
+curl -s -X PUT "$API_URL/admin/approvals/appr_xxx/approve" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"duration": "8h"}'
+
+# Deny a command
+curl -s -X PUT "$API_URL/admin/approvals/appr_xxx/deny" \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+
+# Permanently delete an approval record (any status)
+curl -s -X DELETE "$API_URL/admin/approvals/appr_xxx" \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+Time-limited approvals expire silently - the record stays in the database for history, but once the expiry passes the command is no longer in the effective approved list. The next blocked attempt creates a new pending record.
+
 See [SELF_HOSTING.md](SELF_HOSTING.md) for the full admin API reference.
 
 ---
@@ -305,28 +351,81 @@ The MCP server reads from `~/.reach/config.json` - make sure you've run `reach l
 | Tool | Description |
 |---|---|
 | `whoami` | Show current authenticated user and tenant |
-| `list_agents` | List all registered machines |
+| `list_agents` | List all registered machines with mode and access level |
 | `get_agent(agent_id)` | Get status of a specific machine |
 | `exec_command(command, agent_id?, timeout?)` | Run a command and wait for the result |
 | `get_job(job_id)` | Fetch result of a previously submitted job |
 | `list_history(agent_id?, limit?)` | Browse recent job history |
+| `list_approved_commands(agent_id?)` | List pre-approved write commands for an agent (approved mode) |
+| `list_pending_approvals(agent_id?)` | List your blocked commands awaiting admin approval |
 
 ---
 
 ## Policies
 
-Each machine runs in one of three modes, configured via the admin API:
+Each agent runs in one of three modes, configured via the admin API. The mode determines how commands are evaluated before execution.
 
-- **Wild** - allow all commands
-- **Readonly** - block write and destructive commands
-- **Approved** - only approved command patterns can run
+### Wild mode
 
-Use the CLI to view the active policy:
+Wild mode is intentionally permissive. It is designed for personal machines, dev environments, break-glass debugging, and power users who want full command flexibility.
+
+Reach still rejects a small set of commands in wild mode - those that are catastrophic or abuse-like regardless of context: raw disk wipes (`mkfs`, `dd if=`, `wipefs`), recursive deletion of the root filesystem (`rm -rf /`), privileged container and host escapes (`docker run --privileged`, `nsenter --target 1`, `chroot /`), credential exfiltration (`env | curl`), fork bombs, and reverse shells (`/dev/tcp/`, `nc -e`, `socat exec:`). Everything else runs, including reboots, shutdowns, IaC destroys, cloud resource deletions, and package installs.
+
+For production machines, use **Approved** mode and explicitly allowlist the write operations Reach is allowed to perform.
+
+### Readonly mode
+
+Readonly mode blocks any command that writes, deletes, installs, or mutates system state. This includes: file writes and deletes, process kills, service restarts, reboots and shutdowns, package managers, container mutations (`docker run/stop/rm`), firewall changes, user management, IaC destroys (`terraform destroy`, `pulumi destroy`), and cloud destructive operations (`aws ec2 terminate-instances`, `gcloud instances delete`).
+
+Read-only commands (`ls`, `cat`, `git log`, `docker ps`, `kubectl get`, `aws describe-*`, `journalctl`) always pass.
+
+Shell-chained commands are checked segment by segment - `ls && rm file.txt` is blocked even though the `ls` segment is safe.
+
+On Linux, readonly mode enforcement is backed by Landlock (a kernel sandbox) on the agent. Commands run in a sandboxed subprocess that cannot write outside `/tmp`, providing defence-in-depth beyond the pattern-based check.
+
+On macOS, Landlock is not available. Readonly mode relies entirely on the server-side blocked-command list - the server rejects blocked writes before they are queued, so the agent never receives them.
+
+### Approved mode
+
+Reads are always allowed - you do not need to add read commands to any list. Write and destructive operations (anything blocked in readonly mode) are only permitted if the exact command has been pre-approved for this agent.
+
+**How it works:**
+
+1. When a command is submitted, the server classifies it as a write or read (`is_write: true/false`) using the same pattern list as readonly mode, and queues it to the agent.
+2. The agent checks whether the command matches the approved list.
+   - **Approved match** - runs the command normally (write explicitly permitted).
+   - **Not approved, Linux** - runs under Landlock. If Landlock blocks the write, the agent returns a structured error and the backend creates a pending approval record.
+   - **Not approved, macOS** - no Landlock available. The agent uses the server-supplied `is_write` flag: if the command is a write and not approved, it is refused immediately and a pending approval record is created. Read commands always run.
+3. The admin can review pending approvals and approve or deny them via the admin API.
+4. Once approved, the command prefix is included in the approved list on the next sync and runs without restriction.
+
+The match is prefix-based with word boundary: approving `docker logs` permits `docker logs myapp --tail 100` but not `docker rm myapp`.
+
+**Viewing approvals from the CLI:**
 
 ```bash
-reach policy show
-reach policy show --agent prod
+reach approvals                      # effective approved commands (default agent)
+reach approvals --agent prod         # effective approved commands for a specific agent
+reach approvals --pending            # your pending requests (default agent)
+reach approvals --denied             # your denied requests (default agent)
+reach approvals --expired            # your expired approvals (default agent)
+reach approvals --agent prod --pending  # any of the above for a specific agent
 ```
+
+`--pending`, `--denied`, and `--expired` show only your own records. Expired entries are visually marked so you can see why a command stopped working.
+
+### Access level
+
+Each agent has an `access_level` label that combines its policy mode with whether the agent process is running as root. This is shown in `reach agents list` and `reach status`.
+
+| access_level | Mode | Running as root |
+|---|---|---|
+| `open` | wild | yes |
+| `elevated` | wild | no - or - approved + root |
+| `managed` | approved | no - or - readonly + root |
+| `restricted` | readonly | no |
+
+These are factual descriptors, not risk scores. An `open` agent in a personal dev environment is intentional.
 
 ---
 
@@ -339,15 +438,15 @@ Reach is designed for controlled command execution:
 - Agents only make outbound HTTPS requests
 - Commands have a default timeout of 60 seconds
 - Job history is recorded for 7 days
-- Policies are configured server-side - the CLI can view them but cannot change them
+- Policy modes are configured server-side via the admin API
 
 **Always blocked - regardless of mode:**
 
-Destructive filesystem operations (`rm -rf /`, `mkfs`, `dd if=`), shutdown/reboot/poweroff, and fork bombs are rejected by the server before the agent ever sees them.
+Catastrophic filesystem destruction (`rm -rf /`, `mkfs`, `dd if=`, `wipefs`), fork bombs, privileged container and host escapes (`docker run --privileged`, `nsenter --target 1`), credential exfiltration (`env | curl`), and reverse shells are rejected by the server before the agent ever sees them.
 
-**Blocked in readonly mode:**
+**Blocked in readonly mode and unapproved writes in approved mode:**
 
-File writes and deletes, process kills, service restarts, package installs, container mutations (`docker run/stop/rm`), firewall changes, user management, and privilege escalation (`sudo`).
+File writes and deletes, process kills, service restarts, reboots and shutdowns, package installs, container mutations (`docker run/stop/rm`), IaC destroys, cloud destructive operations, firewall changes, user management, and privilege escalation (`sudo`).
 
 See [SELF_HOSTING.md](SELF_HOSTING.md) for the full blocked command reference.
 
@@ -357,7 +456,7 @@ See [SELF_HOSTING.md](SELF_HOSTING.md) for the full blocked command reference.
 
 For production machines, use the **Approved** policy mode - set it via the admin API after creating the agent.
 
-Avoid running production agents in Wild mode unless you fully trust the environment and understand the risk.
+Wild mode is for personal machines, dev environments, and break-glass access. Do not use it on shared production machines.
 
 ---
 
@@ -375,11 +474,12 @@ Avoid running production agents in Wild mode unless you fully trust the environm
 | `reach config show` | Show active profile, API URL, default agent, and aliases |
 | `reach whoami` | Show current user identity (user_id, tenant_id, name) |
 | `reach version` | Show CLI version |
+| `reach man` | Show full command reference in the terminal |
 | **Agents** | |
-| `reach agents list` | List all machines (Tags column shown automatically when agents have tags) |
+| `reach agents list` | List all machines with mode and access level |
 | `reach agents list --tag <key:value>` | Filter machines by tag |
 | `reach agents use <id\|alias>` | Set default machine |
-| `reach status` | Show default machine status |
+| `reach status` | Show default machine status and access level |
 | `reach alias set <name> <id>` | Create alias |
 | `reach alias list` | List aliases |
 | `reach alias remove <name>` | Remove alias |
@@ -393,9 +493,13 @@ Avoid running production agents in Wild mode unless you fully trust the environm
 | `reach history --agent <id\|alias>` | Filter your history by machine |
 | `reach history --limit <n>` | Show up to N jobs (max 100, default 20) |
 | `reach history --cursor <cursor>` | Fetch the next page (cursor from previous response) |
-| **Policy** | |
-| `reach policy show` | Show mode and approved commands for default agent |
-| `reach policy show --agent <id\|alias>` | Show policy for a specific machine |
+| **Approvals** | |
+| `reach approvals` | Show effective approved commands for the default agent |
+| `reach approvals --agent <id\|alias>` | Show effective approved commands for a specific agent |
+| `reach approvals --pending` | Your pending requests for the default agent |
+| `reach approvals --denied` | Your denied requests for the default agent |
+| `reach approvals --expired` | Your expired approvals for the default agent |
+| `reach approvals --agent <id\|alias> --pending` | Any of the above for a specific agent |
 | **AI integration** | |
 | `reach agent-init` | Interactively generate context for your AI agent |
 | `reach agent-init --for claude` | Write CLAUDE.md for Claude Code |

@@ -524,7 +524,7 @@ Response includes `created_by` on every job record - the `user_id` of the CLI us
       "tenant_id": "tenant_xxxxx",
       "created_by": "user_xxxxx",
       "command": "docker ps",
-      "status": "COMPLETE",
+      "status": "SUCCEEDED",
       "exit_code": 0,
       "created_at": "2026-06-17T10:05:00+00:00"
     }
@@ -534,7 +534,7 @@ Response includes `created_by` on every job record - the `user_id` of the CLI us
 ```
 
 Pass `?cursor=<next_cursor>` on the next request to fetch the next page. The cursor encodes the `created_at` of the last returned item - absent when you've reached the last page.
-```
+
 
 ---
 
@@ -592,7 +592,7 @@ curl -s -X DELETE "$API_URL/admin/agents/agent_xxxxx" \
 
 Policies are managed via the admin API, authenticated with your `ADMIN_TOKEN`.
 
-**View policy:**
+**View policy** (returns current mode and list of effective approved commands):
 
 ```bash
 curl -s "$API_URL/admin/agents/agent_xxxxx/policy" \
@@ -608,22 +608,163 @@ curl -s -X PUT "$API_URL/admin/agents/agent_xxxxx/policy/mode" \
   -d '{"mode": "approved"}'
 ```
 
-**Add approved commands:**
+In `approved` mode, commands are not pre-configured by the admin. Instead they are approved on demand through the approval workflow - commands that get blocked by the agent create pending approval records, and the admin reviews them. See [Approvals](#approvals).
+
+---
+
+## Approvals
+
+When an agent runs in `approved` mode and a write command is not yet approved, the agent blocks it and the backend creates a pending approval record. The admin reviews these records and approves or denies them.
+
+Read commands always run in approved mode. Only write commands need approval.
+
+**Pre-approve a command** (without waiting for a block to occur):
 
 ```bash
-curl -s -X POST "$API_URL/admin/agents/agent_xxxxx/policy/commands" \
+# Single command, permanent
+curl -s -X POST "$API_URL/admin/approvals" \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"commands": ["docker ps", "git status"]}'
+  -d '{"agent_id": "agent_xxxxx", "command": "docker restart app"}'
+
+# Single command, time-limited
+curl -s -X POST "$API_URL/admin/approvals" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"agent_id": "agent_xxxxx", "command": "docker restart app", "duration": "8h"}'
+
+# Bulk - provision multiple commands at once
+curl -s -X POST "$API_URL/admin/approvals" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "agent_id": "agent_xxxxx",
+    "commands": ["docker ps", "docker logs app", "kubectl get pods -A"],
+    "duration": "permanent"
+  }'
 ```
 
-**Remove approved commands:**
+Single-command form: record created in `approved` state immediately; returns `409` if already active.
+
+Bulk form (`commands: [...]`): idempotent — commands that already have an active approval are skipped, not errored. Response:
+
+```json
+{
+  "created": [{ "approval_id": "appr_...", "command": "docker logs app", ... }],
+  "skipped": [{ "command": "docker ps", "reason": "already_approved" }]
+}
+```
+
+All pre-approved commands are included in the agent's approved list on the next sync (within 2–15 seconds). Useful for provisioning a new agent before first use.
+
+**List pending approvals** (all agents, or filter by agent or tenant):
 
 ```bash
-curl -s -X DELETE "$API_URL/admin/agents/agent_xxxxx/policy/commands" \
+curl -s "$API_URL/admin/approvals?status=pending" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
+```
+
+Filter by agent:
+```bash
+curl -s "$API_URL/admin/approvals?agent_id=agent_xxxxx&status=pending" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
+```
+
+Results are paginated (default 20, max 100). When more records exist, the response includes `next_cursor`:
+
+```bash
+# First page
+curl -s "$API_URL/admin/approvals?tenant_id=tenant_xxxxx&status=pending&limit=20" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
+
+# Next page
+curl -s "$API_URL/admin/approvals?tenant_id=tenant_xxxxx&status=pending&limit=20&cursor=<next_cursor>" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
+```
+
+**Approve a command** - permanently by default, or with a time limit:
+
+```bash
+# Approve permanently
+curl -s -X PUT "$API_URL/admin/approvals/appr_xxxxx/approve" \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+
+# Approve for a limited time (1h / 8h / 24h / 7d / permanent, or custom Nh / Nd)
+curl -s -X PUT "$API_URL/admin/approvals/appr_xxxxx/approve" \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"commands": ["git status"]}'
+  -d '{"duration": "8h"}'
+```
+
+Supported durations:
+
+| Value | Meaning |
+|---|---|
+| `permanent` (default) | Never expires |
+| `1h` | 1 hour |
+| `8h` | 8 hours |
+| `24h` | 24 hours |
+| `7d` | 7 days |
+| `Nh` / `Nd` | Custom N hours or N days |
+
+Time-limited approvals expire silently - the record stays in the database for history, but once the expiry passes the command is no longer effective. The next blocked attempt creates a new pending record.
+
+**Deny a command:**
+
+```bash
+curl -s -X PUT "$API_URL/admin/approvals/appr_xxxxx/deny" \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+**Revoke an active approval** (deny an already-approved record - takes effect on the next agent sync):
+
+```bash
+curl -s -X PUT "$API_URL/admin/approvals/appr_xxxxx/deny" \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+**Update the duration on an active approval** (re-approve with a new expiry):
+
+```bash
+# Shorten or extend an existing approval to 24 hours from now
+curl -s -X PUT "$API_URL/admin/approvals/appr_xxxxx/approve" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"duration": "24h"}'
+
+# Make an expiring approval permanent
+curl -s -X PUT "$API_URL/admin/approvals/appr_xxxxx/approve" \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+**Re-approve a denied request** (approve an already-denied record):
+
+```bash
+curl -s -X PUT "$API_URL/admin/approvals/appr_xxxxx/approve" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"duration": "8h"}'
+```
+
+The approve and deny endpoints work on records in any state - `pending`, `approved`, or `denied`. Revoke and duration changes take effect on the next agent sync (within 2–15 seconds depending on poll interval).
+
+**Delete an approval record** (permanently removes it - use to clean up stale duplicates or erase records from history):
+
+```bash
+curl -s -X DELETE "$API_URL/admin/approvals/appr_xxxxx" \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+Returns `{"deleted": true}`. Works on records in any status. Deleting an approved record immediately removes the command from the agent's allowed list (same effect as denying, but without leaving a denied record behind).
+
+**Users can check their own approval status** via the CLI:
+
+```bash
+reach approvals                    # effective approved commands for the default agent
+reach approvals --pending          # my pending requests (awaiting review)
+reach approvals --denied           # my denied requests
+reach approvals --expired          # my expired approvals
+reach approvals --agent prod       # any of the above for a specific agent
 ```
 
 ---
@@ -822,10 +963,12 @@ launchctl load /Library/LaunchDaemons/com.reach-agent.plist
 |---|---|---|---|
 | `GET` | `/me` | user token | Get current user identity (user_id, tenant_id, name) |
 | `POST` | `/jobs` | user token | Create a job |
-| `GET` | `/jobs` | user token | List your own jobs (`?agent_id=` `?limit=` `?cursor=`) - scoped to the authenticated user |
+| `GET` | `/jobs` | user token | List your own jobs (`?agent_id=` `?limit=` `?cursor=`) |
 | `GET` | `/jobs/{id}` | user token | Get job result and output |
-| `GET` | `/agents` | user token | List accessible agents (`?tag=key:value` to filter by tag) |
+| `GET` | `/agents` | user token | List accessible agents (`?tag=key:value` to filter) |
 | `GET` | `/agents/{id}` | user token | Get agent details, policy, and tags |
+| `GET` | `/agents/{id}/approved-commands` | user token | Approval records for an agent (`?status=approved\|pending\|denied\|expired`; default `approved` returns agent-wide effective list; others return your own records) |
+| `GET` | `/approvals/pending` | user token | Your pending approval requests across all agents (`?agent_id=` to filter) |
 
 ### Admin endpoints
 
@@ -841,19 +984,22 @@ launchctl load /Library/LaunchDaemons/com.reach-agent.plist
 | `PUT` | `/admin/tenants/{id}/users/{user_id}/agents` | ADMIN_TOKEN | Replace user's access list (`["*"]` = unrestricted, `[]` = locked out) |
 | `POST` | `/admin/tenants/{id}/users/{user_id}/agents/{agent_id}` | ADMIN_TOKEN | Grant one agent to a restricted user |
 | `DELETE` | `/admin/tenants/{id}/users/{user_id}/agents/{agent_id}` | ADMIN_TOKEN | Revoke one agent from a restricted user |
-| `GET` | `/admin/agents` | ADMIN_TOKEN | List all agents for a tenant (`?tenant_id=` required, `?tag=` optional filter) |
-| `GET` | `/admin/jobs` | ADMIN_TOKEN | List jobs with filters (`?agent_id=` `?tenant_id=` `?created_by=` `?limit=` `?cursor=`) - at least one filter required |
+| `GET` | `/admin/agents` | ADMIN_TOKEN | List all agents for a tenant (`?tenant_id=` required, `?tag=` optional) |
 | `POST` | `/admin/agents` | ADMIN_TOKEN | Create an agent under a tenant |
 | `DELETE` | `/admin/agents/{id}` | ADMIN_TOKEN | Delete an agent (blocked if ACTIVE unless `force`) |
-| `POST` | `/admin/agents/{id}/reissue-install-token` | ADMIN_TOKEN | Reissue install token for an existing agent (blocked if ACTIVE unless `force`) |
+| `POST` | `/admin/agents/{id}/reissue-install-token` | ADMIN_TOKEN | Reissue install token (blocked if ACTIVE unless `force`) |
 | `GET` | `/admin/agents/{id}/tags` | ADMIN_TOKEN | Get agent's current tag list |
 | `PUT` | `/admin/agents/{id}/tags` | ADMIN_TOKEN | Replace tag list entirely |
 | `POST` | `/admin/agents/{id}/tags` | ADMIN_TOKEN | Add tags (merge, no duplicates) |
 | `DELETE` | `/admin/agents/{id}/tags` | ADMIN_TOKEN | Remove specific tags |
-| `GET` | `/admin/agents/{id}/policy` | ADMIN_TOKEN | Get agent policy |
-| `PUT` | `/admin/agents/{id}/policy/mode` | ADMIN_TOKEN | Set policy mode |
-| `POST` | `/admin/agents/{id}/policy/commands` | ADMIN_TOKEN | Add approved commands |
-| `DELETE` | `/admin/agents/{id}/policy/commands` | ADMIN_TOKEN | Remove approved commands |
+| `GET` | `/admin/agents/{id}/policy` | ADMIN_TOKEN | Get agent policy (mode + effective approved commands) |
+| `PUT` | `/admin/agents/{id}/policy/mode` | ADMIN_TOKEN | Set policy mode (`wild` / `readonly` / `approved`) |
+| `GET` | `/admin/jobs` | ADMIN_TOKEN | List jobs (`?agent_id=` `?tenant_id=` `?created_by=` `?limit=` `?cursor=`) |
+| `GET` | `/admin/approvals` | ADMIN_TOKEN | List approval records (`?agent_id=` `?tenant_id=` `?status=pending\|approved\|denied` `?limit=` `?cursor=`). Paginated — default 20, max 100. |
+| `POST` | `/admin/approvals` | ADMIN_TOKEN | Pre-approve without a prior block. Single: `{"agent_id": "...", "command": "...", "duration": "8h"}` → returns approval object (409 if already active). Bulk: `{"agent_id": "...", "commands": [...]}` → returns `{"created": [...], "skipped": [...]}`, idempotent. |
+| `PUT` | `/admin/approvals/{id}/approve` | ADMIN_TOKEN | Approve, re-approve, or update duration (body: `{"duration": "8h"}` optional; default permanent). Works on any status. |
+| `PUT` | `/admin/approvals/{id}/deny` | ADMIN_TOKEN | Deny or revoke - works on any status including already-approved records |
+| `DELETE` | `/admin/approvals/{id}` | ADMIN_TOKEN | Permanently delete an approval record. Works on any status; removing an approved record takes effect on the next agent sync. |
 
 ---
 
@@ -861,18 +1007,34 @@ launchctl load /Library/LaunchDaemons/com.reach-agent.plist
 
 ### AWS (DynamoDB)
 
-| Table | Key | Purpose |
-|---|---|---|
-| `reach-agents` | `agent_id` | Agent records, status, token hash, fingerprint |
-| `reach-tenants` | `tenant_id` | Tenant records |
-| `reach-users` | `user_id` | User records, token hashes, and per-user agent access lists |
-| `reach-jobs` | `job_id` | Job queue and results (TTL: 7 days) |
+| Table | Key | GSIs | Purpose |
+|---|---|---|---|
+| `reach-agents` | `agent_id` | `tenant-index` (tenant_id) | Agent records, status, token hash, fingerprint, mode |
+| `reach-tenants` | `tenant_id` | - | Tenant records |
+| `reach-users` | `user_id` | `token-hash-index` (token_hash), `tenant-index` (tenant_id) | User records, token hashes, per-user agent access lists |
+| `reach-jobs` | `job_id` | `agent-status-index` (agent_id, status), `tenant-history-index` (tenant_id, created_at) | Job queue and results; TTL on `expires_at` auto-deletes after 7 days |
+| `reach-approvals` | `approval_id` | `agent-approvals-index` (agent_id, created_at), `tenant-approvals-index` (tenant_id, created_at) | Approval records: pending, approved (with optional `expires_at`), and denied |
 
 All tables use `DeletionPolicy: Retain` - safe to redeploy the stack without losing data.
 
 ### Docker / FastAPI (PostgreSQL)
 
-Tables (`agents`, `tenants`, `users`, `jobs`) are managed via Alembic migrations. On startup the container runs `alembic upgrade head` automatically - no manual SQL or schema setup needed. Upgrades that include schema changes are applied on the next container restart.
+Tables (`agents`, `tenants`, `users`, `jobs`, `approvals`) are managed via Alembic migrations. On startup the container runs `alembic upgrade head` automatically - no manual SQL or schema setup needed. Upgrades that include schema changes are applied on the next container restart.
+
+Key columns on the `approvals` table:
+
+| Column | Type | Description |
+|---|---|---|
+| `approval_id` | string | Primary key (`appr_xxx`) |
+| `agent_id` | string | Which agent the command was blocked on |
+| `tenant_id` | string | Tenant isolation |
+| `command` | text | The exact command that was blocked |
+| `requested_by` | string | `user_id` of the submitter |
+| `job_id` | string | The job that triggered this record |
+| `status` | string | `pending` / `approved` / `denied` |
+| `expires_at` | string | ISO timestamp; null means permanent; expired approved records are filtered from the effective list but kept for history |
+| `reviewed_at` | string | When the admin acted |
+| `reviewed_by` | string | Who reviewed it |
 
 ---
 
@@ -913,9 +1075,16 @@ In addition to the always-blocked list, readonly mode also blocks:
 
 ### Approved mode
 
-Only commands that exactly match (or start with) an entry in the agent's `approved_commands` list are allowed. Everything else is rejected.
+Read commands always run - approved mode only gates write and destructive operations (anything that would be blocked in readonly mode).
 
-Approved commands are managed via the admin API - the CLI can view them but not change them.
+Write commands are checked against the agent's approved list. If the command matches (exact match or starts-with prefix), it runs normally. If not:
+
+- **Linux** - runs under Landlock sandbox. If the kernel blocks the write, the agent returns `blocked=true`.
+- **macOS** - uses the server-supplied `is_write` flag. If the command is a write and not approved, the agent refuses it immediately without running it.
+
+In both cases the backend creates a pending approval record. The admin reviews it via `GET /admin/approvals?status=pending`, then approves or denies via `PUT /admin/approvals/{id}/approve` (with optional duration) or `PUT /admin/approvals/{id}/deny`. Once approved, the command prefix is included in the approved list on the next sync and runs without restriction. See [Approvals](#approvals).
+
+The match is prefix-based with a word boundary: approving `docker logs` permits `docker logs myapp --tail 100` but not `docker rm myapp`.
 
 ---
 

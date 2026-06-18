@@ -1,8 +1,10 @@
 import os
 from typing import Optional
 
-from sqlalchemy import JSON, Column, Integer, String, Text, create_engine, delete as sa_delete, select, update
+from sqlalchemy import JSON, Boolean, Column, Integer, String, Text, create_engine, delete as sa_delete, select, update
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
+
+from shared.policy import compute_access_level
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 
@@ -23,7 +25,7 @@ class _Agent(_Base):
     agent_version = Column(String)
     machine_fingerprint = Column(String)
     mode = Column(String, nullable=False, default="wild")
-    approved_commands = Column(JSON, default=list)
+    running_as_root = Column(String)  # "true" | "false" | None until first sync
     agent_token_hash = Column(String)
     install_token_hash = Column(String)
     install_token_expires_at = Column(Integer)
@@ -35,6 +37,22 @@ class _Agent(_Base):
     fleet_id = Column(String)
     tags = Column(JSON, default=list)
     created_at = Column(String)
+
+
+class _Approval(_Base):
+    __tablename__ = "approvals"
+    approval_id = Column(String, primary_key=True)
+    tenant_id = Column(String, nullable=False, index=True)
+    agent_id = Column(String, nullable=False, index=True)
+    command = Column(Text)
+    requested_by = Column(String)
+    requester_name = Column(String)
+    job_id = Column(String)
+    status = Column(String, nullable=False)
+    expires_at = Column(String, nullable=True)
+    created_at = Column(String, index=True)
+    reviewed_at = Column(String)
+    reviewed_by = Column(String)
 
 
 class _Tenant(_Base):
@@ -63,6 +81,7 @@ class _Job(_Base):
     command = Column(Text, nullable=False)
     status = Column(String, nullable=False, default="PENDING")
     mode = Column(String)
+    is_write = Column(Boolean, nullable=True)
     exit_code = Column(Integer)
     stdout = Column(Text)
     stderr = Column(Text)
@@ -80,10 +99,18 @@ def _to_dict(row) -> Optional[dict]:
     return {c.key: getattr(row, c.key) for c in row.__mapper__.columns}
 
 
+def _enrich_agent(d: Optional[dict]) -> Optional[dict]:
+    if d is None:
+        return None
+    root = d.get("running_as_root") == "true"
+    d["access_level"] = compute_access_level(d.get("mode", "wild"), root)
+    return d
+
+
 class AgentRepo:
     def get(self, agent_id: str) -> Optional[dict]:
         with SessionLocal() as db:
-            return _to_dict(db.get(_Agent, agent_id))
+            return _enrich_agent(_to_dict(db.get(_Agent, agent_id)))
 
     def claim(self, agent_id: str, fields: dict) -> None:
         with SessionLocal() as db:
@@ -104,12 +131,14 @@ class AgentRepo:
             )
             db.commit()
 
-    def update_heartbeat(self, agent_id: str, reactivate: bool, now_iso: str, agent_version: Optional[str] = None) -> None:
+    def update_heartbeat(self, agent_id: str, reactivate: bool, now_iso: str, agent_version: Optional[str] = None, running_as_root: Optional[bool] = None) -> None:
         values: dict = {"last_heartbeat_at": now_iso}
         if reactivate:
             values["status"] = "ACTIVE"
         if agent_version:
             values["agent_version"] = agent_version
+        if running_as_root is not None:
+            values["running_as_root"] = "true" if running_as_root else "false"
         with SessionLocal() as db:
             db.execute(update(_Agent).where(_Agent.agent_id == agent_id).values(**values))
             db.commit()
@@ -124,7 +153,7 @@ class AgentRepo:
     def list_by_tenant(self, tenant_id: str) -> list:
         with SessionLocal() as db:
             rows = db.execute(select(_Agent).where(_Agent.tenant_id == tenant_id)).scalars().all()
-            return [_to_dict(r) for r in rows]
+            return [_enrich_agent(_to_dict(r)) for r in rows]
 
     def mark_inactive(self, agent_id: str) -> bool:
         with SessionLocal() as db:
@@ -141,12 +170,12 @@ class AgentRepo:
             db.add(_Agent(**agent))
             db.commit()
 
-    def update_policy(self, agent_id: str, mode: str, approved_commands: list) -> None:
+    def update_policy(self, agent_id: str, mode: str) -> None:
         with SessionLocal() as db:
             db.execute(
                 update(_Agent)
                 .where(_Agent.agent_id == agent_id)
-                .values(mode=mode, approved_commands=approved_commands)
+                .values(mode=mode)
             )
             db.commit()
 
@@ -159,7 +188,7 @@ class AgentRepo:
                     _Agent.last_heartbeat_at < cutoff_iso,
                 )
             ).scalars().all()
-            return [_to_dict(r) for r in rows]
+            return [_enrich_agent(_to_dict(r)) for r in rows]
 
     def reissue_install_token(self, agent_id: str, install_token_hash: str, expires_at: int) -> None:
         with SessionLocal() as db:
@@ -347,4 +376,85 @@ class UserRepo:
                         .where(_User.user_id == row.user_id)
                         .values(allowed_agent_ids=[a for a in current if a != agent_id])
                     )
+            db.commit()
+
+
+class ApprovalRepo:
+    def create(self, approval: dict) -> None:
+        with SessionLocal() as db:
+            db.add(_Approval(**approval))
+            db.commit()
+
+    def get(self, approval_id: str) -> Optional[dict]:
+        with SessionLocal() as db:
+            return _to_dict(db.get(_Approval, approval_id))
+
+    def list_by_agent(self, agent_id: str, status: Optional[str] = None, requested_by: Optional[str] = None, limit: Optional[int] = None, cursor: Optional[str] = None) -> list:
+        from sqlalchemy import desc, or_
+        with SessionLocal() as db:
+            stmt = select(_Approval).where(_Approval.agent_id == agent_id)
+            if status is not None:
+                stmt = stmt.where(_Approval.status == status)
+                if status == "approved":
+                    now = _iso()
+                    stmt = stmt.where(
+                        or_(_Approval.expires_at.is_(None), _Approval.expires_at > now)
+                    )
+            if requested_by is not None:
+                stmt = stmt.where(_Approval.requested_by == requested_by)
+            stmt = stmt.order_by(desc(_Approval.created_at))
+            if cursor is not None:
+                stmt = stmt.where(_Approval.created_at < cursor)
+            if limit is not None:
+                stmt = stmt.limit(limit)
+            rows = db.execute(stmt).scalars().all()
+            return [_to_dict(r) for r in rows]
+
+    def list_by_tenant(self, tenant_id: str, agent_id: Optional[str] = None, status: Optional[str] = None, requested_by: Optional[str] = None, limit: Optional[int] = None, cursor: Optional[str] = None) -> list:
+        from sqlalchemy import desc, or_
+        with SessionLocal() as db:
+            stmt = select(_Approval).where(_Approval.tenant_id == tenant_id)
+            if agent_id is not None:
+                stmt = stmt.where(_Approval.agent_id == agent_id)
+            if status is not None:
+                stmt = stmt.where(_Approval.status == status)
+                if status == "approved":
+                    now = _iso()
+                    stmt = stmt.where(
+                        or_(_Approval.expires_at.is_(None), _Approval.expires_at > now)
+                    )
+            if requested_by is not None:
+                stmt = stmt.where(_Approval.requested_by == requested_by)
+            stmt = stmt.order_by(desc(_Approval.created_at))
+            if cursor is not None:
+                stmt = stmt.where(_Approval.created_at < cursor)
+            if limit is not None:
+                stmt = stmt.limit(limit)
+            rows = db.execute(stmt).scalars().all()
+            return [_to_dict(r) for r in rows]
+
+    def exists_pending(self, agent_id: str, command: str) -> bool:
+        with SessionLocal() as db:
+            row = db.execute(
+                select(_Approval).where(
+                    _Approval.agent_id == agent_id,
+                    _Approval.command == command,
+                    _Approval.status == "pending",
+                ).limit(1)
+            ).scalar_one_or_none()
+            return row is not None
+
+    def update_status(self, approval_id: str, status: str, reviewed_at: str, reviewed_by: str, expires_at: Optional[str] = None) -> None:
+        with SessionLocal() as db:
+            db.execute(
+                update(_Approval)
+                .where(_Approval.approval_id == approval_id)
+                .values(status=status, reviewed_at=reviewed_at, reviewed_by=reviewed_by, expires_at=expires_at)
+            )
+            db.commit()
+
+    def delete(self, approval_id: str) -> None:
+        from sqlalchemy import delete as sql_delete
+        with SessionLocal() as db:
+            db.execute(sql_delete(_Approval).where(_Approval.approval_id == approval_id))
             db.commit()

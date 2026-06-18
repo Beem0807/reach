@@ -7,9 +7,24 @@ from reach.client import ReachClient
 mcp = FastMCP(
     "reach",
     instructions=(
-        "Use these tools to run commands on remote machines via reach agents. "
-        "Call list_agents first if you don't know which agent to target. "
-        "exec_command waits for the result - use get_job only to check a job submitted earlier."
+        "Use these tools to run commands on remote machines via reach agents.\n\n"
+        "DISCOVERY: Call list_agents first if you don't know which agent to target. "
+        "Each agent has a 'mode' (wild / readonly / approved) and an 'access_level' label "
+        "(open / elevated / managed / restricted) that tells you how strictly it is configured.\n\n"
+        "MODES:\n"
+        "- wild: all commands run (except a small global blocklist of catastrophic operations).\n"
+        "- readonly: write and destructive commands are rejected by the server before the agent "
+        "ever receives them. Reads always pass.\n"
+        "- approved: reads always run. Write commands only run if pre-approved by an admin. "
+        "If a write is not on the approved list the agent blocks it and creates a pending "
+        "approval record - the command does NOT run silently.\n\n"
+        "WHEN BLOCKED: if exec_command returns a stderr containing 'Blocked: approval required', "
+        "the command needs admin approval. Use list_pending_approvals to see it, and "
+        "list_approved_commands to see what is already allowed on that agent.\n\n"
+        "EXEC TIPS: exec_command waits for the result. Use get_job only to check a job "
+        "submitted earlier with --no-wait. Prefer read-only checks (ps, logs, df) before "
+        "write or restart commands. Explain what you are about to do before running "
+        "destructive commands."
     ),
 )
 
@@ -127,6 +142,41 @@ def list_history(agent_id: str = "", limit: int = 20) -> dict:
     client, _ = _client()
     resolved = cfg_module.resolve_agent(agent_id) if agent_id else None
     return client.list_jobs(agent_id=resolved, limit=min(limit, 100))
+
+
+@mcp.tool()
+def list_approved_commands(agent_id: str = "") -> dict:
+    """List all pre-approved write commands for an agent (approved mode only).
+
+    Returns the full set of commands an admin has approved for this agent.
+    Useful to check before attempting a write command - if it is on this list
+    it will run; if not, it will be blocked and create a pending approval record.
+
+    Args:
+        agent_id: Agent ID or alias to query. Uses the default agent if omitted.
+    """
+    client, default_agent = _client()
+    resolved = cfg_module.resolve_agent(agent_id) if agent_id else default_agent
+    if not resolved:
+        return {"error": "No agent specified and no default agent configured."}
+    return client.list_agent_approved(resolved)
+
+
+@mcp.tool()
+def list_pending_approvals(agent_id: str = "") -> dict:
+    """List your pending approval requests - commands that were blocked and are awaiting admin review.
+
+    Use this after a command is blocked to confirm the approval record was created,
+    or to check the approval status of earlier blocked attempts.
+
+    Args:
+        agent_id: Agent ID or alias. Defaults to the configured default agent.
+    """
+    client, default_agent = _client()
+    resolved = cfg_module.resolve_agent(agent_id) if agent_id else default_agent
+    if not resolved:
+        return {"error": "no agent specified and no default agent configured"}
+    return client.list_agent_approved(resolved, status="pending")
 
 
 def main():

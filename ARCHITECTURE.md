@@ -48,14 +48,25 @@ The agent never accepts inbound connections. It makes outbound HTTPS requests to
 A command goes through four steps:
 
 ```
-1. Submit    CLI / MCP  →  POST /jobs                    →  Backend stores job (PENDING)
-2. Poll      Agent      →  POST /agent/sync               →  Backend returns pending job
-3. Execute   Agent runs the command locally
+1. Submit    CLI / MCP  →  POST /jobs                    →  Backend stores job (PENDING, is_write annotated)
+2. Poll      Agent      →  POST /agent/sync               →  Backend returns pending job + is_write flag
+3. Execute   Agent runs the command; enforcement depends on mode and OS (see Policy enforcement)
 4. Result    Agent      →  POST /agent/jobs/{id}/result   →  Backend stores output (SUCCEEDED / FAILED)
 5. Retrieve  CLI / MCP  →  GET  /jobs/{id}                →  Backend returns output
 ```
 
 The CLI and MCP server both poll `GET /jobs/{id}` until the job reaches a terminal state or the timeout is hit. The agent has no direct channel back to the submitter - results go through the backend.
+
+**In approved mode**, step 3 may produce a blocked result:
+
+```
+3a. Execute  Agent checks approved list and OS:
+              Linux  - unapproved write runs under Landlock; kernel blocks it
+              macOS  - unapproved write detected via server-supplied is_write flag; blocked early
+3b. Result   Agent posts result with blocked=true, is_write=true
+3c. Record   Backend updates is_write on the job; creates a pending approval record
+3d. Notify   User sees it via `reach approvals --pending`; admin approves or denies via admin API
+```
 
 ---
 
@@ -65,7 +76,7 @@ The CLI and MCP server both poll `GET /jobs/{id}` until the job reaches a termin
 
 A Python CLI (`reach`) that authenticates with a user token and talks to the backend over HTTPS. Manages a local config file (`~/.reach/config.json`) with the API URL, user token, default agent, and aliases.
 
-Notable commands: `exec`, `job`, `history`, `agents`, `policy show`, `agent-init`, `mcp`.
+Notable commands: `exec`, `job`, `history`, `agents`, `approvals` (with `--pending`/`--denied`/`--expired` flags), `agent-init`, `mcp`, `man`.
 
 ### MCP server (`cli/reach/mcp_server.py`)
 
@@ -94,9 +105,9 @@ A background scheduler (APScheduler on FastAPI, EventBridge on Lambda) runs ever
 
 A Go binary installed via `install.sh`. On Linux it runs as a systemd service under a dedicated `reach-agent` system user. On macOS it runs as a foreground process by default (stops when the terminal closes), or with `--background` as a LaunchDaemon under the same dedicated `reach-agent` system user (starts on boot, same security model as Linux). On startup it claims itself using an install token, then enters a poll loop:
 
-1. `POST /agent/sync` - sends heartbeat, receives pending job (if any)
-2. Runs the command in a subprocess with a 60-second timeout
-3. `POST /agent/jobs/{id}/result` - posts stdout, stderr, exit code
+1. `POST /agent/sync` - sends heartbeat and `running_as_root` flag, receives pending job (if any) with `is_write` flag and the list of approved commands
+2. Runs the command, optionally under a Landlock sandbox on Linux or via `is_write` enforcement on macOS (see [Policy enforcement](#policy-enforcement))
+3. `POST /agent/jobs/{id}/result` - posts stdout, stderr, exit code, whether the command was blocked, and `is_write` (set to `true` if blocked)
 
 The agent self-rotates its token every 30 days. See [SELF_HOSTING.md](SELF_HOSTING.md) for the full agent lifecycle.
 
@@ -155,17 +166,112 @@ This keeps latency low during active use without burning unnecessary requests wh
 
 ## Policy enforcement
 
-Commands are evaluated server-side before being queued. The agent never sees a blocked command.
+Commands pass through two evaluation layers: server-side (before the job is queued) and agent-side (at execution time).
 
-Three modes per agent: `wild` (allow all), `readonly` (block writes and destructive ops), `approved` (allowlist of exact command prefixes). Modes are set via the admin API and are immutable from the CLI - the CLI can view the policy but not change it.
+### Server-side checks
 
-A global blocklist (fork bombs, `rm -rf /`, `mkfs`, `dd if=`, shutdown/reboot) is enforced regardless of mode.
+The backend runs two checks on every command before storing the job:
+
+**Global blocklist** (`BLOCKED_PATTERNS`) - always rejected regardless of mode. Covers catastrophic and abuse-like operations: raw disk wipes (`mkfs`, `dd if=`, `wipefs`, `shred /dev/`), recursive deletion of the root filesystem, fork bombs, privileged container and host escapes (`docker run --privileged`, `nsenter --target 1`, `chroot /`), credential exfiltration (`env | curl`), and reverse shells (`/dev/tcp/`, `nc -e`, `socat exec:`).
+
+**Readonly blocklist** (`READONLY_BLOCKED`) - checked in `readonly` mode only. Blocks writes, deletes, service management, reboots and shutdowns, IaC destroys, cloud destructive operations, package installs, and privilege escalation. Read-only commands always pass. Chained commands (`ls && rm file`) are split on `;`, `&&`, `||`, and `|` and checked segment by segment.
+
+In `approved` mode, the server does not apply the readonly blocklist - it queues everything to the agent so the agent can enforce and create approval records when needed. The server annotates each job with `is_write: true/false` (from the same `READONLY_BLOCKED` patterns) so the agent knows whether the command is a write without replicating the pattern logic.
+
+### Agent-side enforcement
+
+**Linux (Landlock LSM)**
+
+On Linux, `readonly` and `approved` mode commands run in a sandboxed subprocess:
+- The agent re-execs a new process under [Landlock](https://docs.kernel.org/userspace-api/landlock.html) v3, restricting filesystem access to read-only on `/` and read-write on `/tmp`.
+- The sandboxed process executes the command via bash.
+
+**macOS (no Landlock)**
+
+macOS does not have Landlock. Enforcement differs by mode:
+- `readonly` - fully server-side. The server rejects write commands before queuing; the agent never receives them.
+- `approved` - the agent uses the `is_write` flag from the sync response. If `is_write=true` and the command is not in the approved list, the agent blocks it immediately and returns `blocked=true`. Read commands (`is_write=false`) always run. This matches the Linux Landlock behaviour: reads pass, unapproved writes are blocked and create a pending approval record.
+
+**Approved mode logic (both platforms)**
+
+When the agent receives a job in approved mode, it also receives the current approved command list and the `is_write` flag from the sync response.
+
+- If the command matches an entry in the approved list (prefix match with word boundary), it runs normally - the write is explicitly permitted.
+- **Linux:** if not approved, runs under Landlock. If Landlock blocks the command (permission denied), the agent posts `blocked=true, is_write=true` in the job result.
+- **macOS:** if not approved and `is_write=true`, the agent returns `blocked=true, is_write=true` immediately without running the command.
+- The backend receives `blocked=true`, updates `is_write` on the job record, looks up the requesting user, and creates a pending record in the `approvals` table.
+- The admin can review these records via the admin API and approve or deny them.
+- Once approved, the command prefix is included in the approved list on the next sync, and the command runs without restriction.
+
+### Approved list matching
+
+The match is prefix-based with a word boundary: an approved entry of `docker logs` permits `docker logs myapp --tail 100` but not `docker rm myapp`. Matching checks `cmd == approved` or `cmd.startswith(approved + " ")`.
+
+---
+
+## Approvals
+
+Approval records can be created two ways: automatically when an agent blocks a command in approved mode, or proactively by an admin via `POST /admin/approvals` (pre-approve without needing a prior block). The schema is the same either way:
+
+```
+approvals table:
+  approval_id    - unique ID (appr_xxx)
+  tenant_id      - which tenant
+  agent_id       - which agent blocked the command
+  command        - the exact command that was blocked
+  requested_by   - user_id of the submitter
+  requester_name - display name of the submitter
+  job_id         - the job that triggered this record
+  status         - pending | approved | denied
+  expires_at     - ISO timestamp after which the approval stops being effective (null = permanent)
+  created_at     - when the block occurred
+  reviewed_at    - when the admin acted
+  reviewed_by    - who reviewed it
+```
+
+Admins manage approvals via `GET/PUT/DELETE /admin/approvals`. `DELETE /admin/approvals/{id}` permanently removes a record of any status - useful for cleaning up stale pending records or removing an approved command from the effective list immediately. Users manage approvals through `reach approvals` with status flags: default shows effective approved commands (agent-wide); `--pending`, `--denied`, and `--expired` show the current user's own records for the agent.
+
+Only one pending record is created per `(agent_id, command)` pair at a time. If a command is blocked and a pending record already exists for that exact command on that agent, no duplicate is created. Once the existing record is approved or denied, the next block creates a fresh pending record.
+
+### Time-limited approvals
+
+When approving, the admin can supply a `duration` in the request body:
+
+| Value | Meaning |
+|---|---|
+| `permanent` (default) | Never expires |
+| `1h` | 1 hour |
+| `8h` | 8 hours |
+| `24h` | 24 hours |
+| `7d` | 7 days |
+| `Nh` / `Nd` | Custom N hours or N days |
+
+`expires_at` is stored as an ISO timestamp. The record stays in the database after expiry (history is preserved), but `list_by_agent(status="approved")` filters it out - `(expires_at IS NULL OR expires_at > now)`. Once expired, the command is no longer in the effective approved list and the next blocked attempt creates a new pending record.
+
+`reach approvals` shows the expiry (or "permanent") for each effective entry. `reach approvals --expired` fetches records where `status=approved` but `expires_at < now` (the inverse set), filtered to the current user's own records.
+
+---
+
+## Agent privilege and access level
+
+The agent detects whether it is running as root (`os.Getuid() == 0`) and includes `running_as_root: true/false` in each sync request. The backend stores this on the agent record.
+
+`access_level` is a computed label combining the agent's current mode and privilege. It is injected into agent responses at read time - not stored separately.
+
+| access_level | Mode | running_as_root |
+|---|---|---|
+| `open` | wild | true |
+| `elevated` | wild | false - or - approved + root |
+| `managed` | approved | false - or - readonly + root |
+| `restricted` | readonly | false |
+
+This label is shown in `reach agents list` and `reach status`. It is a factual descriptor of how the agent is configured, not a risk score.
 
 ---
 
 ## Multi-tenancy
 
-Every resource (agent, user, job) belongs to a tenant. The backend enforces tenant isolation at the storage layer - user tokens can only see agents and jobs within their own tenant. The admin API (authenticated with `ADMIN_TOKEN`) operates across tenants.
+Every resource (agent, user, job, approval) belongs to a tenant. The backend enforces tenant isolation at the storage layer - user tokens can only see agents, jobs, and approvals within their own tenant. The admin API (authenticated with `ADMIN_TOKEN`) operates across tenants.
 
 ---
 
