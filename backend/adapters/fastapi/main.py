@@ -17,7 +17,9 @@ from handlers.admin_agents import (
     handle_get_agent_tags,
     handle_list_agents_admin,
     handle_reissue_install_token,
+    handle_remove_agent,
     handle_remove_agent_tags,
+    handle_revoke_agent,
     handle_set_agent_tags,
 )
 from handlers.admin_jobs import handle_list_jobs_admin
@@ -159,6 +161,7 @@ async def agent_job_result(job_id: str, request: Request):
 # ---------------------------------------------------------------------------
 
 @app.get("/me")
+@limiter.limit("120/minute")
 async def me(request: Request):
     token = _token(request)
     if not token:
@@ -180,6 +183,7 @@ async def create_job(request: Request):
 
 
 @app.get("/jobs")
+@limiter.limit("120/minute")
 async def list_jobs(request: Request):
     token = _token(request)
     if not token:
@@ -195,6 +199,7 @@ async def list_jobs(request: Request):
 
 
 @app.get("/jobs/{job_id}")
+@limiter.limit("120/minute")
 async def get_job(job_id: str, request: Request):
     token = _token(request)
     if not token:
@@ -203,6 +208,7 @@ async def get_job(job_id: str, request: Request):
 
 
 @app.get("/agents")
+@limiter.limit("60/minute")
 async def list_agents(request: Request):
     token = _token(request)
     if not token:
@@ -212,6 +218,7 @@ async def list_agents(request: Request):
 
 
 @app.get("/agents/{agent_id}")
+@limiter.limit("120/minute")
 async def get_agent(agent_id: str, request: Request):
     token = _token(request)
     if not token:
@@ -220,6 +227,7 @@ async def get_agent(agent_id: str, request: Request):
 
 
 @app.get("/approvals/pending")
+@limiter.limit("60/minute")
 async def list_my_pending(request: Request):
     token = _token(request)
     if not token:
@@ -229,6 +237,7 @@ async def list_my_pending(request: Request):
 
 
 @app.get("/agents/{agent_id}/approved-commands")
+@limiter.limit("60/minute")
 async def list_agent_approved(agent_id: str, request: Request):
     token = _token(request)
     if not token:
@@ -242,6 +251,7 @@ async def list_agent_approved(agent_id: str, request: Request):
 # ---------------------------------------------------------------------------
 
 @app.post("/admin/tenants", status_code=201)
+@limiter.limit("20/minute")
 async def create_tenant(request: Request):
     token = _token(request)
     if not token:
@@ -254,6 +264,7 @@ async def create_tenant(request: Request):
 
 
 @app.get("/admin/tenants")
+@limiter.limit("120/minute")
 async def list_tenants(request: Request):
     token = _token(request)
     if not token:
@@ -262,6 +273,7 @@ async def list_tenants(request: Request):
 
 
 @app.post("/admin/tenants/{tenant_id}/users", status_code=201)
+@limiter.limit("20/minute")
 async def create_user(tenant_id: str, request: Request):
     token = _token(request)
     if not token:
@@ -275,6 +287,7 @@ async def create_user(tenant_id: str, request: Request):
 
 
 @app.get("/admin/tenants/{tenant_id}/users")
+@limiter.limit("120/minute")
 async def list_users(tenant_id: str, request: Request):
     token = _token(request)
     if not token:
@@ -283,6 +296,7 @@ async def list_users(tenant_id: str, request: Request):
 
 
 @app.delete("/admin/tenants/{tenant_id}/users/{user_id}")
+@limiter.limit("30/minute")
 async def delete_user(tenant_id: str, user_id: str, request: Request):
     token = _token(request)
     if not token:
@@ -291,6 +305,7 @@ async def delete_user(tenant_id: str, user_id: str, request: Request):
 
 
 @app.post("/admin/tenants/{tenant_id}/users/{user_id}/rotate-token")
+@limiter.limit("10/minute")
 async def rotate_user_token(tenant_id: str, user_id: str, request: Request):
     token = _token(request)
     if not token:
@@ -300,6 +315,7 @@ async def rotate_user_token(tenant_id: str, user_id: str, request: Request):
 
 
 @app.get("/admin/tenants/{tenant_id}/users/{user_id}/agents")
+@limiter.limit("120/minute")
 async def get_user_agents(tenant_id: str, user_id: str, request: Request):
     token = _token(request)
     if not token:
@@ -308,6 +324,7 @@ async def get_user_agents(tenant_id: str, user_id: str, request: Request):
 
 
 @app.put("/admin/tenants/{tenant_id}/users/{user_id}/agents")
+@limiter.limit("30/minute")
 async def set_user_agents(tenant_id: str, user_id: str, request: Request):
     token = _token(request)
     if not token:
@@ -320,6 +337,7 @@ async def set_user_agents(tenant_id: str, user_id: str, request: Request):
 
 
 @app.post("/admin/tenants/{tenant_id}/users/{user_id}/agents/{agent_id}")
+@limiter.limit("30/minute")
 async def grant_agent_access(tenant_id: str, user_id: str, agent_id: str, request: Request):
     token = _token(request)
     if not token:
@@ -328,6 +346,7 @@ async def grant_agent_access(tenant_id: str, user_id: str, agent_id: str, reques
 
 
 @app.delete("/admin/tenants/{tenant_id}/users/{user_id}/agents/{agent_id}")
+@limiter.limit("30/minute")
 async def revoke_agent_access(tenant_id: str, user_id: str, agent_id: str, request: Request):
     token = _token(request)
     if not token:
@@ -336,6 +355,7 @@ async def revoke_agent_access(tenant_id: str, user_id: str, agent_id: str, reque
 
 
 @app.get("/admin/jobs")
+@limiter.limit("120/minute")
 async def list_jobs_admin(request: Request):
     token = _token(request)
     if not token:
@@ -353,6 +373,7 @@ async def list_jobs_admin(request: Request):
 
 
 @app.get("/admin/agents")
+@limiter.limit("120/minute")
 async def list_agents_admin(request: Request):
     token = _token(request)
     if not token:
@@ -363,6 +384,7 @@ async def list_agents_admin(request: Request):
 
 
 @app.post("/admin/agents", status_code=201)
+@limiter.limit("20/minute")
 async def create_agent(request: Request):
     token = _token(request)
     if not token:
@@ -376,6 +398,7 @@ async def create_agent(request: Request):
 
 
 @app.post("/admin/agents/{agent_id}/reissue-install-token", status_code=201)
+@limiter.limit("10/minute")
 async def reissue_install_token(agent_id: str, request: Request):
     token = _token(request)
     if not token:
@@ -389,6 +412,7 @@ async def reissue_install_token(agent_id: str, request: Request):
 
 
 @app.get("/admin/agents/{agent_id}/tags")
+@limiter.limit("120/minute")
 async def get_agent_tags(agent_id: str, request: Request):
     token = _token(request)
     if not token:
@@ -397,6 +421,7 @@ async def get_agent_tags(agent_id: str, request: Request):
 
 
 @app.put("/admin/agents/{agent_id}/tags")
+@limiter.limit("30/minute")
 async def set_agent_tags(agent_id: str, request: Request):
     token = _token(request)
     if not token:
@@ -409,6 +434,7 @@ async def set_agent_tags(agent_id: str, request: Request):
 
 
 @app.post("/admin/agents/{agent_id}/tags")
+@limiter.limit("30/minute")
 async def add_agent_tags(agent_id: str, request: Request):
     token = _token(request)
     if not token:
@@ -421,6 +447,7 @@ async def add_agent_tags(agent_id: str, request: Request):
 
 
 @app.delete("/admin/agents/{agent_id}/tags")
+@limiter.limit("30/minute")
 async def remove_agent_tags(agent_id: str, request: Request):
     token = _token(request)
     if not token:
@@ -432,19 +459,35 @@ async def remove_agent_tags(agent_id: str, request: Request):
     return _resp(handle_remove_agent_tags(agent_id, body, token))
 
 
+@app.post("/admin/agents/{agent_id}/revoke")
+@limiter.limit("30/minute")
+async def revoke_agent(agent_id: str, request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    return _resp(handle_revoke_agent(agent_id, token))
+
+
+@app.delete("/admin/agents/{agent_id}/remove")
+@limiter.limit("30/minute")
+async def remove_agent(agent_id: str, request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    return _resp(handle_remove_agent(agent_id, token))
+
+
 @app.delete("/admin/agents/{agent_id}")
+@limiter.limit("30/minute")
 async def delete_agent(agent_id: str, request: Request):
     token = _token(request)
     if not token:
         return JSONResponse({"error": "missing Authorization header"}, status_code=401)
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    return _resp(handle_delete_agent(agent_id, body, token))
+    return _resp(handle_delete_agent(agent_id, token))
 
 
 @app.get("/admin/agents/{agent_id}/policy")
+@limiter.limit("120/minute")
 async def get_policy(agent_id: str, request: Request):
     token = _token(request)
     if not token:
@@ -453,6 +496,7 @@ async def get_policy(agent_id: str, request: Request):
 
 
 @app.put("/admin/agents/{agent_id}/policy/mode")
+@limiter.limit("30/minute")
 async def set_mode(agent_id: str, request: Request):
     token = _token(request)
     if not token:
@@ -465,6 +509,7 @@ async def set_mode(agent_id: str, request: Request):
 
 
 @app.get("/admin/approvals")
+@limiter.limit("120/minute")
 async def list_approvals(request: Request):
     token = _token(request)
     if not token:
@@ -473,6 +518,7 @@ async def list_approvals(request: Request):
 
 
 @app.post("/admin/approvals", status_code=201)
+@limiter.limit("30/minute")
 async def pre_approve_command(request: Request):
     token = _token(request)
     if not token:
@@ -485,6 +531,7 @@ async def pre_approve_command(request: Request):
 
 
 @app.put("/admin/approvals/{approval_id}/approve")
+@limiter.limit("60/minute")
 async def approve_approval(approval_id: str, request: Request):
     token = _token(request)
     if not token:
@@ -497,6 +544,7 @@ async def approve_approval(approval_id: str, request: Request):
 
 
 @app.put("/admin/approvals/{approval_id}/deny")
+@limiter.limit("60/minute")
 async def deny_approval(approval_id: str, request: Request):
     token = _token(request)
     if not token:
@@ -509,6 +557,7 @@ async def deny_approval(approval_id: str, request: Request):
 
 
 @app.delete("/admin/approvals/{approval_id}")
+@limiter.limit("30/minute")
 async def delete_approval(approval_id: str, request: Request):
     token = _token(request)
     if not token:
@@ -521,5 +570,6 @@ async def delete_approval(approval_id: str, request: Request):
 # ---------------------------------------------------------------------------
 
 @app.get("/health")
-async def health():
+@limiter.limit("120/minute")
+async def health(request: Request):
     return {"status": "ok"}

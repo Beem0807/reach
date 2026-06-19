@@ -17,12 +17,27 @@ def handle_list_my_pending(query: dict, raw_token: str) -> dict:
 
     agent_id = (query.get("agent_id") or "").strip() or None
 
+    if agent_id:
+        agent = agents_repo.get(agent_id)
+        if not agent or not can_access_agent(user, agent):
+            return _err("agent not found", 404)
+
     items = approvals_repo.list_by_tenant(
         user["tenant_id"],
         agent_id=agent_id,
         status="pending",
         requested_by=user["user_id"],
     )
+
+    if not agent_id:
+        _cache: dict = {}
+        def _can_access(aid: str) -> bool:
+            if aid not in _cache:
+                a = agents_repo.get(aid)
+                _cache[aid] = a is not None and can_access_agent(user, a)
+            return _cache[aid]
+        items = [r for r in items if _can_access(r["agent_id"])]
+
     return _ok({"approvals": items})
 
 

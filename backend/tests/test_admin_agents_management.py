@@ -5,6 +5,8 @@ from handlers.admin_agents import (
     handle_create_agent,
     handle_delete_agent,
     handle_reissue_install_token,
+    handle_remove_agent,
+    handle_revoke_agent,
 )
 
 ADMIN = "test-admin-token"
@@ -16,6 +18,8 @@ _TENANT = {"tenant_id": TENANT}
 _AGENT_CREATED = {"agent_id": AGENT_ID, "tenant_id": TENANT, "status": "CREATED"}
 _AGENT_ACTIVE = {"agent_id": AGENT_ID, "tenant_id": TENANT, "status": "ACTIVE"}
 _AGENT_INACTIVE = {"agent_id": AGENT_ID, "tenant_id": TENANT, "status": "INACTIVE"}
+_AGENT_REVOKED = {"agent_id": AGENT_ID, "tenant_id": TENANT, "status": "REVOKED"}
+_AGENT_DELETED = {"agent_id": AGENT_ID, "tenant_id": TENANT, "status": "DELETED"}
 
 
 class TestCreateAgent:
@@ -97,46 +101,132 @@ class TestCreateAgent:
         assert t1 != t2
 
 
-class TestDeleteAgent:
+class TestRevokeAgent:
+    def _call(self, agent=_AGENT_ACTIVE):
+        with patch("handlers.admin_agents.agents_repo") as ar, \
+             patch("handlers.admin_agents.users_repo") as ur:
+            ar.get.return_value = agent
+            r = handle_revoke_agent(AGENT_ID, ADMIN)
+            return r, ar, ur
+
     def test_unauthorized(self):
-        r = handle_delete_agent(AGENT_ID, {}, "wrong")
+        r = handle_revoke_agent(AGENT_ID, "wrong")
         assert r["statusCode"] == 401
 
     def test_agent_not_found(self):
         with patch("handlers.admin_agents.agents_repo") as ar, \
              patch("handlers.admin_agents.users_repo"):
             ar.get.return_value = None
-            r = handle_delete_agent(AGENT_ID, {}, ADMIN)
+            r = handle_revoke_agent(AGENT_ID, ADMIN)
         assert r["statusCode"] == 404
 
-    def test_active_agent_blocked_without_force(self):
-        with patch("handlers.admin_agents.agents_repo") as ar, \
-             patch("handlers.admin_agents.users_repo"):
-            ar.get.return_value = _AGENT_ACTIVE
-            r = handle_delete_agent(AGENT_ID, {}, ADMIN)
+    def test_revokes_active_agent(self):
+        r, ar, _ = self._call(_AGENT_ACTIVE)
+        assert r["statusCode"] == 200
+        import json
+        assert json.loads(r["body"])["status"] == "REVOKED"
+        ar.set_status.assert_called_once_with(AGENT_ID, "REVOKED")
+
+    def test_revokes_inactive_agent(self):
+        r, ar, _ = self._call(_AGENT_INACTIVE)
+        assert r["statusCode"] == 200
+        ar.set_status.assert_called_once_with(AGENT_ID, "REVOKED")
+
+    def test_revokes_created_agent(self):
+        r, ar, _ = self._call(_AGENT_CREATED)
+        assert r["statusCode"] == 200
+        ar.set_status.assert_called_once_with(AGENT_ID, "REVOKED")
+
+    def test_already_revoked_returns_409(self):
+        r, _, _ = self._call(_AGENT_REVOKED)
         assert r["statusCode"] == 409
 
-    def test_active_agent_deleted_with_force(self):
-        with patch("handlers.admin_agents.agents_repo") as ar, \
-             patch("handlers.admin_agents.users_repo") as ur:
-            ar.get.return_value = _AGENT_ACTIVE
-            r = handle_delete_agent(AGENT_ID, {"force": True}, ADMIN)
-        assert r["statusCode"] == 200
-        ar.delete.assert_called_once_with(AGENT_ID)
+    def test_already_deleted_returns_409(self):
+        r, _, _ = self._call(_AGENT_DELETED)
+        assert r["statusCode"] == 409
 
-    def test_inactive_agent_deleted_without_force(self):
+    def test_removes_from_user_access_lists(self):
+        _, _, ur = self._call(_AGENT_ACTIVE)
+        ur.remove_agent_from_all_users.assert_called_once_with(AGENT_ID, TENANT)
+
+
+class TestDeleteAgent:
+    def _call(self, agent=_AGENT_REVOKED):
         with patch("handlers.admin_agents.agents_repo") as ar, \
              patch("handlers.admin_agents.users_repo"):
-            ar.get.return_value = _AGENT_INACTIVE
-            r = handle_delete_agent(AGENT_ID, {}, ADMIN)
-        assert r["statusCode"] == 200
+            ar.get.return_value = agent
+            r = handle_delete_agent(AGENT_ID, ADMIN)
+            return r, ar
 
-    def test_delete_cleans_up_user_access_lists(self):
+    def test_unauthorized(self):
+        r = handle_delete_agent(AGENT_ID, "wrong")
+        assert r["statusCode"] == 401
+
+    def test_agent_not_found(self):
         with patch("handlers.admin_agents.agents_repo") as ar, \
-             patch("handlers.admin_agents.users_repo") as ur:
-            ar.get.return_value = _AGENT_INACTIVE
-            handle_delete_agent(AGENT_ID, {}, ADMIN)
-        ur.remove_agent_from_all_users.assert_called_once_with(AGENT_ID, TENANT)
+             patch("handlers.admin_agents.users_repo"):
+            ar.get.return_value = None
+            r = handle_delete_agent(AGENT_ID, ADMIN)
+        assert r["statusCode"] == 404
+
+    def test_active_agent_blocked(self):
+        r, _ = self._call(_AGENT_ACTIVE)
+        assert r["statusCode"] == 409
+
+    def test_inactive_agent_blocked(self):
+        r, _ = self._call(_AGENT_INACTIVE)
+        assert r["statusCode"] == 409
+
+    def test_created_agent_blocked(self):
+        r, _ = self._call(_AGENT_CREATED)
+        assert r["statusCode"] == 409
+
+    def test_already_deleted_returns_409(self):
+        r, _ = self._call(_AGENT_DELETED)
+        assert r["statusCode"] == 409
+
+    def test_revoked_agent_soft_deleted(self):
+        r, ar = self._call(_AGENT_REVOKED)
+        assert r["statusCode"] == 200
+        import json
+        assert json.loads(r["body"])["status"] == "DELETED"
+        ar.set_status.assert_called_once_with(AGENT_ID, "DELETED")
+        ar.delete.assert_not_called()
+
+
+class TestRemoveAgent:
+    def _call(self, agent=_AGENT_DELETED):
+        with patch("handlers.admin_agents.agents_repo") as ar, \
+             patch("handlers.admin_agents.users_repo"):
+            ar.get.return_value = agent
+            r = handle_remove_agent(AGENT_ID, ADMIN)
+            return r, ar
+
+    def test_unauthorized(self):
+        r = handle_remove_agent(AGENT_ID, "wrong")
+        assert r["statusCode"] == 401
+
+    def test_agent_not_found(self):
+        with patch("handlers.admin_agents.agents_repo") as ar, \
+             patch("handlers.admin_agents.users_repo"):
+            ar.get.return_value = None
+            r = handle_remove_agent(AGENT_ID, ADMIN)
+        assert r["statusCode"] == 404
+
+    def test_active_agent_blocked(self):
+        r, _ = self._call(_AGENT_ACTIVE)
+        assert r["statusCode"] == 409
+
+    def test_revoked_agent_blocked(self):
+        r, _ = self._call(_AGENT_REVOKED)
+        assert r["statusCode"] == 409
+
+    def test_deleted_agent_physically_removed(self):
+        r, ar = self._call(_AGENT_DELETED)
+        assert r["statusCode"] == 200
+        import json
+        assert json.loads(r["body"])["removed"] is True
+        ar.delete.assert_called_once_with(AGENT_ID)
 
 
 class TestReissueInstallToken:
@@ -178,3 +268,18 @@ class TestReissueInstallToken:
         t1 = json.loads(r1["body"])["install_token"]
         t2 = json.loads(r2["body"])["install_token"]
         assert t1 != t2
+
+    def test_revoked_agent_reissued_returns_created(self):
+        with patch("handlers.admin_agents.agents_repo") as ar:
+            ar.get.return_value = _AGENT_REVOKED
+            r = handle_reissue_install_token(AGENT_ID, {}, ADMIN, API_URL)
+        assert r["statusCode"] == 200
+        body = json.loads(r["body"])
+        assert body["install_token"].startswith("install_")
+        ar.reissue_install_token.assert_called_once()
+
+    def test_deleted_agent_blocked(self):
+        with patch("handlers.admin_agents.agents_repo") as ar:
+            ar.get.return_value = _AGENT_DELETED
+            r = handle_reissue_install_token(AGENT_ID, {}, ADMIN, API_URL)
+        assert r["statusCode"] == 409

@@ -15,7 +15,7 @@ def handle_get_agent(agent_id: str, raw_token: str) -> dict:
         return _err("unauthorized", 401)
 
     agent = agents_repo.get(agent_id)
-    if not agent or not can_access_agent(user, agent):
+    if not agent or agent.get("status") == "DELETED" or not can_access_agent(user, agent):
         return _err("not found", 404)
 
     return _ok({

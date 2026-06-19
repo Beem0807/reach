@@ -126,10 +126,12 @@ class TestCreateJob:
 # ---------------------------------------------------------------------------
 
 class TestGetJob:
-    def _call(self, job=_JOB, user=USER):
+    def _call(self, job=_JOB, user=USER, agent=_AGENT_ACTIVE):
         with patch("handlers.get_job._verify_tenant_token", return_value=user), \
-             patch("handlers.get_job.jobs_repo") as jr:
+             patch("handlers.get_job.jobs_repo") as jr, \
+             patch("handlers.get_job.agents_repo") as agr:
             jr.get.return_value = job
+            agr.get.return_value = agent
             return handle_get_job("job_1", "tok")
 
     def test_unauthorized(self):
@@ -149,6 +151,15 @@ class TestGetJob:
         r = self._call(job=wrong_tenant_job)
         assert r["statusCode"] == 404
 
+    def test_inaccessible_agent_returns_404(self):
+        restricted_user = {**USER, "allowed_agent_ids": ["agent_other"]}
+        r = self._call(user=restricted_user)
+        assert r["statusCode"] == 404
+
+    def test_agent_not_found_returns_404(self):
+        r = self._call(agent=None)
+        assert r["statusCode"] == 404
+
     def test_returns_job_fields(self):
         r = self._call()
         assert r["statusCode"] == 200
@@ -161,8 +172,10 @@ class TestGetJob:
     def test_pending_expired_job_marked_expired(self):
         expired_job = {**_JOB, "status": "PENDING", "expires_at": 1}  # long past
         with patch("handlers.get_job._verify_tenant_token", return_value=USER), \
-             patch("handlers.get_job.jobs_repo") as jr:
+             patch("handlers.get_job.jobs_repo") as jr, \
+             patch("handlers.get_job.agents_repo") as agr:
             jr.get.return_value = expired_job
+            agr.get.return_value = _AGENT_ACTIVE
             r = handle_get_job("job_1", "tok")
         assert json.loads(r["body"])["status"] == "EXPIRED"
         jr.mark_expired.assert_called_once_with("job_1")
@@ -173,10 +186,12 @@ class TestGetJob:
 # ---------------------------------------------------------------------------
 
 class TestListJobs:
-    def _call(self, jobs=None, agent_id=None, limit=20, cursor=None):
-        with patch("handlers.list_jobs._verify_tenant_token", return_value=USER), \
-             patch("handlers.list_jobs.jobs_repo") as jr:
+    def _call(self, jobs=None, agent_id=None, limit=20, cursor=None, user=USER, agent=_AGENT_ACTIVE):
+        with patch("handlers.list_jobs._verify_tenant_token", return_value=user), \
+             patch("handlers.list_jobs.jobs_repo") as jr, \
+             patch("handlers.list_jobs.agents_repo") as agr:
             jr.list_by_tenant.return_value = jobs or []
+            agr.get.return_value = agent
             return handle_list_jobs("tok", agent_id, limit, cursor)
 
     def test_unauthorized(self):
@@ -207,15 +222,45 @@ class TestListJobs:
 
     def test_invalid_cursor_does_not_raise(self):
         with patch("handlers.list_jobs._verify_tenant_token", return_value=USER), \
-             patch("handlers.list_jobs.jobs_repo") as jr:
+             patch("handlers.list_jobs.jobs_repo") as jr, \
+             patch("handlers.list_jobs.agents_repo") as agr:
             jr.list_by_tenant.return_value = []
+            agr.get.return_value = _AGENT_ACTIVE
             r = handle_list_jobs("tok", None, 20, "!!!bad-cursor!!!")
         assert r["statusCode"] == 200
 
     def test_passes_agent_filter(self):
         with patch("handlers.list_jobs._verify_tenant_token", return_value=USER), \
-             patch("handlers.list_jobs.jobs_repo") as jr:
+             patch("handlers.list_jobs.jobs_repo") as jr, \
+             patch("handlers.list_jobs.agents_repo") as agr:
             jr.list_by_tenant.return_value = []
+            agr.get.return_value = _AGENT_ACTIVE
             handle_list_jobs("tok", "agent_a", 20)
         call_args = jr.list_by_tenant.call_args[0]
         assert "agent_a" in call_args
+
+    def test_agent_filter_inaccessible_returns_404(self):
+        restricted_user = {**USER, "allowed_agent_ids": ["agent_other"]}
+        r = self._call(agent_id=AGENT_ID, user=restricted_user)
+        assert r["statusCode"] == 404
+
+    def test_agent_filter_not_found_returns_404(self):
+        r = self._call(agent_id=AGENT_ID, agent=None)
+        assert r["statusCode"] == 404
+
+    def test_no_agent_filter_excludes_inaccessible_jobs(self):
+        job_other = {**_JOB, "job_id": "job_2", "agent_id": "agent_other"}
+        restricted_user = {**USER, "allowed_agent_ids": [AGENT_ID]}
+        def fake_get(aid):
+            if aid == AGENT_ID:
+                return _AGENT_ACTIVE
+            return {"agent_id": aid, "tenant_id": TENANT}
+        with patch("handlers.list_jobs._verify_tenant_token", return_value=restricted_user), \
+             patch("handlers.list_jobs.jobs_repo") as jr, \
+             patch("handlers.list_jobs.agents_repo") as agr:
+            jr.list_by_tenant.return_value = [_JOB, job_other]
+            agr.get.side_effect = fake_get
+            r = handle_list_jobs("tok", None, 20)
+        jobs = json.loads(r["body"])["jobs"]
+        assert len(jobs) == 1
+        assert jobs[0]["job_id"] == "job_1"

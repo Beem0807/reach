@@ -140,6 +140,23 @@ def test_agent_with_no_tags_returns_empty_list():
     assert agent["tags"] == []
 
 
+def test_deleted_agent_excluded_from_list():
+    deleted = {**AGENT_A, "status": "DELETED"}
+    r = _list(agents=[deleted, AGENT_B])
+    import json
+    ids = [a["agent_id"] for a in json.loads(r["body"])["agents"]]
+    assert "agent_a" not in ids
+    assert "agent_b" in ids
+
+
+def test_revoked_agent_included_in_list():
+    revoked = {**AGENT_A, "status": "REVOKED"}
+    r = _list(agents=[revoked, AGENT_B])
+    import json
+    ids = [a["agent_id"] for a in json.loads(r["body"])["agents"]]
+    assert "agent_a" in ids
+
+
 # ---------------------------------------------------------------------------
 # get_agent: 404 on no access (info-leak prevention)
 # ---------------------------------------------------------------------------
@@ -174,3 +191,21 @@ def test_get_agent_returns_tags():
         r = handle_get_agent("agent_a", "tok")
     import json
     assert json.loads(r["body"])["tags"] == ["env:prod"]
+
+
+def test_get_deleted_agent_returns_404():
+    deleted = {**AGENT_A, "status": "DELETED"}
+    with patch("handlers.get_agent._verify_tenant_token", return_value=USER), \
+         patch("handlers.get_agent.agents_repo") as mock_repo:
+        mock_repo.get.return_value = deleted
+        r = handle_get_agent("agent_a", "tok")
+    assert r["statusCode"] == 404
+
+
+def test_get_revoked_agent_returns_200():
+    revoked = {**AGENT_A, "status": "REVOKED"}
+    with patch("handlers.get_agent._verify_tenant_token", return_value=USER), \
+         patch("handlers.get_agent.agents_repo") as mock_repo:
+        mock_repo.get.return_value = revoked
+        r = handle_get_agent("agent_a", "tok")
+    assert r["statusCode"] == 200

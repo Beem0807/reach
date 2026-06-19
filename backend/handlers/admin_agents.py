@@ -106,10 +106,18 @@ def handle_reissue_install_token(agent_id: str, body: dict, raw_token: str, api_
     grant_service_mgmt = bool(body.get("grant_service_mgmt", True))
     grant_docker = bool(body.get("grant_docker", False))
 
-    if agent.get("status") == "ACTIVE" and not force:
+    status = agent.get("status")
+    if status == "DELETED":
+        return _err(
+            "agent is DELETED and cannot be reissued - remove it with "
+            "DELETE /admin/agents/{id}/remove and create a new agent instead",
+            409,
+        )
+    if status == "ACTIVE" and not force:
         return _err(
             "agent is currently ACTIVE - reissuing will disconnect it immediately "
-            "with no in-band recovery. Pass {\"force\": true} to proceed anyway.",
+            "with no in-band recovery. Revoke first with POST /admin/agents/{id}/revoke, "
+            "or pass {\"force\": true} to proceed anyway.",
             409,
         )
 
@@ -160,7 +168,7 @@ def handle_list_agents_admin(tenant_id: str, raw_token: str, tag: str = None) ->
     })
 
 
-def handle_delete_agent(agent_id: str, body: dict, raw_token: str) -> dict:
+def handle_revoke_agent(agent_id: str, raw_token: str) -> dict:
     if not _verify_admin(raw_token):
         return _err("unauthorized", 401)
 
@@ -168,20 +176,63 @@ def handle_delete_agent(agent_id: str, body: dict, raw_token: str) -> dict:
     if not agent:
         return _err("agent not found", 404)
 
-    force = bool(body.get("force", False))
-    if agent.get("status") == "ACTIVE" and not force:
+    status = agent.get("status")
+    if status == "REVOKED":
+        return _err("agent is already REVOKED", 409)
+    if status == "DELETED":
+        return _err("agent is already DELETED", 409)
+
+    agents_repo.set_status(agent_id, "REVOKED")
+    users_repo.remove_agent_from_all_users(agent_id, agent["tenant_id"])
+    logger.info("Revoked agent=%s (was status=%s)", agent_id, status)
+
+    return _ok({"agent_id": agent_id, "status": "REVOKED"})
+
+
+def handle_delete_agent(agent_id: str, raw_token: str) -> dict:
+    if not _verify_admin(raw_token):
+        return _err("unauthorized", 401)
+
+    agent = agents_repo.get(agent_id)
+    if not agent:
+        return _err("agent not found", 404)
+
+    status = agent.get("status")
+    if status == "DELETED":
+        return _err("agent is already DELETED - call DELETE /admin/agents/{id}/remove to physically remove it", 409)
+    if status != "REVOKED":
         return _err(
-            "agent is currently ACTIVE - deleting will disconnect it immediately "
-            "with no in-band recovery. Pass {\"force\": true} to proceed anyway.",
+            f"agent must be REVOKED before deleting (current status: {status}) "
+            "- call POST /admin/agents/{id}/revoke first",
             409,
         )
 
-    tenant_id = agent["tenant_id"]
-    agents_repo.delete(agent_id)
-    users_repo.remove_agent_from_all_users(agent_id, tenant_id)
-    logger.info("Deleted agent=%s (was status=%s)", agent_id, agent.get("status"))
+    agents_repo.set_status(agent_id, "DELETED")
+    logger.info("Soft-deleted agent=%s", agent_id)
 
-    return _ok({"agent_id": agent_id, "deleted": True})
+    return _ok({"agent_id": agent_id, "status": "DELETED"})
+
+
+def handle_remove_agent(agent_id: str, raw_token: str) -> dict:
+    if not _verify_admin(raw_token):
+        return _err("unauthorized", 401)
+
+    agent = agents_repo.get(agent_id)
+    if not agent:
+        return _err("agent not found", 404)
+
+    status = agent.get("status")
+    if status != "DELETED":
+        return _err(
+            f"agent must be DELETED before removing (current status: {status}) "
+            "- call DELETE /admin/agents/{id} first",
+            409,
+        )
+
+    agents_repo.delete(agent_id)
+    logger.info("Permanently removed agent=%s", agent_id)
+
+    return _ok({"agent_id": agent_id, "removed": True})
 
 
 def handle_get_agent_tags(agent_id: str, raw_token: str) -> dict:
@@ -287,18 +338,31 @@ def reissue_install_token_handler(event, context):
     return handle_reissue_install_token(agent_id, body, token, api_url)
 
 
+def revoke_agent_handler(event, context):
+    logger.info("POST /admin/agents/{agent_id}/revoke")
+    token, _ = _token_and_api_url(event)
+    if not token:
+        return _err("missing Authorization header", 401)
+    agent_id = (event.get("pathParameters") or {}).get("agent_id", "")
+    return handle_revoke_agent(agent_id, token)
+
+
 def delete_agent_handler(event, context):
-    import json
     logger.info("DELETE /admin/agents/{agent_id}")
     token, _ = _token_and_api_url(event)
     if not token:
         return _err("missing Authorization header", 401)
-    try:
-        body = json.loads(event.get("body") or "{}")
-    except json.JSONDecodeError:
-        return _err("invalid JSON body")
     agent_id = (event.get("pathParameters") or {}).get("agent_id", "")
-    return handle_delete_agent(agent_id, body, token)
+    return handle_delete_agent(agent_id, token)
+
+
+def remove_agent_handler(event, context):
+    logger.info("DELETE /admin/agents/{agent_id}/remove")
+    token, _ = _token_and_api_url(event)
+    if not token:
+        return _err("missing Authorization header", 401)
+    agent_id = (event.get("pathParameters") or {}).get("agent_id", "")
+    return handle_remove_agent(agent_id, token)
 
 
 def get_agent_tags_handler(event, context):

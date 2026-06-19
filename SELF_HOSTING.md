@@ -166,6 +166,8 @@ Response:
 }
 ```
 
+The `name` field is **required** - the request returns 400 if omitted or blank. Use a human-readable identifier (e.g. the person's name or username) so it's clear who the token belongs to when listing users.
+
 Save the `token` - it's not retrievable again. Run the `cli_login` command to set up the CLI. Repeat this step for each person who needs CLI access to this tenant - each gets their own token, so revoking one person's access never affects anyone else.
 
 **3. Create an agent under the tenant:**
@@ -373,7 +375,7 @@ curl -s -X DELETE "$API_URL/admin/tenants/tenant_xxxxx/users/user_xxxxx/agents/a
 
 Returns `409` if the user is unrestricted, `404` if the agent isn't in their list.
 
-**When an agent is deleted**, reach automatically removes it from every user's `allowed_agent_ids` in that tenant. No manual cleanup needed.
+**When an agent is revoked**, reach automatically removes it from every user's `allowed_agent_ids` in that tenant. No manual cleanup needed.
 
 **Fleet access (coming soon):** a parallel `allowed_fleet_ids` field will let you grant access to all agents in a fleet with a single assignment. Individual `allowed_agent_ids` and fleet access are OR'd - either grants access.
 
@@ -551,13 +553,15 @@ This resets the agent back to `CREATED` status with a new install token - the sa
 
 **This is a hard cutover, not a live rotation.** If the agent is currently running and connected, its existing `agent_token` is invalidated immediately (the machine fingerprint and claim are cleared). The agent will stop syncing on its next poll and go dormant rather than retry forever - it needs to be re-installed with the new install token to come back online. There's no in-band way to recover it remotely once this happens.
 
-To prevent accidental disconnects, the server blocks this for agents currently in `ACTIVE` status:
+It's allowed without confirmation for `CREATED` (never claimed), `INACTIVE` (already lost contact), and `REVOKED` agents - there's no live connection to break in those states. `REVOKED` is the recommended path before reissuing on a machine you plan to re-register.
+
+For `ACTIVE` agents the server blocks it with `409` to prevent accidental disconnects:
 
 ```json
-{"error": "agent is currently ACTIVE - reissuing will disconnect it immediately with no in-band recovery. Pass {\"force\": true} to proceed anyway."}
+{"error": "agent is currently ACTIVE - reissuing will disconnect it immediately with no in-band recovery. Revoke first with POST /admin/agents/{id}/revoke, or pass {\"force\": true} to proceed anyway."}
 ```
 
-It's allowed without confirmation for `CREATED` (never claimed) and `INACTIVE` (already lost contact) agents - there's no live connection to break in those states. To force it through on an `ACTIVE` agent anyway (e.g. a suspected compromised token), pass `force`:
+To force it through on an `ACTIVE` agent (e.g. a suspected compromised token), pass `force`:
 
 ```bash
 curl -s -X POST "$API_URL/admin/agents/agent_xxxxx/reissue-install-token" \
@@ -566,25 +570,48 @@ curl -s -X POST "$API_URL/admin/agents/agent_xxxxx/reissue-install-token" \
   -d '{"force": true}' | python3 -m json.tool
 ```
 
+Returns `409` for `DELETED` agents - remove and create a new agent instead.
+
 ---
 
-## Deleting an agent
+## Decommissioning an agent
 
-Permanently removes the agent record. Unlike reissuing, this does not keep the `agent_id` around - it's gone for good (job history referencing it is unaffected, but `GET /agents/{id}` will 404 afterward).
+Removing an agent is a three-step sequence. Each step requires the previous one to have been completed - this prevents accidental hard-deletes.
+
+### Step 1 - Revoke
+
+Cuts sync access immediately. The agent's next poll returns `403` and it goes dormant. The agent is also removed from every user's `allowed_agent_ids` in that tenant at this point.
+
+```bash
+curl -s -X POST "$API_URL/admin/agents/agent_xxxxx/revoke" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
+```
+
+Returns `409` if the agent is already `REVOKED` or `DELETED`. Works on `CREATED`, `ACTIVE`, and `INACTIVE` agents without any `force` flag.
+
+A revoke can be undone - see [Reissuing an install token](#reissuing-an-install-token) below.
+
+### Step 2 - Soft-delete
+
+Marks the agent `DELETED`. The record stays in the database for audit purposes. Requires `REVOKED` status.
 
 ```bash
 curl -s -X DELETE "$API_URL/admin/agents/agent_xxxxx" \
-  -H "Authorization: Bearer $ADMIN_TOKEN"
+  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
 ```
 
-Same guardrail as reissuing: blocked with `409` if the agent is currently `ACTIVE`, unless you pass `force`:
+Returns `409` if the agent is not `REVOKED` (with a message pointing to the revoke endpoint).
+
+### Step 3 - Remove
+
+Permanently deletes the record from the database. Job history referencing the `agent_id` is unaffected, but `GET /agents/{id}` will 404 afterward. Requires `DELETED` status.
 
 ```bash
-curl -s -X DELETE "$API_URL/admin/agents/agent_xxxxx" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"force": true}'
+curl -s -X DELETE "$API_URL/admin/agents/agent_xxxxx/remove" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
 ```
+
+Returns `409` if the agent is not `DELETED`.
 
 ---
 
@@ -646,7 +673,7 @@ curl -s -X POST "$API_URL/admin/approvals" \
 
 Single-command form: record created in `approved` state immediately; returns `409` if already active.
 
-Bulk form (`commands: [...]`): idempotent — commands that already have an active approval are skipped, not errored. Response:
+Bulk form (`commands: [...]`): idempotent - commands that already have an active approval are skipped, not errored. Response:
 
 ```json
 {
@@ -709,14 +736,7 @@ Supported durations:
 
 Time-limited approvals expire silently - the record stays in the database for history, but once the expiry passes the command is no longer effective. The next blocked attempt creates a new pending record.
 
-**Deny a command:**
-
-```bash
-curl -s -X PUT "$API_URL/admin/approvals/appr_xxxxx/deny" \
-  -H "Authorization: Bearer $ADMIN_TOKEN"
-```
-
-**Revoke an active approval** (deny an already-approved record - takes effect on the next agent sync):
+**Deny or revoke an approval** - works on any status (`pending`, `approved`, or `denied`). Denying an already-approved record takes effect on the next agent sync:
 
 ```bash
 curl -s -X PUT "$API_URL/admin/approvals/appr_xxxxx/deny" \
@@ -786,10 +806,27 @@ User tokens belong to individuals, not the tenant as a whole - each person under
 ## Agent lifecycle
 
 ```
-CREATED → ACTIVE → INACTIVE (heartbeat timeout) → ACTIVE (auto-reactivates on next sync)
+CREATED ──(claim)──► ACTIVE ──(heartbeat gap)──► INACTIVE
+   ▲                    │                              │
+   │               (revoke)                       (revoke)
+   │                    │                              │
+   │                    ▼                              │
+   └──(reissue     REVOKED ◄─────────────────────────┘
+      install           │
+      token)       (delete)
+                        │
+                        ▼
+                   DELETED ──(remove)──► [gone]
 ```
 
 An agent starts as `CREATED`. On first run it calls `POST /agent/claim` with the install token, transitions to `ACTIVE`, and receives a permanent `agent_token`. The install token is then cleared from disk.
+
+- **CREATED** - registered, install token valid for 24 hours. Never claimed.
+- **ACTIVE** - claimed and syncing normally.
+- **INACTIVE** - missed heartbeats. Auto-recovers to ACTIVE on next successful sync.
+- **REVOKED** - access cut. Sync returns 403. Removed from all user access lists. Can be reset to CREATED via `POST /admin/agents/{id}/reissue-install-token`.
+- **DELETED** - soft-deleted. Record stays in the database. Cannot sync or be reissued. Hidden from tenant-facing endpoints (`GET /agents`, `GET /agents/{id}` return 404); visible to the admin API so the remove step can be completed.
+- **[gone]** - permanently removed via the remove action.
 
 The heartbeat checker runs every minute (EventBridge on Lambda, APScheduler on FastAPI) and marks agents `INACTIVE` if no sync has been received in the last 45 seconds. The agent auto-reactivates on its next successful sync. The same check also sweeps PENDING jobs older than 1 hour and marks them `EXPIRED` - so if an agent goes offline after a job is submitted, the job status resolves within an hour rather than lingering indefinitely.
 
@@ -976,7 +1013,7 @@ launchctl load /Library/LaunchDaemons/com.reach-agent.plist
 |---|---|---|---|
 | `POST` | `/admin/tenants` | ADMIN_TOKEN | Create a tenant |
 | `GET` | `/admin/tenants` | ADMIN_TOKEN | List tenants |
-| `POST` | `/admin/tenants/{id}/users` | ADMIN_TOKEN | Create a user under a tenant (issues their token) |
+| `POST` | `/admin/tenants/{id}/users` | ADMIN_TOKEN | Create a user under a tenant (issues their token); body: `{"name": "..."}` - required |
 | `GET` | `/admin/tenants/{id}/users` | ADMIN_TOKEN | List users in a tenant (no raw tokens) |
 | `POST` | `/admin/tenants/{id}/users/{user_id}/rotate-token` | ADMIN_TOKEN | Rotate one user's token (keeps identity, swaps credential) |
 | `DELETE` | `/admin/tenants/{id}/users/{user_id}` | ADMIN_TOKEN | Revoke one user's token |
@@ -986,8 +1023,10 @@ launchctl load /Library/LaunchDaemons/com.reach-agent.plist
 | `DELETE` | `/admin/tenants/{id}/users/{user_id}/agents/{agent_id}` | ADMIN_TOKEN | Revoke one agent from a restricted user |
 | `GET` | `/admin/agents` | ADMIN_TOKEN | List all agents for a tenant (`?tenant_id=` required, `?tag=` optional) |
 | `POST` | `/admin/agents` | ADMIN_TOKEN | Create an agent under a tenant |
-| `DELETE` | `/admin/agents/{id}` | ADMIN_TOKEN | Delete an agent (blocked if ACTIVE unless `force`) |
-| `POST` | `/admin/agents/{id}/reissue-install-token` | ADMIN_TOKEN | Reissue install token (blocked if ACTIVE unless `force`) |
+| `POST` | `/admin/agents/{id}/revoke` | ADMIN_TOKEN | Revoke agent (CREATED/ACTIVE/INACTIVE → REVOKED). Cuts sync access, removes from user access lists. Undoable via reissue. |
+| `DELETE` | `/admin/agents/{id}` | ADMIN_TOKEN | Soft-delete agent (REVOKED → DELETED). Record stays in database. Requires prior revoke. |
+| `DELETE` | `/admin/agents/{id}/remove` | ADMIN_TOKEN | Permanently remove agent record (DELETED only). Irreversible. |
+| `POST` | `/admin/agents/{id}/reissue-install-token` | ADMIN_TOKEN | Reissue install token - resets to CREATED (allowed for CREATED/INACTIVE/REVOKED; blocked for ACTIVE without `force`, blocked for DELETED) |
 | `GET` | `/admin/agents/{id}/tags` | ADMIN_TOKEN | Get agent's current tag list |
 | `PUT` | `/admin/agents/{id}/tags` | ADMIN_TOKEN | Replace tag list entirely |
 | `POST` | `/admin/agents/{id}/tags` | ADMIN_TOKEN | Add tags (merge, no duplicates) |
@@ -995,7 +1034,7 @@ launchctl load /Library/LaunchDaemons/com.reach-agent.plist
 | `GET` | `/admin/agents/{id}/policy` | ADMIN_TOKEN | Get agent policy (mode + effective approved commands) |
 | `PUT` | `/admin/agents/{id}/policy/mode` | ADMIN_TOKEN | Set policy mode (`wild` / `readonly` / `approved`) |
 | `GET` | `/admin/jobs` | ADMIN_TOKEN | List jobs (`?agent_id=` `?tenant_id=` `?created_by=` `?limit=` `?cursor=`) |
-| `GET` | `/admin/approvals` | ADMIN_TOKEN | List approval records (`?agent_id=` `?tenant_id=` `?status=pending\|approved\|denied` `?limit=` `?cursor=`). Paginated — default 20, max 100. |
+| `GET` | `/admin/approvals` | ADMIN_TOKEN | List approval records (`?agent_id=` `?tenant_id=` `?status=pending\|approved\|denied` `?limit=` `?cursor=`). Paginated - default 20, max 100. |
 | `POST` | `/admin/approvals` | ADMIN_TOKEN | Pre-approve without a prior block. Single: `{"agent_id": "...", "command": "...", "duration": "8h"}` → returns approval object (409 if already active). Bulk: `{"agent_id": "...", "commands": [...]}` → returns `{"created": [...], "skipped": [...]}`, idempotent. |
 | `PUT` | `/admin/approvals/{id}/approve` | ADMIN_TOKEN | Approve, re-approve, or update duration (body: `{"duration": "8h"}` optional; default permanent). Works on any status. |
 | `PUT` | `/admin/approvals/{id}/deny` | ADMIN_TOKEN | Deny or revoke - works on any status including already-approved records |
@@ -1090,15 +1129,40 @@ The match is prefix-based with a word boundary: approving `docker logs` permits 
 
 ## Rate limits
 
-Rate limiting applies to the **Docker / FastAPI** deployment only. Each limit is per token (per agent or per user), so one misbehaving agent or user cannot affect others.
+Rate limiting applies to the **Docker / FastAPI** deployment only. The key function uses the Bearer token if present, falling back to the client IP - so one misbehaving agent or user cannot affect others.
+
+**Agent endpoints**
 
 | Endpoint | Limit |
 |---|---|
-| `POST /agent/claim` | 5 per hour per IP (no auth token yet at claim time) |
-| `POST /agent/sync` | 60 per minute per agent token |
-| `POST /agent/jobs/{id}/result` | 60 per minute per agent token |
-| `POST /agent/rotate-token` | 10 per hour per agent token |
-| `POST /jobs` | 30 per minute per user token |
+| `POST /agent/claim` | 5/hour per IP (no auth token at claim time) |
+| `POST /agent/sync` | 60/minute per agent token |
+| `POST /agent/jobs/{id}/result` | 60/minute per agent token |
+| `POST /agent/rotate-token` | 10/hour per agent token |
+
+**User (tenant) endpoints**
+
+| Endpoint | Limit |
+|---|---|
+| `POST /jobs` | 30/minute per user token |
+| `GET /me`, `GET /jobs/{id}`, `GET /agents/{id}` | 120/minute per user token |
+| `GET /jobs`, `GET /agents`, `GET /approvals/pending`, `GET /agents/{id}/approved-commands` | 60/minute per user token |
+
+**Admin endpoints**
+
+| Endpoint | Limit |
+|---|---|
+| All `GET /admin/*` reads | 120/minute per admin token |
+| `PUT /admin/approvals/{id}/approve`, `PUT /admin/approvals/{id}/deny` | 60/minute per admin token |
+| `POST /admin/approvals`, `POST/PUT/DELETE` tag/policy/access/lifecycle writes | 30/minute per admin token |
+| `POST /admin/agents`, `POST /admin/tenants`, `POST /admin/tenants/{id}/users` | 20/minute per admin token |
+| `POST /admin/agents/{id}/reissue-install-token`, `POST /admin/tenants/{id}/users/{id}/rotate-token` | 10/minute per admin token |
+
+**Health**
+
+| Endpoint | Limit |
+|---|---|
+| `GET /health` | 120/minute per IP |
 
 Exceeding a limit returns `429` with `{"error": "rate limit exceeded"}`. The agent's sync loop treats 429 the same as a transient error and retries on the next poll interval.
 

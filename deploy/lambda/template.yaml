@@ -549,6 +549,19 @@ Resources:
             Path: /admin/agents
             Method: POST
 
+  AdminRevokeAgentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-admin-revoke-agent
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.admin_agents.revoke_agent_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /admin/agents/{agent_id}/revoke
+            Method: POST
+
   AdminDeleteAgentFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -560,6 +573,19 @@ Resources:
           Type: HttpApi
           Properties:
             Path: /admin/agents/{agent_id}
+            Method: DELETE
+
+  AdminRemoveAgentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-admin-remove-agent
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.admin_agents.remove_agent_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /admin/agents/{agent_id}/remove
             Method: DELETE
 
   AdminGetAgentTagsFunction:

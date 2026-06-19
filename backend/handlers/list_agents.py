@@ -28,7 +28,8 @@ def handle_list_agents(raw_token: str, tag: Optional[str] = None) -> dict:
             "tags": a.get("tags") or [],
         }
         for a in rows
-        if can_access_agent(user, a)
+        if a.get("status") != "DELETED"
+        and can_access_agent(user, a)
         and (tag is None or tag in (a.get("tags") or []))
     ]
 

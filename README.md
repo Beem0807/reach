@@ -129,17 +129,37 @@ Set it as your default:
 reach agents use agent_xxx
 ```
 
-**To remove an agent:**
+**To decommission an agent (three-step sequence):**
+
+Uninstall the binary from the machine first (optional but recommended):
 
 ```bash
 curl -fsSL https://reach-releases.s3.amazonaws.com/agent/latest/install.sh | sudo bash -s -- --uninstall
 ```
 
-Then delete the agent record via the admin API:
+Then follow the three-step admin API sequence:
 
 ```bash
+# Step 1 - revoke: cuts access immediately, removes from user access lists
+curl -s -X POST "$API_URL/admin/agents/agent_xxx/revoke" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
+
+# Step 2 - soft-delete: marks DELETED, record stays in database
 curl -s -X DELETE "$API_URL/admin/agents/agent_xxx" \
   -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
+
+# Step 3 - remove: permanently deletes the record
+curl -s -X DELETE "$API_URL/admin/agents/agent_xxx/remove" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
+```
+
+Each step requires the previous one to have been completed. To undo a revoke before soft-deleting, reissue an install token - this resets the agent back to CREATED:
+
+```bash
+curl -s -X POST "$API_URL/admin/agents/agent_xxx/reissue-install-token" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{}' | python3 -m json.tool
 ```
 
 ---
@@ -234,6 +254,36 @@ curl -s -X PUT "$API_URL/admin/tenants/tenant_xxxxx/users/user_alice/agents" \
   -d '{"agent_ids": ["*"]}'
 ```
 
+**Decommission an agent (three-step sequence):**
+
+```bash
+# Step 1 - revoke: cuts sync access immediately, removes from all user access lists
+# Can be undone by reissuing an install token (see below)
+curl -s -X POST "$API_URL/admin/agents/agent_xxx/revoke" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
+
+# Step 2 - soft-delete: marks DELETED, record stays in database for audit
+# Requires REVOKED status
+curl -s -X DELETE "$API_URL/admin/agents/agent_xxx" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
+
+# Step 3 - remove: permanently deletes the record
+# Requires DELETED status
+curl -s -X DELETE "$API_URL/admin/agents/agent_xxx/remove" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
+```
+
+**Restore a revoked agent (undo revoke):**
+
+```bash
+# Reissues a fresh install token and resets status to CREATED
+# Works on REVOKED agents only - DELETED agents cannot be reissued
+curl -s -X POST "$API_URL/admin/agents/agent_xxx/reissue-install-token" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{}' | python3 -m json.tool
+```
+
 **Manage agent policy mode:**
 
 ```bash
@@ -249,13 +299,13 @@ curl -s -X POST "$API_URL/admin/approvals" \
   -H "Content-Type: application/json" \
   -d '{"agent_id": "agent_xxx", "command": "docker restart app", "duration": "8h"}'
 
-# Bulk pre-approve (idempotent — skips any that are already approved)
+# Bulk pre-approve (idempotent - skips any that are already approved)
 curl -s -X POST "$API_URL/admin/approvals" \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"agent_id": "agent_xxx", "commands": ["docker ps", "docker logs app", "kubectl get pods -A"]}'
 
-# View pending approval requests (paginated — default 20, max 100; use ?cursor=<next_cursor> for next page)
+# View pending approval requests (paginated - default 20, max 100; use ?cursor=<next_cursor> for next page)
 curl -s "$API_URL/admin/approvals?agent_id=agent_xxx&status=pending" \
   -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
 

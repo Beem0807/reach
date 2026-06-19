@@ -1,8 +1,9 @@
 import logging
 
+from shared.access import can_access_agent
 from shared.auth import _bearer, _verify_tenant_token
 from shared.response import _err, _now, _ok
-from shared.store import jobs_repo
+from shared.store import agents_repo, jobs_repo
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -17,6 +18,10 @@ def handle_get_job(job_id: str, raw_token: str) -> dict:
     if not job:
         return _err("job not found", 404)
     if job.get("tenant_id") != tenant.get("tenant_id"):
+        return _err("not found", 404)
+
+    agent = agents_repo.get(job["agent_id"])
+    if not agent or not can_access_agent(tenant, agent):
         return _err("not found", 404)
 
     if job.get("status") == "PENDING" and _now() > int(job.get("expires_at") or 0):

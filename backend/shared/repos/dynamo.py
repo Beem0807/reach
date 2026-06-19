@@ -134,6 +134,14 @@ class AgentRepo:
             ExpressionAttributeValues={":th": token_hash, ":ti": token_issued_at},
         )
 
+    def set_status(self, agent_id: str, status: str) -> None:
+        _TABLE_AGENTS.update_item(
+            Key={"agent_id": agent_id},
+            UpdateExpression="SET #st = :s",
+            ExpressionAttributeNames={"#st": "status"},
+            ExpressionAttributeValues={":s": status},
+        )
+
     def delete(self, agent_id: str) -> None:
         _TABLE_AGENTS.delete_item(Key={"agent_id": agent_id})
 

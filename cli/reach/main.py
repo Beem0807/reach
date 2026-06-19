@@ -791,6 +791,7 @@ def _status_color(status: str) -> str:
         "ACTIVE": "[green]ACTIVE[/green]",
         "CREATED": "[yellow]CREATED[/yellow]",
         "INACTIVE": "[yellow]INACTIVE[/yellow]",
+        "REVOKED": "[red]REVOKED[/red]",
         "SUSPICIOUS": "[red]SUSPICIOUS[/red]",
         "DISABLED": "[red]DISABLED[/red]",
     }

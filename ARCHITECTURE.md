@@ -140,14 +140,35 @@ The install token is one-time use and is cleared from disk after a successful cl
 ## Agent lifecycle
 
 ```
-CREATED → ACTIVE → INACTIVE → ACTIVE
-                ↘
-              (reissue install token resets to CREATED)
+CREATED ──(claim)──► ACTIVE ──(heartbeat gap)──► INACTIVE
+   ▲                    │                              │
+   │               (revoke)                       (revoke)
+   │                    │                              │
+   │                    ▼                              │
+   └──(reissue     REVOKED ◄─────────────────────────┘
+      install           │
+      token)       (delete)
+                        │
+                        ▼
+                   DELETED ──(remove)──► [gone]
 ```
 
 - **CREATED** - registered, never claimed. Install token valid for 24 hours.
 - **ACTIVE** - claimed and syncing. Transitions to INACTIVE after 45 seconds without a heartbeat.
 - **INACTIVE** - missed heartbeats. Auto-recovers to ACTIVE on next successful sync (no manual intervention needed).
+- **REVOKED** - access permanently cut. The agent can no longer sync (the sync endpoint rejects non-ACTIVE/INACTIVE status with 403). Removed from all users' allowed-agent lists at revoke time. Can be resurrected to CREATED by reissuing an install token (`POST /admin/agents/{id}/reissue-install-token`), which clears the agent token, machine fingerprint, and claimed-at fields so the machine can re-install.
+- **DELETED** - soft-deleted. Record stays in the database for audit purposes. Cannot sync or be reissued. Advance to this state only after REVOKED. Hidden from tenant-facing endpoints (`GET /agents`, `GET /agents/{id}` return 404) but visible to the admin API so the remove step can be completed.
+- **[gone]** - permanently removed from the database via the remove action. No record remains.
+
+The three-step decommission sequence prevents accidental hard-deletes:
+
+| Step | Endpoint | Requires | Effect |
+|---|---|---|---|
+| 1. Revoke | `POST /admin/agents/{id}/revoke` | Any active/inactive/created status | Sets REVOKED, removes from user access lists |
+| 2. Soft-delete | `DELETE /admin/agents/{id}` | REVOKED | Sets DELETED, record stays in table |
+| 3. Remove | `DELETE /admin/agents/{id}/remove` | DELETED | Permanently removes from database |
+
+To undo a revoke: call `POST /admin/agents/{id}/reissue-install-token`. This resets the agent to CREATED with a fresh install token and is the only way to restore a REVOKED agent. DELETED agents cannot be reissued - remove and create a new agent instead.
 
 The heartbeat checker runs every minute and scans for ACTIVE agents whose `last_heartbeat_at` is older than 45 seconds.
 
@@ -272,6 +293,33 @@ This label is shown in `reach agents list` and `reach status`. It is a factual d
 ## Multi-tenancy
 
 Every resource (agent, user, job, approval) belongs to a tenant. The backend enforces tenant isolation at the storage layer - user tokens can only see agents, jobs, and approvals within their own tenant. The admin API (authenticated with `ADMIN_TOKEN`) operates across tenants.
+
+---
+
+## Agent access control
+
+Within a tenant, individual users can be further restricted to a subset of agents. This is separate from tenant isolation and is enforced at the handler layer via `can_access_agent(user, agent)` in `shared/access.py`.
+
+A user record can carry two optional restriction fields:
+
+| Field | Effect |
+|---|---|
+| `allowed_agent_ids` | User can only access agents whose `agent_id` is in this list |
+| `allowed_fleet_ids` | User can only access agents whose `fleet_id` is in this list |
+
+If both fields are `None` (the default), the user is unrestricted and can access any agent in their tenant.
+
+`can_access_agent` is called on every operation that touches a specific agent, including:
+
+- **Agent listing** (`GET /agents`) - filtered to accessible agents only; DELETED agents are excluded entirely
+- **Agent detail** (`GET /agents/{id}`) - returns 404 for inaccessible or DELETED agents
+- **Job submission** (`POST /jobs`) - rejects the job if the user cannot access the target agent
+- **Job detail** (`GET /jobs/{id}`) - returns 404 if the job's agent is inaccessible
+- **Job listing** (`GET /jobs`) - when `agent_id` filter is specified, validates access before querying; when listing all, post-filters to exclude jobs on inaccessible agents
+- **Approved-command lookup** (`GET /agents/{id}/approved-commands`) - returns 404 for inaccessible agents
+- **Pending approval list** (`GET /approvals/pending`) - when `agent_id` is specified, validates access before querying; when listing across all agents, post-filters results to only include agents the user can access
+
+The admin API bypasses `can_access_agent` entirely; admins operate across all tenants and agents.
 
 ---
 

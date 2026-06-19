@@ -46,9 +46,11 @@ def _patch(agent=_AGENT, user=_USER):
 # ---------------------------------------------------------------------------
 
 class TestHandleListMyPending:
-    def _call(self, query=None, user=_USER, approvals=None):
+    def _call(self, query=None, user=_USER, approvals=None, agent=_AGENT):
         with patch("handlers.tenant_approvals._verify_tenant_token", return_value=user), \
+             patch("handlers.tenant_approvals.agents_repo") as agr, \
              patch("handlers.tenant_approvals.approvals_repo") as ar:
+            agr.get.return_value = agent
             ar.list_by_tenant.return_value = approvals or [_PENDING]
             return handle_list_my_pending(query or {}, "tok"), ar
 
@@ -80,6 +82,50 @@ class TestHandleListMyPending:
             status="pending",
             requested_by=USER_ID,
         )
+
+    def test_agent_id_not_found_returns_404(self):
+        with patch("handlers.tenant_approvals._verify_tenant_token", return_value=_USER), \
+             patch("handlers.tenant_approvals.agents_repo") as agr, \
+             patch("handlers.tenant_approvals.approvals_repo"):
+            agr.get.return_value = None
+            r = handle_list_my_pending({"agent_id": AGENT_ID}, "tok")
+        assert r["statusCode"] == 404
+
+    def test_agent_id_no_access_returns_404(self):
+        no_access_user = {**_USER, "allowed_agent_ids": ["agent_other"]}
+        with patch("handlers.tenant_approvals._verify_tenant_token", return_value=no_access_user), \
+             patch("handlers.tenant_approvals.agents_repo") as agr, \
+             patch("handlers.tenant_approvals.approvals_repo"):
+            agr.get.return_value = _AGENT
+            r = handle_list_my_pending({"agent_id": AGENT_ID}, "tok")
+        assert r["statusCode"] == 404
+
+    def test_no_agent_filter_excludes_inaccessible_agents(self):
+        restricted_user = {**_USER, "allowed_agent_ids": ["agent_other"]}
+        pending_on_other = {**_PENDING, "agent_id": "agent_other"}
+        pending_on_a = {**_PENDING, "agent_id": AGENT_ID}
+        def fake_get(aid):
+            return {"agent_id": aid, "tenant_id": TENANT_ID}
+        with patch("handlers.tenant_approvals._verify_tenant_token", return_value=restricted_user), \
+             patch("handlers.tenant_approvals.agents_repo") as agr, \
+             patch("handlers.tenant_approvals.approvals_repo") as ar:
+            agr.get.side_effect = fake_get
+            ar.list_by_tenant.return_value = [pending_on_a, pending_on_other]
+            r = handle_list_my_pending({}, "tok")
+        body = json.loads(r["body"])
+        ids = [a["agent_id"] for a in body["approvals"]]
+        assert "agent_other" in ids
+        assert AGENT_ID not in ids
+
+    def test_no_agent_filter_unrestricted_user_sees_all(self):
+        with patch("handlers.tenant_approvals._verify_tenant_token", return_value=_USER), \
+             patch("handlers.tenant_approvals.agents_repo") as agr, \
+             patch("handlers.tenant_approvals.approvals_repo") as ar:
+            agr.get.return_value = _AGENT
+            ar.list_by_tenant.return_value = [_PENDING]
+            r = handle_list_my_pending({}, "tok")
+        body = json.loads(r["body"])
+        assert len(body["approvals"]) == 1
 
 
 # ---------------------------------------------------------------------------

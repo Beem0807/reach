@@ -2,9 +2,10 @@ import base64
 import logging
 from typing import Optional
 
+from shared.access import can_access_agent
 from shared.auth import _bearer, _verify_tenant_token
 from shared.response import _err, _ok
-from shared.store import jobs_repo
+from shared.store import agents_repo, jobs_repo
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -26,8 +27,22 @@ def handle_list_jobs(raw_token: str, agent_id: Optional[str], limit: int, cursor
     if not tenant:
         return _err("unauthorized", 401)
 
+    if agent_id:
+        agent = agents_repo.get(agent_id)
+        if not agent or not can_access_agent(tenant, agent):
+            return _err("agent not found", 404)
+
     decoded_cursor = _decode_cursor(cursor) if cursor else None
     rows = jobs_repo.list_by_tenant(tenant["tenant_id"], agent_id, limit, created_by=tenant["user_id"], cursor=decoded_cursor)
+
+    if not agent_id:
+        _cache: dict = {}
+        def _accessible(aid: str) -> bool:
+            if aid not in _cache:
+                a = agents_repo.get(aid)
+                _cache[aid] = a is not None and can_access_agent(tenant, a)
+            return _cache[aid]
+        rows = [j for j in rows if _accessible(j["agent_id"])]
 
     jobs = [
         {

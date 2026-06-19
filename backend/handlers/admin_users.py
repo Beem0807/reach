@@ -28,6 +28,8 @@ def handle_create_user(tenant_id: str, body: dict, raw_token: str, api_url: str)
         return _err("tenant not found", 404)
 
     name = body.get("name", "").strip()
+    if not name:
+        return _err("name is required", 400)
     raw_user_token = USER_TOKEN_PREFIX + secrets.token_urlsafe(32)
     user_id = "user_" + secrets.token_urlsafe(12)
 
@@ -35,7 +37,7 @@ def handle_create_user(tenant_id: str, body: dict, raw_token: str, api_url: str)
         "user_id": user_id,
         "tenant_id": tenant_id,
         "token_hash": _hmac_token(raw_user_token),
-        "name": name or None,
+        "name": name,
         "created_at": _iso(),
     })
 
@@ -44,7 +46,7 @@ def handle_create_user(tenant_id: str, body: dict, raw_token: str, api_url: str)
     return _ok({
         "user_id": user_id,
         "tenant_id": tenant_id,
-        "name": name or None,
+        "name": name,
         "token": raw_user_token,
         "commands": {
             "cli_login": f"reach login --api-url \"{api_url}\" --token \"{raw_user_token}\"",

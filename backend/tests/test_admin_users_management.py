@@ -41,21 +41,24 @@ class TestCreateUser:
         assert body["user_id"].startswith("user_")
         assert "cli_login" in body["commands"]
 
-    def test_creates_user_without_name(self):
+    def test_missing_name_returns_400(self):
         r = self._call({})
-        assert r["statusCode"] == 201
-        assert json.loads(r["body"])["name"] is None
+        assert r["statusCode"] == 400
+
+    def test_empty_name_returns_400(self):
+        r = self._call({"name": "   "})
+        assert r["statusCode"] == 400
 
     def test_token_is_unique(self):
         with patch("handlers.admin_users.tenants_repo") as tr, \
              patch("handlers.admin_users.users_repo"):
             tr.get.return_value = _TENANT
-            r1 = handle_create_user(TENANT, {}, ADMIN, API_URL)
-            r2 = handle_create_user(TENANT, {}, ADMIN, API_URL)
+            r1 = handle_create_user(TENANT, {"name": "alice"}, ADMIN, API_URL)
+            r2 = handle_create_user(TENANT, {"name": "bob"}, ADMIN, API_URL)
         assert json.loads(r1["body"])["token"] != json.loads(r2["body"])["token"]
 
     def test_cli_login_contains_api_url_and_token(self):
-        r = self._call()
+        r = self._call({"name": "alice"})
         body = json.loads(r["body"])
         cli = body["commands"]["cli_login"]
         assert API_URL in cli

@@ -216,6 +216,11 @@ class AgentRepo:
             )
             db.commit()
 
+    def set_status(self, agent_id: str, status: str) -> None:
+        with SessionLocal() as db:
+            db.execute(update(_Agent).where(_Agent.agent_id == agent_id).values(status=status))
+            db.commit()
+
     def delete(self, agent_id: str) -> None:
         with SessionLocal() as db:
             db.execute(sa_delete(_Agent).where(_Agent.agent_id == agent_id))

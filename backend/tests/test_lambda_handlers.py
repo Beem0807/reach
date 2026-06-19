@@ -211,8 +211,8 @@ class TestAdminAgentHandlers:
     def test_delete_agent_handler_delegates(self):
         from handlers.admin_agents import delete_agent_handler
         with patch("handlers.admin_agents.handle_delete_agent", return_value=_OK) as h:
-            delete_agent_handler(_evt(body={"force": True}, path={"agent_id": "agent_a"}), None)
-        assert h.call_args[0][0] == "agent_a"
+            delete_agent_handler(_evt(path={"agent_id": "agent_a"}), None)
+        h.assert_called_once_with("agent_a", ADMIN)
 
     def test_get_agent_tags_handler_delegates(self):
         from handlers.admin_agents import get_agent_tags_handler
@@ -260,11 +260,27 @@ class TestAdminAgentHandlers:
         r = delete_agent_handler(_evt(headers={}, path={"agent_id": "a"}), None)
         assert r["statusCode"] == 401
 
-    def test_delete_agent_invalid_json(self):
-        from handlers.admin_agents import delete_agent_handler
-        evt = _evt(path={"agent_id": "a"}); evt["body"] = "bad"
-        r = delete_agent_handler(evt, None)
-        assert r["statusCode"] == 400
+    def test_revoke_agent_handler_delegates(self):
+        from handlers.admin_agents import revoke_agent_handler
+        with patch("handlers.admin_agents.handle_revoke_agent", return_value=_OK) as h:
+            revoke_agent_handler(_evt(path={"agent_id": "agent_a"}), None)
+        h.assert_called_once_with("agent_a", ADMIN)
+
+    def test_revoke_agent_missing_auth(self):
+        from handlers.admin_agents import revoke_agent_handler
+        r = revoke_agent_handler(_evt(headers={}, path={"agent_id": "a"}), None)
+        assert r["statusCode"] == 401
+
+    def test_remove_agent_handler_delegates(self):
+        from handlers.admin_agents import remove_agent_handler
+        with patch("handlers.admin_agents.handle_remove_agent", return_value=_OK) as h:
+            remove_agent_handler(_evt(path={"agent_id": "agent_a"}), None)
+        h.assert_called_once_with("agent_a", ADMIN)
+
+    def test_remove_agent_missing_auth(self):
+        from handlers.admin_agents import remove_agent_handler
+        r = remove_agent_handler(_evt(headers={}, path={"agent_id": "a"}), None)
+        assert r["statusCode"] == 401
 
     def test_get_agent_tags_missing_auth(self):
         from handlers.admin_agents import get_agent_tags_handler
