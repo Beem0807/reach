@@ -728,6 +728,38 @@ func TestSync(t *testing.T) {
 			t.Errorf("Authorization = %q, want 'Bearer tok_abc'", gotAuth)
 		}
 	})
+
+	t.Run("rotate_token field decoded correctly", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(200)
+			json.NewEncoder(w).Encode(SyncResponse{RotateToken: true})
+		}))
+		defer srv.Close()
+
+		resp, err := sync(syncCfg(srv.URL))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !resp.RotateToken {
+			t.Error("expected RotateToken=true")
+		}
+	})
+
+	t.Run("rotate_token absent defaults false", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(200)
+			json.NewEncoder(w).Encode(SyncResponse{Jobs: []Job{{JobID: "job_1", Command: "ls", Mode: "wild"}}})
+		}))
+		defer srv.Close()
+
+		resp, err := sync(syncCfg(srv.URL))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if resp.RotateToken {
+			t.Error("expected RotateToken=false when not set")
+		}
+	})
 }
 
 // ---------------------------------------------------------------------------

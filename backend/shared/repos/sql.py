@@ -33,6 +33,7 @@ class _Agent(_Base):
     last_heartbeat_at = Column(String)
     active_until = Column(Integer)
     token_issued_at = Column(String)
+    rotation_requested = Column(Boolean, default=False)
     type = Column(String, default="manual")
     fleet_id = Column(String)
     tags = Column(JSON, default=list)
@@ -212,8 +213,14 @@ class AgentRepo:
                 update(_Agent).where(_Agent.agent_id == agent_id).values(
                     agent_token_hash=token_hash,
                     token_issued_at=token_issued_at,
+                    rotation_requested=False,
                 )
             )
+            db.commit()
+
+    def request_rotation(self, agent_id: str) -> None:
+        with SessionLocal() as db:
+            db.execute(update(_Agent).where(_Agent.agent_id == agent_id).values(rotation_requested=True))
             db.commit()
 
     def set_status(self, agent_id: str, status: str) -> None:
@@ -395,16 +402,11 @@ class ApprovalRepo:
             return _to_dict(db.get(_Approval, approval_id))
 
     def list_by_agent(self, agent_id: str, status: Optional[str] = None, requested_by: Optional[str] = None, limit: Optional[int] = None, cursor: Optional[str] = None) -> list:
-        from sqlalchemy import desc, or_
+        from sqlalchemy import desc
         with SessionLocal() as db:
             stmt = select(_Approval).where(_Approval.agent_id == agent_id)
             if status is not None:
                 stmt = stmt.where(_Approval.status == status)
-                if status == "approved":
-                    now = _iso()
-                    stmt = stmt.where(
-                        or_(_Approval.expires_at.is_(None), _Approval.expires_at > now)
-                    )
             if requested_by is not None:
                 stmt = stmt.where(_Approval.requested_by == requested_by)
             stmt = stmt.order_by(desc(_Approval.created_at))
@@ -413,21 +415,19 @@ class ApprovalRepo:
             if limit is not None:
                 stmt = stmt.limit(limit)
             rows = db.execute(stmt).scalars().all()
-            return [_to_dict(r) for r in rows]
+            results = [_to_dict(r) for r in rows]
+            if status == "approved":
+                results = self._lazy_expire(results, db)
+            return results
 
     def list_by_tenant(self, tenant_id: str, agent_id: Optional[str] = None, status: Optional[str] = None, requested_by: Optional[str] = None, limit: Optional[int] = None, cursor: Optional[str] = None) -> list:
-        from sqlalchemy import desc, or_
+        from sqlalchemy import desc
         with SessionLocal() as db:
             stmt = select(_Approval).where(_Approval.tenant_id == tenant_id)
             if agent_id is not None:
                 stmt = stmt.where(_Approval.agent_id == agent_id)
             if status is not None:
                 stmt = stmt.where(_Approval.status == status)
-                if status == "approved":
-                    now = _iso()
-                    stmt = stmt.where(
-                        or_(_Approval.expires_at.is_(None), _Approval.expires_at > now)
-                    )
             if requested_by is not None:
                 stmt = stmt.where(_Approval.requested_by == requested_by)
             stmt = stmt.order_by(desc(_Approval.created_at))
@@ -436,7 +436,57 @@ class ApprovalRepo:
             if limit is not None:
                 stmt = stmt.limit(limit)
             rows = db.execute(stmt).scalars().all()
-            return [_to_dict(r) for r in rows]
+            results = [_to_dict(r) for r in rows]
+            if status == "approved":
+                results = self._lazy_expire(results, db)
+                results = self._dedup_by_command(results, db)
+            return results
+
+    @staticmethod
+    def _lazy_expire(records: list, db) -> list:
+        now = _iso()
+        stale_ids = [r["approval_id"] for r in records if r.get("expires_at") and r["expires_at"] <= now]
+        if stale_ids:
+            db.execute(
+                update(_Approval)
+                .where(_Approval.approval_id.in_(stale_ids))
+                .where(_Approval.status == "approved")
+                .values(status="expired")
+            )
+            db.commit()
+        return [r for r in records if r["approval_id"] not in set(stale_ids)]
+
+    @staticmethod
+    def _dedup_by_command(records: list, db) -> list:
+        from collections import defaultdict
+        from sqlalchemy import delete as sql_delete
+        by_command: dict = defaultdict(list)
+        for r in records:
+            by_command[r["command"]].append(r)
+        kept = []
+        to_delete_ids = []
+        for recs in by_command.values():
+            if len(recs) == 1:
+                kept.append(recs[0])
+                continue
+            permanent = [r for r in recs if not r.get("expires_at")]
+            timed = sorted(
+                [r for r in recs if r.get("expires_at")],
+                key=lambda r: r["expires_at"],
+                reverse=True,
+            )
+            if permanent:
+                keeper = permanent[0]
+                to_delete_ids.extend(r["approval_id"] for r in permanent[1:])
+                to_delete_ids.extend(r["approval_id"] for r in timed)
+            else:
+                keeper = timed[0]
+                to_delete_ids.extend(r["approval_id"] for r in timed[1:])
+            kept.append(keeper)
+        if to_delete_ids:
+            db.execute(sql_delete(_Approval).where(_Approval.approval_id.in_(to_delete_ids)))
+            db.commit()
+        return kept
 
     def exists_pending(self, agent_id: str, command: str) -> bool:
         with SessionLocal() as db:
@@ -457,6 +507,32 @@ class ApprovalRepo:
                 .values(status=status, reviewed_at=reviewed_at, reviewed_by=reviewed_by, expires_at=expires_at)
             )
             db.commit()
+
+    def mark_expired(self, now_iso: str) -> int:
+        with SessionLocal() as db:
+            result = db.execute(
+                update(_Approval)
+                .where(_Approval.status == "approved")
+                .where(_Approval.expires_at.isnot(None))
+                .where(_Approval.expires_at < now_iso)
+                .values(status="expired")
+            )
+            db.commit()
+            return result.rowcount
+
+    def delete_stale(self, before_iso: str) -> int:
+        from sqlalchemy import delete as sql_delete, or_, and_
+        with SessionLocal() as db:
+            result = db.execute(
+                sql_delete(_Approval).where(
+                    or_(
+                        and_(_Approval.status == "denied", _Approval.reviewed_at < before_iso),
+                        and_(_Approval.status == "expired", _Approval.expires_at < before_iso),
+                    )
+                )
+            )
+            db.commit()
+            return result.rowcount
 
     def delete(self, approval_id: str) -> None:
         from sqlalchemy import delete as sql_delete

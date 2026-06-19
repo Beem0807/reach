@@ -226,6 +226,7 @@ type Job struct {
 type SyncResponse struct {
 	Jobs            []Job  `json:"jobs"`
 	NextPollSeconds int    `json:"next_poll_seconds"`
+	RotateToken     bool   `json:"rotate_token"`
 	Error           string `json:"error"`
 }
 
@@ -563,6 +564,16 @@ func run(ctx context.Context) error {
 		pollSeconds = syncResp.NextPollSeconds
 		if pollSeconds <= 0 {
 			pollSeconds = idlePollSeconds
+		}
+
+		if syncResp.RotateToken {
+			log.Printf("Admin-requested token rotation received, rotating...")
+			if err := rotateToken(cfg); err != nil {
+				if errors.Is(err, ErrPermanent) {
+					return fmt.Errorf("admin-requested token rotation failed permanently: %w", err)
+				}
+				log.Printf("Admin-requested token rotation failed (will retry next poll): %v", err)
+			}
 		}
 
 		for _, job := range syncResp.Jobs {

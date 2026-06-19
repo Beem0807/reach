@@ -41,6 +41,7 @@ curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh | bash
 The script will:
 - Prompt for release tag (default: `latest`)
 - Prompt for `TOKEN_PEPPER` and `ADMIN_TOKEN` (or generate them)
+- Prompt for `APPROVAL_RETENTION_DAYS` (default: `7`)
 - Start PostgreSQL, the reach backend, and nginx via Docker Compose
 - Optionally start a public tunnel:
   - **cloudflared** - no account needed, URL changes on restart
@@ -74,6 +75,7 @@ The script will:
 - Verify credentials before proceeding
 - Prompt for stack name (default: `reach-platform`) and release tag (default: `latest`)
 - Prompt for `TOKEN_PEPPER` and `ADMIN_TOKEN` (or generate them)
+- Prompt for `APPROVAL_RETENTION_DAYS` (default: `7`)
 - Deploy the CloudFormation stack and wait for it to complete
 - Print your API URL, tokens, and next steps
 
@@ -83,7 +85,7 @@ The script will:
 curl -fsSL https://reach-releases.s3.amazonaws.com/lambda-setup.sh | bash -s -- --update
 ```
 
-The script lists your existing stacks, prompts for the stack name (default: `reach-platform`) and release tag (default: `latest`), and optionally rotates `ADMIN_TOKEN` (leave blank to keep the existing value). `TOKEN_PEPPER` is always kept - it cannot be changed. See [TOKEN_PEPPER is permanent](#token_pepper-is-permanent).
+The script lists your existing stacks, prompts for the stack name (default: `reach-platform`) and release tag (default: `latest`), and optionally rotates `ADMIN_TOKEN` or changes `APPROVAL_RETENTION_DAYS` (leave blank to keep existing values). `TOKEN_PEPPER` is always kept - it cannot be changed. See [TOKEN_PEPPER is permanent](#token_pepper-is-permanent).
 
 ### Tear down
 
@@ -112,8 +114,16 @@ docker run -d \
   -e TOKEN_PEPPER="<your-pepper>" \
   -e ADMIN_TOKEN="<your-admin-token>" \
   -e DATABASE_URL="postgresql://user:pass@host:5432/reach" \
+  -e APPROVAL_RETENTION_DAYS="7" \
   nabeemdev/reach:latest
 ```
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `TOKEN_PEPPER` | Yes | - | HMAC pepper for token hashing. Permanent - changing it invalidates all existing tokens. |
+| `ADMIN_TOKEN` | Yes | - | Bearer token for the admin API. Rotate by restarting with a new value. |
+| `DATABASE_URL` | Yes | - | PostgreSQL connection string. |
+| `APPROVAL_RETENTION_DAYS` | No | `7` | Days to retain terminal approval records (`denied`, `expired`) before they are deleted by the daily cleanup sweep. |
 
 On first startup, Alembic runs `alembic upgrade head` automatically and creates all tables. Subsequent restarts apply any pending migrations from new versions. The image supports `linux/amd64` and `linux/arm64` - works on AWS Graviton, Raspberry Pi, and Apple Silicon without extra flags.
 
@@ -403,6 +413,7 @@ Response:
       "claimed_at": "2026-06-17T10:00:00+00:00",
       "token_issued_at": "2026-06-17T10:00:00+00:00",
       "mode": "readonly",
+      "access_level": "restricted",
       "tags": ["env:prod", "region:us-east-1"]
     }
   ]
@@ -709,21 +720,21 @@ curl -s "$API_URL/admin/approvals?tenant_id=tenant_xxxxx&status=pending&limit=20
   -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
 ```
 
-**Approve a command** - permanently by default, or with a time limit:
+**Approve a pending request** - permanently by default, or with a time limit:
 
 ```bash
 # Approve permanently
 curl -s -X PUT "$API_URL/admin/approvals/appr_xxxxx/approve" \
   -H "Authorization: Bearer $ADMIN_TOKEN"
 
-# Approve for a limited time (1h / 8h / 24h / 7d / permanent, or custom Nh / Nd)
+# Approve for a limited time
 curl -s -X PUT "$API_URL/admin/approvals/appr_xxxxx/approve" \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"duration": "8h"}'
 ```
 
-Supported durations:
+Supported durations for initial approval:
 
 | Value | Meaning |
 |---|---|
@@ -734,19 +745,21 @@ Supported durations:
 | `7d` | 7 days |
 | `Nh` / `Nd` | Custom N hours or N days |
 
-Time-limited approvals expire silently - the record stays in the database for history, but once the expiry passes the command is no longer effective. The next blocked attempt creates a new pending record.
+When a time-limited approval expires, its status transitions to `expired` (via lazy expiry on the next read or the hourly scheduler sweep). The record stays in the database for history and is visible via `--expired`. The next blocked attempt creates a new pending record.
 
-**Deny or revoke an approval** - works on any status (`pending`, `approved`, or `denied`). Denying an already-approved record takes effect on the next agent sync:
+**Deny a pending request:**
 
 ```bash
 curl -s -X PUT "$API_URL/admin/approvals/appr_xxxxx/deny" \
   -H "Authorization: Bearer $ADMIN_TOKEN"
 ```
 
-**Update the duration on an active approval** (re-approve with a new expiry):
+`denied` is terminal - a denied record cannot be updated. Delete it and let the next block create a fresh pending record if re-approval is ever needed.
+
+**Update the duration on an active (approved) approval:**
 
 ```bash
-# Shorten or extend an existing approval to 24 hours from now
+# Extend or shorten to 24 hours from now
 curl -s -X PUT "$API_URL/admin/approvals/appr_xxxxx/approve" \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
@@ -757,16 +770,44 @@ curl -s -X PUT "$API_URL/admin/approvals/appr_xxxxx/approve" \
   -H "Authorization: Bearer $ADMIN_TOKEN"
 ```
 
-**Re-approve a denied request** (approve an already-denied record):
+Only `approved` records can have their duration updated. `pending`, `denied`, and `expired` records return 409. The same duration values are valid as for initial approval, plus `now` to instantly expire:
+
+| Value | Meaning |
+|---|---|
+| `permanent` (default) | Never expires - clears any existing `expires_at` |
+| `1h` / `8h` / `24h` / `7d` | Relative from now |
+| `Nh` / `Nd` | Custom N hours or N days from now |
+| `now` | Instantly expire - sets status to `expired` immediately |
+
+**Instantly expire an approved command** (cuts access on next agent sync without leaving a denied record):
 
 ```bash
 curl -s -X PUT "$API_URL/admin/approvals/appr_xxxxx/approve" \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"duration": "8h"}'
+  -d '{"duration": "now"}'
 ```
 
-The approve and deny endpoints work on records in any state - `pending`, `approved`, or `denied`. Revoke and duration changes take effect on the next agent sync (within 2–15 seconds depending on poll interval).
+This immediately sets the record's status to `expired` and `expires_at` to the current timestamp. The agent stops including it in the approved list on the next sync (within 2–15 seconds).
+
+### Approval lifecycle
+
+| Current status | approve | deny |
+|---|---|---|
+| `pending` | ✓ initial approval (any duration except `now`) | ✓ → `denied` |
+| `approved` | ✓ updates `expires_at`; `duration=now` → status becomes `expired` | 409 |
+| `denied` | 409 | 409 - terminal |
+| `expired` | 409 | 409 - terminal |
+
+### Automatic expiry and cleanup
+
+Expiry and cleanup happen automatically - no manual intervention needed:
+
+**Lazy expiry on read** - when the approved list is fetched (agent sync, policy check, CLI `reach approvals`), any record with `expires_at <= now` is immediately marked `expired` before the response is returned. This keeps the effective list accurate without waiting for a scheduled sweep.
+
+**Hourly sweep** - at the top of every hour the scheduler marks all `approved` records with `expires_at < now` as `expired` in bulk. Catches any records not yet caught by lazy expiry.
+
+**Daily cleanup** - at midnight UTC the scheduler deletes `denied` and `expired` records older than `APPROVAL_RETENTION_DAYS` (default 7). Prevents unbounded table growth over time.
 
 **Delete an approval record** (permanently removes it - use to clean up stale duplicates or erase records from history):
 
@@ -843,6 +884,21 @@ The agent automatically rotates its own `agent_token` every 30 days. On each pol
 Agents upgraded from a version without this field will skip rotation until they next re-claim (which sets `token_issued_at`).
 
 If the config write fails after the server has issued the new token (e.g. disk full), the agent continues the current session in memory but logs a warning - a restart without fixing disk will cause a 401 and the agent will need manual reclaim.
+
+#### Admin-initiated rotation
+
+If you want to rotate an agent token out-of-band (e.g. suspected credential exposure) without disconnecting the agent, use:
+
+```bash
+curl -s -X POST "$API_URL/admin/agents/agent_xxxxx/rotate-token" \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+This sets a `rotation_requested` flag on the agent record. On its next sync the agent receives `"rotate_token": true` in the response and immediately self-rotates using `POST /agent/rotate-token` with its current still-valid token. The flag is cleared atomically when the new token is stored. The agent remains connected throughout - there is no lockout window.
+
+Only ACTIVE and INACTIVE agents can be flagged for rotation (CREATED, REVOKED, and DELETED return 409).
+
+To confirm the rotation completed, poll `GET /admin/agents?tenant_id=...` and check that `token_issued_at` has advanced — there is no dedicated status field in the list response for the flag itself.
 
 ---
 
@@ -1027,6 +1083,7 @@ launchctl load /Library/LaunchDaemons/com.reach-agent.plist
 | `DELETE` | `/admin/agents/{id}` | ADMIN_TOKEN | Soft-delete agent (REVOKED → DELETED). Record stays in database. Requires prior revoke. |
 | `DELETE` | `/admin/agents/{id}/remove` | ADMIN_TOKEN | Permanently remove agent record (DELETED only). Irreversible. |
 | `POST` | `/admin/agents/{id}/reissue-install-token` | ADMIN_TOKEN | Reissue install token - resets to CREATED (allowed for CREATED/INACTIVE/REVOKED; blocked for ACTIVE without `force`, blocked for DELETED) |
+| `POST` | `/admin/agents/{id}/rotate-token` | ADMIN_TOKEN | Request an out-of-band token rotation. Sets a flag on the agent; the agent picks it up on its next sync and self-rotates. Only allowed for ACTIVE or INACTIVE agents. |
 | `GET` | `/admin/agents/{id}/tags` | ADMIN_TOKEN | Get agent's current tag list |
 | `PUT` | `/admin/agents/{id}/tags` | ADMIN_TOKEN | Replace tag list entirely |
 | `POST` | `/admin/agents/{id}/tags` | ADMIN_TOKEN | Add tags (merge, no duplicates) |
@@ -1034,10 +1091,10 @@ launchctl load /Library/LaunchDaemons/com.reach-agent.plist
 | `GET` | `/admin/agents/{id}/policy` | ADMIN_TOKEN | Get agent policy (mode + effective approved commands) |
 | `PUT` | `/admin/agents/{id}/policy/mode` | ADMIN_TOKEN | Set policy mode (`wild` / `readonly` / `approved`) |
 | `GET` | `/admin/jobs` | ADMIN_TOKEN | List jobs (`?agent_id=` `?tenant_id=` `?created_by=` `?limit=` `?cursor=`) |
-| `GET` | `/admin/approvals` | ADMIN_TOKEN | List approval records (`?agent_id=` `?tenant_id=` `?status=pending\|approved\|denied` `?limit=` `?cursor=`). Paginated - default 20, max 100. |
+| `GET` | `/admin/approvals` | ADMIN_TOKEN | List approval records (`?agent_id=` `?tenant_id=` `?status=pending\|approved\|denied\|expired` `?limit=` `?cursor=`). Paginated - default 20, max 100. |
 | `POST` | `/admin/approvals` | ADMIN_TOKEN | Pre-approve without a prior block. Single: `{"agent_id": "...", "command": "...", "duration": "8h"}` → returns approval object (409 if already active). Bulk: `{"agent_id": "...", "commands": [...]}` → returns `{"created": [...], "skipped": [...]}`, idempotent. |
-| `PUT` | `/admin/approvals/{id}/approve` | ADMIN_TOKEN | Approve, re-approve, or update duration (body: `{"duration": "8h"}` optional; default permanent). Works on any status. |
-| `PUT` | `/admin/approvals/{id}/deny` | ADMIN_TOKEN | Deny or revoke - works on any status including already-approved records |
+| `PUT` | `/admin/approvals/{id}/approve` | ADMIN_TOKEN | Approve (`pending` only) or update duration (`approved` only; `duration=now` immediately expires). Returns 409 on `denied` or `expired`. |
+| `PUT` | `/admin/approvals/{id}/deny` | ADMIN_TOKEN | Deny a pending request (`pending` only). Returns 409 on `approved`, `denied`, or `expired`. |
 | `DELETE` | `/admin/approvals/{id}` | ADMIN_TOKEN | Permanently delete an approval record. Works on any status; removing an approved record takes effect on the next agent sync. |
 
 ---
@@ -1052,13 +1109,23 @@ launchctl load /Library/LaunchDaemons/com.reach-agent.plist
 | `reach-tenants` | `tenant_id` | - | Tenant records |
 | `reach-users` | `user_id` | `token-hash-index` (token_hash), `tenant-index` (tenant_id) | User records, token hashes, per-user agent access lists |
 | `reach-jobs` | `job_id` | `agent-status-index` (agent_id, status), `tenant-history-index` (tenant_id, created_at) | Job queue and results; TTL on `expires_at` auto-deletes after 7 days |
-| `reach-approvals` | `approval_id` | `agent-approvals-index` (agent_id, created_at), `tenant-approvals-index` (tenant_id, created_at) | Approval records: pending, approved (with optional `expires_at`), and denied |
+| `reach-approvals` | `approval_id` | `agent-approvals-index` (agent_id, created_at), `tenant-approvals-index` (tenant_id, created_at) | Approval records: `pending`, `approved` (with optional `expires_at`), `denied`, `expired` |
 
 All tables use `DeletionPolicy: Retain` - safe to redeploy the stack without losing data.
 
 ### Docker / FastAPI (PostgreSQL)
 
 Tables (`agents`, `tenants`, `users`, `jobs`, `approvals`) are managed via Alembic migrations. On startup the container runs `alembic upgrade head` automatically - no manual SQL or schema setup needed. Upgrades that include schema changes are applied on the next container restart.
+
+Notable columns on the `agents` table:
+
+| Column | Type | Description |
+|---|---|---|
+| `agent_token_hash` | string | HMAC-SHA256 of the current agent token |
+| `token_issued_at` | string | ISO timestamp of when the current agent token was issued (claim or rotation) |
+| `rotation_requested` | boolean | Set by `POST /admin/agents/{id}/rotate-token`; cleared automatically when the agent self-rotates |
+| `machine_fingerprint` | string | SHA-256 of `machine-id + install_id`; token replay from a different machine is rejected |
+| `active_until` | integer | Unix timestamp until which the agent is considered active (extended by `reach exec`) |
 
 Key columns on the `approvals` table:
 
@@ -1070,8 +1137,8 @@ Key columns on the `approvals` table:
 | `command` | text | The exact command that was blocked |
 | `requested_by` | string | `user_id` of the submitter |
 | `job_id` | string | The job that triggered this record |
-| `status` | string | `pending` / `approved` / `denied` |
-| `expires_at` | string | ISO timestamp; null means permanent; expired approved records are filtered from the effective list but kept for history |
+| `status` | string | `pending` / `approved` / `denied` / `expired` |
+| `expires_at` | string | ISO timestamp; null means permanent; set when approval is time-limited or instantly expired via `duration=now` |
 | `reviewed_at` | string | When the admin acted |
 | `reviewed_by` | string | Who reviewed it |
 
@@ -1156,7 +1223,7 @@ Rate limiting applies to the **Docker / FastAPI** deployment only. The key funct
 | `PUT /admin/approvals/{id}/approve`, `PUT /admin/approvals/{id}/deny` | 60/minute per admin token |
 | `POST /admin/approvals`, `POST/PUT/DELETE` tag/policy/access/lifecycle writes | 30/minute per admin token |
 | `POST /admin/agents`, `POST /admin/tenants`, `POST /admin/tenants/{id}/users` | 20/minute per admin token |
-| `POST /admin/agents/{id}/reissue-install-token`, `POST /admin/tenants/{id}/users/{id}/rotate-token` | 10/minute per admin token |
+| `POST /admin/agents/{id}/reissue-install-token`, `POST /admin/agents/{id}/rotate-token`, `POST /admin/tenants/{id}/users/{id}/rotate-token` | 10/minute per admin token |
 
 **Health**
 

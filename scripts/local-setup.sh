@@ -127,6 +127,12 @@ if [[ -z "$ADMIN_TOKEN" ]]; then
   echo "    Generated ADMIN_TOKEN."
 fi
 
+echo ""
+echo "  APPROVAL_RETENTION_DAYS: how many days to keep denied/expired approval records"
+echo "  before the daily cleanup deletes them (default: 7)."
+read -rp "  APPROVAL_RETENTION_DAYS [7]: " APPROVAL_RETENTION_DAYS < /dev/tty
+APPROVAL_RETENTION_DAYS="${APPROVAL_RETENTION_DAYS:-7}"
+
 TUNNEL_CMD=""
 NGROK_DOMAIN=""
 USE_TUNNEL=false
@@ -258,6 +264,7 @@ services:
       ADMIN_TOKEN: "${ADMIN_TOKEN}"
       DATABASE_URL: postgresql://reach:reach@db:5432/reach
       STORAGE_BACKEND: postgres
+      APPROVAL_RETENTION_DAYS: "${APPROVAL_RETENTION_DAYS:-7}"
     depends_on:
       db:
         condition: service_healthy
@@ -356,6 +363,7 @@ TOKEN_PEPPER=${TOKEN_PEPPER}
 ADMIN_TOKEN=${ADMIN_TOKEN}
 API_URL=${API_URL}
 IMAGE=${IMAGE}
+APPROVAL_RETENTION_DAYS=${APPROVAL_RETENTION_DAYS}
 EOF
 
 # ---------------------------------------------------------------------------

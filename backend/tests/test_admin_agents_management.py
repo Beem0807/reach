@@ -6,6 +6,7 @@ from handlers.admin_agents import (
     handle_delete_agent,
     handle_reissue_install_token,
     handle_remove_agent,
+    handle_request_agent_rotation,
     handle_revoke_agent,
 )
 
@@ -227,6 +228,51 @@ class TestRemoveAgent:
         import json
         assert json.loads(r["body"])["removed"] is True
         ar.delete.assert_called_once_with(AGENT_ID)
+
+
+class TestRequestAgentRotation:
+    def _call(self, agent):
+        with patch("handlers.admin_agents.agents_repo") as ar:
+            ar.get.return_value = agent
+            r = handle_request_agent_rotation(AGENT_ID, ADMIN)
+            return r, ar
+
+    def test_unauthorized(self):
+        r = handle_request_agent_rotation(AGENT_ID, "wrong")
+        assert r["statusCode"] == 401
+
+    def test_agent_not_found(self):
+        with patch("handlers.admin_agents.agents_repo") as ar:
+            ar.get.return_value = None
+            r = handle_request_agent_rotation(AGENT_ID, ADMIN)
+        assert r["statusCode"] == 404
+
+    def test_active_agent_sets_flag(self):
+        r, ar = self._call(_AGENT_ACTIVE)
+        assert r["statusCode"] == 200
+        body = json.loads(r["body"])
+        assert body["rotation_requested"] is True
+        ar.request_rotation.assert_called_once_with(AGENT_ID)
+
+    def test_inactive_agent_sets_flag(self):
+        r, ar = self._call(_AGENT_INACTIVE)
+        assert r["statusCode"] == 200
+        ar.request_rotation.assert_called_once_with(AGENT_ID)
+
+    def test_created_agent_blocked(self):
+        r, ar = self._call(_AGENT_CREATED)
+        assert r["statusCode"] == 409
+        ar.request_rotation.assert_not_called()
+
+    def test_revoked_agent_blocked(self):
+        r, ar = self._call(_AGENT_REVOKED)
+        assert r["statusCode"] == 409
+        ar.request_rotation.assert_not_called()
+
+    def test_deleted_agent_blocked(self):
+        r, ar = self._call(_AGENT_DELETED)
+        assert r["statusCode"] == 409
+        ar.request_rotation.assert_not_called()
 
 
 class TestReissueInstallToken:

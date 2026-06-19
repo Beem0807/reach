@@ -60,6 +60,7 @@ def upgrade() -> None:
         sa.Column('fleet_id', sa.String(), nullable=True),
         sa.Column('tags', sa.JSON(), nullable=True),
         sa.Column('created_at', sa.String(), nullable=True),
+        sa.Column('rotation_requested', sa.Boolean(), nullable=True, server_default=sa.false()),
         sa.PrimaryKeyConstraint('agent_id'),
     )
     op.create_index('ix_agents_tenant_id', 'agents', ['tenant_id'])

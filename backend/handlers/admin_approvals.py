@@ -17,6 +17,8 @@ def _parse_expires_at(duration: str) -> Tuple[bool, Optional[str]]:
     """Returns (ok, expires_at_iso_or_None). expires_at=None means permanent."""
     if not duration or duration == "permanent":
         return True, None
+    if duration == "now":
+        return True, datetime.now(tz=timezone.utc).isoformat()
     if duration in _DURATION_SECONDS:
         secs = _DURATION_SECONDS[duration]
     else:
@@ -81,14 +83,23 @@ def handle_review_approval(approval_id: str, action: str, raw_token: str, body: 
     approval = approvals_repo.get(approval_id)
     if not approval:
         return _err("approval not found", 404)
+    current_status = approval.get("status")
+    if current_status in ("denied", "expired"):
+        return _err(f"{current_status} approvals cannot be updated", 409)
+    if current_status == "approved" and action == "deny":
+        return _err("approved approvals cannot be denied - use duration=now to instantly expire instead", 409)
     new_status = "approved" if action == "approve" else "denied"
     reviewed_at = _iso()
     expires_at: Optional[str] = None
     if action == "approve":
         duration = (body or {}).get("duration", "permanent")
+        if duration == "now" and current_status == "pending":
+            return _err("duration=now is not valid for initial approval; use 1h, 8h, 24h, 7d, permanent, or Nh/Nd", 400)
         ok, expires_at = _parse_expires_at(duration)
         if not ok:
-            return _err(f"invalid duration '{duration}'; use 1h, 8h, 24h, 7d, permanent, or Nh/Nd", 400)
+            return _err(f"invalid duration '{duration}'; use 1h, 8h, 24h, 7d, permanent, now, or Nh/Nd", 400)
+        if duration == "now":
+            new_status = "expired"
     approvals_repo.update_status(approval_id, new_status, reviewed_at, "admin", expires_at=expires_at)
     updated = {**approval, "status": new_status, "reviewed_at": reviewed_at, "reviewed_by": "admin", "expires_at": expires_at}
     logger.info("Approval %s %s by admin (expires_at=%s)", approval_id, new_status, expires_at)
@@ -133,6 +144,8 @@ def handle_pre_approve_command(body: dict, raw_token: str) -> dict:
         return _err("agent not found", 404)
 
     duration = (body or {}).get("duration")
+    if duration == "now":
+        return _err("duration=now is not valid for pre-approve; use 1h, 8h, 24h, 7d, permanent, or Nh/Nd", 400)
     ok, expires_at = _parse_expires_at(duration)
     if not ok:
         return _err(f"invalid duration '{duration}'; use 1h, 8h, 24h, 7d, permanent, or Nh/Nd", 400)

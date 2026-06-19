@@ -80,7 +80,9 @@ Notable commands: `exec`, `job`, `history`, `agents`, `approvals` (with `--pendi
 
 ### MCP server (`cli/reach/mcp_server.py`)
 
-Launched as a subprocess by an MCP-compatible client (Claude Code, Cursor, etc.) and communicates over stdio using JSON-RPC. Exposes the same operations as the CLI as structured tools: `list_agents`, `exec_command`, `get_job`, `list_history`, `whoami`. The client manages the process lifecycle - no hosting or ports needed.
+Launched as a subprocess by an MCP-compatible client (Claude Code, Cursor, etc.) and communicates over stdio using JSON-RPC. Exposes the same operations as the CLI as structured tools: `get_context`, `whoami`, `list_agents`, `get_agent`, `exec_command`, `get_job`, `list_history`, `list_approved_commands`, `list_pending_approvals`. The client manages the process lifecycle - no hosting or ports needed.
+
+`get_context` is the entry point for each session — it returns the authenticated user, the configured default agent (with live mode and access_level), and local aliases in a single call, so the LLM is oriented before it submits any commands.
 
 The MCP server is installed as part of the CLI package (`reach-mcp` entry point).
 
@@ -100,6 +102,8 @@ nginx is required in front of uvicorn for the Docker deployment. Long-polling co
 A background scheduler (APScheduler on FastAPI, EventBridge on Lambda) runs every minute to:
 - Mark agents `INACTIVE` if no heartbeat in the last 45 seconds
 - Expire `PENDING` jobs older than 1 hour to `EXPIRED`
+- At the top of every hour: mark `approved` approval records with `expires_at` in the past as `expired`
+- At midnight UTC: delete `denied` and `expired` approval records older than `APPROVAL_RETENTION_DAYS`
 
 ### Agent (`agent/`)
 
@@ -109,7 +113,7 @@ A Go binary installed via `install.sh`. On Linux it runs as a systemd service un
 2. Runs the command, optionally under a Landlock sandbox on Linux or via `is_write` enforcement on macOS (see [Policy enforcement](#policy-enforcement))
 3. `POST /agent/jobs/{id}/result` - posts stdout, stderr, exit code, whether the command was blocked, and `is_write` (set to `true` if blocked)
 
-The agent self-rotates its token every 30 days. See [SELF_HOSTING.md](SELF_HOSTING.md) for the full agent lifecycle.
+The agent self-rotates its token every 30 days. Admins can also trigger an out-of-band rotation via `POST /admin/agents/{id}/rotate-token`, which sets a `rotation_requested` flag; the agent picks it up on its next sync and self-rotates without any connection interruption. See [SELF_HOSTING.md](SELF_HOSTING.md) for the full agent lifecycle.
 
 ---
 
@@ -133,7 +137,7 @@ Three token types, none stored raw - only `HMAC-SHA256(TOKEN_PEPPER, token)` has
 | Agent token | `agent_` | Backend (at claim) | Agent (every sync) | 30 days, auto-rotated |
 | User token | `tok_` | Admin API | CLI / MCP server | Until revoked |
 
-The install token is one-time use and is cleared from disk after a successful claim. The agent token is bound to a machine fingerprint - a token replayed from a different machine is rejected. The agent rotates its own token every 30 days with no lockout window (old token is valid until the new one is persisted).
+The install token is one-time use and is cleared from disk after a successful claim. The agent token is bound to a machine fingerprint - a token replayed from a different machine is rejected. The agent rotates its own token every 30 days with no lockout window (old token is valid until the new one is persisted). Admins can also request an immediate rotation via `POST /admin/agents/{id}/rotate-token`; the flag is cleared atomically by `update_agent_token_hash` when the new token is stored.
 
 ---
 
@@ -243,33 +247,81 @@ approvals table:
   requested_by   - user_id of the submitter
   requester_name - display name of the submitter
   job_id         - the job that triggered this record
-  status         - pending | approved | denied
+  status         - pending | approved | denied | expired
   expires_at     - ISO timestamp after which the approval stops being effective (null = permanent)
   created_at     - when the block occurred
   reviewed_at    - when the admin acted
   reviewed_by    - who reviewed it
 ```
 
+### Approval lifecycle
+
+```
+              block occurs / pre-approve
+                        │
+                        ▼
+                    [pending]
+                   /         \
+         approve             deny
+              │                 │
+              ▼                 ▼
+         [approved]          [denied] ◄── terminal (no further transitions)
+              │
+     ┌────────┼───────────────┐
+     │        │               │
+  extend   reduce       duration=now
+  duration duration      or expires_at
+     │        │          passes
+     └────────┘               │
+              │               ▼
+              ▼           [expired] ◄── terminal (no further transitions)
+         [approved]
+   (expires_at updated)
+```
+
+| Current status | approve | deny | Notes |
+|---|---|---|---|
+| `pending` | ✓ → `approved` | ✓ → `denied` | Initial review; `duration=now` not allowed |
+| `approved` | ✓ updates `expires_at` | 409 | Use `duration=now` to instantly move to `expired` |
+| `denied` | 409 | 409 | Terminal - delete and let a new block create a fresh one |
+| `expired` | 409 | 409 | Terminal - delete and let a new block create a fresh one |
+
 Admins manage approvals via `GET/PUT/DELETE /admin/approvals`. `DELETE /admin/approvals/{id}` permanently removes a record of any status - useful for cleaning up stale pending records or removing an approved command from the effective list immediately. Users manage approvals through `reach approvals` with status flags: default shows effective approved commands (agent-wide); `--pending`, `--denied`, and `--expired` show the current user's own records for the agent.
 
 Only one pending record is created per `(agent_id, command)` pair at a time. If a command is blocked and a pending record already exists for that exact command on that agent, no duplicate is created. Once the existing record is approved or denied, the next block creates a fresh pending record.
 
+If multiple `approved` records accumulate for the same command on the same agent (can happen if a pending request is approved after a pre-approve was already issued), the repo deduplicates on read: the record with the longest remaining duration is kept (`permanent` beats any timed; latest `expires_at` wins among timed), and duplicates are deleted.
+
 ### Time-limited approvals
 
-When approving, the admin can supply a `duration` in the request body:
+When approving a `pending` record or updating duration on an `approved` record, the admin can supply a `duration` in the request body:
 
-| Value | Meaning |
-|---|---|
-| `permanent` (default) | Never expires |
-| `1h` | 1 hour |
-| `8h` | 8 hours |
-| `24h` | 24 hours |
-| `7d` | 7 days |
-| `Nh` / `Nd` | Custom N hours or N days |
+| Value | Meaning | Allowed on |
+|---|---|---|
+| `permanent` (default) | Never expires | `pending` → approve, `approved` update |
+| `1h` | 1 hour | `pending` → approve, `approved` update |
+| `8h` | 8 hours | `pending` → approve, `approved` update |
+| `24h` | 24 hours | `pending` → approve, `approved` update |
+| `7d` | 7 days | `pending` → approve, `approved` update |
+| `Nh` / `Nd` | Custom N hours or N days | `pending` → approve, `approved` update |
+| `now` | Instantly expire | `approved` update only - sets status to `expired` immediately |
 
-`expires_at` is stored as an ISO timestamp. The record stays in the database after expiry (history is preserved), but `list_by_agent(status="approved")` filters it out - `(expires_at IS NULL OR expires_at > now)`. Once expired, the command is no longer in the effective approved list and the next blocked attempt creates a new pending record.
+Once a record reaches `expired` status, the command is no longer in the effective approved list and the next blocked attempt creates a new pending record.
 
-`reach approvals` shows the expiry (or "permanent") for each effective entry. `reach approvals --expired` fetches records where `status=approved` but `expires_at < now` (the inverse set), filtered to the current user's own records.
+`reach approvals` shows the expiry (or "permanent") for each effective entry. `reach approvals --expired` shows the current user's own records with `status=expired`.
+
+### Automatic expiry and cleanup
+
+Expiry happens through two mechanisms that run in parallel:
+
+**Lazy expiry on read** - whenever `list_by_agent` or `list_by_tenant` is called with `status="approved"`, the repo checks the returned records against the current time. Any record with `expires_at <= now` is immediately marked `expired` in the database before the response is returned. This keeps the effective list accurate between scheduled sweeps.
+
+**Scheduled sweeps** - the heartbeat checker (running every minute) performs two time-based sweeps:
+
+- **Top of every hour** - scans for all `approved` records with `expires_at < now` and bulk-marks them `expired`. Catches any records missed between lazy-expiry reads.
+- **Start of every day (00:00 UTC)** - deletes terminal records (`denied` and `expired`) older than `APPROVAL_RETENTION_DAYS` (default 7, configurable via env var). Prevents unbounded table growth.
+
+The lazy expiry and the hourly sweep are idempotent and safe to run concurrently - both use conditional writes (`status = 'approved'` guard) so double-processing a record is harmless.
 
 ---
 
@@ -286,7 +338,7 @@ The agent detects whether it is running as root (`os.Getuid() == 0`) and include
 | `managed` | approved | false - or - readonly + root |
 | `restricted` | readonly | false |
 
-This label is shown in `reach agents list` and `reach status`. It is a factual descriptor of how the agent is configured, not a risk score.
+This label is shown in `reach agents list` and `reach status`, and is included in the `GET /agents` and `GET /agents/{id}` API responses so MCP clients receive it directly. It is a factual descriptor of how the agent is configured, not a risk score.
 
 ---
 

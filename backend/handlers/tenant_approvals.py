@@ -46,9 +46,8 @@ def handle_list_agent_approved(agent_id: str, raw_token: str, status: str = "app
 
     status="approved" (default): effective approved commands, agent-wide.
     status="pending"|"denied": current user's own records filtered by status.
-    status="expired": current user's own previously-approved records that have since expired.
+    status="expired": current user's own records in terminal expired state.
     """
-    from datetime import datetime, timezone
     user = _verify_tenant_token(raw_token)
     if not user:
         return _err("unauthorized", 401)
@@ -62,9 +61,7 @@ def handle_list_agent_approved(agent_id: str, raw_token: str, status: str = "app
     elif status in ("pending", "denied"):
         items = approvals_repo.list_by_agent(agent_id, status=status, requested_by=user["user_id"])
     elif status == "expired":
-        now = datetime.now(tz=timezone.utc).isoformat()
-        all_mine = approvals_repo.list_by_agent(agent_id, requested_by=user["user_id"])
-        items = [r for r in all_mine if r.get("status") == "approved" and r.get("expires_at") and r["expires_at"] < now]
+        items = approvals_repo.list_by_agent(agent_id, status="expired", requested_by=user["user_id"])
     else:
         return _err(f"invalid status '{status}'; use approved, pending, denied, or expired", 400)
 

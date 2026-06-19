@@ -130,8 +130,15 @@ class AgentRepo:
     def update_agent_token_hash(self, agent_id: str, token_hash: str, token_issued_at: str) -> None:
         _TABLE_AGENTS.update_item(
             Key={"agent_id": agent_id},
-            UpdateExpression="SET agent_token_hash = :th, token_issued_at = :ti",
+            UpdateExpression="SET agent_token_hash = :th, token_issued_at = :ti REMOVE rotation_requested",
             ExpressionAttributeValues={":th": token_hash, ":ti": token_issued_at},
+        )
+
+    def request_rotation(self, agent_id: str) -> None:
+        _TABLE_AGENTS.update_item(
+            Key={"agent_id": agent_id},
+            UpdateExpression="SET rotation_requested = :t",
+            ExpressionAttributeValues={":t": True},
         )
 
     def set_status(self, agent_id: str, status: str) -> None:
@@ -402,8 +409,8 @@ class ApprovalRepo:
                 break
             kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
         if status == "approved":
-            now = _iso()
-            results = [r for r in results if not r.get("expires_at") or r["expires_at"] > now]
+            results = self._lazy_expire(results)
+            results = self._dedup_by_command(results)
         if requested_by is not None:
             results = [r for r in results if r.get("requested_by") == requested_by]
         if limit is not None:
@@ -439,11 +446,62 @@ class ApprovalRepo:
                 break
             kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
         if status == "approved":
-            now = _iso()
-            results = [r for r in results if not r.get("expires_at") or r["expires_at"] > now]
+            results = self._lazy_expire(results)
+            results = self._dedup_by_command(results)
         if limit is not None:
             results = results[:limit]
         return results
+
+    def _lazy_expire(self, records: list) -> list:
+        now = _iso()
+        active = []
+        for r in records:
+            if r.get("expires_at") and r["expires_at"] <= now:
+                try:
+                    _TABLE_APPROVALS.update_item(
+                        Key={"approval_id": r["approval_id"]},
+                        UpdateExpression="SET #st = :s",
+                        ConditionExpression="attribute_exists(approval_id) AND #st = :cur",
+                        ExpressionAttributeNames={"#st": "status"},
+                        ExpressionAttributeValues={":s": "expired", ":cur": "approved"},
+                    )
+                except ClientError as e:
+                    if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
+                        raise
+            else:
+                active.append(r)
+        return active
+
+    def _dedup_by_command(self, records: list) -> list:
+        from collections import defaultdict
+        by_command: dict = defaultdict(list)
+        for r in records:
+            by_command[r["command"]].append(r)
+        kept = []
+        to_delete_ids = []
+        for recs in by_command.values():
+            if len(recs) == 1:
+                kept.append(recs[0])
+                continue
+            permanent = [r for r in recs if not r.get("expires_at")]
+            timed = sorted(
+                [r for r in recs if r.get("expires_at")],
+                key=lambda r: r["expires_at"],
+                reverse=True,
+            )
+            if permanent:
+                keeper = permanent[0]
+                to_delete_ids.extend(r["approval_id"] for r in permanent[1:])
+                to_delete_ids.extend(r["approval_id"] for r in timed)
+            else:
+                keeper = timed[0]
+                to_delete_ids.extend(r["approval_id"] for r in timed[1:])
+            kept.append(keeper)
+        if to_delete_ids:
+            with _TABLE_APPROVALS.batch_writer() as batch:
+                for aid in to_delete_ids:
+                    batch.delete_item(Key={"approval_id": aid})
+        return kept
 
     def exists_pending(self, agent_id: str, command: str) -> bool:
         kwargs: dict = {
@@ -457,6 +515,40 @@ class ApprovalRepo:
 
     def delete(self, approval_id: str) -> None:
         _TABLE_APPROVALS.delete_item(Key={"approval_id": approval_id})
+
+    def mark_expired(self, now_iso: str) -> int:
+        resp = _TABLE_APPROVALS.scan(
+            FilterExpression=Attr("status").eq("approved") & Attr("expires_at").lt(now_iso),
+            ProjectionExpression="approval_id",
+        )
+        items = resp.get("Items", [])
+        for item in items:
+            try:
+                _TABLE_APPROVALS.update_item(
+                    Key={"approval_id": item["approval_id"]},
+                    UpdateExpression="SET #st = :s",
+                    ConditionExpression="#st = :cur",
+                    ExpressionAttributeNames={"#st": "status"},
+                    ExpressionAttributeValues={":s": "expired", ":cur": "approved"},
+                )
+            except ClientError as e:
+                if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
+                    raise
+        return len(items)
+
+    def delete_stale(self, before_iso: str) -> int:
+        resp = _TABLE_APPROVALS.scan(
+            FilterExpression=(
+                (Attr("status").eq("denied") & Attr("reviewed_at").lt(before_iso)) |
+                (Attr("status").eq("expired") & Attr("expires_at").lt(before_iso))
+            ),
+            ProjectionExpression="approval_id",
+        )
+        items = resp.get("Items", [])
+        with _TABLE_APPROVALS.batch_writer() as batch:
+            for item in items:
+                batch.delete_item(Key={"approval_id": item["approval_id"]})
+        return len(items)
 
     def update_status(self, approval_id: str, status: str, reviewed_at: str, reviewed_by: str, expires_at: Optional[str] = None) -> None:
         expr = "SET #st = :s, reviewed_at = :ra, reviewed_by = :rb"

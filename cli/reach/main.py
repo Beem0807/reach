@@ -693,22 +693,17 @@ def _build_agent_context(
     agent_rows = ""
     exec_examples = ""
     app_examples = ""
-    approved_mode_agents = []
 
     for a in agents_config:
         aid = a["agent_id"]
         alias = id_to_alias.get(aid, "")
-        host = a.get("hostname") or "-"
         role = a.get("role") or "-"
         app = a.get("app_name") or ""
-        mode = a.get("mode") or "wild"
-        access_level = a.get("access_level") or ""
         target = alias or aid
         flag = f"--agent {target} " if multi else ""
 
         alias_col = f" (`{alias}`)" if alias else ""
-        mode_col = f"{mode}" + (f" / {access_level}" if access_level else "")
-        agent_rows += f"| `{aid}`{alias_col} | {host} | {role} | {mode_col} |\n"
+        agent_rows += f"| `{aid}`{alias_col} | {role} |\n"
         exec_examples += f"reach exec {flag}-- hostname\n"
         exec_examples += f"reach exec {flag}-- uptime\n"
         exec_examples += f"reach exec {flag}-- df -h\n"
@@ -716,14 +711,16 @@ def _build_agent_context(
             exec_examples += f"reach exec {flag}-- docker ps\n"
             app_examples += f"reach exec {flag}-- docker logs {app} --tail 100\n"
             app_examples += f"reach exec {flag}-- docker restart {app}\n"
-        if mode == "approved":
-            approved_mode_agents.append(target)
 
+    # Agent table intentionally omits hostname, mode, and access_level - those
+    # are live state from the API. Use `reach agents list` or `reach status` to
+    # see current values.
     agents_section = (
         "### Agents\n\n"
-        "| Agent ID | Hostname | Role | Mode |\n"
-        "|---|---|---|---|\n"
+        "| Agent ID | Role |\n"
+        "|---|---|\n"
         f"{agent_rows}"
+        "\nRun `reach agents list` for live status, mode, and access level.\n"
     )
 
     if multi and default_agent_id:
@@ -738,34 +735,31 @@ def _build_agent_context(
         f"* Use `reach exec --agent <id> -- <command>` to target a specific machine.\n"
         f"* Default agent (no --agent flag): `{default_agent_id}`.\n"
         if multi else
-        f"* Always use `reach exec -- <command>` to run commands on the remote machine.\n"
+        "* Always use `reach exec -- <command>` to run commands on the remote machine.\n"
     )
 
     all_examples = exec_examples + (app_examples if app_examples else "")
-
-    if approved_mode_agents:
-        targets = ", ".join(f"`{t}`" for t in approved_mode_agents)
-        policy_section = f"""
-### Policy
-
-{targets} {"is" if len(approved_mode_agents) == 1 else "are"} running in **approved mode**. Reads always run. Write commands only execute if pre-approved by an admin - unapproved writes are blocked and create a pending approval record.
-
-```bash
-reach approvals --agent <id>           # see approved write commands for an agent
-reach approvals --agent <id> --pending # see your pending requests for an agent
-reach approvals --agent <id> --expired # see your expired approvals for an agent
-```
-
-If a command is blocked, do not retry it. Check `reach approvals --agent <id> --pending` to confirm the approval record was created, then inform the user that admin approval is required.
-"""
-    else:
-        policy_section = ""
 
     return f"""## Remote Access
 
 Use `reach` for all remote machine operations. Do not use SSH.
 
 {agents_section}{stack_section}{notes_section}
+### Modes
+
+Each agent has a **mode** and an **access_level**. Check both with `reach status` before running write or destructive commands.
+
+**Mode** — what the server allows:
+- `wild`: all commands run (except a small global blocklist of catastrophic operations like `rm -rf /`, `mkfs`, fork bombs).
+- `readonly`: write and destructive commands are rejected by the server before the agent ever receives them. Reads always pass. Do not attempt writes.
+- `approved`: reads always run. Write commands only run if pre-approved by an admin. If a write is not on the approved list the agent blocks it and creates a pending approval record — the command does NOT run silently. Use `reach approvals --pending` to see it, then tell the user admin approval is required. Do not retry.
+
+**Access level** — mode combined with whether the agent runs as root:
+- `open`: wild + root. Maximum blast radius. Every command runs with full system privileges. Treat all writes as irreversible. Always explain before acting.
+- `elevated`: wild (non-root) or approved (root). High impact — proceed carefully.
+- `managed`: approved (non-root) or readonly (root). Moderate restrictions.
+- `restricted`: readonly + non-root. Safest — writes always rejected, no root access.
+
 ### Common commands
 
 ```bash
@@ -773,10 +767,11 @@ reach agents list
 reach status
 {all_examples.rstrip()}
 ```
-{policy_section}
+
 ### Rules
 
-{rule_agent}* Prefer read-only checks (`status`, `logs`, `ps`) before write/restart commands.
+{rule_agent}* Run `reach status` before write or restart commands to confirm the current mode and access level.
+* Prefer read-only checks (`status`, `logs`, `ps`) before write/restart commands.
 * Explain what you are about to do before running restart, delete, or write commands.
 * If a command fails, check logs before retrying.
 """

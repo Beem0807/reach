@@ -67,7 +67,10 @@ def handle_agent_sync(body: dict, raw_token: str) -> dict:
 
     if jobs_payload:
         next_poll = 2
-    return _ok({"jobs": jobs_payload, "next_poll_seconds": next_poll})
+    resp: dict = {"jobs": jobs_payload, "next_poll_seconds": next_poll}
+    if agent.get("rotation_requested"):
+        resp["rotate_token"] = True
+    return _ok(resp)
 
 
 def agent_sync_handler(event, context):

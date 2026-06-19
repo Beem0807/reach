@@ -32,7 +32,7 @@ _DENIED = {**_APPROVED, "approval_id": "appr_3", "status": "denied"}
 _EXPIRED = {
     **_APPROVED,
     "approval_id": "appr_4",
-    "status": "approved",
+    "status": "expired",
     "expires_at": "2020-01-01T00:00:00+00:00",
 }
 
@@ -208,29 +208,18 @@ class TestHandleListAgentApproved:
 
     # --- expired ---
 
-    def test_expired_returns_only_expired_approved_records(self):
-        future = (datetime.now(tz=timezone.utc) + timedelta(days=1)).isoformat()
-        still_valid = {**_APPROVED, "approval_id": "appr_valid", "expires_at": future}
-        r, apr = self._call(status="expired", items=[_EXPIRED, still_valid])
-        assert r["statusCode"] == 200
-        body = json.loads(r["body"])
-        ids = [a["approval_id"] for a in body["approvals"]]
-        assert "appr_4" in ids
-        assert "appr_valid" not in ids
-
-    def test_expired_filters_by_user(self):
+    def test_expired_queries_repo_with_expired_status(self):
         r, apr = self._call(status="expired", items=[_EXPIRED])
-        apr.list_by_agent.assert_called_once_with(AGENT_ID, requested_by=USER_ID)
+        assert r["statusCode"] == 200
+        apr.list_by_agent.assert_called_once_with(AGENT_ID, status="expired", requested_by=USER_ID)
 
-    def test_expired_skips_non_approved_records(self):
-        past = "2020-01-01T00:00:00+00:00"
-        pending_with_past = {**_PENDING, "expires_at": past}
-        r, _ = self._call(status="expired", items=[pending_with_past])
+    def test_expired_returns_records_from_repo(self):
+        r, _ = self._call(status="expired", items=[_EXPIRED])
         body = json.loads(r["body"])
-        assert body["approvals"] == []
+        assert len(body["approvals"]) == 1
+        assert body["approvals"][0]["approval_id"] == "appr_4"
 
     def test_expired_approved_commands_is_empty(self):
-        # expired records must NOT appear in approved_commands - they are no longer effective
         r, _ = self._call(status="expired", items=[_EXPIRED])
         body = json.loads(r["body"])
         assert body["approved_commands"] == []

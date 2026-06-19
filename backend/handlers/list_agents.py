@@ -25,6 +25,7 @@ def handle_list_agents(raw_token: str, tag: Optional[str] = None) -> dict:
             "agent_version": a.get("agent_version"),
             "claimed_at": a.get("claimed_at"),
             "mode": a.get("mode", "wild"),
+            "access_level": a.get("access_level") or "open",
             "tags": a.get("tags") or [],
         }
         for a in rows

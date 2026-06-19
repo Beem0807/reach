@@ -110,6 +110,17 @@ if [[ "${1:-}" == "--update" ]]; then
   fi
 
   echo ""
+  echo "  APPROVAL_RETENTION_DAYS: days to keep denied/expired approval records (leave blank to keep existing)."
+  read -rp "  APPROVAL_RETENTION_DAYS [keep existing]: " NEW_RETENTION_DAYS < /dev/tty
+  if [[ -n "$NEW_RETENTION_DAYS" ]]; then
+    RETENTION_DAYS_PARAM="ParameterKey=ApprovalRetentionDays,ParameterValue=$NEW_RETENTION_DAYS"
+    echo "    APPROVAL_RETENTION_DAYS set to $NEW_RETENTION_DAYS."
+  else
+    RETENTION_DAYS_PARAM="ParameterKey=ApprovalRetentionDays,UsePreviousValue=true"
+    echo "    APPROVAL_RETENTION_DAYS unchanged."
+  fi
+
+  echo ""
   echo "==> Updating stack '$STACK_NAME'..."
   aws cloudformation update-stack \
     --stack-name "$STACK_NAME" \
@@ -117,6 +128,7 @@ if [[ "${1:-}" == "--update" ]]; then
     --parameters \
       ParameterKey=TokenPepper,UsePreviousValue=true \
       "$ADMIN_TOKEN_PARAM" \
+      "$RETENTION_DAYS_PARAM" \
     --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND \
     --region "$AWS_REGION"
 
@@ -234,6 +246,12 @@ if [[ -z "$ADMIN_TOKEN" ]]; then
   echo "    Generated ADMIN_TOKEN."
 fi
 
+echo ""
+echo "  APPROVAL_RETENTION_DAYS: how many days to keep denied/expired approval records"
+echo "  before the daily cleanup deletes them (default: 7)."
+read -rp "  APPROVAL_RETENTION_DAYS [7]: " APPROVAL_RETENTION_DAYS < /dev/tty
+APPROVAL_RETENTION_DAYS="${APPROVAL_RETENTION_DAYS:-7}"
+
 # ---------------------------------------------------------------------------
 # Check for existing stack
 # ---------------------------------------------------------------------------
@@ -263,6 +281,7 @@ aws cloudformation create-stack \
   --parameters \
     ParameterKey=TokenPepper,ParameterValue="$TOKEN_PEPPER" \
     ParameterKey=AdminToken,ParameterValue="$ADMIN_TOKEN" \
+    ParameterKey=ApprovalRetentionDays,ParameterValue="${APPROVAL_RETENTION_DAYS:-7}" \
   --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND \
   --region "$AWS_REGION"
 

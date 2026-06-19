@@ -8,9 +8,12 @@ mcp = FastMCP(
     "reach",
     instructions=(
         "Use these tools to run commands on remote machines via reach agents.\n\n"
-        "DISCOVERY: Call list_agents first if you don't know which agent to target. "
+        "INIT: Call get_context at the start of every session. It returns your identity, "
+        "the default agent (if configured), and any aliases. Use this to orient yourself "
+        "before calling other tools.\n\n"
+        "DISCOVERY: If no default agent is set, call list_agents to find available targets. "
         "Each agent has a 'mode' (wild / readonly / approved) and an 'access_level' label "
-        "(open / elevated / managed / restricted) that tells you how strictly it is configured.\n\n"
+        "that combines mode with whether the agent runs as root.\n\n"
         "MODES:\n"
         "- wild: all commands run (except a small global blocklist of catastrophic operations).\n"
         "- readonly: write and destructive commands are rejected by the server before the agent "
@@ -18,6 +21,17 @@ mcp = FastMCP(
         "- approved: reads always run. Write commands only run if pre-approved by an admin. "
         "If a write is not on the approved list the agent blocks it and creates a pending "
         "approval record - the command does NOT run silently.\n\n"
+        "ACCESS LEVELS (mode + root privilege combined):\n"
+        "- open: wild mode + root. Maximum blast radius - any command runs with full system "
+        "privileges. Treat every write or destructive command as irreversible. Always explain "
+        "what you are about to do and prefer read-only checks first.\n"
+        "- elevated: wild non-root OR approved root. Either no policy gate but limited OS "
+        "privileges, or write approval required but approved commands run as root. Still "
+        "high-impact - proceed carefully.\n"
+        "- managed: approved non-root OR readonly root. Either writes need approval with "
+        "limited privileges, or reads-only with root visibility. Moderate risk.\n"
+        "- restricted: readonly + non-root. Safest configuration - writes are always rejected "
+        "by the server, no root access. Read freely.\n\n"
         "WHEN BLOCKED: if exec_command returns a stderr containing 'Blocked: approval required', "
         "the command needs admin approval. Use list_pending_approvals to see it, and "
         "list_approved_commands to see what is already allowed on that agent.\n\n"
@@ -41,6 +55,43 @@ def _client() -> tuple[ReachClient, str]:
         )
     default_agent = cfg.get("default_agent_id", "")
     return ReachClient(api_url, token), default_agent
+
+
+@mcp.tool()
+def get_context() -> dict:
+    """Return your current session context: identity, default agent, and aliases.
+
+    Call this at the start of every session to orient yourself before using other tools.
+    Returns who you are authenticated as, which agent is the default target (if any),
+    its current mode and access_level, and any configured aliases.
+    """
+    client, default_agent = _client()
+    cfg = cfg_module.load_profile()
+
+    me = client.get_me()
+    aliases = cfg.get("aliases") or {}
+
+    result: dict = {
+        "user": me,
+        "default_agent_id": default_agent or None,
+        "aliases": aliases,
+    }
+
+    if default_agent:
+        try:
+            agent = client.get_agent(default_agent)
+            result["default_agent"] = {
+                "agent_id": agent.get("agent_id"),
+                "status": agent.get("status"),
+                "hostname": agent.get("hostname"),
+                "mode": agent.get("mode"),
+                "access_level": agent.get("access_level"),
+                "tags": agent.get("tags") or [],
+            }
+        except Exception:
+            result["default_agent"] = {"error": "could not fetch default agent details"}
+
+    return result
 
 
 @mcp.tool()

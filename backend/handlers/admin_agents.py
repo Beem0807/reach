@@ -168,6 +168,23 @@ def handle_list_agents_admin(tenant_id: str, raw_token: str, tag: str = None) ->
     })
 
 
+def handle_request_agent_rotation(agent_id: str, raw_token: str) -> dict:
+    if not _verify_admin(raw_token):
+        return _err("unauthorized", 401)
+
+    agent = agents_repo.get(agent_id)
+    if not agent:
+        return _err("agent not found", 404)
+
+    status = agent.get("status")
+    if status not in ("ACTIVE", "INACTIVE"):
+        return _err(f"cannot request rotation for agent with status {status}", 409)
+
+    agents_repo.request_rotation(agent_id)
+    logger.info("Admin requested token rotation for agent=%s", agent_id)
+    return _ok({"agent_id": agent_id, "rotation_requested": True})
+
+
 def handle_revoke_agent(agent_id: str, raw_token: str) -> dict:
     if not _verify_admin(raw_token):
         return _err("unauthorized", 401)
@@ -336,6 +353,15 @@ def reissue_install_token_handler(event, context):
         return _err("invalid JSON body")
     agent_id = (event.get("pathParameters") or {}).get("agent_id", "")
     return handle_reissue_install_token(agent_id, body, token, api_url)
+
+
+def request_agent_rotation_handler(event, context):
+    logger.info("POST /admin/agents/{agent_id}/rotate-token")
+    token, _ = _token_and_api_url(event)
+    if not token:
+        return _err("missing Authorization header", 401)
+    agent_id = (event.get("pathParameters") or {}).get("agent_id", "")
+    return handle_request_agent_rotation(agent_id, token)
 
 
 def revoke_agent_handler(event, context):

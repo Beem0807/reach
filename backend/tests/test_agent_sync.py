@@ -126,3 +126,17 @@ class TestAgentSync:
         r = self._call(jobs=[_JOB_PENDING])  # default mode is "wild"
         body = json.loads(r["body"])
         assert body["jobs"][0]["approved_commands"] == []
+
+    def test_rotate_token_signal_when_flag_set(self):
+        agent_with_flag = {**_AGENT_ACTIVE, "rotation_requested": True}
+        r = self._call(agent=agent_with_flag)
+        assert json.loads(r["body"])["rotate_token"] is True
+
+    def test_no_rotate_token_signal_when_flag_absent(self):
+        r = self._call()
+        assert "rotate_token" not in json.loads(r["body"])
+
+    def test_no_rotate_token_signal_when_flag_false(self):
+        agent_no_flag = {**_AGENT_ACTIVE, "rotation_requested": False}
+        r = self._call(agent=agent_no_flag)
+        assert "rotate_token" not in json.loads(r["body"])

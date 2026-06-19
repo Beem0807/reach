@@ -91,6 +91,16 @@ class TestParseExpiresAt:
         delta = (parsed - before).total_seconds()
         assert 30 * 86400 - 2 <= delta <= 30 * 86400 + 2
 
+    def test_now_returns_current_timestamp(self):
+        from datetime import datetime, timezone
+        before = datetime.now(tz=timezone.utc)
+        ok, exp = _parse_expires_at("now")
+        after = datetime.now(tz=timezone.utc)
+        assert ok is True
+        assert exp is not None
+        parsed = datetime.fromisoformat(exp)
+        assert before <= parsed <= after
+
     def test_invalid_format_returns_false(self):
         ok, exp = _parse_expires_at("2weeks")
         assert ok is False
@@ -235,6 +245,10 @@ class TestHandleReviewApproval:
         r, ar = self._call(action="approve", body={"duration": "bad"})
         assert r["statusCode"] == 400
 
+    def test_initial_approve_with_duration_now_returns_400(self):
+        r, _ = self._call(action="approve", body={"duration": "now"}, approval=_APPROVAL)
+        assert r["statusCode"] == 400
+
     def test_deny_ignores_duration(self):
         r, ar = self._call(action="deny", body={"duration": "1h"})
         assert r["statusCode"] == 200
@@ -269,22 +283,42 @@ class TestHandleReviewApproval:
         kwargs = ar.update_status.call_args[1]
         assert kwargs.get("expires_at") is None
 
-    def test_revoke_approved_record(self):
-        already_approved = {**_APPROVAL, "status": "approved"}
-        r, ar = self._call(action="deny", approval=already_approved)
+    def test_instant_expire_approved_record(self):
+        from datetime import datetime, timezone
+        already_approved = {**_APPROVAL, "status": "approved", "expires_at": None}
+        r, ar = self._call(action="approve", body={"duration": "now"}, approval=already_approved)
         assert r["statusCode"] == 200
         body = json.loads(r["body"])
-        assert body["status"] == "denied"
-        assert ar.update_status.call_args[0][1] == "denied"
-
-    def test_reapprove_denied_record(self):
-        denied = {**_APPROVAL, "status": "denied"}
-        r, ar = self._call(action="approve", body={"duration": "8h"}, approval=denied)
-        assert r["statusCode"] == 200
-        body = json.loads(r["body"])
-        assert body["status"] == "approved"
+        assert body["status"] == "expired"
+        expires = datetime.fromisoformat(body["expires_at"])
+        assert expires <= datetime.now(tz=timezone.utc)
         kwargs = ar.update_status.call_args[1]
         assert kwargs.get("expires_at") is not None
+
+    def test_deny_approved_record_returns_409(self):
+        already_approved = {**_APPROVAL, "status": "approved"}
+        r, _ = self._call(action="deny", approval=already_approved)
+        assert r["statusCode"] == 409
+
+    def test_denied_record_returns_409(self):
+        denied = {**_APPROVAL, "status": "denied"}
+        r, _ = self._call(action="approve", body={"duration": "8h"}, approval=denied)
+        assert r["statusCode"] == 409
+
+    def test_denied_record_cannot_be_denied_again(self):
+        denied = {**_APPROVAL, "status": "denied"}
+        r, _ = self._call(action="deny", approval=denied)
+        assert r["statusCode"] == 409
+
+    def test_expired_record_cannot_be_approved(self):
+        expired = {**_APPROVAL, "status": "expired", "expires_at": "2020-01-01T00:00:00+00:00"}
+        r, _ = self._call(action="approve", body={"duration": "8h"}, approval=expired)
+        assert r["statusCode"] == 409
+
+    def test_expired_record_cannot_be_denied(self):
+        expired = {**_APPROVAL, "status": "expired", "expires_at": "2020-01-01T00:00:00+00:00"}
+        r, _ = self._call(action="deny", approval=expired)
+        assert r["statusCode"] == 409
 
 
 # ---------------------------------------------------------------------------
@@ -402,6 +436,10 @@ class TestHandlePreApproveCommand:
 
     def test_invalid_duration_returns_400(self):
         r, _ = self._call(body={"agent_id": "agent_a", "command": "docker ps", "duration": "bad"})
+        assert r["statusCode"] == 400
+
+    def test_duration_now_returns_400(self):
+        r, _ = self._call(body={"agent_id": "agent_a", "command": "docker ps", "duration": "now"})
         assert r["statusCode"] == 400
 
     def test_duplicate_active_approval_returns_409(self):
@@ -577,3 +615,139 @@ class TestDynamoUpdateStatusExpiresAt:
         expr = call_kwargs["UpdateExpression"]
         assert "REMOVE expires_at" in expr
         assert ":exp" not in call_kwargs.get("ExpressionAttributeValues", {})
+
+
+# ---------------------------------------------------------------------------
+# _dedup_by_command - SQL repo
+# ---------------------------------------------------------------------------
+
+def _make_approval(approval_id, command, expires_at):
+    return {
+        "approval_id": approval_id,
+        "command": command,
+        "expires_at": expires_at,
+        "status": "approved",
+    }
+
+
+class TestSqlDedupByCommand:
+    @staticmethod
+    def _dedup(records):
+        from shared.repos.sql import ApprovalRepo
+        db = MagicMock()
+        return ApprovalRepo._dedup_by_command(records, db), db
+
+    def test_no_duplicates_returns_all(self):
+        records = [
+            _make_approval("a1", "docker ps", "2099-01-01T00:00:00+00:00"),
+            _make_approval("a2", "ls -la", None),
+        ]
+        result, db = self._dedup(records)
+        assert len(result) == 2
+        db.execute.assert_not_called()
+
+    def test_keeps_longer_timed_over_shorter(self):
+        records = [
+            _make_approval("a1", "docker ps", "2026-06-01T00:00:00+00:00"),
+            _make_approval("a2", "docker ps", "2099-12-31T00:00:00+00:00"),
+        ]
+        result, db = self._dedup(records)
+        assert len(result) == 1
+        assert result[0]["approval_id"] == "a2"
+        db.execute.assert_called_once()
+
+    def test_keeps_permanent_over_timed(self):
+        records = [
+            _make_approval("a1", "docker ps", "2099-12-31T00:00:00+00:00"),
+            _make_approval("a2", "docker ps", None),
+        ]
+        result, db = self._dedup(records)
+        assert len(result) == 1
+        assert result[0]["approval_id"] == "a2"
+        db.execute.assert_called_once()
+
+    def test_multiple_permanent_keeps_first(self):
+        records = [
+            _make_approval("a1", "docker ps", None),
+            _make_approval("a2", "docker ps", None),
+        ]
+        result, _ = self._dedup(records)
+        assert len(result) == 1
+        assert result[0]["approval_id"] == "a1"
+
+    def test_different_commands_all_kept(self):
+        records = [
+            _make_approval("a1", "docker ps", "2026-06-01T00:00:00+00:00"),
+            _make_approval("a2", "ls -la", "2026-06-01T00:00:00+00:00"),
+            _make_approval("a3", "whoami", None),
+        ]
+        result, db = self._dedup(records)
+        assert len(result) == 3
+        db.execute.assert_not_called()
+
+    def test_dedup_across_multiple_commands(self):
+        records = [
+            _make_approval("a1", "docker ps", "2026-01-01T00:00:00+00:00"),
+            _make_approval("a2", "docker ps", "2099-01-01T00:00:00+00:00"),
+            _make_approval("a3", "ls -la", "2026-01-01T00:00:00+00:00"),
+            _make_approval("a4", "ls -la", None),
+        ]
+        result, _ = self._dedup(records)
+        assert len(result) == 2
+        ids = {r["approval_id"] for r in result}
+        assert "a2" in ids  # longer timed for docker ps
+        assert "a4" in ids  # permanent wins for ls -la
+
+
+# ---------------------------------------------------------------------------
+# _dedup_by_command - Dynamo repo
+# ---------------------------------------------------------------------------
+
+class TestDynamoDedupByCommand:
+    @staticmethod
+    def _dynamo_mod():
+        import sys
+        if "shared.repos.dynamo" not in sys.modules:
+            with patch("boto3.resource"):
+                import shared.repos.dynamo  # noqa: F401
+        import shared.repos.dynamo as m
+        return m
+
+    def _dedup(self, records):
+        dynamo = self._dynamo_mod()
+        table_mock = MagicMock()
+        batch_mock = MagicMock()
+        table_mock.batch_writer.return_value.__enter__ = MagicMock(return_value=batch_mock)
+        table_mock.batch_writer.return_value.__exit__ = MagicMock(return_value=False)
+        with patch.object(dynamo, "_TABLE_APPROVALS", table_mock):
+            result = dynamo.ApprovalRepo()._dedup_by_command(records)
+        return result, table_mock, batch_mock
+
+    def test_no_duplicates_no_deletes(self):
+        records = [
+            _make_approval("a1", "docker ps", "2099-01-01T00:00:00+00:00"),
+            _make_approval("a2", "ls -la", None),
+        ]
+        result, table, _ = self._dedup(records)
+        assert len(result) == 2
+        table.batch_writer.assert_not_called()
+
+    def test_keeps_longer_timed_deletes_shorter(self):
+        records = [
+            _make_approval("a1", "docker ps", "2026-06-01T00:00:00+00:00"),
+            _make_approval("a2", "docker ps", "2099-12-31T00:00:00+00:00"),
+        ]
+        result, _, batch = self._dedup(records)
+        assert len(result) == 1
+        assert result[0]["approval_id"] == "a2"
+        batch.delete_item.assert_called_once_with(Key={"approval_id": "a1"})
+
+    def test_keeps_permanent_deletes_timed(self):
+        records = [
+            _make_approval("a1", "docker ps", "2099-12-31T00:00:00+00:00"),
+            _make_approval("a2", "docker ps", None),
+        ]
+        result, _, batch = self._dedup(records)
+        assert len(result) == 1
+        assert result[0]["approval_id"] == "a2"
+        batch.delete_item.assert_called_once_with(Key={"approval_id": "a1"})
