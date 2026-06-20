@@ -246,6 +246,23 @@ class JobRepo:
                     raise
         return count
 
+    def delete_stale(self, before_iso: str) -> int:
+        terminal = ["SUCCEEDED", "FAILED", "REJECTED", "EXPIRED"]
+        fe = Attr("created_at").lt(before_iso) & (
+            Attr("status").eq("SUCCEEDED") |
+            Attr("status").eq("FAILED") |
+            Attr("status").eq("REJECTED") |
+            Attr("status").eq("EXPIRED")
+        )
+        items = _TABLE_JOBS.scan(
+            FilterExpression=fe,
+            ProjectionExpression="job_id",
+        ).get("Items", [])
+        with _TABLE_JOBS.batch_writer() as batch:
+            for item in items:
+                batch.delete_item(Key={"job_id": item["job_id"]})
+        return len(items)
+
     def get_pending_for_agent(self, agent_id: str) -> list:
         return _TABLE_JOBS.query(
             IndexName="agent-status-index",

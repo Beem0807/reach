@@ -31,6 +31,7 @@ def handle_heartbeat_check() -> dict:
 
     expired_approvals = 0
     deleted_approvals = 0
+    deleted_jobs = 0
 
     if now_dt.minute == 0:
         expired_approvals = approvals_repo.mark_expired(now_iso)
@@ -38,17 +39,24 @@ def handle_heartbeat_check() -> dict:
             logger.info("Marked %d approval(s) as expired", expired_approvals)
 
     if now_dt.hour == 0 and now_dt.minute == 0:
-        retention_days = int(os.environ.get("APPROVAL_RETENTION_DAYS", "7"))
-        before_iso = (now_dt - timedelta(days=retention_days)).isoformat()
-        deleted_approvals = approvals_repo.delete_stale(before_iso)
+        approval_retention_days = int(os.environ.get("APPROVAL_RETENTION_DAYS", "7"))
+        before_approvals = (now_dt - timedelta(days=approval_retention_days)).isoformat()
+        deleted_approvals = approvals_repo.delete_stale(before_approvals)
         if deleted_approvals:
-            logger.info("Deleted %d stale approval record(s) older than %d days", deleted_approvals, retention_days)
+            logger.info("Deleted %d stale approval record(s) older than %d days", deleted_approvals, approval_retention_days)
+
+        job_retention_days = int(os.environ.get("JOB_RETENTION_DAYS", "7"))
+        before_jobs = (now_dt - timedelta(days=job_retention_days)).isoformat()
+        deleted_jobs = jobs_repo.delete_stale(before_jobs)
+        if deleted_jobs:
+            logger.info("Deleted %d stale job record(s) older than %d days", deleted_jobs, job_retention_days)
 
     return {
         "marked_inactive": marked_inactive,
         "expired_jobs": expired_jobs,
         "expired_approvals": expired_approvals,
         "deleted_approvals": deleted_approvals,
+        "deleted_jobs": deleted_jobs,
     }
 
 
@@ -56,10 +64,11 @@ def heartbeat_handler(event, context):
     result = handle_heartbeat_check()
     logger.info(
         "Heartbeat check complete: %d agent(s) marked INACTIVE, %d job(s) expired, "
-        "%d approval(s) expired, %d stale approval(s) deleted",
+        "%d approval(s) expired, %d stale approval(s) deleted, %d stale job(s) deleted",
         result["marked_inactive"],
         result["expired_jobs"],
         result["expired_approvals"],
         result["deleted_approvals"],
+        result["deleted_jobs"],
     )
     return result

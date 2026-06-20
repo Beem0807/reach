@@ -82,7 +82,7 @@ Notable commands: `exec`, `job`, `history`, `agents`, `approvals` (with `--pendi
 
 Launched as a subprocess by an MCP-compatible client (Claude Code, Cursor, etc.) and communicates over stdio using JSON-RPC. Exposes the same operations as the CLI as structured tools: `get_context`, `whoami`, `list_agents`, `get_agent`, `exec_command`, `get_job`, `list_history`, `list_approved_commands`, `list_pending_approvals`. The client manages the process lifecycle - no hosting or ports needed.
 
-`get_context` is the entry point for each session — it returns the authenticated user, the configured default agent (with live mode and access_level), and local aliases in a single call, so the LLM is oriented before it submits any commands.
+`get_context` is the entry point for each session - it returns the authenticated user, the configured default agent (with live mode and access_level), and local aliases in a single call, so the LLM is oriented before it submits any commands.
 
 The MCP server is installed as part of the CLI package (`reach-mcp` entry point).
 

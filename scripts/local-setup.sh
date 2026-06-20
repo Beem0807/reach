@@ -133,6 +133,12 @@ echo "  before the daily cleanup deletes them (default: 7)."
 read -rp "  APPROVAL_RETENTION_DAYS [7]: " APPROVAL_RETENTION_DAYS < /dev/tty
 APPROVAL_RETENTION_DAYS="${APPROVAL_RETENTION_DAYS:-7}"
 
+echo ""
+echo "  JOB_RETENTION_DAYS: how many days to keep completed job records (SUCCEEDED, FAILED,"
+echo "  REJECTED, EXPIRED) before the daily cleanup deletes them (default: 7)."
+read -rp "  JOB_RETENTION_DAYS [7]: " JOB_RETENTION_DAYS < /dev/tty
+JOB_RETENTION_DAYS="${JOB_RETENTION_DAYS:-7}"
+
 TUNNEL_CMD=""
 NGROK_DOMAIN=""
 USE_TUNNEL=false
@@ -265,6 +271,7 @@ services:
       DATABASE_URL: postgresql://reach:reach@db:5432/reach
       STORAGE_BACKEND: postgres
       APPROVAL_RETENTION_DAYS: "${APPROVAL_RETENTION_DAYS:-7}"
+      JOB_RETENTION_DAYS: "${JOB_RETENTION_DAYS:-7}"
     depends_on:
       db:
         condition: service_healthy
@@ -364,6 +371,7 @@ ADMIN_TOKEN=${ADMIN_TOKEN}
 API_URL=${API_URL}
 IMAGE=${IMAGE}
 APPROVAL_RETENTION_DAYS=${APPROVAL_RETENTION_DAYS}
+JOB_RETENTION_DAYS=${JOB_RETENTION_DAYS}
 EOF
 
 # ---------------------------------------------------------------------------

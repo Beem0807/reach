@@ -41,7 +41,7 @@ curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh | bash
 The script will:
 - Prompt for release tag (default: `latest`)
 - Prompt for `TOKEN_PEPPER` and `ADMIN_TOKEN` (or generate them)
-- Prompt for `APPROVAL_RETENTION_DAYS` (default: `7`)
+- Prompt for `APPROVAL_RETENTION_DAYS` and `JOB_RETENTION_DAYS` (default: `7` each)
 - Start PostgreSQL, the reach backend, and nginx via Docker Compose
 - Optionally start a public tunnel:
   - **cloudflared** - no account needed, URL changes on restart
@@ -75,7 +75,7 @@ The script will:
 - Verify credentials before proceeding
 - Prompt for stack name (default: `reach-platform`) and release tag (default: `latest`)
 - Prompt for `TOKEN_PEPPER` and `ADMIN_TOKEN` (or generate them)
-- Prompt for `APPROVAL_RETENTION_DAYS` (default: `7`)
+- Prompt for `APPROVAL_RETENTION_DAYS` and `JOB_RETENTION_DAYS` (default: `7` each)
 - Deploy the CloudFormation stack and wait for it to complete
 - Print your API URL, tokens, and next steps
 
@@ -85,7 +85,7 @@ The script will:
 curl -fsSL https://reach-releases.s3.amazonaws.com/lambda-setup.sh | bash -s -- --update
 ```
 
-The script lists your existing stacks, prompts for the stack name (default: `reach-platform`) and release tag (default: `latest`), and optionally rotates `ADMIN_TOKEN` or changes `APPROVAL_RETENTION_DAYS` (leave blank to keep existing values). `TOKEN_PEPPER` is always kept - it cannot be changed. See [TOKEN_PEPPER is permanent](#token_pepper-is-permanent).
+The script lists your existing stacks, prompts for the stack name (default: `reach-platform`) and release tag (default: `latest`), and optionally rotates `ADMIN_TOKEN` or changes `APPROVAL_RETENTION_DAYS` or `JOB_RETENTION_DAYS` (leave blank to keep existing values). `TOKEN_PEPPER` is always kept - it cannot be changed. See [TOKEN_PEPPER is permanent](#token_pepper-is-permanent).
 
 ### Tear down
 
@@ -115,6 +115,7 @@ docker run -d \
   -e ADMIN_TOKEN="<your-admin-token>" \
   -e DATABASE_URL="postgresql://user:pass@host:5432/reach" \
   -e APPROVAL_RETENTION_DAYS="7" \
+  -e JOB_RETENTION_DAYS="7" \
   nabeemdev/reach:latest
 ```
 
@@ -124,6 +125,7 @@ docker run -d \
 | `ADMIN_TOKEN` | Yes | - | Bearer token for the admin API. Rotate by restarting with a new value. |
 | `DATABASE_URL` | Yes | - | PostgreSQL connection string. |
 | `APPROVAL_RETENTION_DAYS` | No | `7` | Days to retain terminal approval records (`denied`, `expired`) before they are deleted by the daily cleanup sweep. |
+| `JOB_RETENTION_DAYS` | No | `7` | Days to retain terminal job records (`SUCCEEDED`, `FAILED`, `REJECTED`, `EXPIRED`) before they are deleted by the daily cleanup sweep. |
 
 On first startup, Alembic runs `alembic upgrade head` automatically and creates all tables. Subsequent restarts apply any pending migrations from new versions. The image supports `linux/amd64` and `linux/arm64` - works on AWS Graviton, Raspberry Pi, and Apple Silicon without extra flags.
 
@@ -807,7 +809,7 @@ Expiry and cleanup happen automatically - no manual intervention needed:
 
 **Hourly sweep** - at the top of every hour the scheduler marks all `approved` records with `expires_at < now` as `expired` in bulk. Catches any records not yet caught by lazy expiry.
 
-**Daily cleanup** - at midnight UTC the scheduler deletes `denied` and `expired` records older than `APPROVAL_RETENTION_DAYS` (default 7). Prevents unbounded table growth over time.
+**Daily cleanup** - at midnight UTC the scheduler deletes `denied` and `expired` approval records older than `APPROVAL_RETENTION_DAYS` (default 7), and terminal job records (`SUCCEEDED`, `FAILED`, `REJECTED`, `EXPIRED`) older than `JOB_RETENTION_DAYS` (default 7). Prevents unbounded table growth over time.
 
 **Delete an approval record** (permanently removes it - use to clean up stale duplicates or erase records from history):
 
@@ -898,7 +900,7 @@ This sets a `rotation_requested` flag on the agent record. On its next sync the 
 
 Only ACTIVE and INACTIVE agents can be flagged for rotation (CREATED, REVOKED, and DELETED return 409).
 
-To confirm the rotation completed, poll `GET /admin/agents?tenant_id=...` and check that `token_issued_at` has advanced — there is no dedicated status field in the list response for the flag itself.
+To confirm the rotation completed, poll `GET /admin/agents?tenant_id=...` and check that `token_issued_at` has advanced - there is no dedicated status field in the list response for the flag itself.
 
 ---
 
@@ -1108,7 +1110,7 @@ launchctl load /Library/LaunchDaemons/com.reach-agent.plist
 | `reach-agents` | `agent_id` | `tenant-index` (tenant_id) | Agent records, status, token hash, fingerprint, mode |
 | `reach-tenants` | `tenant_id` | - | Tenant records |
 | `reach-users` | `user_id` | `token-hash-index` (token_hash), `tenant-index` (tenant_id) | User records, token hashes, per-user agent access lists |
-| `reach-jobs` | `job_id` | `agent-status-index` (agent_id, status), `tenant-history-index` (tenant_id, created_at) | Job queue and results; TTL on `expires_at` auto-deletes after 7 days |
+| `reach-jobs` | `job_id` | `agent-status-index` (agent_id, status), `tenant-history-index` (tenant_id, created_at) | Job queue and results; terminal records deleted by the daily heartbeat sweep after `JOB_RETENTION_DAYS` (default 7) |
 | `reach-approvals` | `approval_id` | `agent-approvals-index` (agent_id, created_at), `tenant-approvals-index` (tenant_id, created_at) | Approval records: `pending`, `approved` (with optional `expires_at`), `denied`, `expired` |
 
 All tables use `DeletionPolicy: Retain` - safe to redeploy the stack without losing data.

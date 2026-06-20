@@ -16,6 +16,7 @@ Globals:
         STORAGE_BACKEND: dynamo
         RELEASES_S3_BASE: !Ref ReleasesS3Base
         APPROVAL_RETENTION_DAYS: !Ref ApprovalRetentionDays
+        JOB_RETENTION_DAYS: !Ref JobRetentionDays
 
 Parameters:
   TokenPepper:
@@ -34,6 +35,10 @@ Parameters:
     Type: Number
     Default: 7
     Description: Days to retain terminal approval records (denied, expired) before the daily cleanup deletes them
+  JobRetentionDays:
+    Type: Number
+    Default: 7
+    Description: Days to retain terminal job records (SUCCEEDED, FAILED, REJECTED, EXPIRED) before the daily cleanup deletes them
 
 Resources:
   # -----------------------------------------------------------------------
@@ -145,9 +150,6 @@ Resources:
               KeyType: RANGE
           Projection:
             ProjectionType: ALL
-      TimeToLiveSpecification:
-        AttributeName: expires_at
-        Enabled: true
 
   ApprovalsTable:
     Type: AWS::DynamoDB::Table

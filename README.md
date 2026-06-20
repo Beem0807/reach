@@ -11,11 +11,11 @@ reach exec --agent prod -- docker ps
 
 ## What can I use this for?
 
-- **Let Claude Code inspect a remote dev box** — ask Claude to check what's running, tail logs, or diff configs without leaving your editor
-- **Debug Docker containers without SSH** — `reach exec -- docker ps`, `docker logs`, `docker inspect` from anywhere
-- **Check Kubernetes pods from an in-cluster agent** — install the agent inside the cluster, run `kubectl` commands through it from your laptop
-- **Run approved operational commands on production machines** — lock agents to `approved` mode so only allowlisted commands can execute; everything else is blocked and queued for admin review
-- **Give AI tools controlled machine access without exposing SSH** — no open ports, no VPN, no key distribution; the agent makes outbound HTTPS calls to your backend
+- **Let Claude Code inspect a remote dev box** - ask Claude to check what's running, tail logs, or diff configs without leaving your editor
+- **Debug Docker containers without SSH** - `reach exec -- docker ps`, `docker logs`, `docker inspect` from anywhere
+- **Check Kubernetes pods from an in-cluster agent** - install the agent inside the cluster, run `kubectl` commands through it from your laptop
+- **Run approved operational commands on production machines** - lock agents to `approved` mode so only allowlisted commands can execute; everything else is blocked and queued for admin review
+- **Give AI tools controlled machine access without exposing SSH** - no open ports, no VPN, no key distribution; the agent makes outbound HTTPS calls to your backend
 
 ---
 
@@ -399,7 +399,7 @@ The MCP server reads from `~/.reach/config.json` - make sure you've run `reach l
 
 | Tool | Description |
 |---|---|
-| `get_context` | **Call first.** Returns your identity, default agent (with mode and access_level), and aliases — full session orientation in one call |
+| `get_context` | **Call first.** Returns your identity, default agent (with mode and access_level), and aliases - full session orientation in one call |
 | `whoami` | Show current authenticated user and tenant |
 | `list_agents` | List all registered machines with mode and access level |
 | `get_agent(agent_id)` | Get status of a specific machine |

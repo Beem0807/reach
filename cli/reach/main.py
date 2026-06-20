@@ -749,16 +749,16 @@ Use `reach` for all remote machine operations. Do not use SSH.
 
 Each agent has a **mode** and an **access_level**. Check both with `reach status` before running write or destructive commands.
 
-**Mode** — what the server allows:
+**Mode** - what the server allows:
 - `wild`: all commands run (except a small global blocklist of catastrophic operations like `rm -rf /`, `mkfs`, fork bombs).
 - `readonly`: write and destructive commands are rejected by the server before the agent ever receives them. Reads always pass. Do not attempt writes.
-- `approved`: reads always run. Write commands only run if pre-approved by an admin. If a write is not on the approved list the agent blocks it and creates a pending approval record — the command does NOT run silently. Use `reach approvals --pending` to see it, then tell the user admin approval is required. Do not retry.
+- `approved`: reads always run. Write commands only run if pre-approved by an admin. If a write is not on the approved list the agent blocks it and creates a pending approval record - the command does NOT run silently. Use `reach approvals --pending` to see it, then tell the user admin approval is required. Do not retry.
 
-**Access level** — mode combined with whether the agent runs as root:
+**Access level** - mode combined with whether the agent runs as root:
 - `open`: wild + root. Maximum blast radius. Every command runs with full system privileges. Treat all writes as irreversible. Always explain before acting.
-- `elevated`: wild (non-root) or approved (root). High impact — proceed carefully.
+- `elevated`: wild (non-root) or approved (root). High impact - proceed carefully.
 - `managed`: approved (non-root) or readonly (root). Moderate restrictions.
-- `restricted`: readonly + non-root. Safest — writes always rejected, no root access.
+- `restricted`: readonly + non-root. Safest - writes always rejected, no root access.
 
 ### Common commands
 

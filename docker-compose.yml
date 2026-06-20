@@ -22,6 +22,7 @@ services:
       ADMIN_TOKEN: ${ADMIN_TOKEN:-localadmin}
       DATABASE_URL: postgresql://reach:reach@db:5432/reach
       APPROVAL_RETENTION_DAYS: ${APPROVAL_RETENTION_DAYS:-7}
+      JOB_RETENTION_DAYS: ${JOB_RETENTION_DAYS:-7}
     depends_on:
       db:
         condition: service_healthy

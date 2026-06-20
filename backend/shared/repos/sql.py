@@ -279,6 +279,19 @@ class JobRepo:
             db.commit()
             return result.rowcount
 
+    def delete_stale(self, before_iso: str) -> int:
+        from sqlalchemy import delete as sql_delete
+        terminal = ("SUCCEEDED", "FAILED", "REJECTED", "EXPIRED")
+        with SessionLocal() as db:
+            result = db.execute(
+                sql_delete(_Job).where(
+                    _Job.status.in_(terminal),
+                    _Job.created_at < before_iso,
+                )
+            )
+            db.commit()
+            return result.rowcount
+
     def get_pending_for_agent(self, agent_id: str) -> list:
         with SessionLocal() as db:
             rows = db.execute(
