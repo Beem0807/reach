@@ -1,8 +1,42 @@
-from mcp.server.fastmcp import FastMCP
+import re
 import time
+from typing import Optional
+
+from mcp.server.fastmcp import FastMCP
 
 from reach import config as cfg_module
 from reach.client import ReachClient
+
+# ---------------------------------------------------------------------------
+# Best-effort redaction - mirrors shared/redact.py in the backend.
+# Applied here so data already in the DB is also sanitised before Claude sees it.
+# ---------------------------------------------------------------------------
+_REDACT_PATTERNS: list[tuple[re.Pattern, str]] = [
+    (re.compile(r'\bAKIA[A-Z0-9]{16}\b'), '[AWS_KEY_ID]'),
+    (re.compile(r'(?i)(aws_secret_access_key|aws_secret)\s*[=:]\s*\S+'), r'\1=[AWS_SECRET]'),
+    (re.compile(r'-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----.*?-----END (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----', re.DOTALL), '[PRIVATE_KEY_REDACTED]'),
+    (re.compile(r'\beyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b'), '[JWT_REDACTED]'),
+    (re.compile(r'(?i)(https?|postgres(?:ql)?|mysql|mongodb|redis|amqp)://[^:@\s]+:[^@\s]+@'), r'\1://[CREDENTIALS_REDACTED]@'),
+    (re.compile(r'(?i)\bbearer\s+[A-Za-z0-9\-._~+/]+=*'), 'Bearer [TOKEN_REDACTED]'),
+    (re.compile(r'(?i)(?<![A-Za-z])(password|passwd|secret|api[_-]?key|auth[_-]?token|access[_-]?token|private[_-]?key|secret[_-]?key|client[_-]?secret|db[_-]?password|database[_-]?password|smtp[_-]?password|token[_-]?pepper|token[_-]?secret)\s*[=:]\s*\S+'), r'\1=[REDACTED]'),
+    (re.compile(r'\b(ghp|ghs|gho|github_pat|glpat|xoxb|xoxp)[_-][A-Za-z0-9_-]{10,}\b'), r'\1_[TOKEN_REDACTED]'),
+    (re.compile(r'\bAIza[0-9A-Za-z\-_]{35}\b'), '[GOOGLE_API_KEY]'),
+    (re.compile(r'\bya29\.[0-9A-Za-z\-_]+\b'), '[GOOGLE_OAUTH_TOKEN]'),
+    (re.compile(r'\b(sk_live|sk_test|rk_live)_[A-Za-z0-9]{10,}\b'), r'\1_[STRIPE_KEY]'),
+    (re.compile(r'\bsk-(?:proj-)?[A-Za-z0-9_\-]{20,}\b'), '[OPENAI_KEY]'),
+    (re.compile(r'\bhv[sbr]\.[A-Za-z0-9_-]{10,}\b'), '[VAULT_TOKEN]'),
+    (re.compile(r'\bnpm_[A-Za-z0-9]{36}\b'), '[NPM_TOKEN]'),
+    (re.compile(r'\bSG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}\b'), '[SENDGRID_KEY]'),
+    (re.compile(r'(?i)(?<![A-Za-z])(key|token|secret|password)\s*[=:]\s*[0-9a-f]{32,}\b'), r'\1=[HEX_SECRET_REDACTED]'),
+]
+
+
+def _redact(text: Optional[str]) -> Optional[str]:
+    if not text:
+        return text
+    for pattern, replacement in _REDACT_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
 
 mcp = FastMCP(
     "reach",
@@ -164,8 +198,8 @@ def exec_command(command: str, agent_id: str = "", timeout: int = 60) -> dict:
                 "command": command,
                 "status": result["status"],
                 "exit_code": result.get("exit_code"),
-                "stdout": result.get("stdout") or "",
-                "stderr": result.get("stderr") or "",
+                "stdout": _redact(result.get("stdout") or ""),
+                "stderr": _redact(result.get("stderr") or ""),
                 "duration_ms": result.get("duration_ms"),
             }
         time.sleep(2)
@@ -179,7 +213,10 @@ def get_job(job_id: str) -> dict:
         job_id: The job ID returned by exec_command.
     """
     client, _ = _client()
-    return client.get_job(job_id)
+    result = client.get_job(job_id)
+    result["stdout"] = _redact(result.get("stdout"))
+    result["stderr"] = _redact(result.get("stderr"))
+    return result
 
 
 @mcp.tool()

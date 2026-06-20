@@ -1,0 +1,1189 @@
+import { useState, useEffect, useCallback, useRef } from 'react';
+import type { TenantConfig, Approval, Agent } from '../types';
+import {
+  listAllTenantApprovals, listTenantApprovals, approveTenantApproval, denyTenantApproval,
+  deleteTenantApproval, tenantPreApprove, listTenantAgents,
+} from '../api';
+import { Modal } from '../components/Modal';
+import { Spinner } from '../components/Spinner';
+import { CopyButton } from '../components/CopyButton';
+
+function useColumnResize(count: number) {
+  const [minWidths, setMinWidths] = useState<number[]>(() => Array(count).fill(0));
+  const dragging = useRef<{ col: number; startX: number; startW: number } | null>(null);
+  const onResizeStart = useCallback((e: React.MouseEvent, col: number) => {
+    e.preventDefault();
+    const th = (e.currentTarget as HTMLElement).closest('th') as HTMLElement;
+    dragging.current = { col, startX: e.clientX, startW: th.offsetWidth };
+    const onMove = (ev: MouseEvent) => {
+      if (!dragging.current) return;
+      const { col: c, startX, startW: sw } = dragging.current;
+      setMinWidths(ws => { const n = [...ws]; n[c] = Math.max(60, sw + ev.clientX - startX); return n; });
+    };
+    const onUp = () => {
+      dragging.current = null;
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+    };
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  }, []);
+  return { minWidths, onResizeStart };
+}
+
+type StatusTab = 'pending' | 'approved' | 'denied' | 'expired';
+
+const DURATIONS = ['permanent', '1h', '8h', '24h', '7d', '30d', '90d'] as const;
+type Duration = typeof DURATIONS[number];
+
+function fmtDate(iso: string) {
+  return new Date(iso).toLocaleString(undefined, {
+    month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+  });
+}
+
+function fmtExpiry(iso?: string) {
+  if (!iso) return 'permanent';
+  const d = new Date(iso);
+  if (d.getTime() < Date.now()) return 'expired';
+  return d.toLocaleString(undefined, {
+    month: 'short', day: 'numeric',
+    hour: '2-digit', minute: '2-digit',
+  });
+}
+
+const STATUS_STYLE: Record<string, string> = {
+  pending:  'bg-amber-50 text-amber-700 border border-amber-200',
+  approved: 'bg-emerald-50 text-emerald-700 border border-emerald-200',
+  denied:   'bg-red-50 text-red-700 border border-red-200',
+  expired:  'bg-gray-100 text-gray-500 border border-gray-200',
+};
+
+function StatusBadge({ status }: { status: string }) {
+  return (
+    <span className={`inline-flex px-2 py-0.5 rounded-full text-[11px] font-semibold capitalize ${STATUS_STYLE[status] ?? 'bg-gray-100 text-gray-500'}`}>
+      {status}
+    </span>
+  );
+}
+
+export function TenantApprovalsPage({ config }: { config: TenantConfig }) {
+  const isOperator = config.role === 'admin' || config.role === 'operator';
+
+  return isOperator
+    ? <OperatorApprovalsView config={config} />
+    : <DeveloperApprovalsView config={config} />;
+}
+
+// ---------------------------------------------------------------------------
+// Developer view - my pending requests + request button
+// ---------------------------------------------------------------------------
+
+function DeveloperApprovalsView({ config }: { config: TenantConfig }) {
+  const { apiUrl, tenantToken } = config;
+  const { minWidths: dw, onResizeStart: dr } = useColumnResize(4);
+  const devTh = (label: string, i: number) => (
+    <th key={label} style={dw[i] ? { minWidth: dw[i] } : undefined} className="relative text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wider whitespace-nowrap">
+      {label}
+      <div onMouseDown={e => dr(e, i)} className="absolute right-0 top-0 h-full w-1 cursor-col-resize hover:bg-indigo-300 transition-colors" />
+    </th>
+  );
+  const [agents, setAgents] = useState<Agent[]>([]);
+  const [approvals, setApprovals] = useState<Approval[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [showModal, setShowModal] = useState(false);
+
+  useEffect(() => {
+    listTenantAgents(apiUrl, tenantToken)
+      .then(r => setAgents(r.agents ?? []))
+      .catch(() => {});
+  }, [apiUrl, tenantToken]);
+
+  const load = useCallback(() => {
+    setLoading(true);
+    setError('');
+    listTenantApprovals(apiUrl, tenantToken)
+      .then(r => setApprovals(r.approvals ?? []))
+      .catch(() => setError('Failed to load your approval requests'))
+      .finally(() => setLoading(false));
+  }, [apiUrl, tenantToken]);
+
+  useEffect(() => { load(); }, [load]);
+
+  const handleSubmit = async (agentId: string, command: string) => {
+    await tenantPreApprove(apiUrl, tenantToken, agentId, command);
+    setShowModal(false);
+    load();
+  };
+
+  return (
+    <div className="min-h-full bg-slate-50">
+      <div className="bg-gradient-to-r from-indigo-700 to-indigo-600 px-8 py-5">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-4">
+            <div className="w-10 h-10 rounded-xl bg-white/10 ring-1 ring-white/20 flex items-center justify-center shrink-0">
+              <svg className="w-5 h-5 text-white" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M9 12.75L11.25 15 15 9.75m-3-7.036A11.959 11.959 0 013.598 6 11.99 11.99 0 003 9.749c0 5.592 3.824 10.29 9 11.623 5.176-1.332 9-6.03 9-11.622 0-1.31-.21-2.571-.598-3.751h-.152c-3.196 0-6.1-1.248-8.25-3.285z" />
+              </svg>
+            </div>
+            <div>
+              <h1 className="text-xl font-bold text-white">My Approval Requests</h1>
+              <p className="text-sm text-indigo-200">Your pending command approval requests</p>
+            </div>
+          </div>
+          <button
+            onClick={() => setShowModal(true)}
+            className="inline-flex items-center gap-1.5 bg-white text-indigo-700 hover:bg-indigo-50 text-sm font-semibold px-4 py-2 rounded-lg transition-colors shadow-sm"
+          >
+            <span className="text-base leading-none">+</span> Request approval
+          </button>
+        </div>
+      </div>
+
+      <div className="px-8 py-6 space-y-4">
+        {error && (
+          <div className="flex items-center gap-2 text-sm text-red-700 bg-red-50 border border-red-200 rounded-lg px-4 py-3">
+            <span className="shrink-0">⚠</span> {error}
+          </div>
+        )}
+
+        {loading ? (
+          <div className="flex justify-center py-20"><Spinner /></div>
+        ) : (
+          <div className="bg-white rounded-xl border border-gray-200 shadow-sm overflow-hidden">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b border-gray-200 bg-gray-50">
+                  {devTh('Command', 0)}
+                  {devTh('Agent', 1)}
+                  {devTh('Requested', 2)}
+                  {devTh('Status', 3)}
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-100">
+                {approvals.length === 0 ? (
+                  <tr>
+                    <td colSpan={99}>
+                      <div className="flex flex-col items-center py-16 text-center">
+                        <div className="w-12 h-12 rounded-full bg-gray-100 flex items-center justify-center mb-3">
+                          <svg className="w-6 h-6 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 12.75L11.25 15 15 9.75m-3-7.036A11.959 11.959 0 013.598 6 11.99 11.99 0 003 9.749c0 5.592 3.824 10.29 9 11.623 5.176-1.332 9-6.03 9-11.622 0-1.31-.21-2.571-.598-3.751h-.152c-3.196 0-6.1-1.248-8.25-3.285z" />
+                          </svg>
+                        </div>
+                        <p className="text-sm font-medium text-gray-500">No pending requests</p>
+                        <p className="text-xs text-gray-400 mt-1">
+                          Use{' '}
+                          <button onClick={() => setShowModal(true)} className="text-indigo-600 hover:underline">
+                            Request approval
+                          </button>{' '}
+                          to ask an operator to permit a command.
+                        </p>
+                      </div>
+                    </td>
+                  </tr>
+                ) : approvals.map(a => (
+                  <tr key={a.approval_id} className="hover:bg-slate-50/80 transition-colors">
+                    <td className="px-4 py-3.5 max-w-[280px]">
+                      <span className="font-mono text-sm text-gray-800 bg-gray-100 px-2 py-0.5 rounded block truncate">
+                        {a.command}
+                      </span>
+                    </td>
+                    <td className="px-4 py-3.5">
+                      <div className="flex items-center gap-1.5">
+                        <div className="w-5 h-5 rounded bg-indigo-100 flex items-center justify-center shrink-0">
+                          <svg className="w-3 h-3 text-indigo-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                            <path strokeLinecap="round" strokeLinejoin="round" d="M5.25 14.25h13.5m-13.5 0a3 3 0 01-3-3m3 3a3 3 0 100 6h13.5a3 3 0 100-6m-16.5-3a3 3 0 013-3h13.5a3 3 0 013 3" />
+                          </svg>
+                        </div>
+                        <span className="text-sm text-gray-700 font-medium whitespace-nowrap">
+                          {a.agent_hostname ?? a.agent_id}
+                        </span>
+                      </div>
+                    </td>
+                    <td className="px-4 py-3.5 text-sm text-gray-500 whitespace-nowrap">
+                      {fmtDate(a.created_at)}
+                    </td>
+                    <td className="px-4 py-3.5">
+                      <StatusBadge status={a.status} />
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      {showModal && (
+        <RequestApprovalModal
+          agents={agents}
+          onClose={() => setShowModal(false)}
+          onSubmit={handleSubmit}
+        />
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Operator/Admin view - full management
+// ---------------------------------------------------------------------------
+
+function OperatorApprovalsView({ config }: { config: TenantConfig }) {
+  const { apiUrl, tenantToken } = config;
+  const canAdd = true; // operator+
+  const { minWidths: ow, onResizeStart: or_ } = useColumnResize(10);
+  const opTh = (label: string, i: number) => (
+    <th key={label} style={ow[i] ? { minWidth: ow[i] } : undefined} className="relative text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wider whitespace-nowrap">
+      {label}
+      <div onMouseDown={e => or_(e, i)} className="absolute right-0 top-0 h-full w-1 cursor-col-resize hover:bg-indigo-300 transition-colors" />
+    </th>
+  );
+
+  const [tab, setTab] = useState<StatusTab>('pending');
+  const [agents, setAgents] = useState<Agent[]>([]);
+  const [agentFilter, setAgentFilter] = useState('');
+  const [approvals, setApprovals] = useState<Approval[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [bulking, setBulking] = useState<'approve' | 'deny' | null>(null);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [bulkModal, setBulkModal] = useState<'approve' | 'deny' | null>(null);
+  const [tabCounts, setTabCounts] = useState<Partial<Record<StatusTab, number>>>({});
+  const [showApprovalId, setShowApprovalId] = useState<boolean>(() => {
+    try { return localStorage.getItem('approvals_show_id') === 'true'; } catch { return false; }
+  });
+
+  const loadSeqRef = useRef(0);
+
+  type ModalState =
+    | { type: 'approve'; approval: Approval }
+    | { type: 'update-duration'; approval: Approval }
+    | { type: 'deny'; approval: Approval }
+    | { type: 'delete'; approval: Approval }
+    | { type: 'expire-now'; approval: Approval }
+    | { type: 'add' }
+    | null;
+  const [modal, setModal] = useState<ModalState>(null);
+
+  useEffect(() => {
+    listTenantAgents(apiUrl, tenantToken)
+      .then(r => setAgents(r.agents ?? []))
+      .catch(() => {});
+  }, [apiUrl, tenantToken]);
+
+  const load = useCallback((reset = true) => {
+    const seq = ++loadSeqRef.current;
+    setLoading(true);
+    setError('');
+    const params: Record<string, string> = { status: tab };
+    if (agentFilter) params.agent_id = agentFilter;
+
+    listAllTenantApprovals(apiUrl, tenantToken, params)
+      .then(r => {
+        if (loadSeqRef.current !== seq) return;
+        const list = r.approvals ?? [];
+        setApprovals(prev => reset ? list : [...prev, ...list]);
+        setTabCounts(prev => ({ ...prev, [tab]: list.length }));
+      })
+      .catch(() => {
+        if (loadSeqRef.current !== seq) return;
+        setError('Failed to load approvals');
+      })
+      .finally(() => {
+        if (loadSeqRef.current !== seq) return;
+        setLoading(false);
+      });
+  }, [apiUrl, tenantToken, tab, agentFilter]);
+
+  useEffect(() => { load(true); }, [load]);
+
+  useEffect(() => { setSelectedIds(new Set()); }, [tab]);
+
+  useEffect(() => {
+    (['pending', 'approved', 'expired'] as StatusTab[]).forEach(s => {
+      listAllTenantApprovals(apiUrl, tenantToken, { status: s })
+        .then(r => setTabCounts(prev => ({ ...prev, [s]: (r.approvals ?? []).length })))
+        .catch(() => {});
+    });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [apiUrl, tenantToken]);
+
+  const reload = useCallback(() => load(true), [load]);
+
+  const toggleSelect = (id: string) => {
+    setSelectedIds(prev => {
+      const next = new Set(prev);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
+  };
+
+  const toggleSelectAll = () => {
+    if (selectedIds.size === approvals.length && approvals.length > 0) {
+      setSelectedIds(new Set());
+    } else {
+      setSelectedIds(new Set(approvals.map(a => a.approval_id)));
+    }
+  };
+
+  const doApprove = async (id: string, duration?: string) => {
+    await approveTenantApproval(apiUrl, tenantToken, id, duration);
+    setModal(null);
+    reload();
+  };
+
+  const doDeny = async (id: string) => {
+    await denyTenantApproval(apiUrl, tenantToken, id);
+    setModal(null);
+    reload();
+  };
+
+  const doDelete = async (id: string) => {
+    await deleteTenantApproval(apiUrl, tenantToken, id);
+    setModal(null);
+    setApprovals(prev => prev.filter(a => a.approval_id !== id));
+  };
+
+  const doAddApproval = async (agentId: string, command: string, duration?: string) => {
+    await tenantPreApprove(apiUrl, tenantToken, agentId, command, duration);
+    setModal(null);
+    setTab('approved');
+    reload();
+  };
+
+  const doBulkApprove = async () => {
+    const ids = [...selectedIds];
+    if (ids.length === 0) return;
+    setBulking('approve');
+    try {
+      await Promise.allSettled(ids.map(id => approveTenantApproval(apiUrl, tenantToken, id)));
+    } finally {
+      setBulking(null);
+      setSelectedIds(new Set());
+      setBulkModal(null);
+      reload();
+    }
+  };
+
+  const doBulkDeny = async () => {
+    const ids = [...selectedIds];
+    if (ids.length === 0) return;
+    setBulking('deny');
+    try {
+      await Promise.allSettled(ids.map(id => denyTenantApproval(apiUrl, tenantToken, id)));
+    } finally {
+      setBulking(null);
+      setSelectedIds(new Set());
+      setBulkModal(null);
+      reload();
+    }
+  };
+
+  const TABS: StatusTab[] = ['pending', 'approved', 'denied', 'expired'];
+
+  return (
+    <div className="min-h-full bg-slate-50">
+      <div className="bg-gradient-to-r from-indigo-700 to-indigo-600 px-8 py-5">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-4">
+            <div className="w-10 h-10 rounded-xl bg-white/10 ring-1 ring-white/20 flex items-center justify-center shrink-0">
+              <svg className="w-5 h-5 text-white" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M9 12.75L11.25 15 15 9.75m-3-7.036A11.959 11.959 0 013.598 6 11.99 11.99 0 003 9.749c0 5.592 3.824 10.29 9 11.623 5.176-1.332 9-6.03 9-11.622 0-1.31-.21-2.571-.598-3.751h-.152c-3.196 0-6.1-1.248-8.25-3.285z" />
+              </svg>
+            </div>
+            <div>
+              <h1 className="text-xl font-bold text-white">Approvals</h1>
+              <p className="text-sm text-indigo-200">Review and manage command approval requests</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            {tabCounts.pending != null && (
+              <span className="inline-flex items-center gap-1.5 bg-amber-500/20 border border-amber-400/30 text-amber-200 text-xs font-semibold px-3 py-1.5 rounded-lg">
+                <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse shrink-0" />
+                {tabCounts.pending} pending
+              </span>
+            )}
+            {tabCounts.approved != null && (
+              <span className="inline-flex items-center gap-1.5 bg-emerald-500/20 border border-emerald-400/30 text-emerald-300 text-xs font-semibold px-3 py-1.5 rounded-lg">
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 shrink-0" />
+                {tabCounts.approved} approved
+              </span>
+            )}
+            {tabCounts.expired != null && tabCounts.expired > 0 && (
+              <span className="inline-flex items-center gap-1.5 bg-white/10 border border-white/20 text-indigo-200 text-xs font-semibold px-3 py-1.5 rounded-lg">
+                {tabCounts.expired} expired
+              </span>
+            )}
+            {canAdd && (
+              <button
+                onClick={() => setModal({ type: 'add' })}
+                className="inline-flex items-center gap-1.5 bg-white text-indigo-700 hover:bg-indigo-50 text-sm font-semibold px-4 py-2 rounded-lg transition-colors shadow-sm ml-1"
+              >
+                <span className="text-base leading-none">+</span> Add approval
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+
+      <div className="px-8 py-6 space-y-4">
+        <div className="flex gap-1 border-b border-gray-200">
+          {TABS.map(t => (
+            <button
+              key={t}
+              onClick={() => setTab(t)}
+              className={`px-4 py-2.5 text-sm font-medium transition-colors border-b-2 -mb-px capitalize flex items-center gap-2 ${
+                tab === t
+                  ? 'border-indigo-600 text-indigo-600'
+                  : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'
+              }`}
+            >
+              {t === 'pending' && tab !== 'pending' && approvals.length > 0 && (
+                <span className="w-1.5 h-1.5 rounded-full bg-amber-400" />
+              )}
+              {t}
+              {tab === t && !loading && approvals.length > 0 && (
+                <span className="bg-indigo-100 text-indigo-700 text-xs font-semibold px-1.5 py-0.5 rounded-full">
+                  {approvals.length}
+                </span>
+              )}
+            </button>
+          ))}
+        </div>
+
+        <div className="flex items-center gap-3 flex-wrap">
+          <select
+            value={agentFilter}
+            onChange={e => setAgentFilter(e.target.value)}
+            className="border border-gray-300 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent bg-white shadow-sm"
+          >
+            <option value="">All agents</option>
+            {agents.map(a => (
+              <option key={a.agent_id} value={a.agent_id}>
+                {a.hostname ?? a.agent_id}
+              </option>
+            ))}
+          </select>
+          {agentFilter && (
+            <button onClick={() => setAgentFilter('')} className="text-sm text-indigo-600 hover:text-indigo-800">
+              Clear filter
+            </button>
+          )}
+          {tab === 'pending' && selectedIds.size > 0 && (
+            <div className="ml-auto flex items-center gap-2">
+              <span className="text-xs text-gray-500">{selectedIds.size} selected</span>
+              <button
+                onClick={() => setBulkModal('approve')}
+                disabled={!!bulking}
+                className="inline-flex items-center gap-1.5 text-sm font-semibold px-3 py-1.5 rounded-lg bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-50 transition-colors shadow-sm"
+              >
+                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" />
+                </svg>
+                Approve ({selectedIds.size})
+              </button>
+              <button
+                onClick={() => setBulkModal('deny')}
+                disabled={!!bulking}
+                className="inline-flex items-center gap-1.5 text-sm font-semibold px-3 py-1.5 rounded-lg bg-red-600 text-white hover:bg-red-700 disabled:opacity-50 transition-colors shadow-sm"
+              >
+                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                </svg>
+                Deny ({selectedIds.size})
+              </button>
+            </div>
+          )}
+        </div>
+
+        {error && (
+          <div className="flex items-center gap-2 text-sm text-red-700 bg-red-50 border border-red-200 rounded-lg px-4 py-3">
+            <span className="shrink-0">⚠</span> {error}
+          </div>
+        )}
+
+        {loading && approvals.length === 0 ? (
+          <div className="flex justify-center py-20"><Spinner /></div>
+        ) : (
+          <div className={`bg-white rounded-xl border border-gray-200 shadow-sm overflow-hidden relative ${loading ? 'opacity-60 pointer-events-none' : ''}`}>
+            {loading && (
+              <div className="absolute inset-0 flex items-center justify-center z-10">
+                <Spinner />
+              </div>
+            )}
+            <div className="flex justify-end px-3 py-2 border-b border-gray-100 bg-gray-50/60">
+              <button
+                onClick={() => {
+                  const next = !showApprovalId;
+                  setShowApprovalId(next);
+                  try { localStorage.setItem('approvals_show_id', String(next)); } catch {}
+                }}
+                className={`inline-flex items-center gap-1.5 text-xs font-medium px-2.5 py-1.5 rounded-lg border transition-colors ${
+                  showApprovalId
+                    ? 'bg-gray-800 text-white border-gray-800'
+                    : 'text-gray-500 border-gray-200 bg-white hover:bg-gray-50 hover:text-gray-700 hover:border-gray-300'
+                }`}
+              >
+                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M9 4.5v15m6-15v15M3.75 9h16.5M3.75 15h16.5" />
+                </svg>
+                Approval ID
+              </button>
+            </div>
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b border-gray-200 bg-gray-50">
+                  {tab === 'pending' && (
+                    <th className="w-10 pl-4 pr-2 py-3">
+                      <input
+                        type="checkbox"
+                        checked={approvals.length > 0 && selectedIds.size === approvals.length}
+                        ref={el => { if (el) el.indeterminate = selectedIds.size > 0 && selectedIds.size < approvals.length; }}
+                        onChange={toggleSelectAll}
+                        className="w-4 h-4 cursor-pointer rounded accent-indigo-600"
+                      />
+                    </th>
+                  )}
+                  {opTh('Command', 0)}
+                  {opTh('Agent', 1)}
+                  {opTh('Requested by', 2)}
+                  {opTh('Created', 3)}
+                  {tab === 'approved' ? (
+                    <>
+                      {opTh('Reviewed by', 4)}
+                      {opTh('Reviewed at', 5)}
+                      {opTh('Expiry', 6)}
+                    </>
+                  ) : (
+                    opTh('Status', 4)
+                  )}
+                  {showApprovalId && opTh('Approval ID', 7)}
+                  <th />
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-100">
+                {approvals.length === 0 ? (
+                  <tr>
+                    <td colSpan={99}>
+                      <div className="flex flex-col items-center py-16 text-center">
+                        <div className="w-12 h-12 rounded-full bg-gray-100 flex items-center justify-center mb-3">
+                          <svg className="w-6 h-6 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 12.75L11.25 15 15 9.75m-3-7.036A11.959 11.959 0 013.598 6 11.99 11.99 0 003 9.749c0 5.592 3.824 10.29 9 11.623 5.176-1.332 9-6.03 9-11.622 0-1.31-.21-2.571-.598-3.751h-.152c-3.196 0-6.1-1.248-8.25-3.285z" />
+                          </svg>
+                        </div>
+                        <p className="text-sm font-medium text-gray-500">No {tab} approvals</p>
+                        {tab === 'pending' && canAdd && (
+                          <p className="text-xs text-gray-400 mt-1">
+                            Use{' '}
+                            <button onClick={() => setModal({ type: 'add' })} className="text-indigo-600 hover:underline">
+                              Add approval
+                            </button>{' '}
+                            to proactively approve a command.
+                          </p>
+                        )}
+                      </div>
+                    </td>
+                  </tr>
+                ) : approvals.map(a => (
+                  <tr key={a.approval_id} className={`hover:bg-slate-50/80 transition-colors group ${tab === 'pending' && selectedIds.has(a.approval_id) ? 'bg-indigo-50/40' : ''}`}>
+                    {tab === 'pending' && (
+                      <td className="w-10 pl-4 pr-2 py-3.5">
+                        <input
+                          type="checkbox"
+                          checked={selectedIds.has(a.approval_id)}
+                          onChange={() => toggleSelect(a.approval_id)}
+                          onClick={e => e.stopPropagation()}
+                          className="w-4 h-4 cursor-pointer rounded accent-indigo-600"
+                        />
+                      </td>
+                    )}
+                    <td className="px-4 py-3.5 max-w-[280px]">
+                      <span className="font-mono text-sm text-gray-800 bg-gray-100 group-hover:bg-gray-200 transition-colors px-2 py-0.5 rounded block truncate">
+                        {a.command}
+                      </span>
+                    </td>
+                    <td className="px-4 py-3.5">
+                      <div className="flex items-center gap-1.5">
+                        <div className="w-5 h-5 rounded bg-indigo-100 flex items-center justify-center shrink-0">
+                          <svg className="w-3 h-3 text-indigo-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                            <path strokeLinecap="round" strokeLinejoin="round" d="M5.25 14.25h13.5m-13.5 0a3 3 0 01-3-3m3 3a3 3 0 100 6h13.5a3 3 0 100-6m-16.5-3a3 3 0 013-3h13.5a3 3 0 013 3" />
+                          </svg>
+                        </div>
+                        <span className="text-sm text-gray-700 font-medium whitespace-nowrap">
+                          {a.agent_hostname ?? a.agent_id}
+                        </span>
+                      </div>
+                    </td>
+                    <td className="px-4 py-3.5 text-sm text-gray-600">
+                      {a.requester_name ?? a.requested_by ?? '-'}
+                    </td>
+                    <td className="px-4 py-3.5 text-sm text-gray-500 whitespace-nowrap">
+                      {fmtDate(a.created_at)}
+                    </td>
+                    {tab === 'approved' ? (
+                      <>
+                        <td className="px-4 py-3.5 text-sm text-gray-600 whitespace-nowrap">
+                          {a.reviewed_by ?? '-'}
+                        </td>
+                        <td className="px-4 py-3.5 text-sm text-gray-500 whitespace-nowrap">
+                          {a.reviewed_at ? fmtDate(a.reviewed_at) : '-'}
+                        </td>
+                        <td className="px-4 py-3.5 text-sm">
+                          <span className={`inline-flex items-center gap-1.5 font-medium ${a.expires_at ? 'text-amber-600' : 'text-emerald-700'}`}>
+                            <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${a.expires_at ? 'bg-amber-400' : 'bg-emerald-400'}`} />
+                            {fmtExpiry(a.expires_at)}
+                          </span>
+                        </td>
+                      </>
+                    ) : (
+                      <td className="px-4 py-3.5 text-sm">
+                        <StatusBadge status={a.status} />
+                      </td>
+                    )}
+                    {showApprovalId && (
+                      <td className="px-4 py-3.5 font-mono text-xs text-gray-400 whitespace-nowrap">{a.approval_id}</td>
+                    )}
+                    <td className="px-4 py-3.5">
+                      <div className="flex items-center gap-1.5 justify-end whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity">
+                        {tab === 'pending' && (
+                          <>
+                            <button
+                              onClick={() => setModal({ type: 'approve', approval: a })}
+                              className="text-xs font-semibold text-emerald-700 hover:text-white hover:bg-emerald-600 bg-emerald-50 border border-emerald-200 px-2.5 py-1 rounded-md transition-colors"
+                            >
+                              Approve
+                            </button>
+                            <button
+                              onClick={() => setModal({ type: 'deny', approval: a })}
+                              className="text-xs font-semibold text-red-600 hover:text-white hover:bg-red-600 bg-red-50 border border-red-200 px-2.5 py-1 rounded-md transition-colors"
+                            >
+                              Deny
+                            </button>
+                          </>
+                        )}
+                        {tab === 'approved' && (
+                          <>
+                            <button
+                              onClick={() => setModal({ type: 'update-duration', approval: a })}
+                              className="text-xs font-medium text-gray-600 hover:text-gray-900 bg-gray-100 hover:bg-gray-200 px-2.5 py-1 rounded-md transition-colors"
+                            >
+                              Edit
+                            </button>
+                            <button
+                              onClick={() => setModal({ type: 'expire-now', approval: a })}
+                              className="text-xs font-medium text-amber-700 hover:text-white hover:bg-amber-600 bg-amber-50 border border-amber-200 px-2.5 py-1 rounded-md transition-colors"
+                            >
+                              Expire now
+                            </button>
+                          </>
+                        )}
+                        <button
+                          onClick={() => setModal({ type: 'delete', approval: a })}
+                          className="w-6 h-6 flex items-center justify-center text-gray-300 hover:text-red-500 hover:bg-red-50 rounded-md transition-colors text-xs"
+                          title="Delete record"
+                        >
+                          ✕
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      {bulkModal && (
+        <BulkConfirmModal
+          action={bulkModal}
+          count={selectedIds.size}
+          loading={!!bulking}
+          onClose={() => setBulkModal(null)}
+          onConfirm={bulkModal === 'approve' ? doBulkApprove : doBulkDeny}
+        />
+      )}
+
+      {modal?.type === 'deny' && (
+        <DenyModal
+          approval={modal.approval}
+          onClose={() => setModal(null)}
+          onConfirm={(id: string) => doDeny(id).catch(e => setError((e as Error).message))}
+        />
+      )}
+
+      {modal?.type === 'delete' && (
+        <DeleteApprovalModal
+          approval={modal.approval}
+          onClose={() => setModal(null)}
+          onConfirm={(id: string) => doDelete(id).catch(e => setError((e as Error).message))}
+        />
+      )}
+
+      {modal?.type === 'expire-now' && (
+        <ExpireNowModal
+          approval={modal.approval}
+          onClose={() => setModal(null)}
+          onConfirm={() => doApprove(modal.approval.approval_id, 'now').catch(e => setError((e as Error).message))}
+        />
+      )}
+
+      {modal?.type === 'approve' && (
+        <ApproveModal
+          approval={modal.approval}
+          onClose={() => setModal(null)}
+          onApprove={doApprove}
+        />
+      )}
+
+      {modal?.type === 'update-duration' && (
+        <ApproveModal
+          approval={modal.approval}
+          title="Update duration"
+          showNow
+          onClose={() => setModal(null)}
+          onApprove={doApprove}
+        />
+      )}
+
+      {modal?.type === 'add' && (
+        <AddApprovalModal
+          agents={agents}
+          onClose={() => setModal(null)}
+          onSubmit={doAddApproval}
+        />
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Bulk confirm modal
+// ---------------------------------------------------------------------------
+
+function BulkConfirmModal({ action, count, loading, onClose, onConfirm }: {
+  action: 'approve' | 'deny';
+  count: number;
+  loading: boolean;
+  onClose: () => void;
+  onConfirm: () => Promise<void>;
+}) {
+  const isApprove = action === 'approve';
+  return (
+    <Modal title={isApprove ? 'Approve selected' : 'Deny selected'} onClose={onClose}>
+      <div className="space-y-4">
+        <div className={`rounded-lg p-4 border ${isApprove ? 'bg-emerald-50 border-emerald-200' : 'bg-red-50 border-red-200'}`}>
+          <p className={`text-sm font-medium ${isApprove ? 'text-emerald-800' : 'text-red-800'}`}>
+            {isApprove
+              ? `Approve ${count} selected request${count !== 1 ? 's' : ''}? The agents will be permitted to run these commands.`
+              : `Deny ${count} selected request${count !== 1 ? 's' : ''}? The agents will not be permitted to run these commands.`}
+          </p>
+        </div>
+        <div className="flex justify-end gap-3 pt-1">
+          <button type="button" onClick={onClose} disabled={loading} className="text-sm text-gray-500 hover:text-gray-700 px-3 py-2 disabled:opacity-50">
+            Cancel
+          </button>
+          <button
+            onClick={onConfirm}
+            disabled={loading}
+            className={`flex items-center gap-2 text-white text-sm font-semibold px-4 py-2 rounded-lg disabled:opacity-60 transition-colors shadow-sm ${isApprove ? 'bg-emerald-600 hover:bg-emerald-700' : 'bg-red-600 hover:bg-red-700'}`}
+          >
+            {loading && <Spinner className="h-4 w-4" />}
+            {isApprove ? `Approve ${count}` : `Deny ${count}`}
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Developer: request approval modal
+// ---------------------------------------------------------------------------
+
+function RequestApprovalModal({
+  agents, onClose, onSubmit,
+}: {
+  agents: Agent[];
+  onClose: () => void;
+  onSubmit: (agentId: string, command: string) => Promise<void>;
+}) {
+  const [agentId, setAgentId] = useState('');
+  const [command, setCommand] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const submit = async () => {
+    if (!agentId || !command.trim()) { setError('Agent and command are required.'); return; }
+    setLoading(true); setError('');
+    try { await onSubmit(agentId, command.trim()); }
+    catch (e) { setError((e as Error).message); setLoading(false); }
+  };
+
+  const activeAgents = agents.filter(a => a.status === 'ACTIVE' || a.status === 'INACTIVE');
+
+  return (
+    <Modal title="Request approval" onClose={onClose}>
+      <div className="space-y-4">
+        <div className="bg-indigo-50 border border-indigo-200 rounded-lg px-3 py-2.5">
+          <p className="text-xs text-indigo-700">
+            Your request will go to <strong>pending</strong> - an operator or admin must approve it before the agent can run the command.
+          </p>
+        </div>
+        <div>
+          <label className="block text-sm font-semibold text-gray-700 mb-1.5">Agent</label>
+          <select
+            value={agentId}
+            onChange={e => setAgentId(e.target.value)}
+            autoFocus
+            className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent bg-white"
+          >
+            <option value="">Select agent…</option>
+            {activeAgents.map(a => (
+              <option key={a.agent_id} value={a.agent_id}>
+                {a.hostname ?? a.agent_id}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div>
+          <label className="block text-sm font-semibold text-gray-700 mb-1.5">Command</label>
+          <input
+            value={command}
+            onChange={e => setCommand(e.target.value)}
+            onKeyDown={e => e.key === 'Enter' && submit()}
+            placeholder="docker restart app"
+            className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+          />
+          <p className="text-xs text-gray-400 mt-1">
+            Prefix match - approving "docker restart" also permits "docker restart app".
+          </p>
+        </div>
+        {error && <p className="text-sm text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2">{error}</p>}
+        <div className="flex justify-end gap-3 pt-1">
+          <button onClick={onClose} className="text-sm text-gray-500 hover:text-gray-700 px-3 py-2">Cancel</button>
+          <button
+            onClick={submit}
+            disabled={loading}
+            className="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-semibold px-4 py-2 rounded-lg disabled:opacity-60 transition-colors shadow-sm"
+          >
+            {loading && <Spinner className="h-4 w-4" />} Submit request
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Operator modals (approve, deny, expire, delete, add)
+// ---------------------------------------------------------------------------
+
+function ApproveModal({
+  approval, title = 'Approve command', showNow = false, onClose, onApprove,
+}: {
+  approval: Approval;
+  title?: string;
+  showNow?: boolean;
+  onClose: () => void;
+  onApprove: (id: string, duration?: string) => Promise<void>;
+}) {
+  const [duration, setDuration] = useState<Duration>('permanent');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const submit = async (d?: string) => {
+    setLoading(true); setError('');
+    try { await onApprove(approval.approval_id, d); }
+    catch (e) { setError((e as Error).message); setLoading(false); }
+  };
+
+  return (
+    <Modal title={title} onClose={onClose}>
+      <div className="space-y-4">
+        <div className="bg-gray-50 rounded-lg p-3 border border-gray-100 space-y-2">
+          <div>
+            <p className="text-xs font-medium text-gray-400 uppercase tracking-wider mb-1.5">Command</p>
+            <code className="text-sm text-gray-800 break-all font-mono block bg-white border border-gray-200 rounded px-3 py-2">{approval.command}</code>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <div className="w-4 h-4 rounded bg-indigo-100 flex items-center justify-center shrink-0">
+              <svg className="w-2.5 h-2.5 text-indigo-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M5.25 14.25h13.5m-13.5 0a3 3 0 01-3-3m3 3a3 3 0 100 6h13.5a3 3 0 100-6" />
+              </svg>
+            </div>
+            <p className="text-xs text-gray-500">{approval.agent_hostname ?? approval.agent_id}</p>
+          </div>
+          <div className="flex items-center justify-between gap-2 pt-0.5 border-t border-gray-200 group/aid">
+            <span className="text-[10px] font-bold text-gray-400 uppercase tracking-wider">Approval ID</span>
+            <div className="flex items-center gap-1.5 min-w-0">
+              <span className="text-[11px] font-mono text-gray-400 truncate">{approval.approval_id}</span>
+              <CopyButton text={approval.approval_id} className="opacity-0 group-hover/aid:opacity-100 transition-opacity shrink-0 !px-1.5 !py-0.5 text-[10px]" />
+            </div>
+          </div>
+        </div>
+        <div>
+          <label className="block text-sm font-semibold text-gray-700 mb-2">Duration</label>
+          <div className="flex flex-wrap gap-2">
+            {DURATIONS.map(d => (
+              <button
+                key={d}
+                onClick={() => setDuration(d)}
+                className={`px-3 py-1.5 text-sm rounded-lg border transition-all ${
+                  duration === d
+                    ? 'bg-indigo-600 text-white border-indigo-600 shadow-sm'
+                    : 'border-gray-300 text-gray-600 hover:border-indigo-300 hover:text-indigo-600 hover:bg-indigo-50'
+                }`}
+              >
+                {d}
+              </button>
+            ))}
+          </div>
+        </div>
+        {error && <p className="text-sm text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2">{error}</p>}
+        <div className="flex justify-end gap-3 pt-1">
+          <button onClick={onClose} className="text-sm text-gray-500 hover:text-gray-700 px-3 py-2">Cancel</button>
+          {showNow && (
+            <button
+              onClick={() => submit('now')}
+              disabled={loading}
+              className="text-sm font-medium text-amber-700 hover:text-white hover:bg-amber-600 border border-amber-300 bg-amber-50 px-4 py-2 rounded-lg transition-colors"
+            >
+              Expire now
+            </button>
+          )}
+          <button
+            onClick={() => submit(duration === 'permanent' ? undefined : duration)}
+            disabled={loading}
+            className="flex items-center gap-2 bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-semibold px-4 py-2 rounded-lg disabled:opacity-60 transition-colors shadow-sm"
+          >
+            {loading && <Spinner className="h-4 w-4" />}
+            {showNow ? 'Save' : 'Approve'}
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+function ExpireNowModal({ approval, onClose, onConfirm }: {
+  approval: Approval;
+  onClose: () => void;
+  onConfirm: () => void;
+}) {
+  const [loading, setLoading] = useState(false);
+  const submit = () => { setLoading(true); onConfirm(); };
+  return (
+    <Modal title="Expire approval" onClose={onClose}>
+      <div className="space-y-4">
+        <div className="bg-amber-50 border border-amber-200 rounded-lg p-4">
+          <p className="text-sm text-amber-800 font-medium">This approval will be revoked immediately. The agent will need a new approval to run this command.</p>
+        </div>
+        <div className="bg-gray-50 rounded-lg p-3 border border-gray-100 space-y-2">
+          <div>
+            <p className="text-xs font-medium text-gray-400 uppercase tracking-wider mb-1.5">Command</p>
+            <code className="text-sm text-gray-800 break-all font-mono block bg-white border border-gray-200 rounded px-3 py-2">{approval.command}</code>
+          </div>
+          <p className="text-xs text-gray-500">{approval.agent_hostname ?? approval.agent_id}</p>
+          <div className="flex items-center justify-between gap-2 pt-0.5 border-t border-gray-200 group/aid">
+            <span className="text-[10px] font-bold text-gray-400 uppercase tracking-wider">Approval ID</span>
+            <div className="flex items-center gap-1.5 min-w-0">
+              <span className="text-[11px] font-mono text-gray-400 truncate">{approval.approval_id}</span>
+              <CopyButton text={approval.approval_id} className="opacity-0 group-hover/aid:opacity-100 transition-opacity shrink-0 !px-1.5 !py-0.5 text-[10px]" />
+            </div>
+          </div>
+        </div>
+        <div className="flex justify-end gap-3 pt-1">
+          <button type="button" onClick={onClose} className="text-sm text-gray-500 hover:text-gray-700 px-3 py-2">Cancel</button>
+          <button
+            onClick={submit}
+            disabled={loading}
+            className="flex items-center gap-2 bg-amber-600 hover:bg-amber-700 text-white text-sm font-semibold px-4 py-2 rounded-lg disabled:opacity-60 transition-colors shadow-sm"
+          >
+            {loading && <Spinner className="h-4 w-4" />} Expire now
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+function DenyModal({ approval, onClose, onConfirm }: {
+  approval: Approval;
+  onClose: () => void;
+  onConfirm: (id: string) => void;
+}) {
+  const [loading, setLoading] = useState(false);
+  const submit = () => { setLoading(true); onConfirm(approval.approval_id); };
+  return (
+    <Modal title="Deny request" onClose={onClose}>
+      <div className="space-y-4">
+        <div className="bg-red-50 border border-red-200 rounded-lg p-4">
+          <p className="text-sm text-red-800 font-medium">The agent will not be permitted to run this command.</p>
+        </div>
+        <div className="bg-gray-50 rounded-lg p-3 border border-gray-100 space-y-2">
+          <div>
+            <p className="text-xs font-medium text-gray-400 uppercase tracking-wider mb-1.5">Command</p>
+            <code className="text-sm text-gray-800 break-all font-mono block bg-white border border-gray-200 rounded px-3 py-2">{approval.command}</code>
+          </div>
+          <p className="text-xs text-gray-500">{approval.agent_hostname ?? approval.agent_id}</p>
+          <div className="flex items-center justify-between gap-2 pt-0.5 border-t border-gray-200 group/aid">
+            <span className="text-[10px] font-bold text-gray-400 uppercase tracking-wider">Approval ID</span>
+            <div className="flex items-center gap-1.5 min-w-0">
+              <span className="text-[11px] font-mono text-gray-400 truncate">{approval.approval_id}</span>
+              <CopyButton text={approval.approval_id} className="opacity-0 group-hover/aid:opacity-100 transition-opacity shrink-0 !px-1.5 !py-0.5 text-[10px]" />
+            </div>
+          </div>
+        </div>
+        <div className="flex justify-end gap-3 pt-1">
+          <button type="button" onClick={onClose} className="text-sm text-gray-500 hover:text-gray-700 px-3 py-2">Cancel</button>
+          <button
+            onClick={submit}
+            disabled={loading}
+            className="flex items-center gap-2 bg-red-600 hover:bg-red-700 text-white text-sm font-semibold px-4 py-2 rounded-lg disabled:opacity-60 transition-colors shadow-sm"
+          >
+            {loading && <Spinner className="h-4 w-4" />} Deny request
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+function DeleteApprovalModal({ approval, onClose, onConfirm }: {
+  approval: Approval;
+  onClose: () => void;
+  onConfirm: (id: string) => void;
+}) {
+  const [loading, setLoading] = useState(false);
+  const submit = () => { setLoading(true); onConfirm(approval.approval_id); };
+  return (
+    <Modal title="Delete record" onClose={onClose}>
+      <div className="space-y-4">
+        <div className="bg-red-50 border border-red-200 rounded-lg p-4">
+          <p className="text-sm text-red-800 font-medium">This approval record will be permanently deleted.</p>
+        </div>
+        <div className="bg-gray-50 rounded-lg p-3 border border-gray-100 space-y-2">
+          <div>
+            <p className="text-xs font-medium text-gray-400 uppercase tracking-wider mb-1.5">Command</p>
+            <code className="text-sm text-gray-800 break-all font-mono block bg-white border border-gray-200 rounded px-3 py-2">{approval.command}</code>
+          </div>
+          <p className="text-xs text-gray-500">{approval.agent_hostname ?? approval.agent_id}</p>
+          <div className="flex items-center justify-between gap-2 pt-0.5 border-t border-gray-200 group/aid">
+            <span className="text-[10px] font-bold text-gray-400 uppercase tracking-wider">Approval ID</span>
+            <div className="flex items-center gap-1.5 min-w-0">
+              <span className="text-[11px] font-mono text-gray-400 truncate">{approval.approval_id}</span>
+              <CopyButton text={approval.approval_id} className="opacity-0 group-hover/aid:opacity-100 transition-opacity shrink-0 !px-1.5 !py-0.5 text-[10px]" />
+            </div>
+          </div>
+        </div>
+        <div className="flex justify-end gap-3 pt-1">
+          <button type="button" onClick={onClose} className="text-sm text-gray-500 hover:text-gray-700 px-3 py-2">Cancel</button>
+          <button
+            onClick={submit}
+            disabled={loading}
+            className="flex items-center gap-2 bg-red-600 hover:bg-red-700 text-white text-sm font-semibold px-4 py-2 rounded-lg disabled:opacity-60 transition-colors shadow-sm"
+          >
+            {loading && <Spinner className="h-4 w-4" />} Delete permanently
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+function AddApprovalModal({
+  agents, onClose, onSubmit,
+}: {
+  agents: Agent[];
+  onClose: () => void;
+  onSubmit: (agentId: string, command: string, duration?: string) => Promise<void>;
+}) {
+  const [agentId, setAgentId] = useState('');
+  const [command, setCommand] = useState('');
+  const [duration, setDuration] = useState<Duration>('permanent');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const submit = async () => {
+    if (!agentId || !command.trim()) { setError('Agent and command are required.'); return; }
+    setLoading(true); setError('');
+    try { await onSubmit(agentId, command.trim(), duration === 'permanent' ? undefined : duration); }
+    catch (e) { setError((e as Error).message); setLoading(false); }
+  };
+
+  const activeAgents = agents.filter(a => a.status === 'ACTIVE' || a.status === 'INACTIVE');
+
+  return (
+    <Modal title="Add approval" onClose={onClose}>
+      <div className="space-y-4">
+        <div className="bg-indigo-50 border border-indigo-200 rounded-lg px-3 py-2.5">
+          <p className="text-xs text-indigo-700">
+            Creates an <strong>approved</strong> record directly - the agent can run the command immediately without a pending request.
+          </p>
+        </div>
+        <div>
+          <label className="block text-sm font-semibold text-gray-700 mb-1.5">Agent</label>
+          <select
+            value={agentId}
+            onChange={e => setAgentId(e.target.value)}
+            autoFocus
+            className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent bg-white"
+          >
+            <option value="">Select agent…</option>
+            {activeAgents.map(a => (
+              <option key={a.agent_id} value={a.agent_id}>
+                {a.hostname ?? a.agent_id}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div>
+          <label className="block text-sm font-semibold text-gray-700 mb-1.5">Command</label>
+          <input
+            value={command}
+            onChange={e => setCommand(e.target.value)}
+            onKeyDown={e => e.key === 'Enter' && submit()}
+            placeholder="docker restart app"
+            className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+          />
+          <p className="text-xs text-gray-400 mt-1">
+            Prefix match - "docker restart" also permits "docker restart app".
+          </p>
+        </div>
+        <div>
+          <label className="block text-sm font-semibold text-gray-700 mb-2">Duration</label>
+          <div className="flex flex-wrap gap-2">
+            {DURATIONS.map(d => (
+              <button
+                key={d}
+                onClick={() => setDuration(d)}
+                className={`px-3 py-1.5 text-sm rounded-lg border transition-all ${
+                  duration === d
+                    ? 'bg-indigo-600 text-white border-indigo-600 shadow-sm'
+                    : 'border-gray-300 text-gray-600 hover:border-indigo-300 hover:text-indigo-600 hover:bg-indigo-50'
+                }`}
+              >
+                {d}
+              </button>
+            ))}
+          </div>
+          <p className="text-xs text-gray-400 mt-1.5">Timing applies to the approved record only.</p>
+        </div>
+        {error && <p className="text-sm text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2">{error}</p>}
+        <div className="flex justify-end gap-3 pt-1">
+          <button onClick={onClose} className="text-sm text-gray-500 hover:text-gray-700 px-3 py-2">Cancel</button>
+          <button
+            onClick={submit}
+            disabled={loading}
+            className="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-semibold px-4 py-2 rounded-lg disabled:opacity-60 transition-colors shadow-sm"
+          >
+            {loading && <Spinner className="h-4 w-4" />} Add approval
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}

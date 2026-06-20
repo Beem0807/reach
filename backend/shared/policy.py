@@ -135,8 +135,12 @@ def _is_readonly_blocked(command: str) -> bool:
     return False
 
 
-def compute_access_level(mode: str, running_as_root: bool) -> str:
-    """Factual label combining agent privilege and policy mode."""
+def compute_access_level(
+    mode: str,
+    running_as_root: bool,
+    **_kwargs,
+) -> str:
+    """Privilege label derived from policy mode and root status."""
     if mode == "wild":
         return "open" if running_as_root else "elevated"
     if mode == "approved":

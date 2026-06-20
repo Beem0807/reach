@@ -25,7 +25,14 @@ echo "==> Version: $VERSION"
 echo "==> Running tests..."
 (
   cd "$ROOT_DIR/cli"
-  python3 -m pytest tests/ -q --tb=short
+  # Run in an isolated venv so the gate doesn't depend on a globally-installed
+  # pytest (Homebrew/system python is often PEP 668 externally-managed).
+  VENV_DIR="$(mktemp -d)"
+  trap 'rm -rf "$VENV_DIR"' EXIT
+  python3 -m venv "$VENV_DIR"
+  "$VENV_DIR/bin/pip" install --quiet --upgrade pip
+  "$VENV_DIR/bin/pip" install --quiet pytest .
+  "$VENV_DIR/bin/python" -m pytest tests/ -q --tb=short
 )
 
 DIST_DIR="$(mktemp -d)"

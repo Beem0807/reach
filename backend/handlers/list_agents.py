@@ -24,9 +24,20 @@ def handle_list_agents(raw_token: str, tag: Optional[str] = None) -> dict:
             "hostname": a.get("hostname"),
             "agent_version": a.get("agent_version"),
             "claimed_at": a.get("claimed_at"),
+            "last_heartbeat_at": a.get("last_heartbeat_at"),
+            "token_issued_at": a.get("token_issued_at"),
+            "install_token_expires_at": a.get("install_token_expires_at"),
+            "active_until": a.get("active_until"),
+            "fleet_id": a.get("fleet_id"),
+            "type": a.get("type"),
             "mode": a.get("mode", "wild"),
             "access_level": a.get("access_level") or "open",
+            "running_as_root": a.get("running_as_root"),
             "tags": a.get("tags") or [],
+            "grant_service_mgmt": a.get("grant_service_mgmt", False),
+            "grant_docker": a.get("grant_docker", False),
+            "service_mgmt_detected": a.get("service_mgmt_detected"),
+            "docker_detected": a.get("docker_detected"),
         }
         for a in rows
         if a.get("status") != "DELETED"

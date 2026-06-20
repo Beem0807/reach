@@ -1,24 +1,35 @@
 #!/usr/bin/env bash
-# Build and publish the reach backend: Docker image + Lambda package.
-# Usage: ./scripts/release_backend.sh [--image nabeemdev/reach] [--bucket reach-releases] [--push]
+# Build and publish the reach backend: Docker image + Lambda package + UI.
+#
+# Usage:
+#   ./scripts/release_backend.sh                         # build + upload S3 artifacts (no Docker push)
+#   ./scripts/release_backend.sh --push                  # build + upload + push Docker image
+#   ./scripts/release_backend.sh --push --no-cache       # same, without Docker layer cache
+#   ./scripts/release_backend.sh --image myorg/reach     # override Docker image name
+#   ./scripts/release_backend.sh --bucket my-bucket      # override S3 bucket
 
 set -euo pipefail
 
 IMAGE="nabeemdev/reach"
 BUCKET="reach-releases"
 PUSH=false
+NO_CACHE=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --image)  IMAGE="$2";  shift 2 ;;
-    --bucket) BUCKET="$2"; shift 2 ;;
-    --push)   PUSH=true;   shift   ;;
-    *) echo "Usage: $0 [--image <repo/name>] [--bucket <s3-bucket>] [--push]"; exit 1 ;;
+    --image)     IMAGE="$2";        shift 2 ;;
+    --bucket)    BUCKET="$2";       shift 2 ;;
+    --push)      PUSH=true;         shift   ;;
+    --no-cache)  NO_CACHE="--no-cache"; shift ;;
+    *) echo "Usage: $0 [--image <repo/name>] [--bucket <s3-bucket>] [--push] [--no-cache]"; exit 1 ;;
   esac
 done
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
+# ---------------------------------------------------------------------------
+# Version
+# ---------------------------------------------------------------------------
 VERSION=$(grep '__version__' "$ROOT_DIR/backend/version.py" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
 if [[ -z "$VERSION" ]]; then
   echo "Error: could not read __version__ from backend/version.py"
@@ -27,25 +38,66 @@ fi
 echo "==> Version: $VERSION"
 
 # ---------------------------------------------------------------------------
+# Dependency checks
+# ---------------------------------------------------------------------------
+echo "==> Checking dependencies..."
+
+for cmd in docker aws sam npm python3; do
+  if ! command -v "$cmd" &>/dev/null; then
+    echo "Error: '$cmd' is required but not installed."
+    exit 1
+  fi
+done
+
+if ! docker buildx version &>/dev/null 2>&1; then
+  echo "Error: docker buildx is required. Install Docker Desktop or the buildx plugin."
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
-echo "==> Running tests..."
+echo "==> Running backend tests..."
 (
   cd "$ROOT_DIR/backend"
   STORAGE_BACKEND=postgres DATABASE_URL="sqlite:///:memory:" \
     ADMIN_TOKEN=test-admin-token TOKEN_PEPPER=test-pepper \
-    python3 -m pytest tests/ -q --tb=short
+    "${UV:-$(command -v uv || echo uv)}" run --with-requirements requirements-dev.txt pytest tests/ -q --tb=short
+)
+
+echo "==> Running frontend tests..."
+(
+  cd "$ROOT_DIR/ui"
+  npm ci --silent
+  npm test -- --run
 )
 
 # ---------------------------------------------------------------------------
 # Docker image
 # ---------------------------------------------------------------------------
-echo "==> Building $IMAGE:$VERSION and $IMAGE:latest..."
-docker build \
-  --platform linux/amd64,linux/arm64 \
-  -t "$IMAGE:$VERSION" \
-  -t "$IMAGE:latest" \
-  "$ROOT_DIR"
+if [[ "$PUSH" == true ]]; then
+  echo "==> Building and pushing $IMAGE:$VERSION and $IMAGE:latest (linux/amd64, linux/arm64)..."
+  docker buildx build \
+    --platform linux/amd64,linux/arm64 \
+    $NO_CACHE \
+    -t "$IMAGE:$VERSION" \
+    -t "$IMAGE:latest" \
+    --push \
+    "$ROOT_DIR"
+else
+  # Multi-platform requires --push; build native platform only for local testing
+  NATIVE=$(docker info --format '{{.Architecture}}' \
+    | sed 's/x86_64/amd64/' | sed 's/aarch64/arm64/')
+  echo "==> Building $IMAGE:$VERSION locally (linux/$NATIVE)..."
+  echo "    (pass --push to build linux/amd64+arm64 and push to registry)"
+  docker buildx build \
+    --platform "linux/$NATIVE" \
+    $NO_CACHE \
+    -t "$IMAGE:$VERSION" \
+    -t "$IMAGE:latest" \
+    --load \
+    "$ROOT_DIR"
+fi
 
 # ---------------------------------------------------------------------------
 # Lambda package
@@ -65,39 +117,54 @@ aws s3 cp "$PACKAGED_TEMPLATE" "s3://$BUCKET/lambda/v${VERSION}/template.yaml"
 aws s3 cp "$PACKAGED_TEMPLATE" "s3://$BUCKET/lambda/latest/template.yaml"
 
 # ---------------------------------------------------------------------------
+# UI
+# ---------------------------------------------------------------------------
+echo "==> Building UI..."
+(
+  cd "$ROOT_DIR/ui"
+  npm run build
+)
+
+UI_TARBALL="/tmp/reach-ui-${VERSION}.tar.gz"
+tar -czf "$UI_TARBALL" -C "$ROOT_DIR/ui/dist" .
+
+echo "==> Uploading UI..."
+aws s3 cp "$UI_TARBALL" "s3://$BUCKET/lambda/v${VERSION}/ui.tar.gz"
+aws s3 cp "$UI_TARBALL" "s3://$BUCKET/lambda/latest/ui.tar.gz"
+rm -f "$UI_TARBALL"
+
+# ---------------------------------------------------------------------------
 # Setup scripts
 # ---------------------------------------------------------------------------
-echo "==> Uploading local-setup.sh..."
-aws s3 cp "$ROOT_DIR/scripts/local-setup.sh" "s3://$BUCKET/local-setup.sh"
-
-echo "==> Uploading lambda-setup.sh..."
+echo "==> Uploading setup scripts..."
+aws s3 cp "$ROOT_DIR/scripts/local-setup.sh"  "s3://$BUCKET/local-setup.sh"
 aws s3 cp "$ROOT_DIR/scripts/lambda-setup.sh" "s3://$BUCKET/lambda-setup.sh"
 
 # ---------------------------------------------------------------------------
-# Docker push
+# Summary
 # ---------------------------------------------------------------------------
+echo ""
+echo "┌─────────────────────────────────────────────────────────────────┐"
+echo "│                    release complete                             │"
+echo "└─────────────────────────────────────────────────────────────────┘"
+echo ""
+echo "  Version: $VERSION"
+echo ""
+echo "  ── Docker ───────────────────────────────────────────────────────"
 if [[ "$PUSH" == true ]]; then
-  echo "==> Pushing $IMAGE:$VERSION..."
-  docker push "$IMAGE:$VERSION"
-  echo "==> Pushing $IMAGE:latest..."
-  docker push "$IMAGE:latest"
-  echo ""
-  echo "==> Done. Published:"
-  echo "    $IMAGE:$VERSION"
-  echo "    $IMAGE:latest"
-  echo "    s3://$BUCKET/lambda/v${VERSION}/template.yaml"
-  echo "    s3://$BUCKET/lambda/latest/template.yaml"
-  echo "    s3://$BUCKET/lambda/code/ (function zips)"
-  echo "    s3://$BUCKET/local-setup.sh"
-  echo "    s3://$BUCKET/lambda-setup.sh"
+  echo "  $IMAGE:$VERSION         (pushed)"
+  echo "  $IMAGE:latest           (pushed)"
 else
-  echo ""
-  echo "==> Built locally (pass --push to publish Docker image):"
-  echo "    $IMAGE:$VERSION"
-  echo "    $IMAGE:latest"
-  echo "    s3://$BUCKET/lambda/v${VERSION}/template.yaml (uploaded)"
-  echo "    s3://$BUCKET/lambda/latest/template.yaml (uploaded)"
-  echo "    s3://$BUCKET/lambda/code/ (function zips uploaded)"
-  echo "    s3://$BUCKET/local-setup.sh (uploaded)"
-  echo "    s3://$BUCKET/lambda-setup.sh (uploaded)"
+  echo "  $IMAGE:$VERSION         (local only - pass --push to publish)"
+  echo "  $IMAGE:latest           (local only)"
 fi
+echo ""
+echo "  ── S3: $BUCKET ──────────────────────────────────────────────────"
+echo "  lambda/v${VERSION}/template.yaml"
+echo "  lambda/latest/template.yaml"
+echo "  lambda/code/              (function zips)"
+echo "  lambda/v${VERSION}/ui.tar.gz"
+echo "  lambda/latest/ui.tar.gz"
+echo "  local-setup.sh"
+echo "  lambda-setup.sh"
+echo ""

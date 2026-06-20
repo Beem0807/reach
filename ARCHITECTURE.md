@@ -51,8 +51,8 @@ A command goes through four steps:
 1. Submit    CLI / MCP  →  POST /jobs                    →  Backend stores job (PENDING, is_write annotated)
 2. Poll      Agent      →  POST /agent/sync               →  Backend returns pending job + is_write flag
 3. Execute   Agent runs the command; enforcement depends on mode and OS (see Policy enforcement)
-4. Result    Agent      →  POST /agent/jobs/{id}/result   →  Backend stores output (SUCCEEDED / FAILED)
-5. Retrieve  CLI / MCP  →  GET  /jobs/{id}                →  Backend returns output
+4. Result    Agent      →  POST /agent/jobs/{id}/result   →  Backend redacts secrets, stores output (SUCCEEDED / FAILED)
+5. Retrieve  CLI / MCP  →  GET  /jobs/{id}                →  Backend returns output (MCP redacts again before the LLM sees it)
 ```
 
 The CLI and MCP server both poll `GET /jobs/{id}` until the job reaches a terminal state or the timeout is hit. The agent has no direct channel back to the submitter - results go through the backend.
@@ -65,7 +65,7 @@ The CLI and MCP server both poll `GET /jobs/{id}` until the job reaches a termin
               macOS  - unapproved write detected via server-supplied is_write flag; blocked early
 3b. Result   Agent posts result with blocked=true, is_write=true
 3c. Record   Backend updates is_write on the job; creates a pending approval record
-3d. Notify   User sees it via `reach approvals --pending`; admin approves or denies via admin API
+3d. Notify   User sees it via `reach approvals --pending`; an operator or admin approves or denies in the tenant console (or via `PUT /tenant/approvals/{id}/approve`)
 ```
 
 ---
@@ -74,7 +74,7 @@ The CLI and MCP server both poll `GET /jobs/{id}` until the job reaches a termin
 
 ### CLI (`cli/`)
 
-A Python CLI (`reach`) that authenticates with a user token and talks to the backend over HTTPS. Manages a local config file (`~/.reach/config.json`) with the API URL, user token, default agent, and aliases.
+A Python CLI (`reach`) that authenticates with an API token (`tok_`) and talks to the backend over HTTPS. Manages a local config file (`~/.reach/config.json`) with the API URL, API token, default agent, and aliases.
 
 Notable commands: `exec`, `job`, `history`, `agents`, `approvals` (with `--pending`/`--denied`/`--expired` flags), `agent-init`, `mcp`, `man`.
 
@@ -92,10 +92,11 @@ A FastAPI application with a storage-backend abstraction that supports two datab
 
 | Deployment | Runtime | Database |
 |---|---|---|
-| Docker | FastAPI (uvicorn behind nginx) | PostgreSQL (via SQLAlchemy + Alembic) |
+| Docker | FastAPI (uvicorn behind nginx) | PostgreSQL (via SQLAlchemy + Alembic) - default |
+| Docker on AWS | FastAPI (uvicorn behind nginx) | DynamoDB (boto3) - opt-in with `STORAGE_BACKEND=dynamo` |
 | Lambda | API Gateway + Lambda | DynamoDB (boto3) |
 
-The same handler code runs in both deployments. The storage layer is swapped via the `STORAGE_BACKEND` env var (`postgres` or `dynamo`). Handlers import from `shared.store`, which returns the correct repo implementation.
+The same handler code runs in every deployment. The storage layer is swapped via the `STORAGE_BACKEND` env var (`postgres` or `dynamo`). Handlers import from `shared.store`, which returns the correct repo implementation.
 
 nginx is required in front of uvicorn for the Docker deployment. Long-polling connections from the agent (`POST /agent/sync`) need to be terminated cleanly; uvicorn alone does not handle this correctly under load.
 
@@ -103,7 +104,7 @@ A background scheduler (APScheduler on FastAPI, EventBridge on Lambda) runs ever
 - Mark agents `INACTIVE` if no heartbeat in the last 45 seconds
 - Expire `PENDING` jobs older than 1 hour to `EXPIRED`
 - At the top of every hour: mark `approved` approval records with `expires_at` in the past as `expired`
-- At midnight UTC: delete `denied` and `expired` approval records older than `APPROVAL_RETENTION_DAYS`
+- At midnight UTC: delete records past their retention window - `denied`/`expired` approvals older than `APPROVAL_RETENTION_DAYS` (7), terminal jobs older than `JOB_RETENTION_DAYS` (7), audit logs older than `AUDIT_RETENTION_DAYS` (90), and agent status history older than `AGENT_HISTORY_RETENTION_DAYS` (30)
 
 ### Agent (`agent/`)
 
@@ -113,15 +114,17 @@ A Go binary installed via `install.sh`. On Linux it runs as a systemd service un
 2. Runs the command, optionally under a Landlock sandbox on Linux or via `is_write` enforcement on macOS (see [Policy enforcement](#policy-enforcement))
 3. `POST /agent/jobs/{id}/result` - posts stdout, stderr, exit code, whether the command was blocked, and `is_write` (set to `true` if blocked)
 
-The agent self-rotates its token every 30 days. Admins can also trigger an out-of-band rotation via `POST /admin/agents/{id}/rotate-token`, which sets a `rotation_requested` flag; the agent picks it up on its next sync and self-rotates without any connection interruption. See [SELF_HOSTING.md](SELF_HOSTING.md) for the full agent lifecycle.
+The agent self-rotates its token every 30 days. Tenant admins can also trigger an out-of-band rotation via `POST /tenant/agents/{id}/request-rotation`, which sets a `rotation_requested` flag; the agent picks it up on its next sync and self-rotates without any connection interruption. See [SELF_HOSTING.md](SELF_HOSTING.md) for the full agent lifecycle.
 
 ---
 
 ## Storage backend split
 
-Lambda functions are stateless and short-lived. DynamoDB requires no persistent connection - each request opens and closes independently, which is the only viable model for Lambda at scale. Lambda + PostgreSQL is deliberately not supported: ephemeral connections exhaust PostgreSQL's connection limit quickly, and the fix (RDS Proxy) adds cost that defeats the purpose of the serverless option.
+Lambda functions are stateless and short-lived. DynamoDB requires no persistent connection - each request opens and closes independently, which is the only viable model for Lambda at scale. Lambda + PostgreSQL is deliberately **not** supported: ephemeral connections exhaust PostgreSQL's connection limit quickly, and the fix (RDS Proxy) adds cost that defeats the purpose of the serverless option.
 
-FastAPI in Docker holds a connection pool for the lifetime of the process, which is exactly what PostgreSQL expects. DynamoDB outside of AWS requires AWS credentials and doesn't make sense in a self-hosted context.
+FastAPI in Docker holds a connection pool for the lifetime of the process, which is exactly what PostgreSQL expects - the default for the container image. **FastAPI + DynamoDB is also supported when the container runs on AWS** (ECS/Fargate/EKS): a long-lived process talking to DynamoDB is fine - boto3 reuses HTTP connections, so the connection-limit problem that rules out Lambda + PostgreSQL does not apply in reverse. This lets you run the container without managing an RDS instance. It is scoped to AWS-hosted containers because the boto3 client uses the standard AWS credential/region chain (task role, IRSA, instance profile, or env vars); off-AWS DynamoDB is not a supported target.
+
+Unlike Postgres (tables created by Alembic) or Lambda (tables created by CloudFormation), the Docker + DynamoDB path creates its tables with an idempotent bootstrap (`shared/dynamo_bootstrap.py`) that runs from the same canonical schema (`shared/dynamo_schema.py`) on container start. See [SELF_HOSTING.md](SELF_HOSTING.md#dynamodb-on-aws) for the deployment steps and IAM policy.
 
 The storage abstraction (`backend/shared/repos/base.py`) defines a common interface. `sql.py` implements it with SQLAlchemy, `dynamo.py` with boto3. Handlers never import from either directly.
 
@@ -133,11 +136,11 @@ Three token types, none stored raw - only `HMAC-SHA256(TOKEN_PEPPER, token)` has
 
 | Token | Prefix | Issued by | Used by | Lifetime |
 |---|---|---|---|---|
-| Install token | `install_` | Admin API | Agent (once, at claim) | 24 hours |
+| Install token | `install_` | `POST /tenant/agents` (tenant admin) | Agent (once, at claim) | 24 hours |
 | Agent token | `agent_` | Backend (at claim) | Agent (every sync) | 30 days, auto-rotated |
-| User token | `tok_` | Admin API | CLI / MCP server | Until revoked |
+| API token | `tok_` | `POST /tenant/api-tokens` (any tenant user) | CLI / MCP server | Until revoked |
 
-The install token is one-time use and is cleared from disk after a successful claim. The agent token is bound to a machine fingerprint - a token replayed from a different machine is rejected. The agent rotates its own token every 30 days with no lockout window (old token is valid until the new one is persisted). Admins can also request an immediate rotation via `POST /admin/agents/{id}/rotate-token`; the flag is cleared atomically by `update_agent_token_hash` when the new token is stored.
+The install token is one-time use and is cleared from disk after a successful claim. The agent token is bound to a machine fingerprint - a token replayed from a different machine is rejected. The agent rotates its own token every 30 days with no lockout window (old token is valid until the new one is persisted). Tenant admins can also request an immediate rotation via `POST /tenant/agents/{id}/request-rotation`; the flag is cleared atomically by `update_agent_token_hash` when the new token is stored.
 
 ---
 
@@ -160,19 +163,19 @@ CREATED ──(claim)──► ACTIVE ──(heartbeat gap)──► INACTIVE
 - **CREATED** - registered, never claimed. Install token valid for 24 hours.
 - **ACTIVE** - claimed and syncing. Transitions to INACTIVE after 45 seconds without a heartbeat.
 - **INACTIVE** - missed heartbeats. Auto-recovers to ACTIVE on next successful sync (no manual intervention needed).
-- **REVOKED** - access permanently cut. The agent can no longer sync (the sync endpoint rejects non-ACTIVE/INACTIVE status with 403). Removed from all users' allowed-agent lists at revoke time. Can be resurrected to CREATED by reissuing an install token (`POST /admin/agents/{id}/reissue-install-token`), which clears the agent token, machine fingerprint, and claimed-at fields so the machine can re-install.
-- **DELETED** - soft-deleted. Record stays in the database for audit purposes. Cannot sync or be reissued. Advance to this state only after REVOKED. Hidden from tenant-facing endpoints (`GET /agents`, `GET /agents/{id}` return 404) but visible to the admin API so the remove step can be completed.
+- **REVOKED** - access permanently cut. The agent can no longer sync (the sync endpoint rejects non-ACTIVE/INACTIVE status with 403). Removed from all users' allowed-agent lists at revoke time. Can be resurrected to CREATED by reissuing an install token (`POST /tenant/agents/{id}/reissue-install-token`), which clears the agent token, machine fingerprint, and claimed-at fields so the machine can re-install.
+- **DELETED** - soft-deleted. Record stays in the database for audit purposes. Cannot sync or be reissued. Advance to this state only after REVOKED. Hidden from the user-facing endpoints (`GET /agents`, `GET /agents/{id}` return 404) but still actionable by tenant admins so the remove step can be completed.
 - **[gone]** - permanently removed from the database via the remove action. No record remains.
 
 The three-step decommission sequence prevents accidental hard-deletes:
 
 | Step | Endpoint | Requires | Effect |
 |---|---|---|---|
-| 1. Revoke | `POST /admin/agents/{id}/revoke` | Any active/inactive/created status | Sets REVOKED, removes from user access lists |
-| 2. Soft-delete | `DELETE /admin/agents/{id}` | REVOKED | Sets DELETED, record stays in table |
-| 3. Remove | `DELETE /admin/agents/{id}/remove` | DELETED | Permanently removes from database |
+| 1. Revoke | `POST /tenant/agents/{id}/revoke` | Any active/inactive/created status | Sets REVOKED, removes from user access lists |
+| 2. Soft-delete | `DELETE /tenant/agents/{id}` | REVOKED | Sets DELETED, record stays in table |
+| 3. Remove | `DELETE /tenant/agents/{id}/remove` | DELETED | Permanently removes from database |
 
-To undo a revoke: call `POST /admin/agents/{id}/reissue-install-token`. This resets the agent to CREATED with a fresh install token and is the only way to restore a REVOKED agent. DELETED agents cannot be reissued - remove and create a new agent instead.
+To undo a revoke: call `POST /tenant/agents/{id}/reissue-install-token`. This resets the agent to CREATED with a fresh install token and is the only way to restore a REVOKED agent. DELETED agents cannot be reissued - remove and create a new agent instead.
 
 The heartbeat checker runs every minute and scans for ACTIVE agents whose `last_heartbeat_at` is older than 45 seconds.
 
@@ -225,7 +228,7 @@ When the agent receives a job in approved mode, it also receives the current app
 - **Linux:** if not approved, runs under Landlock. If Landlock blocks the command (permission denied), the agent posts `blocked=true, is_write=true` in the job result.
 - **macOS:** if not approved and `is_write=true`, the agent returns `blocked=true, is_write=true` immediately without running the command.
 - The backend receives `blocked=true`, updates `is_write` on the job record, looks up the requesting user, and creates a pending record in the `approvals` table.
-- The admin can review these records via the admin API and approve or deny them.
+- An operator or admin can review these records (tenant console → Approvals, or the `/tenant/approvals` endpoints) and approve or deny them.
 - Once approved, the command prefix is included in the approved list on the next sync, and the command runs without restriction.
 
 ### Approved list matching
@@ -236,7 +239,7 @@ The match is prefix-based with a word boundary: an approved entry of `docker log
 
 ## Approvals
 
-Approval records can be created two ways: automatically when an agent blocks a command in approved mode, or proactively by an admin via `POST /admin/approvals` (pre-approve without needing a prior block). The schema is the same either way:
+Approval records can be created two ways: automatically when an agent blocks a command in approved mode, or proactively by an operator or admin via `POST /tenant/approvals` (pre-approve without needing a prior block). The schema is the same either way:
 
 ```
 approvals table:
@@ -286,7 +289,7 @@ approvals table:
 | `denied` | 409 | 409 | Terminal - delete and let a new block create a fresh one |
 | `expired` | 409 | 409 | Terminal - delete and let a new block create a fresh one |
 
-Admins manage approvals via `GET/PUT/DELETE /admin/approvals`. `DELETE /admin/approvals/{id}` permanently removes a record of any status - useful for cleaning up stale pending records or removing an approved command from the effective list immediately. Users manage approvals through `reach approvals` with status flags: default shows effective approved commands (agent-wide); `--pending`, `--denied`, and `--expired` show the current user's own records for the agent.
+Operators and admins manage approvals via `GET /tenant/approvals`, `PUT /tenant/approvals/{id}/approve`, `PUT /tenant/approvals/{id}/deny`, and `DELETE /tenant/approvals/{id}`. `DELETE /tenant/approvals/{id}` permanently removes a record of any status - useful for cleaning up stale pending records or removing an approved command from the effective list immediately. Users manage approvals through `reach approvals` with status flags: default shows effective approved commands (agent-wide); `--pending`, `--denied`, and `--expired` show the current user's own records for the agent.
 
 Only one pending record is created per `(agent_id, command)` pair at a time. If a command is blocked and a pending record already exists for that exact command on that agent, no duplicate is created. Once the existing record is approved or denied, the next block creates a fresh pending record.
 
@@ -294,7 +297,7 @@ If multiple `approved` records accumulate for the same command on the same agent
 
 ### Time-limited approvals
 
-When approving a `pending` record or updating duration on an `approved` record, the admin can supply a `duration` in the request body:
+When approving a `pending` record or updating duration on an `approved` record, the reviewer (operator or admin) can supply a `duration` in the request body:
 
 | Value | Meaning | Allowed on |
 |---|---|---|
@@ -334,8 +337,8 @@ The agent detects whether it is running as root (`os.Getuid() == 0`) and include
 | access_level | Mode | running_as_root |
 |---|---|---|
 | `open` | wild | true |
-| `elevated` | wild | false - or - approved + root |
-| `managed` | approved | false - or - readonly + root |
+| `elevated` | wild (non-root) or approved (root) | - |
+| `managed` | approved (non-root) or readonly (root) | - |
 | `restricted` | readonly | false |
 
 This label is shown in `reach agents list` and `reach status`, and is included in the `GET /agents` and `GET /agents/{id}` API responses so MCP clients receive it directly. It is a factual descriptor of how the agent is configured, not a risk score.
@@ -344,7 +347,7 @@ This label is shown in `reach agents list` and `reach status`, and is included i
 
 ## Multi-tenancy
 
-Every resource (agent, user, job, approval) belongs to a tenant. The backend enforces tenant isolation at the storage layer - user tokens can only see agents, jobs, and approvals within their own tenant. The admin API (authenticated with `ADMIN_TOKEN`) operates across tenants.
+Every resource (agent, user, job, approval) belongs to a tenant. The backend enforces tenant isolation at the storage layer - user API tokens can only see agents, jobs, and approvals within their own tenant. The platform admin API (authenticated with a session token from `ADMIN_PASSWORD`) operates across tenants for provisioning only.
 
 ---
 
@@ -371,7 +374,7 @@ If both fields are `None` (the default), the user is unrestricted and can access
 - **Approved-command lookup** (`GET /agents/{id}/approved-commands`) - returns 404 for inaccessible agents
 - **Pending approval list** (`GET /approvals/pending`) - when `agent_id` is specified, validates access before querying; when listing across all agents, post-filters results to only include agents the user can access
 
-The admin API bypasses `can_access_agent` entirely; admins operate across all tenants and agents.
+`can_access_agent` governs the user-facing data endpoints listed above (`/me`, `/jobs`, `/agents`, `/approvals/pending`). The platform admin API (`GET /admin/agents`, read-only) operates across tenants and is not subject to it. Tenant management endpoints (`/tenant/*`, admin/operator role) operate on every agent in their own tenant and are gated by role, not by per-user agent restrictions.
 
 ---
 

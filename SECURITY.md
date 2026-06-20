@@ -36,7 +36,7 @@ Only the latest released version receives security fixes. Older versions are not
 **Reach does not protect against:**
 
 - **Malicious or compromised machine owner** - the person who owns the machine the agent runs on can read the agent config file, extract the agent token, and use it to submit arbitrary commands (in wild mode) or approved commands (in approved mode). Reach is not a security boundary between a machine owner and their own machine.
-- **Compromised `ADMIN_TOKEN`** - whoever holds `ADMIN_TOKEN` can create tenants, agents, and users; change policy modes; approve any command; and revoke access. Treat it like a root credential.
+- **Compromised `ADMIN_PASSWORD`** - whoever knows `ADMIN_PASSWORD` can create and manage tenants and users across all tenants. Treat it like a root credential for provisioning. Policy management, approvals, and agent operations are controlled by tenant admin users separately.
 - **Compromised `TOKEN_PEPPER`** - `TOKEN_PEPPER` is used to hash all tokens. If it leaks alongside the database, all token hashes become forgeable. See [Backend compromise](#what-happens-if-the-backend-is-compromised).
 - **Kernel-level bypasses** - the Landlock sandbox on Linux protects against unapproved writes at the kernel level, but kernel exploits or privileged container escapes are out of scope.
 - **Command-obfuscation edge cases in wild mode** - wild mode runs commands through `bash -lc`. Shell aliases, `$PATH` manipulation, or creative quoting on the submitting machine may produce commands that look safe but behave differently on the remote. Use `approved` or `readonly` mode on any machine where this matters.
@@ -49,6 +49,12 @@ Only the latest released version receives security fixes. Older versions are not
 For full architectural detail see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 **Tokens** - no token is stored raw. Only `HMAC-SHA256(TOKEN_PEPPER, token)` hashes are persisted. If the database is compromised without `TOKEN_PEPPER`, tokens cannot be recovered or forged.
+
+**User passwords** - console login passwords are hashed with PBKDF2-HMAC-SHA256 (200,000 iterations) using a unique 16-byte random salt per user, stored as `pbkdf2$salt$hash`. The raw password is never stored. New passwords must be at least 8 characters. First-login passwords are randomly generated, issued once, and must be changed before the account can be used.
+
+**Console session tokens** - the web console issues short-lived (8-hour) HS256 session tokens that are distinct from API tokens and are never persisted server-side. The platform admin session is signed with `ADMIN_PASSWORD`; the tenant console session is signed with a dedicated `SESSION_SIGNING_KEY` and carries the user's tenant and role. Both signing secrets are **safe to rotate** - doing so only invalidates active sessions, so users simply log in again. This is deliberately separate from `TOKEN_PEPPER` (which hashes stored credentials and cannot be rotated without reissuing everything), so session-key rotation never touches stored tokens. The CLI and MCP server do **not** use session tokens - they authenticate with long-lived API tokens (`tok_`).
+
+**Constant-time comparison** - passwords, token hashes, session signatures, and `ADMIN_PASSWORD` are all compared with `hmac.compare_digest` to avoid leaking information through timing.
 
 **Agent token binding** - agent tokens are bound to a machine fingerprint at claim time. A token stolen from one machine cannot be replayed from another.
 
@@ -64,17 +70,38 @@ For full architectural detail see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 **sudo access** - the agent runs as a non-privileged `reach-agent` system user with no sudoers entry by default. `sudo` commands will fail unless you explicitly grant sudo access. For production, prefer `approved` mode and allowlist only the specific `sudo` commands needed. See [Agent sudo access](SELF_HOSTING.md#agent-sudo-access).
 
+**Secret redaction** - command output is scrubbed for recognizable secrets before it is stored or shown to an AI agent. See [Secret redaction in command output](#secret-redaction-in-command-output).
+
+**Brute-force mitigation** - all login endpoints (`POST /admin/login`, `POST /tenant/login`) are rate limited to 10 requests/minute per IP, and every other endpoint is rate limited as well (see [API.md](API.md#rate-limits)). There is no per-account lockout counter; protection relies on rate limiting combined with strong, randomly generated credentials. Counters are in-memory (per-process) by default - if you run more than one backend replica, point them at a shared store via `RATE_LIMIT_STORAGE_URI` so the limit holds across replicas (see [Running multiple replicas](SELF_HOSTING.md#running-multiple-replicas)).
+
+---
+
+## Secret redaction in command output
+
+Command `stdout` and `stderr` are passed through a best-effort secret scrubber before they are persisted or surfaced. Redaction runs at two independent layers:
+
+1. **Backend** - `stdout`/`stderr` are redacted before the job result is written to the database, so secrets are not stored at rest in job history.
+2. **MCP server** - output is redacted again locally before it is returned to the AI agent (Claude, Cursor, etc.), so a secret never reaches the model even if it somehow reached the client.
+
+Recognized patterns include:
+
+- Cloud credentials - AWS access key IDs (`AKIA…`) and secret keys, Google API keys (`AIza…`) and OAuth tokens (`ya29.…`)
+- SaaS / provider tokens - GitHub/GitLab/Slack (`ghp_`, `ghs_`, `glpat-`, `xoxb-`, `xoxp-`), Stripe (`sk_live_`, `rk_live_`), OpenAI (`sk-…`, `sk-proj-…`), HashiCorp Vault (`hvs.`, `hvb.`, `hvr.`), npm, and SendGrid (`SG.…`) keys
+- Generic secrets - PEM private key blocks, JWTs, bearer tokens in headers, credentials embedded in URLs (`proto://user:pass@host`), common secret env-var assignments (e.g. `*_PASSWORD=`, `*_SECRET=`), and high-entropy hex values in a key-name context
+
+This is **defense-in-depth, not a guarantee.** It catches structurally recognizable secrets, not every possible format. Do not rely on it as the only control - prefer `readonly` or `approved` mode on machines that hold sensitive data, and avoid commands that print credentials in the first place.
+
 ---
 
 ## Where tokens are stored
 
 | Token | Stored on | Format |
 |---|---|---|
-| `ADMIN_TOKEN` | Your environment / secrets manager | Raw (you set it) |
+| `ADMIN_PASSWORD` | Your environment / secrets manager | Raw (you set it) |
 | `TOKEN_PEPPER` | Your environment / secrets manager | Raw (you set it) |
 | Install token | Agent config file (`/etc/reach-agent/config.json`) until claim; then cleared | Raw until claim, then gone |
 | Agent token | Agent config file (`/etc/reach-agent/config.json`) | Raw - **protect this file** |
-| User token | Returned once at creation; not stored by the backend | Raw - user must store it |
+| API token (`tok_`) | Returned once at creation; not stored by the backend | Raw - user must store it |
 | All token hashes | Database (DynamoDB or PostgreSQL) | `HMAC-SHA256(TOKEN_PEPPER, token)` only |
 
 The agent config file is written with `0600` permissions and owned by the `reach-agent` system user. Only root and `reach-agent` can read it. Protect it like an SSH private key.
@@ -85,21 +112,11 @@ The agent config file is written with `0600` permissions and owned by the `reach
 
 **Agent tokens** rotate automatically every 30 days. The agent checks token age on each poll and calls `POST /agent/rotate-token` using the current still-valid token. The new token is written to disk atomically before the old one is invalidated - no lockout window.
 
-Admins can also trigger an out-of-band rotation at any time:
+Tenant admins can also trigger an out-of-band rotation from the tenant console under **Agents → [agent] → Request rotation**. This sets a flag on the agent record; the agent self-rotates on its next sync and the flag is cleared. The agent stays connected throughout.
 
-```bash
-curl -s -X POST "$API_URL/admin/agents/agent_xxxxx/rotate-token" \
-  -H "Authorization: Bearer $ADMIN_TOKEN"
-```
+**User API tokens** do not expire automatically. Revoke individual tokens from the tenant console under **API Tokens**, or revoke all tokens for a user under **Users → [user] → Revoke all tokens**.
 
-This sets a flag on the agent record. On the next sync the agent self-rotates and the flag is cleared. The agent stays connected throughout.
-
-**User tokens** do not expire automatically. Rotate manually:
-
-```bash
-curl -s -X POST "$API_URL/admin/tenants/tenant_xxxxx/users/user_xxxxx/rotate-token" \
-  -H "Authorization: Bearer $ADMIN_TOKEN"
-```
+**`SESSION_SIGNING_KEY` is safe to rotate** - set a new value and restart. The only effect is that active console sessions stop verifying, so users log in again. There is no data impact and nothing to migrate. Rotate it on a schedule, or immediately if you suspect a session token was leaked.
 
 **`TOKEN_PEPPER` must never be rotated** - changing it invalidates every agent token, user token, and install token simultaneously. See [SELF_HOSTING.md](SELF_HOSTING.md#token_pepper-is-permanent).
 
@@ -107,31 +124,11 @@ curl -s -X POST "$API_URL/admin/tenants/tenant_xxxxx/users/user_xxxxx/rotate-tok
 
 ## How to revoke access
 
-**Revoke an agent** (cuts sync access immediately, removes from all user access lists):
+**Revoke an agent**: from the tenant console, go to **Agents → [agent] → Revoke**. Cuts sync access immediately and removes the agent from all user access lists. The agent goes dormant on its next poll. Reissue an install token to bring it back.
 
-```bash
-curl -s -X POST "$API_URL/admin/agents/agent_xxxxx/revoke" \
-  -H "Authorization: Bearer $ADMIN_TOKEN"
-```
+**Revoke a user**: from the tenant console, go to **Users → [user] → Revoke all tokens**. All their API tokens stop working immediately. Other users are unaffected.
 
-The agent cannot sync after revocation. It will stop polling on its next attempt and go dormant. Reissue an install token to bring it back.
-
-**Revoke a user** (invalidates their token immediately):
-
-```bash
-curl -s -X DELETE "$API_URL/admin/tenants/tenant_xxxxx/users/user_xxxxx" \
-  -H "Authorization: Bearer $ADMIN_TOKEN"
-```
-
-**Restrict a user to specific agents** (instead of full tenant access):
-
-```bash
-curl -s -X PUT "$API_URL/admin/tenants/tenant_xxxxx/users/user_xxxxx/agents" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -d '["agent_a", "agent_b"]'
-```
-
-Pass `["*"]` to restore unrestricted access. Pass `[]` to lock the user out of all agents without deleting them.
+**Restrict a user to specific agents**: from the tenant console, go to **Users → [user] → Agent Access**. Set an explicit list of agents the user can see - all others return 404. Pass an empty list to lock them out of all agents without deleting the account.
 
 ---
 
@@ -145,18 +142,13 @@ Every command submitted through Reach creates a **job record** with:
 - Exit code, stdout, stderr, and duration
 - Timestamps for creation, start, and completion
 
-Terminal job records (SUCCEEDED, FAILED, REJECTED, EXPIRED) are deleted by the daily heartbeat sweep, the same mechanism used for approval records. Retention is controlled by `JOB_RETENTION_DAYS` (default 7). This applies equally to both DynamoDB and PostgreSQL deployments.
+Terminal job records are deleted by the daily cleanup after `JOB_RETENTION_DAYS` (default 7).
 
-Admin can query full history:
+Job history is available in the tenant console under **Jobs**, and platform-wide in the platform admin console under **Audit Logs**. The audit log covers 35+ event types including platform and tenant logins (success and failure), user management, agent lifecycle events (create, revoke, rotate, unreachable, recover), policy changes, approval requests/reviews/pre-approvals, and API-token operations. See the full action list in [API.md](API.md#audit-log-actions). Audit entries are retained for `AUDIT_RETENTION_DAYS` (default 90) before the daily cleanup deletes them; agent status-history records for `AGENT_HISTORY_RETENTION_DAYS` (default 30).
 
-```bash
-curl -s "$API_URL/admin/jobs?tenant_id=tenant_xxxxx" \
-  -H "Authorization: Bearer $ADMIN_TOKEN"
-```
+In `approved` mode, every blocked write also creates an **approval record** - a persistent log of what was attempted, who attempted it, and when. Denied and expired approval records are retained for `APPROVAL_RETENTION_DAYS` (default 7) before cleanup. Approved records persist until manually deleted.
 
-In `approved` mode, every blocked write also creates an **approval record** - a persistent log of what was attempted, who attempted it, and when. Approval records for denied or expired commands are retained for `APPROVAL_RETENTION_DAYS` (default 7) before the daily cleanup removes them. Approved records persist until manually deleted.
-
-There is currently no separate audit log stream - the job and approval tables are the audit trail. For compliance-grade logging, forward DynamoDB Streams or PostgreSQL WAL to your preferred log sink.
+The four retention windows are independent environment variables: `APPROVAL_RETENTION_DAYS` (7), `JOB_RETENTION_DAYS` (7), `AUDIT_RETENTION_DAYS` (90), and `AGENT_HISTORY_RETENTION_DAYS` (30). For compliance-grade logging that outlives these windows, forward DynamoDB Streams or PostgreSQL WAL to your preferred log sink.
 
 ---
 
@@ -167,18 +159,18 @@ An attacker with read access to the **database only** (no `TOKEN_PEPPER`) sees:
 - Agent IDs, tenant IDs, job history, approval records - metadata exposure
 
 An attacker with the **database + `TOKEN_PEPPER`**:
-- Can forge any token (agent, user, install)
+- Can forge any token (agent, API token, install token)
 - Can impersonate any agent or user
-- **Immediate response**: rotate `ADMIN_TOKEN`, issue new install tokens for all agents (resets all agent tokens), issue new user tokens for all users, then change `TOKEN_PEPPER` **last** (changing it simultaneously invalidates everything above - do it after you've already reset)
+- **Immediate response**: rotate `ADMIN_PASSWORD`, reissue install tokens for all agents (resets all agent tokens), revoke all user API tokens, then change `TOKEN_PEPPER` **last** (changing it simultaneously invalidates everything above - do it after you've already reset)
 
-An attacker with **`ADMIN_TOKEN`** only (no database):
-- Can create agents/tenants/users, approve commands, change policy modes
+An attacker with **`ADMIN_PASSWORD`** only (no database):
+- Can create tenants and users; cannot manage agents, policies, or approvals
 - Cannot read existing token hashes (they need the DB for that)
-- **Immediate response**: rotate `ADMIN_TOKEN` by redeploying with a new value
+- **Immediate response**: redeploy with a new `ADMIN_PASSWORD`
 
 An attacker with **agent config file access on the remote machine**:
 - Has the raw agent token - can submit any command the agent's mode/policy allows
-- **Immediate response**: revoke the agent via `POST /admin/agents/{id}/revoke`, then reissue an install token and reinstall
+- **Immediate response**: revoke the agent from the tenant console, then reissue an install token and reinstall
 
 ---
 
@@ -187,10 +179,12 @@ An attacker with **agent config file access on the remote machine**:
 **Network**
 - Deploy the backend behind HTTPS with a valid TLS certificate. The agent verifies TLS by default.
 - Do not expose the backend admin endpoints publicly if avoidable - restrict `/admin/*` routes by IP or put them behind a private load balancer.
+- The backend ships with permissive CORS (`allow_origins=["*"]`). This is low-risk because every authenticated endpoint uses a `Authorization: Bearer` token rather than cookies, so a third-party site cannot ride a logged-in user's session. If you want defense-in-depth, restrict allowed origins to your console's domain at the reverse proxy.
+- Rate limiting keys off the client IP for unauthenticated endpoints. If you front the backend with a proxy or load balancer, ensure it sets `X-Forwarded-For` correctly so per-IP limits apply to the real client.
 
 **Secrets**
-- Store `TOKEN_PEPPER` and `ADMIN_TOKEN` in a secrets manager (AWS Secrets Manager, HashiCorp Vault, etc.), not in environment files or version control.
-- Rotate `ADMIN_TOKEN` regularly. Never rotate `TOKEN_PEPPER`.
+- Store `TOKEN_PEPPER` and `ADMIN_PASSWORD` in a secrets manager (AWS Secrets Manager, HashiCorp Vault, etc.), not in environment files or version control.
+- Rotate `ADMIN_PASSWORD` regularly. Never rotate `TOKEN_PEPPER`.
 - Use a long, randomly generated `TOKEN_PEPPER` (at least 32 bytes of entropy).
 
 **Agent policy**
@@ -199,11 +193,11 @@ An attacker with **agent config file access on the remote machine**:
 - Restrict users to specific agents rather than granting full tenant access where possible.
 
 **Monitoring**
-- Alert on unexpected `ADMIN_TOKEN` usage (new tenants, policy changes outside a deployment window).
-- Monitor job history for commands that look anomalous for the agent's role.
-- Set `APPROVAL_RETENTION_DAYS` long enough for your incident response window (14–30 days recommended for production).
+- Alert on unexpected platform admin activity - `admin.login` / `admin.login_failed` events from unknown IPs, and new tenants or user changes outside a deployment window. Repeated `admin.login_failed` entries indicate a brute-force attempt against `ADMIN_PASSWORD`.
+- Monitor the tenant audit log for policy changes, approval decisions, and repeated `user.login_failed` events (failed logins against tenant accounts) outside normal operations.
+- Set `APPROVAL_RETENTION_DAYS` long enough for your incident response window (14–30 days recommended for production), and `AUDIT_RETENTION_DAYS` long enough for your audit/compliance window (the default is 90).
 
 **Token hygiene**
-- Distribute user tokens over a secure channel (not plaintext Slack/email).
-- Revoke user tokens when team members leave.
+- Share API tokens over a secure channel (not plaintext Slack/email). Tokens are shown once at creation.
+- Revoke user API tokens when team members leave.
 - Treat agent tokens like SSH private keys - they grant command execution on the machine they're bound to.

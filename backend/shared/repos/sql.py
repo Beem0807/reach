@@ -1,9 +1,12 @@
 import os
+from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import JSON, Boolean, Column, Integer, String, Text, create_engine, delete as sa_delete, select, update
+from sqlalchemy import JSON, Boolean, Column, Integer, String, Text, UniqueConstraint, create_engine, delete as sa_delete, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
+from shared.exceptions import NameTakenError
 from shared.policy import compute_access_level
 
 DATABASE_URL = os.environ["DATABASE_URL"]
@@ -38,6 +41,10 @@ class _Agent(_Base):
     fleet_id = Column(String)
     tags = Column(JSON, default=list)
     created_at = Column(String)
+    grant_service_mgmt = Column(Boolean, default=False)
+    grant_docker = Column(Boolean, default=False)
+    service_mgmt_detected = Column(Boolean)
+    docker_detected = Column(Boolean)
 
 
 class _Approval(_Base):
@@ -59,19 +66,67 @@ class _Approval(_Base):
 class _Tenant(_Base):
     __tablename__ = "tenants"
     tenant_id = Column(String, primary_key=True)
-    name = Column(String)
+    name = Column(String, unique=True)
+    status = Column(String, default='ACTIVE', server_default='ACTIVE')
     created_at = Column(String)
 
 
 class _User(_Base):
     __tablename__ = "users"
+    __table_args__ = (UniqueConstraint('tenant_id', 'username', name='ix_users_tenant_username'),)
     user_id = Column(String, primary_key=True)
     tenant_id = Column(String, nullable=False, index=True)
-    token_hash = Column(String, nullable=False, unique=True, index=True)
     name = Column(String)
+    username = Column(String)
+    password_hash = Column(String)
+    role = Column(String)               # TENANT_ADMIN | TENANT_USER | None (legacy)
+    must_reset_password = Column(Boolean, default=False)
+    disabled_at = Column(String)
+    last_login_at = Column(String)
     created_at = Column(String)
     allowed_agent_ids = Column(JSON)
     allowed_fleet_ids = Column(JSON)
+    status = Column(String, default='ACTIVE', server_default='ACTIVE')
+
+
+class _ApiToken(_Base):
+    __tablename__ = "api_tokens"
+    token_id = Column(String, primary_key=True)
+    user_id = Column(String, nullable=False, index=True)
+    tenant_id = Column(String, nullable=False, index=True)
+    token_hash = Column(String, nullable=False, unique=True, index=True)
+    name = Column(String)
+    status = Column(String, default='ACTIVE', server_default='ACTIVE')
+    created_at = Column(String)
+    last_used_at = Column(String)
+    revoked_at = Column(String)
+
+
+class _AgentHistory(_Base):
+    __tablename__ = "agent_history"
+    history_id = Column(String, primary_key=True)
+    agent_id = Column(String, nullable=False, index=True)
+    tenant_id = Column(String, nullable=False, index=True)
+    from_status = Column(String)
+    to_status = Column(String, nullable=False)
+    triggered_by = Column(String)
+    note = Column(String)
+    created_at = Column(String, nullable=False, index=True)
+
+
+class _AuditLog(_Base):
+    __tablename__ = "audit_logs"
+    log_id = Column(String, primary_key=True)
+    tenant_id = Column(String, index=True)
+    actor_id = Column(String, index=True)
+    actor_name = Column(String)
+    actor_role = Column(String)
+    action = Column(String, nullable=False)
+    resource_type = Column(String)
+    resource_id = Column(String)
+    event_metadata = Column(JSON)
+    ip_address = Column(String)
+    created_at = Column(String, nullable=False, index=True)
 
 
 class _Job(_Base):
@@ -94,6 +149,10 @@ class _Job(_Base):
     expires_at = Column(Integer)
 
 
+def _iso() -> str:
+    return datetime.now(tz=timezone.utc).isoformat()
+
+
 def _to_dict(row) -> Optional[dict]:
     if row is None:
         return None
@@ -104,7 +163,13 @@ def _enrich_agent(d: Optional[dict]) -> Optional[dict]:
     if d is None:
         return None
     root = d.get("running_as_root") == "true"
-    d["access_level"] = compute_access_level(d.get("mode", "wild"), root)
+    d["access_level"] = compute_access_level(
+        d.get("mode", "wild"), root,
+        grant_docker=bool(d.get("grant_docker")),
+        grant_service_mgmt=bool(d.get("grant_service_mgmt")),
+        docker_detected=bool(d.get("docker_detected")),
+        service_mgmt_detected=bool(d.get("service_mgmt_detected")),
+    )
     return d
 
 
@@ -132,7 +197,13 @@ class AgentRepo:
             )
             db.commit()
 
-    def update_heartbeat(self, agent_id: str, reactivate: bool, now_iso: str, agent_version: Optional[str] = None, running_as_root: Optional[bool] = None) -> None:
+    def update_heartbeat(
+        self, agent_id: str, reactivate: bool, now_iso: str,
+        agent_version: Optional[str] = None,
+        running_as_root: Optional[bool] = None,
+        docker_detected: Optional[bool] = None,
+        service_mgmt_detected: Optional[bool] = None,
+    ) -> None:
         values: dict = {"last_heartbeat_at": now_iso}
         if reactivate:
             values["status"] = "ACTIVE"
@@ -140,6 +211,10 @@ class AgentRepo:
             values["agent_version"] = agent_version
         if running_as_root is not None:
             values["running_as_root"] = "true" if running_as_root else "false"
+        if docker_detected is not None:
+            values["docker_detected"] = docker_detected
+        if service_mgmt_detected is not None:
+            values["service_mgmt_detected"] = service_mgmt_detected
         with SessionLocal() as db:
             db.execute(update(_Agent).where(_Agent.agent_id == agent_id).values(**values))
             db.commit()
@@ -191,7 +266,10 @@ class AgentRepo:
             ).scalars().all()
             return [_enrich_agent(_to_dict(r)) for r in rows]
 
-    def reissue_install_token(self, agent_id: str, install_token_hash: str, expires_at: int) -> None:
+    def reissue_install_token(
+        self, agent_id: str, install_token_hash: str, expires_at: int,
+        grant_service_mgmt: bool = False, grant_docker: bool = False,
+    ) -> None:
         with SessionLocal() as db:
             db.execute(
                 update(_Agent)
@@ -203,6 +281,8 @@ class AgentRepo:
                     agent_token_hash=None,
                     machine_fingerprint=None,
                     claimed_at=None,
+                    grant_service_mgmt=grant_service_mgmt,
+                    grant_docker=grant_docker,
                 )
             )
             db.commit()
@@ -236,6 +316,18 @@ class AgentRepo:
     def set_tags(self, agent_id: str, tags: list) -> None:
         with SessionLocal() as db:
             db.execute(update(_Agent).where(_Agent.agent_id == agent_id).values(tags=tags))
+            db.commit()
+
+    def update_grants(self, agent_id: str, grant_docker: Optional[bool] = None, grant_service_mgmt: Optional[bool] = None) -> None:
+        values: dict = {}
+        if grant_docker is not None:
+            values["grant_docker"] = grant_docker
+        if grant_service_mgmt is not None:
+            values["grant_service_mgmt"] = grant_service_mgmt
+        if not values:
+            return
+        with SessionLocal() as db:
+            db.execute(update(_Agent).where(_Agent.agent_id == agent_id).values(**values))
             db.commit()
 
 
@@ -339,15 +431,37 @@ class TenantRepo:
         with SessionLocal() as db:
             return _to_dict(db.get(_Tenant, tenant_id))
 
-    def create(self, tenant: dict) -> None:
+    def get_by_name(self, name: str) -> Optional[dict]:
         with SessionLocal() as db:
-            db.add(_Tenant(**tenant))
-            db.commit()
+            row = db.execute(select(_Tenant).where(_Tenant.name == name)).scalar_one_or_none()
+            return _to_dict(row)
+
+    def create(self, tenant: dict) -> None:
+        try:
+            with SessionLocal() as db:
+                db.add(_Tenant(**tenant))
+                db.commit()
+        except IntegrityError:
+            raise NameTakenError(tenant.get("name", ""))
 
     def list_all(self) -> list:
         with SessionLocal() as db:
             rows = db.execute(select(_Tenant)).scalars().all()
             return [_to_dict(r) for r in rows]
+
+    def set_status(self, tenant_id: str, status: str) -> None:
+        with SessionLocal() as db:
+            db.execute(update(_Tenant).where(_Tenant.tenant_id == tenant_id).values(status=status))
+            db.commit()
+
+    def delete_cascade(self, tenant_id: str) -> None:
+        with SessionLocal() as db:
+            db.execute(sa_delete(_Approval).where(_Approval.tenant_id == tenant_id))
+            db.execute(sa_delete(_Job).where(_Job.tenant_id == tenant_id))
+            db.execute(sa_delete(_User).where(_User.tenant_id == tenant_id))
+            db.execute(sa_delete(_Agent).where(_Agent.tenant_id == tenant_id))
+            db.execute(sa_delete(_Tenant).where(_Tenant.tenant_id == tenant_id))
+            db.commit()
 
 
 class UserRepo:
@@ -355,24 +469,22 @@ class UserRepo:
         with SessionLocal() as db:
             return _to_dict(db.get(_User, user_id))
 
-    def get_by_hash(self, token_hash: str) -> Optional[dict]:
-        with SessionLocal() as db:
-            row = db.execute(select(_User).where(_User.token_hash == token_hash)).scalar_one_or_none()
-            return _to_dict(row)
-
     def create(self, user: dict) -> None:
-        with SessionLocal() as db:
-            db.add(_User(**user))
-            db.commit()
+        try:
+            with SessionLocal() as db:
+                db.add(_User(**user))
+                db.commit()
+        except IntegrityError:
+            raise NameTakenError(user.get("username", ""))
 
     def list_by_tenant(self, tenant_id: str) -> list:
         with SessionLocal() as db:
             rows = db.execute(select(_User).where(_User.tenant_id == tenant_id)).scalars().all()
             return [_to_dict(r) for r in rows]
 
-    def update_token_hash(self, user_id: str, token_hash: str) -> None:
+    def revoke(self, user_id: str) -> None:
         with SessionLocal() as db:
-            db.execute(update(_User).where(_User.user_id == user_id).values(token_hash=token_hash))
+            db.execute(update(_User).where(_User.user_id == user_id).values(status='REVOKED'))
             db.commit()
 
     def delete(self, user_id: str) -> None:
@@ -383,6 +495,56 @@ class UserRepo:
     def set_allowed_agents(self, user_id: str, agent_ids: list) -> None:
         with SessionLocal() as db:
             db.execute(update(_User).where(_User.user_id == user_id).values(allowed_agent_ids=agent_ids))
+            db.commit()
+
+    def get_by_username(self, tenant_id: str, username: str) -> Optional[dict]:
+        with SessionLocal() as db:
+            row = db.execute(
+                select(_User).where(
+                    _User.tenant_id == tenant_id,
+                    _User.username == username,
+                    _User.status != 'REVOKED',
+                )
+            ).scalar_one_or_none()
+            return _to_dict(row)
+
+    def update_password(self, user_id: str, password_hash: str, must_reset: bool = False) -> None:
+        with SessionLocal() as db:
+            db.execute(
+                update(_User).where(_User.user_id == user_id)
+                .values(password_hash=password_hash, must_reset_password=must_reset)
+            )
+            db.commit()
+
+    def set_last_login(self, user_id: str, now_iso: str) -> None:
+        with SessionLocal() as db:
+            db.execute(update(_User).where(_User.user_id == user_id).values(last_login_at=now_iso))
+            db.commit()
+
+    def disable(self, user_id: str, now_iso: str) -> None:
+        with SessionLocal() as db:
+            db.execute(
+                update(_User).where(_User.user_id == user_id)
+                .values(status='REVOKED', disabled_at=now_iso)
+            )
+            db.commit()
+
+    def enable(self, user_id: str) -> None:
+        with SessionLocal() as db:
+            db.execute(
+                update(_User).where(_User.user_id == user_id)
+                .values(status='ACTIVE', disabled_at=None)
+            )
+            db.commit()
+
+    def set_role(self, user_id: str, role: str) -> None:
+        with SessionLocal() as db:
+            db.execute(update(_User).where(_User.user_id == user_id).values(role=role))
+            db.commit()
+
+    def update_name(self, user_id: str, name: str) -> None:
+        with SessionLocal() as db:
+            db.execute(update(_User).where(_User.user_id == user_id).values(name=name))
             db.commit()
 
     def remove_agent_from_all_users(self, agent_id: str, tenant_id: str) -> None:
@@ -455,52 +617,6 @@ class ApprovalRepo:
                 results = self._dedup_by_command(results, db)
             return results
 
-    @staticmethod
-    def _lazy_expire(records: list, db) -> list:
-        now = _iso()
-        stale_ids = [r["approval_id"] for r in records if r.get("expires_at") and r["expires_at"] <= now]
-        if stale_ids:
-            db.execute(
-                update(_Approval)
-                .where(_Approval.approval_id.in_(stale_ids))
-                .where(_Approval.status == "approved")
-                .values(status="expired")
-            )
-            db.commit()
-        return [r for r in records if r["approval_id"] not in set(stale_ids)]
-
-    @staticmethod
-    def _dedup_by_command(records: list, db) -> list:
-        from collections import defaultdict
-        from sqlalchemy import delete as sql_delete
-        by_command: dict = defaultdict(list)
-        for r in records:
-            by_command[r["command"]].append(r)
-        kept = []
-        to_delete_ids = []
-        for recs in by_command.values():
-            if len(recs) == 1:
-                kept.append(recs[0])
-                continue
-            permanent = [r for r in recs if not r.get("expires_at")]
-            timed = sorted(
-                [r for r in recs if r.get("expires_at")],
-                key=lambda r: r["expires_at"],
-                reverse=True,
-            )
-            if permanent:
-                keeper = permanent[0]
-                to_delete_ids.extend(r["approval_id"] for r in permanent[1:])
-                to_delete_ids.extend(r["approval_id"] for r in timed)
-            else:
-                keeper = timed[0]
-                to_delete_ids.extend(r["approval_id"] for r in timed[1:])
-            kept.append(keeper)
-        if to_delete_ids:
-            db.execute(sql_delete(_Approval).where(_Approval.approval_id.in_(to_delete_ids)))
-            db.commit()
-        return kept
-
     def exists_pending(self, agent_id: str, command: str) -> bool:
         with SessionLocal() as db:
             row = db.execute(
@@ -552,3 +668,205 @@ class ApprovalRepo:
         with SessionLocal() as db:
             db.execute(sql_delete(_Approval).where(_Approval.approval_id == approval_id))
             db.commit()
+
+    @staticmethod
+    def _lazy_expire(records: list, db) -> list:
+        now = _iso()
+        stale_ids = [r["approval_id"] for r in records if r.get("expires_at") and r["expires_at"] <= now]
+        if stale_ids:
+            db.execute(
+                update(_Approval)
+                .where(_Approval.approval_id.in_(stale_ids))
+                .where(_Approval.status == "approved")
+                .values(status="expired")
+            )
+            db.commit()
+        return [r for r in records if r["approval_id"] not in set(stale_ids)]
+
+    @staticmethod
+    def _dedup_by_command(records: list, db) -> list:
+        from collections import defaultdict
+        from sqlalchemy import delete as sql_delete
+        by_command: dict = defaultdict(list)
+        for r in records:
+            by_command[r["command"]].append(r)
+        kept = []
+        to_delete_ids = []
+        for recs in by_command.values():
+            if len(recs) == 1:
+                kept.append(recs[0])
+                continue
+            permanent = [r for r in recs if not r.get("expires_at")]
+            timed = sorted(
+                [r for r in recs if r.get("expires_at")],
+                key=lambda r: r["expires_at"],
+                reverse=True,
+            )
+            if permanent:
+                keeper = permanent[0]
+                to_delete_ids.extend(r["approval_id"] for r in permanent[1:])
+                to_delete_ids.extend(r["approval_id"] for r in timed)
+            else:
+                keeper = timed[0]
+                to_delete_ids.extend(r["approval_id"] for r in timed[1:])
+            kept.append(keeper)
+        if to_delete_ids:
+            db.execute(sql_delete(_Approval).where(_Approval.approval_id.in_(to_delete_ids)))
+            db.commit()
+        return kept
+
+
+class ApiTokenRepo:
+    def create(self, token: dict) -> None:
+        with SessionLocal() as db:
+            db.add(_ApiToken(**token))
+            db.commit()
+
+    def get_by_hash(self, token_hash: str) -> Optional[dict]:
+        with SessionLocal() as db:
+            row = db.execute(
+                select(_ApiToken).where(_ApiToken.token_hash == token_hash, _ApiToken.status == 'ACTIVE')
+            ).scalar_one_or_none()
+            return _to_dict(row)
+
+    def list_by_user(self, user_id: str) -> list:
+        with SessionLocal() as db:
+            rows = db.execute(
+                select(_ApiToken).where(_ApiToken.user_id == user_id)
+                .order_by(_ApiToken.created_at.desc())
+            ).scalars().all()
+            return [_to_dict(r) for r in rows]
+
+    def list_by_tenant(self, tenant_id: str) -> list:
+        with SessionLocal() as db:
+            rows = db.execute(
+                select(_ApiToken).where(_ApiToken.tenant_id == tenant_id)
+                .order_by(_ApiToken.created_at.desc())
+            ).scalars().all()
+            return [_to_dict(r) for r in rows]
+
+    def revoke(self, token_id: str, now_iso: str) -> bool:
+        with SessionLocal() as db:
+            result = db.execute(
+                update(_ApiToken)
+                .where(_ApiToken.token_id == token_id, _ApiToken.status == 'ACTIVE')
+                .values(status='REVOKED', revoked_at=now_iso)
+            )
+            db.commit()
+            return result.rowcount > 0
+
+    def touch(self, token_id: str, now_iso: str) -> None:
+        with SessionLocal() as db:
+            db.execute(update(_ApiToken).where(_ApiToken.token_id == token_id).values(last_used_at=now_iso))
+            db.commit()
+
+    def rename(self, token_id: str, name: str) -> bool:
+        with SessionLocal() as db:
+            result = db.execute(
+                update(_ApiToken)
+                .where(_ApiToken.token_id == token_id)
+                .values(name=name)
+            )
+            db.commit()
+            return result.rowcount > 0
+
+
+class AgentHistoryRepo:
+    def create(self, entry: dict) -> None:
+        with SessionLocal() as db:
+            db.add(_AgentHistory(**entry))
+            db.commit()
+
+    def list_by_agent(self, agent_id: str, limit: int = 50) -> list:
+        with SessionLocal() as db:
+            rows = db.execute(
+                select(_AgentHistory)
+                .where(_AgentHistory.agent_id == agent_id)
+                .order_by(_AgentHistory.created_at.desc())
+                .limit(limit)
+            ).scalars().all()
+            return [_to_dict(r) for r in rows]
+
+    def delete_stale(self, before_iso: str) -> int:
+        with SessionLocal() as db:
+            result = db.execute(
+                sa_delete(_AgentHistory).where(_AgentHistory.created_at < before_iso)
+            )
+            db.commit()
+            return result.rowcount
+
+
+def _audit_to_dict(row) -> Optional[dict]:
+    d = _to_dict(row)
+    if d is None:
+        return None
+    d["metadata"] = d.pop("event_metadata", None)
+    return d
+
+
+class AuditRepo:
+    def create(self, entry: dict) -> None:
+        with SessionLocal() as db:
+            db.add(_AuditLog(**entry))
+            db.commit()
+
+    def list_platform(self, limit: int = 100, cursor: Optional[str] = None,
+                      action: Optional[str] = None, actor: Optional[str] = None,
+                      resource: Optional[str] = None, ip: Optional[str] = None,
+                      since: Optional[str] = None, until: Optional[str] = None) -> list:
+        """Platform-level audit events (tenant_id IS NULL or any)."""
+        from sqlalchemy import desc
+        with SessionLocal() as db:
+            stmt = select(_AuditLog).order_by(desc(_AuditLog.created_at))
+            if cursor:
+                stmt = stmt.where(_AuditLog.created_at < cursor)
+            if since:
+                stmt = stmt.where(_AuditLog.created_at >= since)
+            if until:
+                stmt = stmt.where(_AuditLog.created_at <= until)
+            if action:
+                stmt = stmt.where(_AuditLog.action == action)
+            if actor:
+                stmt = stmt.where(_AuditLog.actor_name.ilike(f"%{actor}%"))
+            if resource:
+                stmt = stmt.where(_AuditLog.resource_id.ilike(f"%{resource}%"))
+            if ip:
+                stmt = stmt.where(_AuditLog.ip_address.ilike(f"%{ip}%"))
+            stmt = stmt.limit(limit)
+            return [_audit_to_dict(r) for r in db.execute(stmt).scalars().all()]
+
+    def list_by_tenant(self, tenant_id: str, limit: int = 100, cursor: Optional[str] = None,
+                       action: Optional[str] = None, actor: Optional[str] = None,
+                       resource: Optional[str] = None, ip: Optional[str] = None,
+                       since: Optional[str] = None, until: Optional[str] = None) -> list:
+        from sqlalchemy import desc
+        with SessionLocal() as db:
+            stmt = (
+                select(_AuditLog)
+                .where(_AuditLog.tenant_id == tenant_id)
+                .order_by(desc(_AuditLog.created_at))
+            )
+            if cursor:
+                stmt = stmt.where(_AuditLog.created_at < cursor)
+            if since:
+                stmt = stmt.where(_AuditLog.created_at >= since)
+            if until:
+                stmt = stmt.where(_AuditLog.created_at <= until)
+            if action:
+                stmt = stmt.where(_AuditLog.action == action)
+            if actor:
+                stmt = stmt.where(_AuditLog.actor_name.ilike(f"%{actor}%"))
+            if resource:
+                stmt = stmt.where(_AuditLog.resource_id.ilike(f"%{resource}%"))
+            if ip:
+                stmt = stmt.where(_AuditLog.ip_address.ilike(f"%{ip}%"))
+            stmt = stmt.limit(limit)
+            return [_audit_to_dict(r) for r in db.execute(stmt).scalars().all()]
+
+    def delete_stale(self, before_iso: str) -> int:
+        with SessionLocal() as db:
+            result = db.execute(
+                sa_delete(_AuditLog).where(_AuditLog.created_at < before_iso)
+            )
+            db.commit()
+            return result.rowcount

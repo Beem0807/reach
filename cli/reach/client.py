@@ -4,11 +4,11 @@ import requests
 
 
 class ReachClient:
-    def __init__(self, api_url: str, tenant_token: str):
+    def __init__(self, api_url: str, api_key: str):
         self.api_url = api_url.rstrip("/")
         self.session = requests.Session()
         self.session.headers.update({
-            "Authorization": f"Bearer {tenant_token}",
+            "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         })
 

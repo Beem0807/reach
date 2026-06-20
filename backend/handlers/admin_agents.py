@@ -1,141 +1,15 @@
+"""Platform admin: read-only agent listing (used for tenant card counts)."""
 import logging
 import os
-import secrets
 
-from shared.auth import INSTALL_TOKEN_PREFIX, _hmac_token
-from shared.response import _err, _iso, _now, _ok
-from shared.store import agents_repo, tenants_repo, users_repo
-from shared.tags import validate_tags
+from shared.policy import compute_access_level
+from shared.response import _err, _ok
+from shared.store import agents_repo, tenants_repo
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-ADMIN_TOKEN = os.environ["ADMIN_TOKEN"]
-S3_BASE = os.environ.get("RELEASES_S3_BASE", "https://reach-releases.s3.amazonaws.com")
-_AGENT_VERSION = os.environ.get("AGENT_VERSION", "latest")
-_S3_VERSIONED = f"{S3_BASE}/agent/{_AGENT_VERSION}"
-
-INSTALL_TOKEN_TTL = 86400  # 24 hours
-
-
-def _verify_admin(raw: str) -> bool:
-    import hmac
-    return hmac.compare_digest(raw, ADMIN_TOKEN)
-
-
-def _build_install_commands(
-    api_url: str,
-    agent_id: str,
-    raw_install_token: str,
-    grant_service_mgmt: bool = True,
-    grant_docker: bool = False,
-) -> dict:
-    agent_flags = (
-        f"--api-url \"{api_url}\" "
-        f"--agent-id \"{agent_id}\" "
-        f"--install-token \"{raw_install_token}\" "
-        f"--yes"
-    )
-    if not grant_service_mgmt:
-        agent_flags += " --no-grant-service-mgmt"
-    if grant_docker:
-        agent_flags += " --grant-docker"
-    return {
-        "agent": (
-            f"curl -fsSL {_S3_VERSIONED}/install.sh | sudo bash -s -- {agent_flags}"
-        ),
-        "cli_use": f"reach agents use {agent_id}",
-    }
-
-
-def handle_create_agent(body: dict, raw_token: str, api_url: str) -> dict:
-    if not _verify_admin(raw_token):
-        return _err("unauthorized", 401)
-
-    tenant_id = body.get("tenant_id", "").strip()
-    mode = body.get("mode", "wild").strip()
-    grant_service_mgmt = bool(body.get("grant_service_mgmt", True))
-    grant_docker = bool(body.get("grant_docker", False))
-
-    if not tenant_id:
-        return _err("tenant_id required")
-    if mode not in ("wild", "readonly", "approved"):
-        return _err("mode must be wild, readonly, or approved")
-    if not tenants_repo.get(tenant_id):
-        return _err("tenant not found", 404)
-
-    agent_id = "agent_" + secrets.token_urlsafe(12)
-    raw_install_token = INSTALL_TOKEN_PREFIX + secrets.token_urlsafe(32)
-    expires_at = _now() + INSTALL_TOKEN_TTL
-
-    agents_repo.create({
-        "agent_id": agent_id,
-        "tenant_id": tenant_id,
-        "status": "CREATED",
-        "type": "manual",
-        "fleet_id": None,
-        "mode": mode,
-        "install_token_hash": _hmac_token(raw_install_token),
-        "install_token_expires_at": expires_at,
-        "created_at": _iso(),
-    })
-
-    logger.info("Created agent=%s tenant=%s", agent_id, tenant_id)
-
-    return _ok({
-        "agent_id": agent_id,
-        "tenant_id": tenant_id,
-        "install_token": raw_install_token,
-        "install_token_expires_at": _iso(),
-        "mode": mode,
-        "commands": _build_install_commands(
-            api_url, agent_id, raw_install_token, grant_service_mgmt, grant_docker
-        ),
-    }, 201)
-
-
-def handle_reissue_install_token(agent_id: str, body: dict, raw_token: str, api_url: str) -> dict:
-    if not _verify_admin(raw_token):
-        return _err("unauthorized", 401)
-
-    agent = agents_repo.get(agent_id)
-    if not agent:
-        return _err("agent not found", 404)
-
-    force = bool(body.get("force", False))
-    grant_service_mgmt = bool(body.get("grant_service_mgmt", True))
-    grant_docker = bool(body.get("grant_docker", False))
-
-    status = agent.get("status")
-    if status == "DELETED":
-        return _err(
-            "agent is DELETED and cannot be reissued - remove it with "
-            "DELETE /admin/agents/{id}/remove and create a new agent instead",
-            409,
-        )
-    if status == "ACTIVE" and not force:
-        return _err(
-            "agent is currently ACTIVE - reissuing will disconnect it immediately "
-            "with no in-band recovery. Revoke first with POST /admin/agents/{id}/revoke, "
-            "or pass {\"force\": true} to proceed anyway.",
-            409,
-        )
-
-    raw_install_token = INSTALL_TOKEN_PREFIX + secrets.token_urlsafe(32)
-    expires_at = _now() + INSTALL_TOKEN_TTL
-
-    agents_repo.reissue_install_token(agent_id, _hmac_token(raw_install_token), expires_at)
-
-    logger.info("Reissued install token for agent=%s (was status=%s)", agent_id, agent.get("status"))
-
-    return _ok({
-        "agent_id": agent_id,
-        "install_token": raw_install_token,
-        "install_token_expires_at": _iso(),
-        "commands": _build_install_commands(
-            api_url, agent_id, raw_install_token, grant_service_mgmt, grant_docker
-        ),
-    })
+from shared.admin_auth import verify_session_token as _verify_admin
 
 
 def handle_list_agents_admin(tenant_id: str, raw_token: str, tag: str = None) -> dict:
@@ -150,293 +24,47 @@ def handle_list_agents_admin(tenant_id: str, raw_token: str, tag: str = None) ->
 
     rows = agents_repo.list_by_tenant(tenant_id)
 
+    def _enrich(a: dict) -> dict:
+        mode = a.get("mode", "wild")
+        root_str = a.get("running_as_root")
+        root_bool = root_str == "true" if root_str in ("true", "false") else None
+        access_level = compute_access_level(mode, bool(root_bool)) if root_bool is not None else None
+        return {
+            "agent_id":                  a["agent_id"],
+            "tenant_id":                 a.get("tenant_id"),
+            "status":                    a.get("status"),
+            "hostname":                  a.get("hostname"),
+            "agent_version":             a.get("agent_version"),
+            "mode":                      mode,
+            "running_as_root":           root_str,
+            "access_level":              access_level,
+            "claimed_at":                a.get("claimed_at"),
+            "last_heartbeat_at":         a.get("last_heartbeat_at"),
+            "active_until":              a.get("active_until"),
+            "token_issued_at":           a.get("token_issued_at"),
+            "install_token_expires_at":  a.get("install_token_expires_at"),
+            "rotation_requested":        a.get("rotation_requested", False),
+            "fleet_id":                  a.get("fleet_id"),
+            "type":                      a.get("type"),
+            "tags":                      a.get("tags") or [],
+        }
+
     return _ok({
         "agents": [
-            {
-                "agent_id": a["agent_id"],
-                "status": a.get("status"),
-                "hostname": a.get("hostname"),
-                "agent_version": a.get("agent_version"),
-                "claimed_at": a.get("claimed_at"),
-                "token_issued_at": a.get("token_issued_at"),
-                "mode": a.get("mode", "wild"),
-                "tags": a.get("tags") or [],
-            }
+            _enrich(a)
             for a in rows
             if tag is None or tag in (a.get("tags") or [])
         ]
     })
 
 
-def handle_request_agent_rotation(agent_id: str, raw_token: str) -> dict:
-    if not _verify_admin(raw_token):
-        return _err("unauthorized", 401)
-
-    agent = agents_repo.get(agent_id)
-    if not agent:
-        return _err("agent not found", 404)
-
-    status = agent.get("status")
-    if status not in ("ACTIVE", "INACTIVE"):
-        return _err(f"cannot request rotation for agent with status {status}", 409)
-
-    agents_repo.request_rotation(agent_id)
-    logger.info("Admin requested token rotation for agent=%s", agent_id)
-    return _ok({"agent_id": agent_id, "rotation_requested": True})
-
-
-def handle_revoke_agent(agent_id: str, raw_token: str) -> dict:
-    if not _verify_admin(raw_token):
-        return _err("unauthorized", 401)
-
-    agent = agents_repo.get(agent_id)
-    if not agent:
-        return _err("agent not found", 404)
-
-    status = agent.get("status")
-    if status == "REVOKED":
-        return _err("agent is already REVOKED", 409)
-    if status == "DELETED":
-        return _err("agent is already DELETED", 409)
-
-    agents_repo.set_status(agent_id, "REVOKED")
-    users_repo.remove_agent_from_all_users(agent_id, agent["tenant_id"])
-    logger.info("Revoked agent=%s (was status=%s)", agent_id, status)
-
-    return _ok({"agent_id": agent_id, "status": "REVOKED"})
-
-
-def handle_delete_agent(agent_id: str, raw_token: str) -> dict:
-    if not _verify_admin(raw_token):
-        return _err("unauthorized", 401)
-
-    agent = agents_repo.get(agent_id)
-    if not agent:
-        return _err("agent not found", 404)
-
-    status = agent.get("status")
-    if status == "DELETED":
-        return _err("agent is already DELETED - call DELETE /admin/agents/{id}/remove to physically remove it", 409)
-    if status != "REVOKED":
-        return _err(
-            f"agent must be REVOKED before deleting (current status: {status}) "
-            "- call POST /admin/agents/{id}/revoke first",
-            409,
-        )
-
-    agents_repo.set_status(agent_id, "DELETED")
-    logger.info("Soft-deleted agent=%s", agent_id)
-
-    return _ok({"agent_id": agent_id, "status": "DELETED"})
-
-
-def handle_remove_agent(agent_id: str, raw_token: str) -> dict:
-    if not _verify_admin(raw_token):
-        return _err("unauthorized", 401)
-
-    agent = agents_repo.get(agent_id)
-    if not agent:
-        return _err("agent not found", 404)
-
-    status = agent.get("status")
-    if status != "DELETED":
-        return _err(
-            f"agent must be DELETED before removing (current status: {status}) "
-            "- call DELETE /admin/agents/{id} first",
-            409,
-        )
-
-    agents_repo.delete(agent_id)
-    logger.info("Permanently removed agent=%s", agent_id)
-
-    return _ok({"agent_id": agent_id, "removed": True})
-
-
-def handle_get_agent_tags(agent_id: str, raw_token: str) -> dict:
-    if not _verify_admin(raw_token):
-        return _err("unauthorized", 401)
-    agent = agents_repo.get(agent_id)
-    if not agent:
-        return _err("agent not found", 404)
-    return _ok({"agent_id": agent_id, "tags": agent.get("tags") or []})
-
-
-def handle_set_agent_tags(agent_id: str, body: dict, raw_token: str) -> dict:
-    if not _verify_admin(raw_token):
-        return _err("unauthorized", 401)
-    agent = agents_repo.get(agent_id)
-    if not agent:
-        return _err("agent not found", 404)
-    tags = body.get("tags", [])
-    err = validate_tags(tags)
-    if err:
-        return _err(err, 400)
-    agents_repo.set_tags(agent_id, tags)
-    logger.info("Set tags for agent=%s tags=%s", agent_id, tags)
-    return _ok({"agent_id": agent_id, "tags": tags})
-
-
-def handle_add_agent_tags(agent_id: str, body: dict, raw_token: str) -> dict:
-    if not _verify_admin(raw_token):
-        return _err("unauthorized", 401)
-    agent = agents_repo.get(agent_id)
-    if not agent:
-        return _err("agent not found", 404)
-    new_tags = body.get("tags", [])
-    err = validate_tags(new_tags)
-    if err:
-        return _err(err, 400)
-    current = set(agent.get("tags") or [])
-    merged = list(current | set(new_tags))
-    agents_repo.set_tags(agent_id, merged)
-    logger.info("Added tags for agent=%s tags=%s", agent_id, new_tags)
-    return _ok({"agent_id": agent_id, "tags": merged})
-
-
-def handle_remove_agent_tags(agent_id: str, body: dict, raw_token: str) -> dict:
-    if not _verify_admin(raw_token):
-        return _err("unauthorized", 401)
-    agent = agents_repo.get(agent_id)
-    if not agent:
-        return _err("agent not found", 404)
-    remove = set(body.get("tags", []))
-    current = agent.get("tags") or []
-    updated = [t for t in current if t not in remove]
-    agents_repo.set_tags(agent_id, updated)
-    logger.info("Removed tags for agent=%s removed=%s", agent_id, remove)
-    return _ok({"agent_id": agent_id, "tags": updated})
-
-
-def _token_and_api_url(event: dict) -> tuple:
-    headers = event.get("headers") or {}
-    token = headers.get("authorization", "")
-    if token.lower().startswith("bearer "):
-        token = token[7:].strip()
-    host = headers.get("host", "")
-    api_url = f"https://{host}" if host else os.environ.get("API_URL", "")
-    return token, api_url
-
-
 def list_agents_admin_handler(event, context):
     logger.info("GET /admin/agents")
-    token, _ = _token_and_api_url(event)
+    auth = (event.get("headers") or {}).get("authorization", "")
+    token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
     if not token:
         return _err("missing Authorization header", 401)
     qs = event.get("queryStringParameters") or {}
     tenant_id = qs.get("tenant_id", "")
     tag = qs.get("tag") or None
     return handle_list_agents_admin(tenant_id, token, tag)
-
-
-def create_agent_handler(event, context):
-    import json
-    logger.info("POST /admin/agents")
-    token, api_url = _token_and_api_url(event)
-    if not token:
-        return _err("missing Authorization header", 401)
-    try:
-        body = json.loads(event.get("body") or "{}")
-    except json.JSONDecodeError:
-        return _err("invalid JSON body")
-    return handle_create_agent(body, token, api_url)
-
-
-def reissue_install_token_handler(event, context):
-    import json
-    logger.info("POST /admin/agents/{agent_id}/reissue-install-token")
-    token, api_url = _token_and_api_url(event)
-    if not token:
-        return _err("missing Authorization header", 401)
-    try:
-        body = json.loads(event.get("body") or "{}")
-    except json.JSONDecodeError:
-        return _err("invalid JSON body")
-    agent_id = (event.get("pathParameters") or {}).get("agent_id", "")
-    return handle_reissue_install_token(agent_id, body, token, api_url)
-
-
-def request_agent_rotation_handler(event, context):
-    logger.info("POST /admin/agents/{agent_id}/rotate-token")
-    token, _ = _token_and_api_url(event)
-    if not token:
-        return _err("missing Authorization header", 401)
-    agent_id = (event.get("pathParameters") or {}).get("agent_id", "")
-    return handle_request_agent_rotation(agent_id, token)
-
-
-def revoke_agent_handler(event, context):
-    logger.info("POST /admin/agents/{agent_id}/revoke")
-    token, _ = _token_and_api_url(event)
-    if not token:
-        return _err("missing Authorization header", 401)
-    agent_id = (event.get("pathParameters") or {}).get("agent_id", "")
-    return handle_revoke_agent(agent_id, token)
-
-
-def delete_agent_handler(event, context):
-    logger.info("DELETE /admin/agents/{agent_id}")
-    token, _ = _token_and_api_url(event)
-    if not token:
-        return _err("missing Authorization header", 401)
-    agent_id = (event.get("pathParameters") or {}).get("agent_id", "")
-    return handle_delete_agent(agent_id, token)
-
-
-def remove_agent_handler(event, context):
-    logger.info("DELETE /admin/agents/{agent_id}/remove")
-    token, _ = _token_and_api_url(event)
-    if not token:
-        return _err("missing Authorization header", 401)
-    agent_id = (event.get("pathParameters") or {}).get("agent_id", "")
-    return handle_remove_agent(agent_id, token)
-
-
-def get_agent_tags_handler(event, context):
-    logger.info("GET /admin/agents/{agent_id}/tags")
-    token, _ = _token_and_api_url(event)
-    if not token:
-        return _err("missing Authorization header", 401)
-    agent_id = (event.get("pathParameters") or {}).get("agent_id", "")
-    return handle_get_agent_tags(agent_id, token)
-
-
-def set_agent_tags_handler(event, context):
-    import json
-    logger.info("PUT /admin/agents/{agent_id}/tags")
-    token, _ = _token_and_api_url(event)
-    if not token:
-        return _err("missing Authorization header", 401)
-    try:
-        body = json.loads(event.get("body") or "{}")
-    except json.JSONDecodeError:
-        return _err("invalid JSON body")
-    agent_id = (event.get("pathParameters") or {}).get("agent_id", "")
-    return handle_set_agent_tags(agent_id, body, token)
-
-
-def add_agent_tags_handler(event, context):
-    import json
-    logger.info("POST /admin/agents/{agent_id}/tags")
-    token, _ = _token_and_api_url(event)
-    if not token:
-        return _err("missing Authorization header", 401)
-    try:
-        body = json.loads(event.get("body") or "{}")
-    except json.JSONDecodeError:
-        return _err("invalid JSON body")
-    agent_id = (event.get("pathParameters") or {}).get("agent_id", "")
-    return handle_add_agent_tags(agent_id, body, token)
-
-
-def remove_agent_tags_handler(event, context):
-    import json
-    logger.info("DELETE /admin/agents/{agent_id}/tags")
-    token, _ = _token_and_api_url(event)
-    if not token:
-        return _err("missing Authorization header", 401)
-    try:
-        body = json.loads(event.get("body") or "{}")
-    except json.JSONDecodeError:
-        return _err("invalid JSON body")
-    agent_id = (event.get("pathParameters") or {}).get("agent_id", "")
-    return handle_remove_agent_tags(agent_id, body, token)

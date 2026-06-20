@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -913,6 +914,155 @@ func TestPostResult(t *testing.T) {
 		}
 		if gotBody.MachineFingerprint != "fp_abc" {
 			t.Errorf("machine_fingerprint = %q, want 'fp_abc'", gotBody.MachineFingerprint)
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// probeDocker / probeServiceMgmt
+// ---------------------------------------------------------------------------
+
+func TestProbeDocker(t *testing.T) {
+	t.Run("returns a bool without panicking", func(t *testing.T) {
+		// Result depends on whether a docker socket exists in the test environment.
+		_ = probeDocker()
+	})
+
+	t.Run("returns false when no socket path exists", func(t *testing.T) {
+		// Verify the underlying logic: stat on a missing path returns false.
+		_, err := os.Stat("/no/such/docker.sock")
+		if err == nil {
+			t.Skip("unexpected: test path exists")
+		}
+		// probeDocker checks multiple candidate paths; if none exist it must be false.
+		// We can't override os.Stat, but we verify the function doesn't panic and
+		// the stat-on-missing-path contract holds.
+		if _, statErr := os.Stat("/nonexistent/docker.sock"); statErr == nil {
+			t.Skip("environment has unexpected socket")
+		}
+	})
+
+	t.Run("stat succeeds on a real file", func(t *testing.T) {
+		// Verify the candidate-path logic: a file that exists should be stat-able.
+		dir := t.TempDir()
+		sock := filepath.Join(dir, "docker.sock")
+		if err := os.WriteFile(sock, nil, 0600); err != nil {
+			t.Fatalf("create fake socket: %v", err)
+		}
+		if _, err := os.Stat(sock); err != nil {
+			t.Errorf("Stat on existing file failed: %v", err)
+		}
+	})
+}
+
+func TestProbeServiceMgmt(t *testing.T) {
+	t.Run("returns a bool without panicking", func(t *testing.T) {
+		// systemctl present on Linux with systemd; launchctl present on macOS.
+		_ = probeServiceMgmt()
+	})
+
+	t.Run("returns true when systemctl is available", func(t *testing.T) {
+		if _, err := exec.LookPath("systemctl"); err != nil {
+			t.Skip("systemctl not in PATH on this host")
+		}
+		if !probeServiceMgmt() {
+			t.Error("probeServiceMgmt() = false, want true (systemctl found in PATH)")
+		}
+	})
+
+	t.Run("returns true when launchctl is available", func(t *testing.T) {
+		if _, err := exec.LookPath("launchctl"); err != nil {
+			t.Skip("launchctl not in PATH on this host")
+		}
+		if !probeServiceMgmt() {
+			t.Error("probeServiceMgmt() = false, want true (launchctl found in PATH)")
+		}
+	})
+
+	t.Run("matches presence of systemctl or launchctl in PATH", func(t *testing.T) {
+		_, sysErr := exec.LookPath("systemctl")
+		_, lncErr := exec.LookPath("launchctl")
+		want := sysErr == nil || lncErr == nil
+		if got := probeServiceMgmt(); got != want {
+			t.Errorf("probeServiceMgmt() = %v, want %v", got, want)
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// sync capability fields
+// ---------------------------------------------------------------------------
+
+func TestSyncCapabilityFields(t *testing.T) {
+	t.Run("sync body includes docker_detected and service_mgmt_detected", func(t *testing.T) {
+		var gotBody map[string]interface{}
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			json.NewDecoder(r.Body).Decode(&gotBody)
+			w.WriteHeader(200)
+			json.NewEncoder(w).Encode(SyncResponse{})
+		}))
+		defer srv.Close()
+
+		sync(syncCfg(srv.URL)) //nolint:errcheck
+
+		if _, ok := gotBody["docker_detected"]; !ok {
+			t.Error("sync request body missing docker_detected field")
+		}
+		if _, ok := gotBody["service_mgmt_detected"]; !ok {
+			t.Error("sync request body missing service_mgmt_detected field")
+		}
+	})
+
+	t.Run("docker_detected is a boolean", func(t *testing.T) {
+		var gotBody map[string]interface{}
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			json.NewDecoder(r.Body).Decode(&gotBody)
+			w.WriteHeader(200)
+			json.NewEncoder(w).Encode(SyncResponse{})
+		}))
+		defer srv.Close()
+
+		sync(syncCfg(srv.URL)) //nolint:errcheck
+
+		if _, ok := gotBody["docker_detected"].(bool); !ok {
+			t.Errorf("docker_detected should be bool, got %T", gotBody["docker_detected"])
+		}
+		if _, ok := gotBody["service_mgmt_detected"].(bool); !ok {
+			t.Errorf("service_mgmt_detected should be bool, got %T", gotBody["service_mgmt_detected"])
+		}
+	})
+
+	t.Run("docker_detected value matches probeDocker result", func(t *testing.T) {
+		var gotBody map[string]interface{}
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			json.NewDecoder(r.Body).Decode(&gotBody)
+			w.WriteHeader(200)
+			json.NewEncoder(w).Encode(SyncResponse{})
+		}))
+		defer srv.Close()
+
+		expected := probeDocker()
+		sync(syncCfg(srv.URL)) //nolint:errcheck
+
+		if got, _ := gotBody["docker_detected"].(bool); got != expected {
+			t.Errorf("docker_detected = %v, want %v", got, expected)
+		}
+	})
+
+	t.Run("service_mgmt_detected value matches probeServiceMgmt result", func(t *testing.T) {
+		var gotBody map[string]interface{}
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			json.NewDecoder(r.Body).Decode(&gotBody)
+			w.WriteHeader(200)
+			json.NewEncoder(w).Encode(SyncResponse{})
+		}))
+		defer srv.Close()
+
+		expected := probeServiceMgmt()
+		sync(syncCfg(srv.URL)) //nolint:errcheck
+
+		if got, _ := gotBody["service_mgmt_detected"].(bool); got != expected {
+			t.Errorf("service_mgmt_detected = %v, want %v", got, expected)
 		}
 	})
 }

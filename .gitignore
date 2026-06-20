@@ -10,6 +10,16 @@ __pycache__/
 .venv/
 dist/
 *.egg-info/
+.coverage
+
+# Build artifacts
+backend/ui_dist/
+ui/dist/
+ui/node_modules/
+ui/coverage/
+
+# Local dev DB
+*.db
 
 # AWS SAM
 .aws-sam/

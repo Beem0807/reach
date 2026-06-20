@@ -12,21 +12,42 @@ Globals:
     Environment:
       Variables:
         TOKEN_PEPPER: !Ref TokenPepper
-        ADMIN_TOKEN: !Ref AdminToken
+        SESSION_SIGNING_KEY: !Ref SessionSigningKey
+        ADMIN_PASSWORD: !Ref AdminPassword
         STORAGE_BACKEND: dynamo
         RELEASES_S3_BASE: !Ref ReleasesS3Base
         APPROVAL_RETENTION_DAYS: !Ref ApprovalRetentionDays
         JOB_RETENTION_DAYS: !Ref JobRetentionDays
+        AUDIT_RETENTION_DAYS: !Ref AuditRetentionDays
+        AGENT_HISTORY_RETENTION_DAYS: !Ref AgentHistoryRetentionDays
+  HttpApi:
+    CorsConfiguration:
+      AllowMethods:
+        - GET
+        - POST
+        - PUT
+        - PATCH
+        - DELETE
+        - OPTIONS
+      AllowHeaders:
+        - Authorization
+        - Content-Type
+      AllowOrigins:
+        - "*"
 
 Parameters:
   TokenPepper:
     Type: String
     NoEcho: true
-    Description: Server-side HMAC pepper for token hashing
-  AdminToken:
+    Description: Server-side HMAC pepper for token hashing (permanent - never rotate)
+  SessionSigningKey:
     Type: String
     NoEcho: true
-    Description: Bearer token for admin API endpoints (bootstrap, policy management)
+    Description: HMAC key for signing tenant session (login) tokens. Safe to rotate - only forces re-login.
+  AdminPassword:
+    Type: String
+    NoEcho: true
+    Description: Password for the admin console (generates 8-hour session tokens on login)
   ReleasesS3Base:
     Type: String
     Default: "https://reach-releases.s3.amazonaws.com"
@@ -39,6 +60,14 @@ Parameters:
     Type: Number
     Default: 7
     Description: Days to retain terminal job records (SUCCEEDED, FAILED, REJECTED, EXPIRED) before the daily cleanup deletes them
+  AuditRetentionDays:
+    Type: Number
+    Default: 90
+    Description: Days to retain audit log records before the daily cleanup deletes them
+  AgentHistoryRetentionDays:
+    Type: Number
+    Default: 30
+    Description: Days to retain agent heartbeat and status history records before the daily cleanup deletes them
 
 Resources:
   # -----------------------------------------------------------------------
@@ -95,6 +124,8 @@ Resources:
           AttributeType: S
         - AttributeName: tenant_id
           AttributeType: S
+        - AttributeName: username
+          AttributeType: S
       KeySchema:
         - AttributeName: user_id
           KeyType: HASH
@@ -109,6 +140,14 @@ Resources:
           KeySchema:
             - AttributeName: tenant_id
               KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+        - IndexName: tenant-username-index
+          KeySchema:
+            - AttributeName: tenant_id
+              KeyType: HASH
+            - AttributeName: username
+              KeyType: RANGE
           Projection:
             ProjectionType: ALL
 
@@ -188,6 +227,99 @@ Resources:
           Projection:
             ProjectionType: ALL
 
+  ApiTokensTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: reach-api-tokens
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: token_id
+          AttributeType: S
+        - AttributeName: token_hash
+          AttributeType: S
+        - AttributeName: user_id
+          AttributeType: S
+        - AttributeName: tenant_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: token_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: token-hash-index
+          KeySchema:
+            - AttributeName: token_hash
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+        - IndexName: user-index
+          KeySchema:
+            - AttributeName: user_id
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+        - IndexName: tenant-index
+          KeySchema:
+            - AttributeName: tenant_id
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+
+  AuditLogsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: reach-audit-logs
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: log_id
+          AttributeType: S
+        - AttributeName: tenant_id
+          AttributeType: S
+        - AttributeName: created_at
+          AttributeType: S
+      KeySchema:
+        - AttributeName: log_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: tenant-created-index
+          KeySchema:
+            - AttributeName: tenant_id
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  AgentHistoryTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: reach-agent-history
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: history_id
+          AttributeType: S
+        - AttributeName: agent_id
+          AttributeType: S
+        - AttributeName: created_at
+          AttributeType: S
+      KeySchema:
+        - AttributeName: history_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: agent-id-index
+          KeySchema:
+            - AttributeName: agent_id
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
   # -----------------------------------------------------------------------
   # Shared IAM role - all Lambda functions use this
   # -----------------------------------------------------------------------
@@ -217,10 +349,17 @@ Resources:
                   - !GetAtt UsersTable.Arn
                   - !GetAtt JobsTable.Arn
                   - !GetAtt ApprovalsTable.Arn
+                  - !GetAtt ApiTokensTable.Arn
+                  - !GetAtt AuditLogsTable.Arn
+                  - !GetAtt AgentHistoryTable.Arn
                   - !Sub "${AgentsTable.Arn}/index/*"
                   - !Sub "${UsersTable.Arn}/index/*"
                   - !Sub "${JobsTable.Arn}/index/*"
                   - !Sub "${ApprovalsTable.Arn}/index/*"
+                  - !Sub "${ApiTokensTable.Arn}/index/*"
+                  - !Sub "${AuditLogsTable.Arn}/index/*"
+                  - !Sub "${TenantsTable.Arn}/index/*"
+                  - !Sub "${AgentHistoryTable.Arn}/index/*"
 
   # -----------------------------------------------------------------------
   # Agent endpoints
@@ -278,7 +417,7 @@ Resources:
             Method: POST
 
   # -----------------------------------------------------------------------
-  # Tenant (CLI) endpoints
+  # Tenant endpoints - job execution, agent lookup, approval checks (CLI)
   # -----------------------------------------------------------------------
   MeFunction:
     Type: AWS::Serverless::Function
@@ -385,8 +524,268 @@ Resources:
             Method: GET
 
   # -----------------------------------------------------------------------
-  # Admin endpoints - protected by ADMIN_TOKEN
+  # Tenant console auth endpoints
   # -----------------------------------------------------------------------
+  TenantLoginFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-tenant-login
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.tenant_login.tenant_login_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /tenant/login
+            Method: POST
+
+  TenantChangePasswordFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-tenant-change-password
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.tenant_login.change_password_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /tenant/me/password
+            Method: POST
+
+  TenantMeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-tenant-me
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.tenant_login.tenant_me_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /tenant/me
+            Method: GET
+
+  # -----------------------------------------------------------------------
+  # Tenant console user management endpoints
+  # -----------------------------------------------------------------------
+  TenantListUsersFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-tenant-list-users
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.tenant_users.list_users_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /tenant/users
+            Method: GET
+
+  TenantCreateUserFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-tenant-create-user
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.tenant_users.create_user_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /tenant/users
+            Method: POST
+
+  TenantDisableUserFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-tenant-disable-user
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.tenant_users.disable_user_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /tenant/users/{user_id}/disable
+            Method: POST
+
+  TenantRevokeUserTokensFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-tenant-revoke-user-tokens
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.tenant_tokens.revoke_user_tokens_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /tenant/users/{user_id}/revoke-tokens
+            Method: POST
+
+  TenantEnableUserFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-tenant-enable-user
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.tenant_users.enable_user_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /tenant/users/{user_id}/enable
+            Method: POST
+
+  TenantSetUserRoleFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-tenant-set-user-role
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.tenant_users.set_role_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /tenant/users/{user_id}/role
+            Method: PUT
+
+  TenantResetUserPasswordFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-tenant-reset-user-password
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.tenant_users.reset_password_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /tenant/users/{user_id}/reset-password
+            Method: POST
+
+  TenantGetUserAgentsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-tenant-get-user-agents
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.tenant_users.get_user_agents_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /tenant/users/{user_id}/agents
+            Method: GET
+
+  TenantSetUserAgentsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-tenant-set-user-agents
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.tenant_users.set_user_agents_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /tenant/users/{user_id}/agents
+            Method: PUT
+
+  # -----------------------------------------------------------------------
+  # Tenant console API token endpoints
+  # -----------------------------------------------------------------------
+  TenantListApiTokensFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-tenant-list-api-tokens
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.tenant_tokens.list_tokens_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /tenant/api-tokens
+            Method: GET
+
+  TenantCreateApiTokenFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-tenant-create-api-token
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.tenant_tokens.create_token_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /tenant/api-tokens
+            Method: POST
+
+  TenantRenameApiTokenFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-tenant-rename-api-token
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.tenant_tokens.rename_token_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /tenant/api-tokens/{token_id}
+            Method: PATCH
+
+  TenantRevokeApiTokenFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-tenant-revoke-api-token
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.tenant_tokens.revoke_token_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /tenant/api-tokens/{token_id}
+            Method: DELETE
+
+  # -----------------------------------------------------------------------
+  # Audit log endpoints
+  # -----------------------------------------------------------------------
+  PlatformAuditLogsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-platform-audit-logs
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.audit_logs.platform_audit_logs_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /admin/audit-logs
+            Method: GET
+
+  TenantAuditLogsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-tenant-audit-logs
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.audit_logs.tenant_audit_logs_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /tenant/audit-logs
+            Method: GET
+
+  # -----------------------------------------------------------------------
+  # Admin endpoints - login issues an 8-hour session token; all other
+  # endpoints below require that token in the Authorization header
+  # -----------------------------------------------------------------------
+  AdminLoginFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-admin-login
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.admin_login.admin_login_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /admin/login
+            Method: POST
+
   AdminCreateTenantFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -413,18 +812,18 @@ Resources:
             Path: /admin/tenants
             Method: GET
 
-  AdminCreateUserFunction:
+  AdminDeleteTenantFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: reach-admin-create-user
+      FunctionName: reach-admin-delete-tenant
       Role: !GetAtt LambdaRole.Arn
-      Handler: handlers.admin_users.create_user_handler
+      Handler: handlers.admin_tenants.delete_tenant_handler
       Events:
         Api:
           Type: HttpApi
           Properties:
-            Path: /admin/tenants/{tenant_id}/users
-            Method: POST
+            Path: /admin/tenants/{tenant_id}
+            Method: DELETE
 
   AdminListUsersFunction:
     Type: AWS::Serverless::Function
@@ -439,96 +838,96 @@ Resources:
             Path: /admin/tenants/{tenant_id}/users
             Method: GET
 
-  AdminDeleteUserFunction:
+  AdminDisableTenantFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: reach-admin-delete-user
+      FunctionName: reach-admin-disable-tenant
       Role: !GetAtt LambdaRole.Arn
-      Handler: handlers.admin_users.delete_user_handler
+      Handler: handlers.admin_tenants.disable_tenant_handler
       Events:
         Api:
           Type: HttpApi
           Properties:
-            Path: /admin/tenants/{tenant_id}/users/{user_id}
-            Method: DELETE
-
-  AdminRotateUserTokenFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      FunctionName: reach-admin-rotate-user-token
-      Role: !GetAtt LambdaRole.Arn
-      Handler: handlers.admin_users.rotate_user_token_handler
-      Events:
-        Api:
-          Type: HttpApi
-          Properties:
-            Path: /admin/tenants/{tenant_id}/users/{user_id}/rotate-token
+            Path: /admin/tenants/{tenant_id}/disable
             Method: POST
 
-  AdminGetUserAgentsFunction:
+  AdminEnableTenantFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: reach-admin-get-user-agents
+      FunctionName: reach-admin-enable-tenant
       Role: !GetAtt LambdaRole.Arn
-      Handler: handlers.admin_users.get_user_agents_handler
+      Handler: handlers.admin_tenants.enable_tenant_handler
       Events:
         Api:
           Type: HttpApi
           Properties:
-            Path: /admin/tenants/{tenant_id}/users/{user_id}/agents
-            Method: GET
-
-  AdminSetUserAgentsFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      FunctionName: reach-admin-set-user-agents
-      Role: !GetAtt LambdaRole.Arn
-      Handler: handlers.admin_users.set_user_agents_handler
-      Events:
-        Api:
-          Type: HttpApi
-          Properties:
-            Path: /admin/tenants/{tenant_id}/users/{user_id}/agents
-            Method: PUT
-
-  AdminGrantAgentAccessFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      FunctionName: reach-admin-grant-agent-access
-      Role: !GetAtt LambdaRole.Arn
-      Handler: handlers.admin_users.grant_agent_access_handler
-      Events:
-        Api:
-          Type: HttpApi
-          Properties:
-            Path: /admin/tenants/{tenant_id}/users/{user_id}/agents/{agent_id}
+            Path: /admin/tenants/{tenant_id}/enable
             Method: POST
 
-  AdminRevokeAgentAccessFunction:
+  AdminCreateAdminUserFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: reach-admin-revoke-agent-access
+      FunctionName: reach-admin-create-admin-user
       Role: !GetAtt LambdaRole.Arn
-      Handler: handlers.admin_users.revoke_agent_access_handler
+      Handler: handlers.admin_tenants.create_admin_user_handler
       Events:
         Api:
           Type: HttpApi
           Properties:
-            Path: /admin/tenants/{tenant_id}/users/{user_id}/agents/{agent_id}
-            Method: DELETE
+            Path: /admin/tenants/{tenant_id}/admin-users
+            Method: POST
 
-  AdminListJobsFunction:
+  AdminPlatformResetPasswordFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: reach-admin-list-jobs
+      FunctionName: reach-admin-platform-reset-password
       Role: !GetAtt LambdaRole.Arn
-      Handler: handlers.admin_jobs.list_jobs_admin_handler
+      Handler: handlers.admin_tenants.platform_reset_password_handler
       Events:
         Api:
           Type: HttpApi
           Properties:
-            Path: /admin/jobs
-            Method: GET
+            Path: /admin/tenants/{tenant_id}/users/{user_id}/reset-password
+            Method: POST
+
+  AdminPlatformDisableUserFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-admin-platform-disable-user
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.admin_tenants.platform_disable_user_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /admin/tenants/{tenant_id}/users/{user_id}/disable
+            Method: POST
+
+  AdminPlatformSetRoleFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-admin-platform-set-role
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.admin_tenants.platform_set_role_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /admin/tenants/{tenant_id}/users/{user_id}/role
+            Method: PATCH
+
+  AdminPlatformUpdateNameFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-admin-platform-update-name
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.admin_tenants.platform_update_name_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /admin/tenants/{tenant_id}/users/{user_id}/name
+            Method: PATCH
 
   AdminListAgentsFunction:
     Type: AWS::Serverless::Function
@@ -543,212 +942,192 @@ Resources:
             Path: /admin/agents
             Method: GET
 
-  AdminCreateAgentFunction:
+  # -----------------------------------------------------------------------
+  # Tenant admin - agent management endpoints
+  # -----------------------------------------------------------------------
+  TenantCreateAgentFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: reach-admin-create-agent
+      FunctionName: reach-tenant-create-agent
       Role: !GetAtt LambdaRole.Arn
-      Handler: handlers.admin_agents.create_agent_handler
+      Handler: handlers.tenant_agents.create_tenant_agent_handler
       Events:
         Api:
           Type: HttpApi
           Properties:
-            Path: /admin/agents
+            Path: /tenant/agents
             Method: POST
 
-  AdminRevokeAgentFunction:
+  TenantReissueInstallTokenFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: reach-admin-revoke-agent
+      FunctionName: reach-tenant-reissue-install-token
       Role: !GetAtt LambdaRole.Arn
-      Handler: handlers.admin_agents.revoke_agent_handler
+      Handler: handlers.tenant_agents.reissue_tenant_install_token_handler
       Events:
         Api:
           Type: HttpApi
           Properties:
-            Path: /admin/agents/{agent_id}/revoke
+            Path: /tenant/agents/{agent_id}/reissue-install-token
             Method: POST
 
-  AdminDeleteAgentFunction:
+  TenantRevokeAgentFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: reach-admin-delete-agent
+      FunctionName: reach-tenant-revoke-agent
       Role: !GetAtt LambdaRole.Arn
-      Handler: handlers.admin_agents.delete_agent_handler
+      Handler: handlers.tenant_agents.revoke_tenant_agent_handler
       Events:
         Api:
           Type: HttpApi
           Properties:
-            Path: /admin/agents/{agent_id}
+            Path: /tenant/agents/{agent_id}/revoke
+            Method: POST
+
+  TenantDeleteAgentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-tenant-delete-agent
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.tenant_agents.delete_tenant_agent_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /tenant/agents/{agent_id}
             Method: DELETE
 
-  AdminRemoveAgentFunction:
+  TenantRemoveAgentFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: reach-admin-remove-agent
+      FunctionName: reach-tenant-remove-agent
       Role: !GetAtt LambdaRole.Arn
-      Handler: handlers.admin_agents.remove_agent_handler
+      Handler: handlers.tenant_agents.remove_tenant_agent_handler
       Events:
         Api:
           Type: HttpApi
           Properties:
-            Path: /admin/agents/{agent_id}/remove
+            Path: /tenant/agents/{agent_id}/remove
             Method: DELETE
 
-  AdminGetAgentTagsFunction:
+  TenantSetAgentTagsFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: reach-admin-get-agent-tags
+      FunctionName: reach-tenant-set-agent-tags
       Role: !GetAtt LambdaRole.Arn
-      Handler: handlers.admin_agents.get_agent_tags_handler
+      Handler: handlers.tenant_agents.set_tenant_agent_tags_handler
       Events:
         Api:
           Type: HttpApi
           Properties:
-            Path: /admin/agents/{agent_id}/tags
-            Method: GET
-
-  AdminSetAgentTagsFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      FunctionName: reach-admin-set-agent-tags
-      Role: !GetAtt LambdaRole.Arn
-      Handler: handlers.admin_agents.set_agent_tags_handler
-      Events:
-        Api:
-          Type: HttpApi
-          Properties:
-            Path: /admin/agents/{agent_id}/tags
+            Path: /tenant/agents/{agent_id}/tags
             Method: PUT
 
-  AdminAddAgentTagsFunction:
+  TenantRequestAgentRotationFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: reach-admin-add-agent-tags
+      FunctionName: reach-tenant-request-agent-rotation
       Role: !GetAtt LambdaRole.Arn
-      Handler: handlers.admin_agents.add_agent_tags_handler
+      Handler: handlers.tenant_agents.request_agent_rotation_handler
       Events:
         Api:
           Type: HttpApi
           Properties:
-            Path: /admin/agents/{agent_id}/tags
+            Path: /tenant/agents/{agent_id}/request-rotation
             Method: POST
 
-  AdminRemoveAgentTagsFunction:
+  TenantSetAgentModeFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: reach-admin-remove-agent-tags
+      FunctionName: reach-tenant-set-agent-mode
       Role: !GetAtt LambdaRole.Arn
-      Handler: handlers.admin_agents.remove_agent_tags_handler
+      Handler: handlers.tenant_agents.set_tenant_agent_mode_handler
       Events:
         Api:
           Type: HttpApi
           Properties:
-            Path: /admin/agents/{agent_id}/tags
-            Method: DELETE
-
-  AdminReissueInstallTokenFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      FunctionName: reach-admin-reissue-install-token
-      Role: !GetAtt LambdaRole.Arn
-      Handler: handlers.admin_agents.reissue_install_token_handler
-      Events:
-        Api:
-          Type: HttpApi
-          Properties:
-            Path: /admin/agents/{agent_id}/reissue-install-token
-            Method: POST
-
-  AdminRequestAgentRotationFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      FunctionName: reach-admin-request-agent-rotation
-      Role: !GetAtt LambdaRole.Arn
-      Handler: handlers.admin_agents.request_agent_rotation_handler
-      Events:
-        Api:
-          Type: HttpApi
-          Properties:
-            Path: /admin/agents/{agent_id}/rotate-token
-            Method: POST
-
-  AdminGetPolicyFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      FunctionName: reach-admin-get-policy
-      Role: !GetAtt LambdaRole.Arn
-      Handler: handlers.admin_policy.get_policy_handler
-      Events:
-        Api:
-          Type: HttpApi
-          Properties:
-            Path: /admin/agents/{agent_id}/policy
-            Method: GET
-
-  AdminSetModeFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      FunctionName: reach-admin-set-mode
-      Role: !GetAtt LambdaRole.Arn
-      Handler: handlers.admin_policy.set_mode_handler
-      Events:
-        Api:
-          Type: HttpApi
-          Properties:
-            Path: /admin/agents/{agent_id}/policy/mode
+            Path: /tenant/agents/{agent_id}/policy/mode
             Method: PUT
 
-  AdminListApprovalsFunction:
+  TenantAcknowledgeCapabilityFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: reach-admin-list-approvals
+      FunctionName: reach-tenant-acknowledge-capability
       Role: !GetAtt LambdaRole.Arn
-      Handler: handlers.admin_approvals.list_approvals_handler
+      Handler: handlers.tenant_agents.acknowledge_capability_handler
       Events:
         Api:
           Type: HttpApi
           Properties:
-            Path: /admin/approvals
-            Method: GET
-
-  AdminReviewApprovalFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      FunctionName: reach-admin-review-approval
-      Role: !GetAtt LambdaRole.Arn
-      Handler: handlers.admin_approvals.review_approval_handler
-      Events:
-        Api:
-          Type: HttpApi
-          Properties:
-            Path: /admin/approvals/{approval_id}/{action}
-            Method: PUT
-
-  AdminPreApproveCommandFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      FunctionName: reach-admin-pre-approve-command
-      Role: !GetAtt LambdaRole.Arn
-      Handler: handlers.admin_approvals.pre_approve_command_handler
-      Events:
-        Api:
-          Type: HttpApi
-          Properties:
-            Path: /admin/approvals
+            Path: /tenant/agents/{agent_id}/acknowledge-capability
             Method: POST
 
-  AdminDeleteApprovalFunction:
+  TenantAgentHistoryFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: reach-admin-delete-approval
+      FunctionName: reach-tenant-agent-history
       Role: !GetAtt LambdaRole.Arn
-      Handler: handlers.admin_approvals.delete_approval_handler
+      Handler: handlers.tenant_agents.agent_history_handler
       Events:
         Api:
           Type: HttpApi
           Properties:
-            Path: /admin/approvals/{approval_id}
+            Path: /tenant/agents/{agent_id}/history
+            Method: GET
+
+  # -----------------------------------------------------------------------
+  # Tenant admin - approval management endpoints
+  # -----------------------------------------------------------------------
+  TenantListAllApprovalsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-tenant-list-all-approvals
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.tenant_approvals.list_all_approvals_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /tenant/approvals
+            Method: GET
+
+  TenantPreApproveFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-tenant-pre-approve
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.tenant_approvals.pre_approve_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /tenant/approvals
+            Method: POST
+
+  TenantReviewApprovalFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-tenant-review-approval
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.tenant_approvals.review_approval_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /tenant/approvals/{approval_id}/{action}
+            Method: PUT
+
+  TenantDeleteApprovalFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-tenant-delete-approval
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.tenant_approvals.delete_approval_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /tenant/approvals/{approval_id}
             Method: DELETE
 
   # -----------------------------------------------------------------------
@@ -768,7 +1147,107 @@ Resources:
             Name: reach-heartbeat-check
             Description: Mark agents INACTIVE (45s gap); expire stale approvals hourly; purge old terminal approvals daily
 
+  # -----------------------------------------------------------------------
+  # UI: S3 bucket + CloudFront distribution
+  # -----------------------------------------------------------------------
+  AdminUiBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "reach-ui-${AWS::AccountId}-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  AdminUiBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AdminUiBucket
+      PolicyDocument:
+        Statement:
+          - Sid: AllowCloudFrontRead
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${AdminUiBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${AdminUiDistribution}"
+
+  AdminUiOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "reach-ui-oac-${AWS::StackName}"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  UiPathRewriteFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub "reach-ui-rewrite-${AWS::StackName}"
+      AutoPublish: true
+      FunctionConfig:
+        Comment: Rewrite /ui and /ui/ to /ui/index.html for SPA entry point
+        Runtime: cloudfront-js-2.0
+      FunctionCode: |
+        function handler(event) {
+          var uri = event.request.uri;
+          if (uri === '/ui' || uri === '/ui/') {
+            event.request.uri = '/ui/index.html';
+          }
+          return event.request;
+        }
+
+  AdminUiDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Origins:
+          - Id: AdminUiS3Origin
+            DomainName: !GetAtt AdminUiBucket.RegionalDomainName
+            S3OriginConfig: {}
+            OriginAccessControlId: !Ref AdminUiOriginAccessControl
+          - Id: ApiGatewayOrigin
+            DomainName: !Sub "${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+            CustomOriginConfig:
+              HTTPSPort: 443
+              OriginProtocolPolicy: https-only
+        DefaultCacheBehavior:
+          TargetOriginId: ApiGatewayOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [DELETE, GET, HEAD, OPTIONS, PATCH, POST, PUT]
+          CachedMethods: [GET, HEAD]
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad       # CachingDisabled
+          OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac  # AllViewerExceptHostHeader
+        CacheBehaviors:
+          - PathPattern: /ui*
+            TargetOriginId: AdminUiS3Origin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS]
+            CachedMethods: [GET, HEAD]
+            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # CachingOptimized
+            FunctionAssociations:
+              - EventType: viewer-request
+                FunctionARN: !GetAtt UiPathRewriteFunction.FunctionARN
+
 Outputs:
   ApiUrl:
-    Description: HTTP API endpoint URL
-    Value: !Sub "https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+    Description: API URL (via CloudFront)
+    Value: !Sub "https://${AdminUiDistribution.DomainName}"
+
+  AdminUiUrl:
+    Description: UI URL (CloudFront /ui/)
+    Value: !Sub "https://${AdminUiDistribution.DomainName}/ui/"
+
+  AdminUiBucketName:
+    Description: S3 bucket name for UI assets
+    Value: !Ref AdminUiBucket
+
+  CloudFrontDistributionId:
+    Description: CloudFront distribution ID (for cache invalidations)
+    Value: !Ref AdminUiDistribution

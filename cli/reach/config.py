@@ -77,10 +77,13 @@ def list_profiles() -> list:
 def require(key: str) -> str:
     cfg = load_profile()
     val = cfg.get(key)
+    # Backward compat: api_key was previously stored as tenant_token
+    if not val and key == "api_key":
+        val = cfg.get("tenant_token")
     if not val:
         raise SystemExit(
             f"[reach] missing '{key}' in config. "
-            f"Run 'reach login' first, or 'reach use <agent_id>' to set an agent."
+            f"Run 'reach login' first, or 'reach agents use <agent_id>' to set an agent."
         )
     return val
 

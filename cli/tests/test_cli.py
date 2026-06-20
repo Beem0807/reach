@@ -12,11 +12,16 @@ from typer.testing import CliRunner
 
 from reach.main import app
 
-runner = CliRunner(mix_stderr=False)
+# Click >= 8.2 dropped the mix_stderr kwarg (stdout/stderr are always separate);
+# older Click needs it to keep stderr out of result.output.
+try:
+    runner = CliRunner(mix_stderr=False)
+except TypeError:
+    runner = CliRunner()
 
 _PROFILE = {
     "api_url": "https://api.example.com",
-    "tenant_token": "tok_test",
+    "api_key": "tok_test",
     "default_agent_id": "agent_a",
 }
 
@@ -27,15 +32,18 @@ _AGENT = {
     "agent_version": "0.1.0",
     "machine_fingerprint": "fp_abc123",
     "claimed_at": "2026-06-17T10:00:00+00:00",
+    "token_issued_at": "2026-06-17T10:00:00+00:00",
     "last_heartbeat_at": "2026-06-17T10:01:00+00:00",
+    "active_until": "2026-06-17T11:01:00+00:00",
     "mode": "wild",
-    "approved_commands": [],
+    "access_level": "open",
     "tags": [],
 }
 
 _JOB = {
     "job_id": "job_1",
     "agent_id": "agent_a",
+    "created_by": "user_1",
     "command": "ls",
     "status": "SUCCEEDED",
     "exit_code": 0,
@@ -43,6 +51,8 @@ _JOB = {
     "stderr": "",
     "duration_ms": 42,
     "created_at": "2026-06-17T10:00:00+00:00",
+    "started_at": "2026-06-17T10:00:01+00:00",
+    "completed_at": "2026-06-17T10:00:01+00:00",
 }
 
 _ME = {
@@ -141,6 +151,29 @@ class TestLogin:
              patch("reach.main.cfg_module.save", side_effect=_save):
             runner.invoke(app, ["login", "--api-url", "https://api.example.com/", "--token", "tok"])
         assert saved["profiles"]["default"]["api_url"] == "https://api.example.com"
+
+    def test_saves_api_key_not_tenant_token(self):
+        saved = {}
+        def _save(data):
+            saved.update(data)
+        with patch("reach.main.cfg_module.load", return_value={"active_profile": "default", "profiles": {}}), \
+             patch("reach.main.cfg_module.save", side_effect=_save):
+            runner.invoke(app, ["login", "--api-url", "https://api.example.com", "--token", "tok_abc"])
+        profile = saved["profiles"]["default"]
+        assert profile.get("api_key") == "tok_abc"
+        assert "tenant_token" not in profile
+
+    def test_login_removes_legacy_tenant_token(self):
+        saved = {}
+        def _save(data):
+            saved.update(data)
+        existing = {"api_url": "https://old.example.com", "tenant_token": "old_tok"}
+        with patch("reach.main.cfg_module.load", return_value={"active_profile": "default", "profiles": {"default": existing}}), \
+             patch("reach.main.cfg_module.save", side_effect=_save):
+            runner.invoke(app, ["login", "--api-url", "https://api.example.com", "--token", "new_tok"], input="y\n")
+        profile = saved["profiles"]["default"]
+        assert "tenant_token" not in profile
+        assert profile.get("api_key") == "new_tok"
 
     def test_custom_profile_name(self):
         saved = {}
@@ -343,6 +376,18 @@ class TestExec:
         with _mock_cfg(), patch("reach.main.ReachClient", return_value=mock_client):
             result = runner.invoke(app, ["exec", "--", "ls"])
         assert result.exit_code == 1
+
+    def test_rejected_job_exits_nonzero(self):
+        mock_client = self._client(job_status="REJECTED", exit_code=None)
+        with _mock_cfg(), patch("reach.main.ReachClient", return_value=mock_client):
+            result = runner.invoke(app, ["exec", "--", "ls"])
+        assert result.exit_code != 0
+
+    def test_expired_job_exits_nonzero(self):
+        mock_client = self._client(job_status="EXPIRED", exit_code=None)
+        with _mock_cfg(), patch("reach.main.ReachClient", return_value=mock_client):
+            result = runner.invoke(app, ["exec", "--", "ls"])
+        assert result.exit_code != 0
 
     def test_target_agent_override(self):
         mock_client = self._client()
@@ -634,7 +679,7 @@ class TestApprovals:
         }
         # Build a fresh profile so mutations from other tests (e.g. TestAgentsUse mutates _PROFILE)
         # don't bleed in - always start with agent_a as the default.
-        fresh = {"api_url": "https://api.example.com", "tenant_token": "tok_test", "default_agent_id": "agent_a"}
+        fresh = {"api_url": "https://api.example.com", "api_key": "tok_test", "default_agent_id": "agent_a"}
         with _mock_cfg(profile=fresh), patch("reach.main.ReachClient", return_value=mock_client):
             result = runner.invoke(app, ["approvals"] + args)
         return result, mock_client

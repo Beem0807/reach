@@ -1,44 +1,55 @@
 import json
 import logging
+import os
 from contextlib import asynccontextmanager
 from typing import Optional
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
-from handlers.admin_agents import (
-    handle_add_agent_tags,
-    handle_create_agent,
-    handle_delete_agent,
-    handle_get_agent_tags,
-    handle_list_agents_admin,
-    handle_reissue_install_token,
-    handle_remove_agent,
-    handle_remove_agent_tags,
-    handle_revoke_agent,
-    handle_set_agent_tags,
+from handlers.admin_agents import handle_list_agents_admin
+from handlers.admin_tenants import (
+    handle_create_tenant, handle_list_tenants,
+    handle_disable_tenant, handle_enable_tenant, handle_delete_tenant,
+    handle_create_tenant_admin_user, handle_platform_reset_user_password, handle_platform_disable_user,
+    handle_platform_set_user_role, handle_platform_update_user_name,
 )
-from handlers.admin_jobs import handle_list_jobs_admin
-from handlers.admin_tenants import handle_create_tenant, handle_list_tenants
-from handlers.admin_users import (
-    handle_create_user,
-    handle_delete_user,
-    handle_grant_agent_access,
-    handle_get_user_agents,
-    handle_list_users,
-    handle_revoke_agent_access,
-    handle_rotate_user_token,
-    handle_set_user_agents,
+from handlers.tenant_login import handle_tenant_login, handle_change_password, handle_tenant_me
+from handlers.tenant_users import (
+    handle_list_tenant_users, handle_create_tenant_user,
+    handle_disable_tenant_user, handle_enable_tenant_user,
+    handle_set_user_role, handle_reset_user_password,
+    handle_get_user_agents, handle_set_user_agents,
 )
-from handlers.admin_approvals import handle_delete_approval, handle_list_approvals, handle_pre_approve_command, handle_review_approval
-from handlers.admin_policy import (
-    handle_get_policy,
-    handle_set_mode,
+from handlers.tenant_tokens import handle_create_api_token, handle_list_api_tokens, handle_revoke_api_token, handle_rename_api_token, handle_revoke_all_user_tokens
+from handlers.tenant_agents import (
+    handle_acknowledge_capability,
+    handle_create_tenant_agent,
+    handle_reissue_tenant_install_token,
+    handle_revoke_tenant_agent,
+    handle_delete_tenant_agent,
+    handle_remove_tenant_agent,
+    handle_set_tenant_agent_tags,
+    handle_set_tenant_agent_mode,
+    handle_request_agent_rotation,
 )
+from handlers.tenant_approvals import (
+    handle_list_my_pending,
+    handle_list_agent_approved,
+    handle_tenant_list_all_approvals,
+    handle_tenant_review_approval,
+    handle_tenant_create_approval,
+    handle_tenant_delete_approval,
+)
+from handlers.audit_logs import handle_list_platform_audit_logs, handle_list_tenant_audit_logs
+from handlers.admin_users import handle_list_users
+from shared.tenant_auth import verify_tenant_token
 from handlers.agent_claim import handle_agent_claim
 from handlers.agent_job_result import handle_agent_job_result
 from handlers.agent_rotate_token import handle_agent_rotate_token
@@ -48,9 +59,10 @@ from handlers.me import handle_me
 from handlers.get_agent import handle_get_agent
 from handlers.get_job import handle_get_job
 from handlers.heartbeat import handle_heartbeat_check
+from shared.admin_auth import verify_session_token
+from handlers.admin_login import handle_admin_login
 from handlers.list_agents import handle_list_agents
 from handlers.list_jobs import handle_list_jobs
-from handlers.tenant_approvals import handle_list_agent_approved, handle_list_my_pending
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -78,7 +90,12 @@ def _rate_limit_key(request: Request) -> str:
     return (request.client.host if request.client else None) or "unknown"
 
 
-limiter = Limiter(key_func=_rate_limit_key)
+# In-memory counters are per-process, so they only enforce correctly on a single
+# instance. To rate limit correctly across multiple backend replicas, set
+# RATE_LIMIT_STORAGE_URI to a shared store, e.g. redis://host:6379. Defaults to
+# in-memory, which is right for a single instance or local dev.
+_RATE_LIMIT_STORAGE = os.environ.get("RATE_LIMIT_STORAGE_URI", "memory://")
+limiter = Limiter(key_func=_rate_limit_key, storage_uri=_RATE_LIMIT_STORAGE)
 
 
 async def _rate_limit_handler(request: Request, exc: RateLimitExceeded) -> JSONResponse:
@@ -99,12 +116,25 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="reach API", version="1.0.0", lifespan=lifespan)
 app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
+)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_handler)
 
+# Docker image copies built UI assets to ui_dist; local dev uses ui/dist directly
+_UI_DIST = os.path.join(os.path.dirname(__file__), "..", "..", "ui_dist")
+if not os.path.isdir(_UI_DIST):
+    _UI_DIST = os.path.join(os.path.dirname(__file__), "..", "..", "..", "ui", "dist")
+if os.path.isdir(_UI_DIST):
+    app.mount("/ui", StaticFiles(directory=_UI_DIST, html=True), name="ui")
+
 
 # ---------------------------------------------------------------------------
-# Agent endpoints
+# Agent endpoints (agent-to-server)
 # ---------------------------------------------------------------------------
 
 @app.post("/agent/claim")
@@ -157,7 +187,7 @@ async def agent_job_result(job_id: str, request: Request):
 
 
 # ---------------------------------------------------------------------------
-# Tenant (CLI) endpoints
+# Tenant (CLI / SDK) endpoints
 # ---------------------------------------------------------------------------
 
 @app.get("/me")
@@ -247,7 +277,22 @@ async def list_agent_approved(agent_id: str, request: Request):
 
 
 # ---------------------------------------------------------------------------
-# Admin endpoints - protected by ADMIN_TOKEN
+# Platform admin login
+# ---------------------------------------------------------------------------
+
+@app.post("/admin/login")
+@limiter.limit("10/minute")
+async def admin_login(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    ip = request.client.host if request.client else ""
+    return _resp(handle_admin_login(body, ip))
+
+
+# ---------------------------------------------------------------------------
+# Platform admin - tenant management
 # ---------------------------------------------------------------------------
 
 @app.post("/admin/tenants", status_code=201)
@@ -260,7 +305,8 @@ async def create_tenant(request: Request):
         body = await request.json()
     except Exception:
         body = {}
-    return _resp(handle_create_tenant(body, token))
+    ip = request.client.host if request.client else ""
+    return _resp(handle_create_tenant(body, token, ip))
 
 
 @app.get("/admin/tenants")
@@ -272,9 +318,38 @@ async def list_tenants(request: Request):
     return _resp(handle_list_tenants(token))
 
 
-@app.post("/admin/tenants/{tenant_id}/users", status_code=201)
+@app.post("/admin/tenants/{tenant_id}/disable")
 @limiter.limit("20/minute")
-async def create_user(tenant_id: str, request: Request):
+async def disable_tenant(tenant_id: str, request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    ip = request.client.host if request.client else ""
+    return _resp(handle_disable_tenant(tenant_id, token, ip))
+
+
+@app.post("/admin/tenants/{tenant_id}/enable")
+@limiter.limit("20/minute")
+async def enable_tenant(tenant_id: str, request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    ip = request.client.host if request.client else ""
+    return _resp(handle_enable_tenant(tenant_id, token, ip))
+
+
+@app.delete("/admin/tenants/{tenant_id}")
+@limiter.limit("10/minute")
+async def delete_tenant(tenant_id: str, request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    return _resp(handle_delete_tenant(tenant_id, token))
+
+
+@app.post("/admin/tenants/{tenant_id}/admin-users", status_code=201)
+@limiter.limit("20/minute")
+async def create_platform_tenant_user(tenant_id: str, request: Request):
     token = _token(request)
     if not token:
         return JSONResponse({"error": "missing Authorization header"}, status_code=401)
@@ -282,8 +357,8 @@ async def create_user(tenant_id: str, request: Request):
         body = await request.json()
     except Exception:
         body = {}
-    api_url = str(request.base_url).rstrip("/")
-    return _resp(handle_create_user(tenant_id, body, token, api_url))
+    ip = request.client.host if request.client else ""
+    return _resp(handle_create_tenant_admin_user(tenant_id, body, token, ip))
 
 
 @app.get("/admin/tenants/{tenant_id}/users")
@@ -295,81 +370,51 @@ async def list_users(tenant_id: str, request: Request):
     return _resp(handle_list_users(tenant_id, token))
 
 
-@app.delete("/admin/tenants/{tenant_id}/users/{user_id}")
-@limiter.limit("30/minute")
-async def delete_user(tenant_id: str, user_id: str, request: Request):
-    token = _token(request)
-    if not token:
-        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
-    return _resp(handle_delete_user(tenant_id, user_id, token))
-
-
-@app.post("/admin/tenants/{tenant_id}/users/{user_id}/rotate-token")
+@app.post("/admin/tenants/{tenant_id}/users/{user_id}/reset-password")
 @limiter.limit("10/minute")
-async def rotate_user_token(tenant_id: str, user_id: str, request: Request):
+async def platform_reset_user_password(tenant_id: str, user_id: str, request: Request):
     token = _token(request)
     if not token:
         return JSONResponse({"error": "missing Authorization header"}, status_code=401)
-    api_url = str(request.base_url).rstrip("/")
-    return _resp(handle_rotate_user_token(tenant_id, user_id, token, api_url))
+    ip = request.client.host if request.client else ""
+    return _resp(handle_platform_reset_user_password(tenant_id, user_id, token, ip))
 
 
-@app.get("/admin/tenants/{tenant_id}/users/{user_id}/agents")
-@limiter.limit("120/minute")
-async def get_user_agents(tenant_id: str, user_id: str, request: Request):
+@app.post("/admin/tenants/{tenant_id}/users/{user_id}/disable")
+@limiter.limit("20/minute")
+async def platform_disable_user(tenant_id: str, user_id: str, request: Request):
     token = _token(request)
     if not token:
         return JSONResponse({"error": "missing Authorization header"}, status_code=401)
-    return _resp(handle_get_user_agents(tenant_id, user_id, token))
+    ip = request.client.host if request.client else ""
+    return _resp(handle_platform_disable_user(tenant_id, user_id, token, ip))
 
 
-@app.put("/admin/tenants/{tenant_id}/users/{user_id}/agents")
-@limiter.limit("30/minute")
-async def set_user_agents(tenant_id: str, user_id: str, request: Request):
+@app.patch("/admin/tenants/{tenant_id}/users/{user_id}/role")
+@limiter.limit("20/minute")
+async def platform_set_user_role(tenant_id: str, user_id: str, request: Request):
     token = _token(request)
     if not token:
         return JSONResponse({"error": "missing Authorization header"}, status_code=401)
     try:
         body = await request.json()
     except Exception:
-        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
-    return _resp(handle_set_user_agents(tenant_id, user_id, body, token))
+        body = {}
+    ip = request.client.host if request.client else ""
+    return _resp(handle_platform_set_user_role(tenant_id, user_id, body, token, ip))
 
 
-@app.post("/admin/tenants/{tenant_id}/users/{user_id}/agents/{agent_id}")
-@limiter.limit("30/minute")
-async def grant_agent_access(tenant_id: str, user_id: str, agent_id: str, request: Request):
+@app.patch("/admin/tenants/{tenant_id}/users/{user_id}/name")
+@limiter.limit("20/minute")
+async def platform_update_user_name(tenant_id: str, user_id: str, request: Request):
     token = _token(request)
     if not token:
         return JSONResponse({"error": "missing Authorization header"}, status_code=401)
-    return _resp(handle_grant_agent_access(tenant_id, user_id, agent_id, token))
-
-
-@app.delete("/admin/tenants/{tenant_id}/users/{user_id}/agents/{agent_id}")
-@limiter.limit("30/minute")
-async def revoke_agent_access(tenant_id: str, user_id: str, agent_id: str, request: Request):
-    token = _token(request)
-    if not token:
-        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
-    return _resp(handle_revoke_agent_access(tenant_id, user_id, agent_id, token))
-
-
-@app.get("/admin/jobs")
-@limiter.limit("120/minute")
-async def list_jobs_admin(request: Request):
-    token = _token(request)
-    if not token:
-        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
-    qs = request.query_params
-    agent_id = qs.get("agent_id", "")
-    tenant_id = qs.get("tenant_id", "")
-    created_by = qs.get("created_by", "")
-    cursor = qs.get("cursor")
     try:
-        limit = max(1, min(int(qs.get("limit", 20)), 100))
-    except (ValueError, TypeError):
-        limit = 20
-    return _resp(handle_list_jobs_admin(token, agent_id, tenant_id, created_by, limit, cursor))
+        body = await request.json()
+    except Exception:
+        body = {}
+    return _resp(handle_platform_update_user_name(tenant_id, user_id, body, token))
 
 
 @app.get("/admin/agents")
@@ -383,23 +428,205 @@ async def list_agents_admin(request: Request):
     return _resp(handle_list_agents_admin(tenant_id, token, tag))
 
 
-@app.post("/admin/agents", status_code=201)
-@limiter.limit("20/minute")
-async def create_agent(request: Request):
+@app.get("/admin/audit-logs")
+@limiter.limit("60/minute")
+async def platform_audit_logs(request: Request):
     token = _token(request)
     if not token:
         return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    qs = request.query_params
+    cursor = qs.get("cursor")
     try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    api_url = str(request.base_url).rstrip("/")
-    return _resp(handle_create_agent(body, token, api_url))
+        limit = max(1, min(int(qs.get("limit", 100)), 200))
+    except (ValueError, TypeError):
+        limit = 100
+    return _resp(handle_list_platform_audit_logs(token, limit, cursor,
+        action=qs.get("action"), actor=qs.get("actor"),
+        resource=qs.get("resource"), ip=qs.get("ip"),
+        since=qs.get("since"), until=qs.get("until")))
 
 
-@app.post("/admin/agents/{agent_id}/reissue-install-token", status_code=201)
+# ---------------------------------------------------------------------------
+# Tenant admin - auth
+# ---------------------------------------------------------------------------
+
+@app.post("/tenant/login")
 @limiter.limit("10/minute")
-async def reissue_install_token(agent_id: str, request: Request):
+async def tenant_login(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    ip = request.client.host if request.client else ""
+    return _resp(handle_tenant_login(body, ip))
+
+
+@app.post("/tenant/me/password")
+@limiter.limit("10/minute")
+async def tenant_change_password(request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    payload = verify_tenant_token(token)
+    if not payload:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    ip = request.client.host if request.client else ""
+    return _resp(handle_change_password(body, payload, ip))
+
+
+@app.get("/tenant/me")
+@limiter.limit("120/minute")
+async def tenant_me(request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    payload = verify_tenant_token(token)
+    if not payload:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    return _resp(handle_tenant_me(payload))
+
+
+# ---------------------------------------------------------------------------
+# Tenant admin - user management
+# ---------------------------------------------------------------------------
+
+@app.get("/tenant/users")
+@limiter.limit("60/minute")
+async def tenant_list_users(request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    payload = verify_tenant_token(token)
+    if not payload:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    return _resp(handle_list_tenant_users(payload))
+
+
+@app.post("/tenant/users", status_code=201)
+@limiter.limit("20/minute")
+async def tenant_create_user(request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    payload = verify_tenant_token(token)
+    if not payload:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    ip = request.client.host if request.client else ""
+    return _resp(handle_create_tenant_user(body, payload, ip))
+
+
+@app.post("/tenant/users/{user_id}/disable")
+@limiter.limit("20/minute")
+async def tenant_disable_user(user_id: str, request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    payload = verify_tenant_token(token)
+    if not payload:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    ip = request.client.host if request.client else ""
+    return _resp(handle_disable_tenant_user(user_id, payload, ip))
+
+
+@app.post("/tenant/users/{user_id}/enable")
+@limiter.limit("20/minute")
+async def tenant_enable_user(user_id: str, request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    payload = verify_tenant_token(token)
+    if not payload:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    ip = request.client.host if request.client else ""
+    return _resp(handle_enable_tenant_user(user_id, payload, ip))
+
+
+@app.post("/tenant/users/{user_id}/revoke-tokens")
+@limiter.limit("20/minute")
+async def tenant_revoke_user_tokens(user_id: str, request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    payload = verify_tenant_token(token)
+    if not payload:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    ip = request.client.host if request.client else ""
+    return _resp(handle_revoke_all_user_tokens(user_id, payload, ip))
+
+
+@app.put("/tenant/users/{user_id}/role")
+@limiter.limit("20/minute")
+async def tenant_set_user_role(user_id: str, request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    payload = verify_tenant_token(token)
+    if not payload:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    ip = request.client.host if request.client else ""
+    return _resp(handle_set_user_role(user_id, body, payload, ip))
+
+
+@app.post("/tenant/users/{user_id}/reset-password")
+@limiter.limit("10/minute")
+async def tenant_reset_user_password(user_id: str, request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    payload = verify_tenant_token(token)
+    if not payload:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    ip = request.client.host if request.client else ""
+    return _resp(handle_reset_user_password(user_id, payload, ip))
+
+
+@app.get("/tenant/users/{user_id}/agents")
+@limiter.limit("60/minute")
+async def tenant_get_user_agents(user_id: str, request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    payload = verify_tenant_token(token)
+    if not payload:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    return _resp(handle_get_user_agents(user_id, payload))
+
+
+@app.put("/tenant/users/{user_id}/agents")
+@limiter.limit("30/minute")
+async def tenant_set_user_agents(user_id: str, request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    payload = verify_tenant_token(token)
+    if not payload:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    return _resp(handle_set_user_agents(user_id, body, payload))
+
+
+# ---------------------------------------------------------------------------
+# Tenant admin - agent management
+# ---------------------------------------------------------------------------
+
+@app.post("/tenant/agents", status_code=201)
+@limiter.limit("20/minute")
+async def tenant_create_agent(request: Request):
     token = _token(request)
     if not token:
         return JSONResponse({"error": "missing Authorization header"}, status_code=401)
@@ -408,131 +635,12 @@ async def reissue_install_token(agent_id: str, request: Request):
     except Exception:
         body = {}
     api_url = str(request.base_url).rstrip("/")
-    return _resp(handle_reissue_install_token(agent_id, body, token, api_url))
+    return _resp(handle_create_tenant_agent(body, token, api_url))
 
 
-@app.get("/admin/agents/{agent_id}/tags")
-@limiter.limit("120/minute")
-async def get_agent_tags(agent_id: str, request: Request):
-    token = _token(request)
-    if not token:
-        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
-    return _resp(handle_get_agent_tags(agent_id, token))
-
-
-@app.put("/admin/agents/{agent_id}/tags")
-@limiter.limit("30/minute")
-async def set_agent_tags(agent_id: str, request: Request):
-    token = _token(request)
-    if not token:
-        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
-    return _resp(handle_set_agent_tags(agent_id, body, token))
-
-
-@app.post("/admin/agents/{agent_id}/tags")
-@limiter.limit("30/minute")
-async def add_agent_tags(agent_id: str, request: Request):
-    token = _token(request)
-    if not token:
-        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
-    return _resp(handle_add_agent_tags(agent_id, body, token))
-
-
-@app.delete("/admin/agents/{agent_id}/tags")
-@limiter.limit("30/minute")
-async def remove_agent_tags(agent_id: str, request: Request):
-    token = _token(request)
-    if not token:
-        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
-    return _resp(handle_remove_agent_tags(agent_id, body, token))
-
-
-@app.post("/admin/agents/{agent_id}/revoke")
-@limiter.limit("30/minute")
-async def revoke_agent(agent_id: str, request: Request):
-    token = _token(request)
-    if not token:
-        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
-    return _resp(handle_revoke_agent(agent_id, token))
-
-
-@app.delete("/admin/agents/{agent_id}/remove")
-@limiter.limit("30/minute")
-async def remove_agent(agent_id: str, request: Request):
-    token = _token(request)
-    if not token:
-        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
-    return _resp(handle_remove_agent(agent_id, token))
-
-
-@app.delete("/admin/agents/{agent_id}")
-@limiter.limit("30/minute")
-async def delete_agent(agent_id: str, request: Request):
-    token = _token(request)
-    if not token:
-        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
-    return _resp(handle_delete_agent(agent_id, token))
-
-
-@app.get("/admin/agents/{agent_id}/policy")
-@limiter.limit("120/minute")
-async def get_policy(agent_id: str, request: Request):
-    token = _token(request)
-    if not token:
-        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
-    return _resp(handle_get_policy(agent_id, token))
-
-
-@app.put("/admin/agents/{agent_id}/policy/mode")
-@limiter.limit("30/minute")
-async def set_mode(agent_id: str, request: Request):
-    token = _token(request)
-    if not token:
-        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
-    return _resp(handle_set_mode(agent_id, body, token))
-
-
-@app.get("/admin/approvals")
-@limiter.limit("120/minute")
-async def list_approvals(request: Request):
-    token = _token(request)
-    if not token:
-        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
-    return _resp(handle_list_approvals(dict(request.query_params), token))
-
-
-@app.post("/admin/approvals", status_code=201)
-@limiter.limit("30/minute")
-async def pre_approve_command(request: Request):
-    token = _token(request)
-    if not token:
-        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
-    return _resp(handle_pre_approve_command(body, token))
-
-
-@app.put("/admin/approvals/{approval_id}/approve")
-@limiter.limit("60/minute")
-async def approve_approval(approval_id: str, request: Request):
+@app.post("/tenant/agents/{agent_id}/reissue-install-token", status_code=201)
+@limiter.limit("10/minute")
+async def tenant_reissue_install_token(agent_id: str, request: Request):
     token = _token(request)
     if not token:
         return JSONResponse({"error": "missing Authorization header"}, status_code=401)
@@ -540,12 +648,132 @@ async def approve_approval(approval_id: str, request: Request):
         body = await request.json()
     except Exception:
         body = {}
-    return _resp(handle_review_approval(approval_id, "approve", token, body))
+    api_url = str(request.base_url).rstrip("/")
+    return _resp(handle_reissue_tenant_install_token(agent_id, body, token, api_url))
 
 
-@app.put("/admin/approvals/{approval_id}/deny")
+@app.post("/tenant/agents/{agent_id}/revoke")
+@limiter.limit("30/minute")
+async def tenant_revoke_agent(agent_id: str, request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    return _resp(handle_revoke_tenant_agent(agent_id, token))
+
+
+@app.delete("/tenant/agents/{agent_id}/remove")
+@limiter.limit("20/minute")
+async def tenant_remove_agent(agent_id: str, request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    return _resp(handle_remove_tenant_agent(agent_id, token))
+
+
+@app.delete("/tenant/agents/{agent_id}")
+@limiter.limit("30/minute")
+async def tenant_delete_agent(agent_id: str, request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    return _resp(handle_delete_tenant_agent(agent_id, token))
+
+
+@app.put("/tenant/agents/{agent_id}/tags")
+@limiter.limit("30/minute")
+async def tenant_set_agent_tags(agent_id: str, request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    return _resp(handle_set_tenant_agent_tags(agent_id, body, token))
+
+
+@app.post("/tenant/agents/{agent_id}/request-rotation")
+@limiter.limit("10/minute")
+async def tenant_request_agent_rotation(agent_id: str, request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    return _resp(handle_request_agent_rotation(agent_id, token))
+
+
+@app.post("/tenant/agents/{agent_id}/acknowledge-capability")
+@limiter.limit("30/minute")
+async def tenant_acknowledge_capability(agent_id: str, request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    return _resp(handle_acknowledge_capability(agent_id, body, token))
+
+
+@app.put("/tenant/agents/{agent_id}/policy/mode")
+@limiter.limit("30/minute")
+async def tenant_set_agent_mode(agent_id: str, request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    return _resp(handle_set_tenant_agent_mode(agent_id, body, token))
+
+
+@app.get("/tenant/agents/{agent_id}/history")
 @limiter.limit("60/minute")
-async def deny_approval(approval_id: str, request: Request):
+async def tenant_agent_history(agent_id: str, request: Request):
+    from shared.store import agent_history_repo, agents_repo as _ar
+    from shared.tenant_auth import verify_tenant_token as _vt
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    payload = _vt(token)
+    if not payload:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    agent = _ar.get(agent_id)
+    if not agent or agent.get("tenant_id") != payload.get("tenant_id"):
+        return JSONResponse({"error": "not found"}, status_code=404)
+    history = agent_history_repo.list_by_agent(agent_id, limit=50)
+    return JSONResponse({"status": "ok", "history": history})
+
+
+# ---------------------------------------------------------------------------
+# Tenant admin - approval management
+# ---------------------------------------------------------------------------
+
+@app.get("/tenant/approvals")
+@limiter.limit("60/minute")
+async def tenant_list_all_approvals(request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    return _resp(handle_tenant_list_all_approvals(dict(request.query_params), token))
+
+
+@app.post("/tenant/approvals", status_code=201)
+@limiter.limit("30/minute")
+async def tenant_create_approval(request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    return _resp(handle_tenant_create_approval(body, token))
+
+
+@app.put("/tenant/approvals/{approval_id}/approve")
+@limiter.limit("60/minute")
+async def tenant_approve_approval(approval_id: str, request: Request):
     token = _token(request)
     if not token:
         return JSONResponse({"error": "missing Authorization header"}, status_code=401)
@@ -553,16 +781,125 @@ async def deny_approval(approval_id: str, request: Request):
         body = await request.json()
     except Exception:
         body = {}
-    return _resp(handle_review_approval(approval_id, "deny", token, body))
+    return _resp(handle_tenant_review_approval(approval_id, "approve", token, body))
 
 
-@app.delete("/admin/approvals/{approval_id}")
-@limiter.limit("30/minute")
-async def delete_approval(approval_id: str, request: Request):
+@app.put("/tenant/approvals/{approval_id}/deny")
+@limiter.limit("60/minute")
+async def tenant_deny_approval(approval_id: str, request: Request):
     token = _token(request)
     if not token:
         return JSONResponse({"error": "missing Authorization header"}, status_code=401)
-    return _resp(handle_delete_approval(approval_id, token))
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    return _resp(handle_tenant_review_approval(approval_id, "deny", token, body))
+
+
+@app.delete("/tenant/approvals/{approval_id}")
+@limiter.limit("30/minute")
+async def tenant_delete_approval(approval_id: str, request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    return _resp(handle_tenant_delete_approval(approval_id, token))
+
+
+# ---------------------------------------------------------------------------
+# Tenant admin - API tokens
+# ---------------------------------------------------------------------------
+
+@app.get("/tenant/api-tokens")
+@limiter.limit("60/minute")
+async def tenant_list_tokens(request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    payload = verify_tenant_token(token)
+    if not payload:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    return _resp(handle_list_api_tokens(payload))
+
+
+@app.post("/tenant/api-tokens", status_code=201)
+@limiter.limit("20/minute")
+async def tenant_create_token(request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    payload = verify_tenant_token(token)
+    if not payload:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    ip = request.client.host if request.client else ""
+    return _resp(handle_create_api_token(body, payload, ip))
+
+
+@app.patch("/tenant/api-tokens/{token_id}")
+@limiter.limit("30/minute")
+async def tenant_rename_token(token_id: str, request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    payload = verify_tenant_token(token)
+    if not payload:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    ip = request.client.host if request.client else ""
+    return _resp(handle_rename_api_token(token_id, body, payload, ip))
+
+
+@app.delete("/tenant/api-tokens/{token_id}")
+@limiter.limit("20/minute")
+async def tenant_revoke_token(token_id: str, request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    payload = verify_tenant_token(token)
+    if not payload:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    ip = request.client.host if request.client else ""
+    return _resp(handle_revoke_api_token(token_id, payload, ip))
+
+
+# ---------------------------------------------------------------------------
+# Tenant admin - audit logs
+# ---------------------------------------------------------------------------
+
+@app.get("/tenant/audit-logs")
+@limiter.limit("60/minute")
+async def tenant_audit_logs(request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    qs = request.query_params
+    cursor = qs.get("cursor")
+    try:
+        limit = max(1, min(int(qs.get("limit", 100)), 200))
+    except (ValueError, TypeError):
+        limit = 100
+    return _resp(handle_list_tenant_audit_logs(token, limit, cursor,
+        action=qs.get("action"), actor=qs.get("actor"),
+        resource=qs.get("resource"), ip=qs.get("ip"),
+        since=qs.get("since"), until=qs.get("until")))
+
+
+# ---------------------------------------------------------------------------
+# Root redirect → UI
+# ---------------------------------------------------------------------------
+
+@app.get("/")
+@limiter.limit("120/minute")
+async def root(request: Request):
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url="/ui/", status_code=301)
 
 
 # ---------------------------------------------------------------------------

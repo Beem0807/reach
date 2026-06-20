@@ -19,13 +19,29 @@ services:
     build: .
     environment:
       TOKEN_PEPPER: ${TOKEN_PEPPER:-localtest}
-      ADMIN_TOKEN: ${ADMIN_TOKEN:-localadmin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-localadmin}
       DATABASE_URL: postgresql://reach:reach@db:5432/reach
       APPROVAL_RETENTION_DAYS: ${APPROVAL_RETENTION_DAYS:-7}
       JOB_RETENTION_DAYS: ${JOB_RETENTION_DAYS:-7}
+      AUDIT_RETENTION_DAYS: ${AUDIT_RETENTION_DAYS:-90}
+      AGENT_HISTORY_RETENTION_DAYS: ${AGENT_HISTORY_RETENTION_DAYS:-30}
     depends_on:
       db:
         condition: service_healthy
+
+  seed:
+    build: .
+    command: python /scripts/seed.py
+    environment:
+      TOKEN_PEPPER: ${TOKEN_PEPPER:-localtest}
+      DATABASE_URL: postgresql://reach:reach@db:5432/reach
+    volumes:
+      - ./scripts:/scripts:ro
+    depends_on:
+      backend:
+        condition: service_started
+    profiles:
+      - seed
 
   nginx:
     image: nginx:alpine

@@ -242,3 +242,13 @@ def test_readonly_chained_reads_not_blocked():
 ])
 def test_compute_access_level(mode, root, expected):
     assert compute_access_level(mode, root) == expected
+
+
+def test_compute_access_level_ignores_extra_kwargs():
+    # repos pass grant/detected kwargs; they should not affect the result
+    result = compute_access_level(
+        "wild", True,
+        grant_docker=True, grant_service_mgmt=True,
+        docker_detected=True, service_mgmt_detected=True,
+    )
+    assert result == "open"

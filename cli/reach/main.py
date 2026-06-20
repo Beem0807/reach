@@ -40,7 +40,7 @@ def version():
 # ---------------------------------------------------------------------------
 # reach config
 # ---------------------------------------------------------------------------
-config_app = typer.Typer(help="Inspect local CLI configuration.")
+config_app = typer.Typer(help="Inspect local CLI configuration.", no_args_is_help=True)
 app.add_typer(config_app, name="config")
 
 
@@ -78,19 +78,21 @@ def config_show():
 @app.command()
 def login(
     api_url: str = typer.Option(..., "--api-url", help="Backend API URL"),
-    token: str = typer.Option(..., "--token", help="Tenant token"),
+    api_key: str = typer.Option(..., "--api-key", "--token", help="API key (from the tenant console → API Tokens)"),
     profile: str = typer.Option("default", "--profile", "-p", help="Profile name to save under"),
 ):
-    """Store API URL and tenant token. Use --profile to manage multiple tenants."""
+    """Store API URL and API key. Use --profile to manage multiple tenants."""
     full = cfg_module.load()
     existing = full.get("profiles", {}).get(profile, {})
-    if existing.get("api_url") or existing.get("tenant_token"):
+    if existing.get("api_url") or existing.get("api_key") or existing.get("tenant_token"):
         console.print(f"[yellow]Profile '{profile}' already exists (API: {existing.get('api_url')}).[/yellow]")
         if not Confirm.ask("Overwrite?", default=False):
             raise typer.Exit(0)
     profile_data = dict(existing)
     profile_data["api_url"] = api_url.rstrip("/")
-    profile_data["tenant_token"] = token
+    profile_data["api_key"] = api_key
+    # Remove legacy key if present
+    profile_data.pop("tenant_token", None)
     full.setdefault("profiles", {})[profile] = profile_data
     full["active_profile"] = profile
     cfg_module.save(full)
@@ -106,9 +108,9 @@ def login(
 def whoami():
     """Show the currently authenticated user."""
     api_url = cfg_module.require("api_url")
-    tenant_token = cfg_module.require("tenant_token")
+    api_key = cfg_module.require("api_key")
 
-    client = ReachClient(api_url, tenant_token)
+    client = ReachClient(api_url, api_key)
     try:
         data = client.get_me()
     except requests.HTTPError as e:
@@ -118,6 +120,10 @@ def whoami():
     console.print(f"[bold]User ID:[/bold]   {data.get('user_id')}")
     console.print(f"[bold]Tenant ID:[/bold] {data.get('tenant_id')}")
     console.print(f"[bold]Name:[/bold]      {data.get('name') or '-'}")
+    if data.get('username'):
+        console.print(f"[bold]Username:[/bold]  {data.get('username')}")
+    if data.get('role'):
+        console.print(f"[bold]Role:[/bold]      {data.get('role')}")
     console.print(f"[bold]Created:[/bold]   {data.get('created_at') or '-'}")
 
 
@@ -128,10 +134,10 @@ def whoami():
 def status():
     """Show the status of the default agent."""
     api_url = cfg_module.require("api_url")
-    tenant_token = cfg_module.require("tenant_token")
+    api_key = cfg_module.require("api_key")
     agent_id = cfg_module.require("default_agent_id")
 
-    client = ReachClient(api_url, tenant_token)
+    client = ReachClient(api_url, api_key)
     try:
         agent = client.get_agent(agent_id)
     except requests.HTTPError as e:
@@ -158,7 +164,7 @@ def status():
 # ---------------------------------------------------------------------------
 # reach agents
 # ---------------------------------------------------------------------------
-agents_app = typer.Typer(help="Manage and list remote agents.")
+agents_app = typer.Typer(help="Manage and list remote agents.", no_args_is_help=True)
 app.add_typer(agents_app, name="agents")
 
 
@@ -168,9 +174,9 @@ def agents_list(
 ):
     """List all agents for your tenant."""
     api_url = cfg_module.require("api_url")
-    tenant_token = cfg_module.require("tenant_token")
+    api_key = cfg_module.require("api_key")
 
-    client = ReachClient(api_url, tenant_token)
+    client = ReachClient(api_url, api_key)
     try:
         data = client.list_agents(tag=tag)
     except requests.HTTPError as e:
@@ -243,7 +249,7 @@ def agents_use(agent_id: str = typer.Argument(..., help="Agent ID or alias to se
 # ---------------------------------------------------------------------------
 # reach alias
 # ---------------------------------------------------------------------------
-alias_app = typer.Typer(help="Manage agent aliases (e.g. prod, staging).")
+alias_app = typer.Typer(help="Manage agent aliases (e.g. prod, staging).", no_args_is_help=True)
 app.add_typer(alias_app, name="alias")
 
 
@@ -309,10 +315,10 @@ def exec_cmd(
 
     full_command = " ".join(args)
     api_url = cfg_module.require("api_url")
-    tenant_token = cfg_module.require("tenant_token")
+    api_key = cfg_module.require("api_key")
     agent_id = cfg_module.resolve_agent(agent) if agent else cfg_module.require("default_agent_id")
 
-    client = ReachClient(api_url, tenant_token)
+    client = ReachClient(api_url, api_key)
 
     try:
         job = client.create_job(agent_id, full_command)
@@ -360,9 +366,9 @@ def exec_cmd(
 def job_cmd(job_id: str = typer.Argument(..., help="Job ID to fetch")):
     """Fetch the full output of a past job by ID."""
     api_url = cfg_module.require("api_url")
-    tenant_token = cfg_module.require("tenant_token")
+    api_key = cfg_module.require("api_key")
 
-    client = ReachClient(api_url, tenant_token)
+    client = ReachClient(api_url, api_key)
     try:
         result = client.get_job(job_id)
     except requests.HTTPError as e:
@@ -385,11 +391,11 @@ def history(
 ):
     """Show your recent jobs."""
     api_url = cfg_module.require("api_url")
-    tenant_token = cfg_module.require("tenant_token")
+    api_key = cfg_module.require("api_key")
 
     agent_id = cfg_module.resolve_agent(agent) if agent else None
 
-    client = ReachClient(api_url, tenant_token)
+    client = ReachClient(api_url, api_key)
     try:
         data = client.list_jobs(agent_id=agent_id, limit=limit, cursor=cursor)
     except requests.HTTPError as e:
@@ -494,10 +500,10 @@ def approvals(
         status = "approved"
 
     api_url = cfg_module.require("api_url")
-    tenant_token = cfg_module.require("tenant_token")
+    api_key = cfg_module.require("api_key")
     agent_id = cfg_module.resolve_agent(agent) if agent else cfg_module.require("default_agent_id")
 
-    client = ReachClient(api_url, tenant_token)
+    client = ReachClient(api_url, api_key)
     try:
         data = client.list_agent_approved(agent_id, status=status)
     except requests.HTTPError as e:
@@ -566,16 +572,16 @@ def agent_init(
 
     cfg = cfg_module.load_profile()
     api_url = cfg.get("api_url")
-    tenant_token = cfg.get("tenant_token")
+    api_key = cfg.get("api_key") or cfg.get("tenant_token")
     default_agent_id = cfg.get("default_agent_id", "")
 
     console.print(f"\n[bold cyan]reach agent-init --for {for_agent}[/bold cyan]\n")
 
     # Fetch agents from API
     fetched: list[dict] = []
-    if api_url and tenant_token:
+    if api_url and api_key:
         try:
-            client = ReachClient(api_url, tenant_token)
+            client = ReachClient(api_url, api_key)
             fetched = [
                 a for a in client.list_agents().get("agents", [])
                 if a.get("status") in ("ACTIVE", "INACTIVE")
@@ -823,7 +829,7 @@ def _print_job_result(result: dict) -> None:
 # ---------------------------------------------------------------------------
 # reach profile
 # ---------------------------------------------------------------------------
-profile_app = typer.Typer(help="Manage profiles for multiple tenants.")
+profile_app = typer.Typer(help="Manage profiles for multiple tenants.", no_args_is_help=True)
 app.add_typer(profile_app, name="profile")
 
 
@@ -923,7 +929,7 @@ def man():
     console.print("[bold white]reach[/bold white] - remote machine command bridge\n", highlight=False)
 
     section("Auth & setup", [
-        ("reach login --api-url <url> --token <token>",      "Save credentials (default profile)"),
+        ("reach login --api-url <url> --api-key <key>",      "Save credentials (default profile)"),
         ("reach login --profile <name> ...",                  "Save credentials under a named profile"),
         ("reach whoami",                                      "Show current user, tenant, and API URL"),
         ("reach version",                                     "Show CLI version"),

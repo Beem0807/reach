@@ -248,6 +248,25 @@ class TestListJobs:
         r = self._call(agent_id=AGENT_ID, agent=None)
         assert r["statusCode"] == 404
 
+    def test_enriches_agent_hostname_and_mode(self):
+        agent_with_host = {**_AGENT_ACTIVE, "hostname": "prod-01.local", "mode": "readonly"}
+        r = self._call([_JOB], agent=agent_with_host)
+        jobs = json.loads(r["body"])["jobs"]
+        assert jobs[0]["agent_hostname"] == "prod-01.local"
+        assert jobs[0]["agent_mode"] == "readonly"
+
+    def test_agent_hostname_none_when_not_set(self):
+        r = self._call([_JOB])  # _AGENT_ACTIVE has no hostname field
+        jobs = json.loads(r["body"])["jobs"]
+        assert jobs[0]["agent_hostname"] is None
+        assert jobs[0]["agent_mode"] == "wild"
+
+    def test_list_includes_stdout_and_stderr(self):
+        r = self._call([_JOB])
+        jobs = json.loads(r["body"])["jobs"]
+        assert jobs[0]["stdout"] == "output"
+        assert jobs[0]["stderr"] == ""
+
     def test_no_agent_filter_excludes_inaccessible_jobs(self):
         job_other = {**_JOB, "job_id": "job_2", "agent_id": "agent_other"}
         restricted_user = {**USER, "allowed_agent_ids": [AGENT_ID]}

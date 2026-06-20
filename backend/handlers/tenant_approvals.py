@@ -1,12 +1,41 @@
 import logging
+import re
+import secrets
+from datetime import datetime, timedelta, timezone
+from typing import Optional, Tuple
 
+import shared.audit as audit
 from shared.access import can_access_agent
 from shared.auth import _bearer, _verify_tenant_token
-from shared.response import _err, _ok
+from shared.response import _err, _iso, _ok
 from shared.store import agents_repo, approvals_repo
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
+
+_DURATION_SECONDS = {"1h": 3600, "8h": 28800, "24h": 86400, "7d": 604800}
+_ROLE_RANK = {"admin": 3, "operator": 2, "developer": 1}
+
+
+def _require_role(user: dict, min_role: str) -> bool:
+    return _ROLE_RANK.get(user.get("role", "developer"), 0) >= _ROLE_RANK.get(min_role, 0)
+
+
+def _parse_expires_at(duration: str) -> Tuple[bool, Optional[str]]:
+    if not duration or duration == "permanent":
+        return True, None
+    if duration == "now":
+        return True, datetime.now(tz=timezone.utc).isoformat()
+    if duration in _DURATION_SECONDS:
+        secs = _DURATION_SECONDS[duration]
+    else:
+        m = re.fullmatch(r"(\d+)(h|d)", duration)
+        if not m:
+            return False, None
+        n, unit = int(m.group(1)), m.group(2)
+        secs = n * 3600 if unit == "h" else n * 86400
+    expires = datetime.now(tz=timezone.utc) + timedelta(seconds=secs)
+    return True, expires.isoformat()
 
 
 def handle_list_my_pending(query: dict, raw_token: str) -> dict:
@@ -67,6 +96,278 @@ def handle_list_agent_approved(agent_id: str, raw_token: str, status: str = "app
 
     approved_commands = [a["command"] for a in items] if status == "approved" else []
     return _ok({"approved_commands": approved_commands, "approvals": items})
+
+
+def handle_tenant_list_all_approvals(query: dict, raw_token: str) -> dict:
+    """List all approvals in the tenant (operator+). Unlike /approvals/pending this is not filtered to own items."""
+    user = _verify_tenant_token(raw_token)
+    if not user:
+        return _err("unauthorized", 401)
+    if not _require_role(user, "operator"):
+        return _err("forbidden", 403)
+
+    agent_id = (query.get("agent_id") or "").strip() or None
+    status = (query.get("status") or "").strip() or None
+
+    approvals = approvals_repo.list_by_tenant(user["tenant_id"], agent_id=agent_id, status=status)
+    _cache: dict = {}
+    def _hostname(aid: str):
+        if aid not in _cache:
+            a = agents_repo.get(aid)
+            _cache[aid] = (a or {}).get("hostname")
+        return _cache[aid]
+    enriched = [{**a, "agent_hostname": _hostname(a["agent_id"])} for a in approvals]
+    return _ok({"approvals": enriched})
+
+
+def handle_tenant_review_approval(approval_id: str, action: str, raw_token: str, body: Optional[dict] = None) -> dict:
+    user = _verify_tenant_token(raw_token)
+    if not user:
+        return _err("unauthorized", 401)
+    if not _require_role(user, "operator"):
+        return _err("forbidden", 403)
+
+    approval = approvals_repo.get(approval_id)
+    if not approval or approval.get("tenant_id") != user["tenant_id"]:
+        return _err("approval not found", 404)
+
+    current_status = approval.get("status")
+    if current_status in ("denied", "expired"):
+        return _err(f"{current_status} approvals cannot be updated", 409)
+    if current_status == "approved" and action == "deny":
+        return _err("approved approvals cannot be denied - use duration=now to instantly expire instead", 409)
+
+    new_status = "approved" if action == "approve" else "denied"
+    reviewed_at = _iso()
+    expires_at: Optional[str] = None
+
+    if action == "approve":
+        duration = (body or {}).get("duration", "permanent")
+        if duration == "now" and current_status == "pending":
+            return _err("duration=now is not valid for initial approval", 400)
+        ok, expires_at = _parse_expires_at(duration)
+        if not ok:
+            return _err(f"invalid duration '{duration}'; use 1h, 8h, 24h, 7d, permanent, now, or Nh/Nd", 400)
+        if duration == "now":
+            new_status = "expired"
+
+    reviewer = user.get("username") or user.get("user_id", "")
+    approvals_repo.update_status(approval_id, new_status, reviewed_at, reviewer, expires_at=expires_at)
+    updated = {**approval, "status": new_status, "reviewed_at": reviewed_at, "reviewed_by": reviewer, "expires_at": expires_at}
+    # Audit action is one of: "approval.approved", "approval.denied", "approval.expired"
+    audit.write(
+        f"approval.{new_status}",
+        tenant_id=user["tenant_id"],
+        actor_id=user.get("user_id", ""),
+        actor_name=reviewer,
+        actor_role=user.get("role", ""),
+        resource_type="approval",
+        resource_id=approval_id,
+        metadata={"command": approval.get("command"), "agent_id": approval.get("agent_id"), "expires_at": expires_at},
+    )
+    logger.info("Approval %s %s by user=%s", approval_id, new_status, user.get("user_id"))
+    return _ok(updated)
+
+
+def handle_tenant_create_approval(body: dict, raw_token: str) -> dict:
+    """Create an approval. Operators/admins create directly approved; developers create pending."""
+    user = _verify_tenant_token(raw_token)
+    if not user:
+        return _err("unauthorized", 401)
+
+    agent_id = (body or {}).get("agent_id", "").strip()
+    if not agent_id:
+        return _err("agent_id is required", 400)
+
+    agent = agents_repo.get(agent_id)
+    if not agent or agent.get("tenant_id") != user["tenant_id"]:
+        return _err("agent not found", 404)
+
+    if not _require_role(user, "operator"):
+        # Developer path: single command → pending
+        command = (body or {}).get("command", "").strip()
+        if not command:
+            return _err("command is required", 400)
+
+        active = approvals_repo.list_by_agent(agent_id, status="approved")
+        if any(a["command"] == command for a in active):
+            return _err("command already has an active approval for this agent", 409)
+
+        pending = approvals_repo.list_by_agent(agent_id, status="pending", requested_by=user["user_id"])
+        if any(a["command"] == command for a in pending):
+            return _err("you already have a pending request for this command", 409)
+
+        now = _iso()
+        requester = user.get("username") or user.get("user_id", "")
+        approval = {
+            "approval_id": "appr_" + secrets.token_urlsafe(12),
+            "tenant_id": user["tenant_id"],
+            "agent_id": agent_id,
+            "command": command,
+            "requested_by": user.get("user_id", ""),
+            "requester_name": requester,
+            "job_id": None,
+            "status": "pending",
+            "created_at": now,
+            "reviewed_at": None,
+            "reviewed_by": None,
+            "expires_at": None,
+        }
+        approvals_repo.create(approval)
+        audit.write(
+            "approval.requested",
+            tenant_id=user["tenant_id"],
+            actor_id=user.get("user_id", ""),
+            actor_name=requester,
+            actor_role=user.get("role", ""),
+            resource_type="approval",
+            resource_id=approval["approval_id"],
+            metadata={"command": command, "agent_id": agent_id},
+        )
+        logger.info("Approval request (pending) created for agent=%s command=%s by user=%s", agent_id, command, user.get("user_id"))
+        return _ok(approval, 201)
+
+    # Operator/admin path: create directly as approved, supports bulk + duration
+    single_command = (body or {}).get("command", "").strip()
+    command_list = (body or {}).get("commands")
+    if command_list is not None:
+        if not isinstance(command_list, list) or not command_list:
+            return _err("commands must be a non-empty list", 400)
+        commands = [c.strip() for c in command_list if isinstance(c, str) and c.strip()]
+        if not commands:
+            return _err("commands must contain at least one non-empty string", 400)
+        bulk = True
+    elif single_command:
+        commands = [single_command]
+        bulk = False
+    else:
+        return _err("command or commands is required", 400)
+
+    duration = (body or {}).get("duration")
+    if duration == "now":
+        return _err("duration=now is not valid for pre-approve; use 1h, 8h, 24h, 7d, permanent, or Nh/Nd", 400)
+    ok, expires_at = _parse_expires_at(duration)
+    if not ok:
+        return _err(f"invalid duration '{duration}'; use 1h, 8h, 24h, 7d, permanent, or Nh/Nd", 400)
+
+    active_commands = {a["command"] for a in approvals_repo.list_by_agent(agent_id, status="approved")}
+    now = _iso()
+    reviewer = user.get("username") or user.get("user_id", "")
+    created = []
+    skipped = []
+
+    for command in commands:
+        if command in active_commands:
+            skipped.append({"command": command, "reason": "already_approved"})
+            continue
+        approval = {
+            "approval_id": "appr_" + secrets.token_urlsafe(12),
+            "tenant_id": user["tenant_id"],
+            "agent_id": agent_id,
+            "command": command,
+            "requested_by": user.get("user_id", ""),
+            "requester_name": reviewer,
+            "job_id": None,
+            "status": "approved",
+            "created_at": now,
+            "reviewed_at": now,
+            "reviewed_by": reviewer,
+            "expires_at": expires_at,
+        }
+        approvals_repo.create(approval)
+        created.append(approval)
+
+    if created:
+        audit.write(
+            "approval.pre_approved",
+            tenant_id=user["tenant_id"],
+            actor_id=user.get("user_id", ""),
+            actor_name=reviewer,
+            actor_role=user.get("role", ""),
+            resource_type="approval",
+            resource_id=agent_id,
+            metadata={"commands": [a["command"] for a in created], "agent_id": agent_id, "expires_at": expires_at, "count": len(created)},
+        )
+    logger.info("Pre-approved %d commands for agent=%s by user=%s (%d skipped)", len(created), agent_id, user.get("user_id"), len(skipped))
+
+    if bulk:
+        return _ok({"created": created, "skipped": skipped})
+    if skipped:
+        return _err("command already has an active approval for this agent", 409)
+    return _ok(created[0])
+
+
+def handle_tenant_delete_approval(approval_id: str, raw_token: str) -> dict:
+    user = _verify_tenant_token(raw_token)
+    if not user:
+        return _err("unauthorized", 401)
+    if not _require_role(user, "operator"):
+        return _err("forbidden", 403)
+
+    approval = approvals_repo.get(approval_id)
+    if not approval or approval.get("tenant_id") != user["tenant_id"]:
+        return _err("approval not found", 404)
+
+    approvals_repo.delete(approval_id)
+    audit.write(
+        "approval.deleted",
+        tenant_id=user["tenant_id"],
+        actor_id=user.get("user_id", ""),
+        actor_name=user.get("username") or user.get("user_id", ""),
+        actor_role=user.get("role", ""),
+        resource_type="approval",
+        resource_id=approval_id,
+        metadata={"command": approval.get("command"), "agent_id": approval.get("agent_id"), "status": approval.get("status")},
+    )
+    logger.info("Approval %s deleted by user=%s", approval_id, user.get("user_id"))
+    return _ok({"deleted": True})
+
+
+def list_all_approvals_handler(event, context):
+    logger.info("GET /tenant/approvals")
+    token = _bearer(event)
+    if not token:
+        return _err("missing Authorization header", 401)
+    query = event.get("queryStringParameters") or {}
+    return handle_tenant_list_all_approvals(query, token)
+
+
+def pre_approve_handler(event, context):
+    import json
+    logger.info("POST /tenant/approvals")
+    token = _bearer(event)
+    if not token:
+        return _err("missing Authorization header", 401)
+    try:
+        body = json.loads(event.get("body") or "{}")
+    except json.JSONDecodeError:
+        return _err("invalid JSON body")
+    return handle_tenant_create_approval(body, token)
+
+
+def review_approval_handler(event, context):
+    import json
+    path = event.get("pathParameters") or {}
+    approval_id = path.get("approval_id", "")
+    action = path.get("action", "")
+    logger.info("PUT /tenant/approvals/%s/%s", approval_id, action)
+    token = _bearer(event)
+    if not token:
+        return _err("missing Authorization header", 401)
+    try:
+        body = json.loads(event.get("body") or "{}")
+    except json.JSONDecodeError:
+        return _err("invalid JSON body")
+    return handle_tenant_review_approval(approval_id, action, token, body)
+
+
+def delete_approval_handler(event, context):
+    logger.info("DELETE /tenant/approvals/{approval_id}")
+    token = _bearer(event)
+    if not token:
+        return _err("missing Authorization header", 401)
+    approval_id = (event.get("pathParameters") or {}).get("approval_id", "")
+    return handle_tenant_delete_approval(approval_id, token)
 
 
 def list_my_pending_handler(event, context):

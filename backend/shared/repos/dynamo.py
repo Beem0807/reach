@@ -13,13 +13,21 @@ _TABLE_TENANTS = _ddb.Table("reach-tenants")
 _TABLE_USERS = _ddb.Table("reach-users")
 _TABLE_JOBS = _ddb.Table("reach-jobs")
 _TABLE_APPROVALS = _ddb.Table("reach-approvals")
+_TABLE_API_TOKENS = _ddb.Table("reach-api-tokens")
+_TABLE_AUDIT_LOGS = _ddb.Table("reach-audit-logs")
 
 
 def _enrich_agent(d: Optional[dict]) -> Optional[dict]:
     if d is None:
         return None
     root = d.get("running_as_root") == "true"
-    d["access_level"] = compute_access_level(d.get("mode", "wild"), root)
+    d["access_level"] = compute_access_level(
+        d.get("mode", "wild"), root,
+        grant_docker=bool(d.get("grant_docker")),
+        grant_service_mgmt=bool(d.get("grant_service_mgmt")),
+        docker_detected=bool(d.get("docker_detected")),
+        service_mgmt_detected=bool(d.get("service_mgmt_detected")),
+    )
     return d
 
 
@@ -49,7 +57,13 @@ class AgentRepo:
             },
         )
 
-    def update_heartbeat(self, agent_id: str, reactivate: bool, now_iso: str, agent_version: Optional[str] = None, running_as_root: Optional[bool] = None) -> None:
+    def update_heartbeat(
+        self, agent_id: str, reactivate: bool, now_iso: str,
+        agent_version: Optional[str] = None,
+        running_as_root: Optional[bool] = None,
+        docker_detected: Optional[bool] = None,
+        service_mgmt_detected: Optional[bool] = None,
+    ) -> None:
         sets = ["last_heartbeat_at = :hb"]
         names: dict = {}
         values: dict = {":hb": now_iso}
@@ -63,6 +77,12 @@ class AgentRepo:
         if running_as_root is not None:
             sets.append("running_as_root = :rar")
             values[":rar"] = "true" if running_as_root else "false"
+        if docker_detected is not None:
+            sets.append("docker_detected = :dd")
+            values[":dd"] = docker_detected
+        if service_mgmt_detected is not None:
+            sets.append("service_mgmt_detected = :smd")
+            values[":smd"] = service_mgmt_detected
         kwargs: dict = {
             "Key": {"agent_id": agent_id},
             "UpdateExpression": "SET " + ", ".join(sets),
@@ -112,11 +132,15 @@ class AgentRepo:
             ExpressionAttributeValues={":m": mode},
         )
 
-    def reissue_install_token(self, agent_id: str, install_token_hash: str, expires_at: int) -> None:
+    def reissue_install_token(
+        self, agent_id: str, install_token_hash: str, expires_at: int,
+        grant_service_mgmt: bool = False, grant_docker: bool = False,
+    ) -> None:
         _TABLE_AGENTS.update_item(
             Key={"agent_id": agent_id},
             UpdateExpression=(
                 "SET #st = :created, install_token_hash = :ith, install_token_expires_at = :exp"
+                ", grant_service_mgmt = :gsm, grant_docker = :gd"
                 " REMOVE agent_token_hash, machine_fingerprint, claimed_at"
             ),
             ExpressionAttributeNames={"#st": "status"},
@@ -124,6 +148,8 @@ class AgentRepo:
                 ":created": "CREATED",
                 ":ith": install_token_hash,
                 ":exp": expires_at,
+                ":gsm": grant_service_mgmt,
+                ":gd": grant_docker,
             },
         )
 
@@ -157,6 +183,22 @@ class AgentRepo:
             Key={"agent_id": agent_id},
             UpdateExpression="SET tags = :t",
             ExpressionAttributeValues={":t": tags},
+        )
+
+    def update_grants(self, agent_id: str, grant_docker=None, grant_service_mgmt=None) -> None:
+        exprs, names, vals = [], {}, {}
+        if grant_docker is not None:
+            exprs.append("grant_docker = :gd")
+            vals[":gd"] = grant_docker
+        if grant_service_mgmt is not None:
+            exprs.append("grant_service_mgmt = :gsm")
+            vals[":gsm"] = grant_service_mgmt
+        if not exprs:
+            return
+        _TABLE_AGENTS.update_item(
+            Key={"agent_id": agent_id},
+            UpdateExpression="SET " + ", ".join(exprs),
+            ExpressionAttributeValues=vals,
         )
 
     def scan_stale_active(self, cutoff_iso: str) -> list:
@@ -332,7 +374,17 @@ class TenantRepo:
     def get(self, tenant_id: str) -> Optional[dict]:
         return _TABLE_TENANTS.get_item(Key={"tenant_id": tenant_id}).get("Item")
 
+    def get_by_name(self, name: str) -> Optional[dict]:
+        import boto3.dynamodb.conditions as c
+        resp = _TABLE_TENANTS.scan(FilterExpression=c.Attr("name").eq(name), Limit=1)
+        items = resp.get("Items", [])
+        return items[0] if items else None
+
     def create(self, tenant: dict) -> None:
+        from shared.exceptions import NameTakenError
+        name = tenant.get("name", "")
+        if name and self.get_by_name(name):
+            raise NameTakenError(name)
         _TABLE_TENANTS.put_item(Item=tenant)
 
     def list_all(self) -> list:
@@ -346,17 +398,18 @@ class TenantRepo:
             kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
         return results
 
+    def set_status(self, tenant_id: str, status: str) -> None:
+        _TABLE_TENANTS.update_item(
+            Key={"tenant_id": tenant_id},
+            UpdateExpression="SET #st = :s",
+            ExpressionAttributeNames={"#st": "status"},
+            ExpressionAttributeValues={":s": status},
+        )
+
 
 class UserRepo:
     def get(self, user_id: str) -> Optional[dict]:
         return _TABLE_USERS.get_item(Key={"user_id": user_id}).get("Item")
-
-    def get_by_hash(self, token_hash: str) -> Optional[dict]:
-        items = _TABLE_USERS.query(
-            IndexName="token-hash-index",
-            KeyConditionExpression=DKey("token_hash").eq(token_hash),
-        ).get("Items", [])
-        return items[0] if items else None
 
     def create(self, user: dict) -> None:
         _TABLE_USERS.put_item(Item=user)
@@ -367,13 +420,6 @@ class UserRepo:
             KeyConditionExpression=DKey("tenant_id").eq(tenant_id),
         ).get("Items", [])
 
-    def update_token_hash(self, user_id: str, token_hash: str) -> None:
-        _TABLE_USERS.update_item(
-            Key={"user_id": user_id},
-            UpdateExpression="SET token_hash = :th",
-            ExpressionAttributeValues={":th": token_hash},
-        )
-
     def delete(self, user_id: str) -> None:
         _TABLE_USERS.delete_item(Key={"user_id": user_id})
 
@@ -382,6 +428,68 @@ class UserRepo:
             Key={"user_id": user_id},
             UpdateExpression="SET allowed_agent_ids = :ids",
             ExpressionAttributeValues={":ids": agent_ids},
+        )
+
+    def get_by_username(self, tenant_id: str, username: str) -> Optional[dict]:
+        items = _TABLE_USERS.query(
+            IndexName="tenant-username-index",
+            KeyConditionExpression=DKey("tenant_id").eq(tenant_id) & DKey("username").eq(username),
+            Limit=1,
+        ).get("Items", [])
+        return items[0] if items else None
+
+    def update_password(self, user_id: str, password_hash: str, must_reset: bool = False) -> None:
+        _TABLE_USERS.update_item(
+            Key={"user_id": user_id},
+            UpdateExpression="SET password_hash = :ph, must_reset_password = :mr",
+            ExpressionAttributeValues={":ph": password_hash, ":mr": must_reset},
+        )
+
+    def set_last_login(self, user_id: str, now_iso: str) -> None:
+        _TABLE_USERS.update_item(
+            Key={"user_id": user_id},
+            UpdateExpression="SET last_login_at = :t",
+            ExpressionAttributeValues={":t": now_iso},
+        )
+
+    def disable(self, user_id: str, now_iso: str) -> None:
+        _TABLE_USERS.update_item(
+            Key={"user_id": user_id},
+            UpdateExpression="SET disabled_at = :t, #st = :s",
+            ExpressionAttributeNames={"#st": "status"},
+            ExpressionAttributeValues={":t": now_iso, ":s": "REVOKED"},
+        )
+
+    def enable(self, user_id: str) -> None:
+        _TABLE_USERS.update_item(
+            Key={"user_id": user_id},
+            UpdateExpression="REMOVE disabled_at SET #st = :s",
+            ExpressionAttributeNames={"#st": "status"},
+            ExpressionAttributeValues={":s": "ACTIVE"},
+        )
+
+    def set_role(self, user_id: str, role: str) -> None:
+        _TABLE_USERS.update_item(
+            Key={"user_id": user_id},
+            UpdateExpression="SET #r = :r",
+            ExpressionAttributeNames={"#r": "role"},
+            ExpressionAttributeValues={":r": role},
+        )
+
+    def update_name(self, user_id: str, name: str) -> None:
+        _TABLE_USERS.update_item(
+            Key={"user_id": user_id},
+            UpdateExpression="SET #n = :n",
+            ExpressionAttributeNames={"#n": "name"},
+            ExpressionAttributeValues={":n": name},
+        )
+
+    def revoke(self, user_id: str) -> None:
+        _TABLE_USERS.update_item(
+            Key={"user_id": user_id},
+            UpdateExpression="SET #st = :s",
+            ExpressionAttributeNames={"#st": "status"},
+            ExpressionAttributeValues={":s": "REVOKED"},
         )
 
     def remove_agent_from_all_users(self, agent_id: str, tenant_id: str) -> None:
@@ -583,3 +691,156 @@ class ApprovalRepo:
             ExpressionAttributeNames={"#st": "status"},
             ExpressionAttributeValues=values,
         )
+
+
+class ApiTokenRepo:
+    def create(self, token: dict) -> None:
+        _TABLE_API_TOKENS.put_item(Item=token)
+
+    def get_by_hash(self, token_hash: str) -> Optional[dict]:
+        items = _TABLE_API_TOKENS.query(
+            IndexName="token-hash-index",
+            KeyConditionExpression=DKey("token_hash").eq(token_hash),
+            Limit=1,
+        ).get("Items", [])
+        return items[0] if items else None
+
+    def list_by_user(self, user_id: str) -> list:
+        return _TABLE_API_TOKENS.query(
+            IndexName="user-index",
+            KeyConditionExpression=DKey("user_id").eq(user_id),
+        ).get("Items", [])
+
+    def list_by_tenant(self, tenant_id: str) -> list:
+        return _TABLE_API_TOKENS.query(
+            IndexName="tenant-index",
+            KeyConditionExpression=DKey("tenant_id").eq(tenant_id),
+        ).get("Items", [])
+
+    def revoke(self, token_id: str, now_iso: str) -> bool:
+        try:
+            _TABLE_API_TOKENS.update_item(
+                Key={"token_id": token_id},
+                UpdateExpression="SET #st = :s, revoked_at = :ra",
+                ConditionExpression="attribute_exists(token_id)",
+                ExpressionAttributeNames={"#st": "status"},
+                ExpressionAttributeValues={":s": "REVOKED", ":ra": now_iso},
+            )
+            return True
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                return False
+            raise
+
+    def touch(self, token_id: str, now_iso: str) -> None:
+        try:
+            _TABLE_API_TOKENS.update_item(
+                Key={"token_id": token_id},
+                UpdateExpression="SET last_used_at = :t",
+                ExpressionAttributeValues={":t": now_iso},
+            )
+        except ClientError:
+            pass
+
+    def rename(self, token_id: str, name: str) -> bool:
+        try:
+            _TABLE_API_TOKENS.update_item(
+                Key={"token_id": token_id},
+                UpdateExpression="SET #n = :name",
+                ConditionExpression="attribute_exists(token_id)",
+                ExpressionAttributeNames={"#n": "name"},
+                ExpressionAttributeValues={":name": name},
+            )
+            return True
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                return False
+            raise
+
+
+_TABLE_AGENT_HISTORY = _ddb.Table("reach-agent-history")
+
+
+class AgentHistoryRepo:
+    def create(self, entry: dict) -> None:
+        _TABLE_AGENT_HISTORY.put_item(Item=entry)
+
+    def list_by_agent(self, agent_id: str, limit: int = 50) -> list:
+        return _TABLE_AGENT_HISTORY.query(
+            IndexName="agent-id-index",
+            KeyConditionExpression=DKey("agent_id").eq(agent_id),
+            ScanIndexForward=False,
+            Limit=limit,
+        ).get("Items", [])
+
+    def delete_stale(self, before_iso: str) -> int:
+        return 0
+
+
+class AuditRepo:
+    def create(self, entry: dict) -> None:
+        _TABLE_AUDIT_LOGS.put_item(Item=entry)
+
+    def list_platform(self, limit: int = 100, cursor: Optional[str] = None,
+                      action: Optional[str] = None, actor: Optional[str] = None,
+                      resource: Optional[str] = None, ip: Optional[str] = None,
+                      since: Optional[str] = None, until: Optional[str] = None) -> list:
+        fe = Attr("created_at").lt(cursor) if cursor else Attr("log_id").exists()
+        if since:
+            fe = fe & Attr("created_at").gte(since)
+        if until:
+            fe = fe & Attr("created_at").lte(until)
+        if action:
+            fe = fe & Attr("action").eq(action)
+        if actor:
+            fe = fe & Attr("actor_name").contains(actor)
+        if resource:
+            fe = fe & Attr("resource_id").contains(resource)
+        if ip:
+            fe = fe & Attr("ip_address").contains(ip)
+        resp = _TABLE_AUDIT_LOGS.scan(FilterExpression=fe, Limit=limit * 5)
+        items = resp.get("Items", [])
+        items.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+        return [_remap_audit(i) for i in items[:limit]]
+
+    def list_by_tenant(self, tenant_id: str, limit: int = 100, cursor: Optional[str] = None,
+                       action: Optional[str] = None, actor: Optional[str] = None,
+                       resource: Optional[str] = None, ip: Optional[str] = None,
+                       since: Optional[str] = None, until: Optional[str] = None) -> list:
+        kce = DKey("tenant_id").eq(tenant_id)
+        if cursor:
+            kce = kce & DKey("created_at").lt(cursor)
+        fe = None
+        if since:
+            fe = Attr("created_at").gte(since)
+        if until:
+            fe = fe & Attr("created_at").lte(until) if fe else Attr("created_at").lte(until)
+        if action:
+            fe = fe & Attr("action").eq(action) if fe else Attr("action").eq(action)
+        if actor:
+            fe = fe & Attr("actor_name").contains(actor) if fe else Attr("actor_name").contains(actor)
+        if resource:
+            fe = fe & Attr("resource_id").contains(resource) if fe else Attr("resource_id").contains(resource)
+        if ip:
+            fe = fe & Attr("ip_address").contains(ip) if fe else Attr("ip_address").contains(ip)
+        kwargs: dict = {
+            "IndexName": "tenant-created-index",
+            "KeyConditionExpression": kce,
+            "ScanIndexForward": False,
+            "Limit": limit,
+        }
+        if fe:
+            kwargs["FilterExpression"] = fe
+        items = _TABLE_AUDIT_LOGS.query(**kwargs).get("Items", [])
+        return [_remap_audit(i) for i in items]
+
+
+    def delete_stale(self, before_iso: str) -> int:
+        return 0
+
+
+def _remap_audit(item: dict) -> dict:
+    out = dict(item)
+    if "event_metadata" in out:
+        out["metadata"] = out.pop("event_metadata")
+    return out

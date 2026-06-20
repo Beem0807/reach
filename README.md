@@ -30,17 +30,41 @@ Reach gives any AI agent - Claude Code, Cursor, custom LLM workflows, or your ow
 ## How it works
 
 1. You deploy the Reach backend (Lambda or Docker).
-2. You create a tenant, a user (for the CLI), and an agent (per machine) via the admin API.
+2. You open the admin console at `/ui`, create a tenant, add users, and register agents - the console gives you ready-to-paste CLI and agent install commands.
 3. You install the CLI on your local machine.
 4. You install the agent on each remote machine.
 5. The agent makes outbound HTTPS requests to your backend - no inbound ports needed.
 6. Commands are queued via the CLI, the agent picks them up and runs them, results come back.
 
+On the local and Lambda options, the interactive setup script does steps 1–3 for you (and even prints the agent install command for step 4) - see [Getting started](#getting-started).
+
+---
+
+## Admin console
+
+The backend ships with a built-in web UI served at `/ui`. It has two separate consoles - choose at the login screen:
+
+**Platform admin console** - log in with `ADMIN_PASSWORD`:
+- **Tenants** - create tenants, enable/disable them, see agent and user counts
+- **Users** - view and manage users across all tenants; reset passwords, change roles, disable accounts
+- **Audit logs** - platform-wide event log covering every action across all tenants
+
+**Tenant console** - log in with a username and password (created by the platform admin):
+- **Dashboard** - agent health bar, pending approvals, recent activity
+- **Agents** - register agents, set policy mode, manage tags, view detected capabilities (Docker, service management), request token rotation, full lifecycle management
+- **Users** - create users with roles (admin / operator / developer), set per-user agent access restrictions, reset passwords (admin role only)
+- **Jobs** - browse job history with full stdout/stderr output
+- **Approvals** - operators review and approve/deny write requests; developers see their own pending requests and can request approval
+- **API Tokens** - create and manage named API tokens for the CLI and MCP server
+- **Audit logs** - tenant-scoped event log (admin role)
+
+The CLI and MCP server authenticate with API tokens, not the admin password. Create tokens in the tenant console under **API Tokens**.
+
 ---
 
 ## Getting started
 
-Reach is self-hosted - you deploy your own backend. Choose one:
+Reach is self-hosted - you deploy your own backend. The fastest path is the **interactive setup script**: one command walks you through a few prompts and bootstraps everything end to end - it deploys the backend, provisions your workspace, admin user, API key, and first agent, then installs the CLI and logs you in. When it finishes, you can run `reach exec -- hostname` straight away. No console clicks, no manual token copying.
 
 **Local machine** (no cloud account needed):
 ```bash
@@ -52,33 +76,19 @@ curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh | bash
 curl -fsSL https://reach-releases.s3.amazonaws.com/lambda-setup.sh | bash
 ```
 
-**Docker + PostgreSQL** (any cloud):
+Both scripts are interactive and safe to re-run - every prompt has a sensible default, and they double as management tools afterward (`--update`, `--down`, and more; see [SELF_HOSTING.md](SELF_HOSTING.md)).
+
+**Docker + PostgreSQL** (any cloud) - this path is a plain container, so you finish setup yourself in the admin console at `http://<your-api-url>/ui`:
 ```bash
 docker run -d -p 8000:8000 \
   -e TOKEN_PEPPER="<your-pepper>" \
-  -e ADMIN_TOKEN="<your-admin-token>" \
+  -e SESSION_SIGNING_KEY="<your-session-key>" \
+  -e ADMIN_PASSWORD="<your-admin-password>" \
   -e DATABASE_URL="postgresql://user:pass@host:5432/reach" \
   nabeemdev/reach:0.1.0
 ```
 
-Once deployed, create a tenant, a user under it, and an agent under it:
-
-```bash
-curl -s -X POST "$API_URL/admin/tenants" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
-
-curl -s -X POST "$API_URL/admin/tenants/tenant_xxxxx/users" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"name": "alice"}' | python3 -m json.tool
-
-curl -s -X POST "$API_URL/admin/agents" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"tenant_id": "tenant_xxxxx"}' | python3 -m json.tool
-```
-
-Each returns ready-to-paste commands for the CLI and agent. Repeat the user step for each person who needs access - everyone gets their own token. See [SELF_HOSTING.md](SELF_HOSTING.md) for the full setup guide for all three deployment options.
+See [SELF_HOSTING.md](SELF_HOSTING.md) for the full setup guide for all three options.
 
 ---
 
@@ -96,25 +106,17 @@ uv tool install https://reach-releases.s3.amazonaws.com/cli/v0.1.0/reach-0.1.0-p
 pip install https://reach-releases.s3.amazonaws.com/cli/v0.1.0/reach-0.1.0-py3-none-any.whl
 ```
 
-Log in with the token from `/admin/tenants/{id}/users`:
+Log in with an API token from the tenant console (**API Tokens → New token**):
 
 ```bash
-reach login --api-url "<your-api-url>" --token "<your-token>"
+reach login --api-url "<your-api-url>" --token "<your-api-token>"
 ```
 
 ---
 
 ## Add a machine
 
-Use the `agent` install command from the `/admin/agents` response directly. Or manually:
-
-```bash
-curl -fsSL https://reach-releases.s3.amazonaws.com/agent/latest/install.sh | sudo bash -s -- \
-  --api-url       "<your-api-url>" \
-  --agent-id      "agent_xxx" \
-  --install-token "install_xxx" \
-  --yes
-```
+In the tenant console, go to **Agents → New agent**, choose a policy mode, and click Create. Copy the install command shown and run it on the target machine.
 
 The script auto-detects your OS and architecture - one command works on Linux and macOS (Intel and Apple Silicon).
 
@@ -129,9 +131,11 @@ The script auto-detects your OS and architecture - one command works on Linux an
 | `--grant-service-mgmt` | Grant `systemctl`/`launchctl` restart/start/stop via sudoers | ✅ on |
 | `--no-grant-service-mgmt` | Skip the sudoers grant | - |
 | `--grant-docker` | Add `reach-agent` to the `docker` group | ❌ off |
+| `--no-grant-docker` | Skip the docker group grant | - |
 | `--background` | macOS only - install as a LaunchDaemon (starts on boot) | - |
+| `--force` | Overwrite an existing agent config without prompting (used for reinstall) | - |
 
-Flags can be combined with `--yes` to override specific defaults, e.g. `--yes --grant-docker` or `--yes --no-grant-service-mgmt`.
+Flags can be combined with `--yes` to override specific defaults, e.g. `--yes --grant-docker` or `--yes --no-grant-service-mgmt`. The install command generated by the console already includes `--yes --force`; the `--api-url`, `--agent-id`, and `--install-token` values are filled in for you.
 
 Set it as your default:
 
@@ -139,37 +143,10 @@ Set it as your default:
 reach agents use agent_xxx
 ```
 
-**To decommission an agent (three-step sequence):**
-
-Uninstall the binary from the machine first (optional but recommended):
+**To decommission an agent:** open the tenant console, go to **Agents**, select the agent, and use the decommission action. To uninstall the binary from the machine first:
 
 ```bash
 curl -fsSL https://reach-releases.s3.amazonaws.com/agent/latest/install.sh | sudo bash -s -- --uninstall
-```
-
-Then follow the three-step admin API sequence:
-
-```bash
-# Step 1 - revoke: cuts access immediately, removes from user access lists
-curl -s -X POST "$API_URL/admin/agents/agent_xxx/revoke" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
-
-# Step 2 - soft-delete: marks DELETED, record stays in database
-curl -s -X DELETE "$API_URL/admin/agents/agent_xxx" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
-
-# Step 3 - remove: permanently deletes the record
-curl -s -X DELETE "$API_URL/admin/agents/agent_xxx/remove" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
-```
-
-Each step requires the previous one to have been completed. To undo a revoke before soft-deleting, reissue an install token - this resets the agent back to CREATED:
-
-```bash
-curl -s -X POST "$API_URL/admin/agents/agent_xxx/reissue-install-token" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{}' | python3 -m json.tool
 ```
 
 ---
@@ -217,130 +194,19 @@ Each profile has its own API URL, token, default agent, and aliases. All command
 
 ## Admin operations
 
-The admin API (authenticated with `ADMIN_TOKEN`) gives you visibility across all tenants.
+Everything in this section is available through the admin console at `/ui`. The platform admin console covers cross-tenant operations (agents, users, audit logs). The tenant console covers per-tenant operations (agents, users, jobs, approvals, API tokens).
 
-**List agents for a tenant:**
+| Operation | Where in the console |
+|---|---|
+| View all agents for a tenant | Tenant console → Agents |
+| View job history | Tenant console → Jobs |
+| Restrict a user to specific agents | Tenant console → Users → [user] → Agent Access |
+| Change an agent's policy mode | Tenant console → Agents → [agent] → Policy |
+| Manage approvals | Tenant console → Approvals |
+| Platform-wide audit log | Platform admin → Audit Logs |
+| Tenant-scoped audit log | Tenant console → Audit Logs |
 
-```bash
-curl -s "$API_URL/admin/agents?tenant_id=tenant_xxxxx" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
-```
-
-**View job history** - filter by tenant, agent, or the user (`created_by`) who ran the command:
-
-```bash
-# All jobs for a tenant
-curl -s "$API_URL/admin/jobs?tenant_id=tenant_xxxxx" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
-
-# All jobs by a specific user
-curl -s "$API_URL/admin/jobs?created_by=user_xxxxx" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
-
-# Paginate with cursor from previous response
-curl -s "$API_URL/admin/jobs?tenant_id=tenant_xxxxx&cursor=<next_cursor>" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
-```
-
-Every job record includes `created_by` (the `user_id` of whoever submitted it), so you can see who ran what and when.
-
-**Control which agents a user can see** - by default every user sees all agents. Restrict a user to specific machines:
-
-```bash
-# Restrict alice to staging only
-curl -s -X PUT "$API_URL/admin/tenants/tenant_xxxxx/users/user_alice/agents" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"agent_ids": ["agent_staging1", "agent_staging2"]}'
-
-# Grant one more
-curl -s -X POST "$API_URL/admin/tenants/tenant_xxxxx/users/user_alice/agents/agent_prod1" \
-  -H "Authorization: Bearer $ADMIN_TOKEN"
-
-# Restore full access
-curl -s -X PUT "$API_URL/admin/tenants/tenant_xxxxx/users/user_alice/agents" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"agent_ids": ["*"]}'
-```
-
-**Decommission an agent (three-step sequence):**
-
-```bash
-# Step 1 - revoke: cuts sync access immediately, removes from all user access lists
-# Can be undone by reissuing an install token (see below)
-curl -s -X POST "$API_URL/admin/agents/agent_xxx/revoke" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
-
-# Step 2 - soft-delete: marks DELETED, record stays in database for audit
-# Requires REVOKED status
-curl -s -X DELETE "$API_URL/admin/agents/agent_xxx" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
-
-# Step 3 - remove: permanently deletes the record
-# Requires DELETED status
-curl -s -X DELETE "$API_URL/admin/agents/agent_xxx/remove" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
-```
-
-**Restore a revoked agent (undo revoke):**
-
-```bash
-# Reissues a fresh install token and resets status to CREATED
-# Works on REVOKED agents only - DELETED agents cannot be reissued
-curl -s -X POST "$API_URL/admin/agents/agent_xxx/reissue-install-token" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{}' | python3 -m json.tool
-```
-
-**Manage agent policy mode:**
-
-```bash
-# Set an agent to approved mode
-curl -s -X PUT "$API_URL/admin/agents/agent_xxx/policy/mode" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"mode": "approved"}'
-
-# Pre-approve a single command
-curl -s -X POST "$API_URL/admin/approvals" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"agent_id": "agent_xxx", "command": "docker restart app", "duration": "8h"}'
-
-# Bulk pre-approve (idempotent - skips any that are already approved)
-curl -s -X POST "$API_URL/admin/approvals" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"agent_id": "agent_xxx", "commands": ["docker ps", "docker logs app", "kubectl get pods -A"]}'
-
-# View pending approval requests (paginated - default 20, max 100; use ?cursor=<next_cursor> for next page)
-curl -s "$API_URL/admin/approvals?agent_id=agent_xxx&status=pending" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
-
-# Approve permanently
-curl -s -X PUT "$API_URL/admin/approvals/appr_xxx/approve" \
-  -H "Authorization: Bearer $ADMIN_TOKEN"
-
-# Approve for a limited time (1h / 8h / 24h / 7d / permanent / custom Nh or Nd)
-curl -s -X PUT "$API_URL/admin/approvals/appr_xxx/approve" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"duration": "8h"}'
-
-# Deny a command
-curl -s -X PUT "$API_URL/admin/approvals/appr_xxx/deny" \
-  -H "Authorization: Bearer $ADMIN_TOKEN"
-
-# Permanently delete an approval record (any status)
-curl -s -X DELETE "$API_URL/admin/approvals/appr_xxx" \
-  -H "Authorization: Bearer $ADMIN_TOKEN"
-```
-
-Time-limited approvals expire silently - the record stays in the database for history, but once the expiry passes the command is no longer in the effective approved list. The next blocked attempt creates a new pending record.
-
-See [SELF_HOSTING.md](SELF_HOSTING.md) for the full admin API reference.
+See [API.md](API.md) for the full endpoint reference if you need to automate any of these operations.
 
 ---
 
@@ -413,7 +279,7 @@ The MCP server reads from `~/.reach/config.json` - make sure you've run `reach l
 
 ## Policies
 
-Each agent runs in one of three modes, configured via the admin API. The mode determines how commands are evaluated before execution.
+Each agent runs in one of three modes, set in the tenant console (or via the API). The mode determines how commands are evaluated before execution.
 
 ### Wild mode
 
@@ -446,7 +312,7 @@ Reads are always allowed - you do not need to add read commands to any list. Wri
    - **Approved match** - runs the command normally (write explicitly permitted).
    - **Not approved, Linux** - runs under Landlock. If Landlock blocks the write, the agent returns a structured error and the backend creates a pending approval record.
    - **Not approved, macOS** - no Landlock available. The agent uses the server-supplied `is_write` flag: if the command is a write and not approved, it is refused immediately and a pending approval record is created. Read commands always run.
-3. The admin can review pending approvals and approve or deny them via the admin API.
+3. An operator or admin reviews pending approvals and approves or denies them in the tenant console under **Approvals**.
 4. Once approved, the command prefix is included in the approved list on the next sync and runs without restriction.
 
 The match is prefix-based with word boundary: approving `docker logs` permits `docker logs myapp --tail 100` but not `docker rm myapp`.
@@ -471,8 +337,8 @@ Each agent has an `access_level` label that combines its policy mode with whethe
 | access_level | Mode | Running as root |
 |---|---|---|
 | `open` | wild | yes |
-| `elevated` | wild | no - or - approved + root |
-| `managed` | approved | no - or - readonly + root |
+| `elevated` | wild (non-root) or approved (root) | - |
+| `managed` | approved (non-root) or readonly (root) | - |
 | `restricted` | readonly | no |
 
 These are factual descriptors, not risk scores. An `open` agent in a personal dev environment is intentional.
@@ -488,7 +354,7 @@ Reach is designed for controlled command execution:
 - Agents only make outbound HTTPS requests
 - Commands have a default timeout of 60 seconds
 - Job history is recorded for 7 days
-- Policy modes are configured server-side via the admin API
+- Policy modes are configured server-side in the tenant console
 
 **Always blocked - regardless of mode:**
 
@@ -504,7 +370,7 @@ See [SELF_HOSTING.md](SELF_HOSTING.md) for the full blocked command reference.
 
 ## Production usage
 
-For production machines, use the **Approved** policy mode - set it via the admin API after creating the agent.
+For production machines, use the **Approved** policy mode - set it in the tenant console when creating the agent, or change it afterward under **Agents → [agent] → Policy**.
 
 Wild mode is for personal machines, dev environments, and break-glass access. Do not use it on shared production machines.
 
@@ -557,6 +423,17 @@ Wild mode is for personal machines, dev environments, and break-glass access. Do
 | `reach agent-init --for system-prompt` | Print system prompt snippet to stdout |
 | `reach agent-init --for mcp` | Print MCP server config to stdout |
 | `reach mcp` | Start the MCP server (stdio transport for any MCP-compatible client) |
+
+---
+
+## Documentation
+
+| Doc | What's in it |
+|---|---|
+| [SELF_HOSTING.md](SELF_HOSTING.md) | Deploy and operate your own backend (Local, AWS Lambda, Docker), first-time setup, agent lifecycle, sudo/docker grants, policy and approval management |
+| [API.md](API.md) | Complete HTTP endpoint reference - platform admin, tenant admin, user/CLI, and agent endpoints, plus rate limits, pagination, and audit-log actions |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | How the pieces fit together - command flow, token model, storage split, policy enforcement, approvals, multi-tenancy |
+| [SECURITY.md](SECURITY.md) | Threat model, token storage and rotation, revoking access, audit history, and production hardening |
 
 ---
 

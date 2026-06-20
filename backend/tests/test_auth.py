@@ -53,17 +53,46 @@ def test_bearer_returns_none_for_empty_header():
 def test_verify_tenant_token_found():
     from shared.auth import _verify_tenant_token
     user = {"user_id": "u1", "tenant_id": "t1"}
-    with patch("shared.store.users_repo") as mock:
-        mock.get_by_hash.return_value = user
-        result = _verify_tenant_token("tok_abc")
+    tenant = {"tenant_id": "t1", "status": "ACTIVE"}
+    payload = {"sub": "u1", "tenant_id": "t1"}
+    with patch("shared.auth.verify_tenant_token" if False else "shared.tenant_auth.verify_tenant_token", return_value=payload), \
+         patch("shared.store.users_repo") as umock, \
+         patch("shared.store.tenants_repo") as tmock:
+        umock.get.return_value = user
+        tmock.get.return_value = tenant
+        result = _verify_tenant_token("jwt_abc")
     assert result == user
 
 
-def test_verify_tenant_token_not_found():
+def test_verify_tenant_token_disabled_tenant_blocked():
     from shared.auth import _verify_tenant_token
-    with patch("shared.store.users_repo") as mock:
-        mock.get_by_hash.return_value = None
-        result = _verify_tenant_token("tok_bad")
+    user = {"user_id": "u1", "tenant_id": "t1"}
+    tenant = {"tenant_id": "t1", "status": "DISABLED"}
+    payload = {"sub": "u1", "tenant_id": "t1"}
+    with patch("shared.tenant_auth.verify_tenant_token", return_value=payload), \
+         patch("shared.store.users_repo") as umock, \
+         patch("shared.store.tenants_repo") as tmock:
+        umock.get.return_value = user
+        tmock.get.return_value = tenant
+        result = _verify_tenant_token("jwt_abc")
+    assert result is None
+
+
+def test_verify_tenant_token_invalid_jwt():
+    from shared.auth import _verify_tenant_token
+    with patch("shared.tenant_auth.verify_tenant_token", return_value=None):
+        result = _verify_tenant_token("not_a_jwt")
+    assert result is None
+
+
+def test_verify_tenant_token_user_not_found():
+    from shared.auth import _verify_tenant_token
+    payload = {"sub": "u1", "tenant_id": "t1"}
+    with patch("shared.tenant_auth.verify_tenant_token", return_value=payload), \
+         patch("shared.store.users_repo") as umock, \
+         patch("shared.store.tenants_repo"):
+        umock.get.return_value = None
+        result = _verify_tenant_token("jwt_abc")
     assert result is None
 
 
@@ -92,3 +121,90 @@ def test_verify_agent_token_agent_not_found():
         mock.get.return_value = None
         result = _verify_agent_token("tok", "agent_a")
     assert result is None
+
+
+# ---------------------------------------------------------------------------
+# _verify_api_key
+# ---------------------------------------------------------------------------
+
+def test_verify_api_key_valid():
+    from shared.auth import _verify_api_key
+    raw = "tok_secret"
+    stored = {"token_id": "tkid_1", "user_id": "u1", "tenant_id": "t1", "status": "ACTIVE"}
+    user = {"user_id": "u1", "tenant_id": "t1"}
+    tenant = {"tenant_id": "t1", "status": "ACTIVE"}
+    with patch("shared.store.api_tokens_repo") as atr, \
+         patch("shared.store.users_repo") as ur, \
+         patch("shared.store.tenants_repo") as tr:
+        atr.get_by_hash.return_value = stored
+        atr.touch.return_value = None
+        ur.get.return_value = user
+        tr.get.return_value = tenant
+        result = _verify_api_key(raw)
+    assert result == user
+    atr.touch.assert_called_once_with("tkid_1", atr.touch.call_args[0][1])
+
+
+def test_verify_api_key_revoked_returns_none():
+    from shared.auth import _verify_api_key
+    stored = {"token_id": "tkid_1", "user_id": "u1", "tenant_id": "t1", "status": "REVOKED"}
+    with patch("shared.store.api_tokens_repo") as atr:
+        atr.get_by_hash.return_value = stored
+        result = _verify_api_key("tok_secret")
+    assert result is None
+
+
+def test_verify_api_key_not_found_returns_none():
+    from shared.auth import _verify_api_key
+    with patch("shared.store.api_tokens_repo") as atr:
+        atr.get_by_hash.return_value = None
+        result = _verify_api_key("tok_unknown")
+    assert result is None
+
+
+def test_verify_api_key_disabled_tenant_returns_none():
+    from shared.auth import _verify_api_key
+    stored = {"token_id": "tkid_1", "user_id": "u1", "tenant_id": "t1", "status": "ACTIVE"}
+    user = {"user_id": "u1", "tenant_id": "t1"}
+    tenant = {"tenant_id": "t1", "status": "DISABLED"}
+    with patch("shared.store.api_tokens_repo") as atr, \
+         patch("shared.store.users_repo") as ur, \
+         patch("shared.store.tenants_repo") as tr:
+        atr.get_by_hash.return_value = stored
+        ur.get.return_value = user
+        tr.get.return_value = tenant
+        result = _verify_api_key("tok_secret")
+    assert result is None
+
+
+def test_verify_api_key_user_not_found_returns_none():
+    from shared.auth import _verify_api_key
+    stored = {"token_id": "tkid_1", "user_id": "u1", "tenant_id": "t1", "status": "ACTIVE"}
+    with patch("shared.store.api_tokens_repo") as atr, \
+         patch("shared.store.users_repo") as ur, \
+         patch("shared.store.tenants_repo"):
+        atr.get_by_hash.return_value = stored
+        ur.get.return_value = None
+        result = _verify_api_key("tok_secret")
+    assert result is None
+
+
+# _verify_tenant_token falls through to api key when JWT fails
+
+def test_verify_tenant_token_falls_through_to_api_key():
+    from shared.auth import _verify_tenant_token
+    user = {"user_id": "u1", "tenant_id": "t1"}
+    with patch("shared.tenant_auth.verify_tenant_token", return_value=None), \
+         patch("shared.auth._verify_api_key", return_value=user) as mock_api_key:
+        result = _verify_tenant_token("tok_abc123")
+    assert result == user
+    mock_api_key.assert_called_once_with("tok_abc123")
+
+
+def test_verify_tenant_token_non_tok_prefix_not_tried_as_api_key():
+    from shared.auth import _verify_tenant_token
+    with patch("shared.tenant_auth.verify_tenant_token", return_value=None), \
+         patch("shared.auth._verify_api_key") as mock_api_key:
+        result = _verify_tenant_token("notavalidtoken")
+    assert result is None
+    mock_api_key.assert_not_called()

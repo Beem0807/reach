@@ -31,6 +31,10 @@ def handle_get_agent(agent_id: str, raw_token: str) -> dict:
         "mode": agent.get("mode", "wild"),
         "access_level": agent.get("access_level") or "open",
         "tags": agent.get("tags") or [],
+        "grant_service_mgmt": agent.get("grant_service_mgmt", False),
+        "grant_docker": agent.get("grant_docker", False),
+        "service_mgmt_detected": agent.get("service_mgmt_detected"),
+        "docker_detected": agent.get("docker_detected"),
     })
 
 

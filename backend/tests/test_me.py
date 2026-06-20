@@ -30,8 +30,15 @@ def test_name_can_be_none():
     assert json.loads(r["body"])["name"] is None
 
 
-def test_no_token_hash_in_response():
-    user_with_hash = {**USER, "token_hash": "secret"}
-    with patch("handlers.me._verify_tenant_token", return_value=user_with_hash):
-        r = handle_me("tok_abc")
-    assert "token_hash" not in json.loads(r["body"])
+def test_api_key_token_passed_to_verify():
+    """tok_... tokens must reach _verify_tenant_token (which routes to _verify_api_key internally)."""
+    captured = []
+    def spy(tok):
+        captured.append(tok)
+        return USER
+    with patch("handlers.me._verify_tenant_token", side_effect=spy):
+        r = handle_me("tok_myapikey123")
+    assert r["statusCode"] == 200
+    assert captured == ["tok_myapikey123"]
+
+

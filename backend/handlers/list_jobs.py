@@ -33,7 +33,7 @@ def handle_list_jobs(raw_token: str, agent_id: Optional[str], limit: int, cursor
             return _err("agent not found", 404)
 
     decoded_cursor = _decode_cursor(cursor) if cursor else None
-    rows = jobs_repo.list_by_tenant(tenant["tenant_id"], agent_id, limit, created_by=tenant["user_id"], cursor=decoded_cursor)
+    rows = jobs_repo.list_by_tenant(tenant["tenant_id"], agent_id, limit, cursor=decoded_cursor)
 
     if not agent_id:
         _cache: dict = {}
@@ -44,14 +44,24 @@ def handle_list_jobs(raw_token: str, agent_id: Optional[str], limit: int, cursor
             return _cache[aid]
         rows = [j for j in rows if _accessible(j["agent_id"])]
 
+    _agent_cache: dict = {}
+    def _agent(aid: str) -> dict:
+        if aid not in _agent_cache:
+            _agent_cache[aid] = agents_repo.get(aid) or {}
+        return _agent_cache[aid]
+
     jobs = [
         {
             "job_id": j["job_id"],
             "agent_id": j["agent_id"],
+            "agent_hostname": _agent(j["agent_id"]).get("hostname"),
+            "agent_mode": _agent(j["agent_id"]).get("mode"),
             "created_by": j.get("created_by"),
             "command": j["command"],
             "status": j["status"],
             "exit_code": j.get("exit_code"),
+            "stdout": j.get("stdout"),
+            "stderr": j.get("stderr"),
             "duration_ms": j.get("duration_ms"),
             "created_at": j.get("created_at"),
             "completed_at": j.get("completed_at"),

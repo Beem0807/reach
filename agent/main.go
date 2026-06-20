@@ -205,14 +205,47 @@ func claim(cfg *Config, fp string) error {
 }
 
 // ---------------------------------------------------------------------------
+// Capability probes
+// ---------------------------------------------------------------------------
+
+// probeDocker reports whether a Docker daemon socket is accessible.
+// Checks /var/run/docker.sock first (Linux + older Docker Desktop for Mac),
+// then $HOME/.docker/run/docker.sock (Docker Desktop for Mac 4.13+).
+func probeDocker() bool {
+	paths := []string{"/var/run/docker.sock"}
+	if home, err := os.UserHomeDir(); err == nil {
+		paths = append(paths, filepath.Join(home, ".docker", "run", "docker.sock"))
+	}
+	for _, p := range paths {
+		if _, err := os.Stat(p); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+// probeServiceMgmt reports whether a service manager is available on this host.
+// Detects systemctl (Linux/systemd) or launchctl (macOS/launchd).
+func probeServiceMgmt() bool {
+	for _, cmd := range []string{"systemctl", "launchctl"} {
+		if _, err := exec.LookPath(cmd); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+// ---------------------------------------------------------------------------
 // Sync
 // ---------------------------------------------------------------------------
 
 type SyncRequest struct {
-	AgentID            string `json:"agent_id"`
-	MachineFingerprint string `json:"machine_fingerprint"`
-	AgentVersion       string `json:"agent_version"`
-	RunningAsRoot      bool   `json:"running_as_root"`
+	AgentID             string `json:"agent_id"`
+	MachineFingerprint  string `json:"machine_fingerprint"`
+	AgentVersion        string `json:"agent_version"`
+	RunningAsRoot       bool   `json:"running_as_root"`
+	DockerDetected      bool   `json:"docker_detected"`
+	ServiceMgmtDetected bool   `json:"service_mgmt_detected"`
 }
 
 type Job struct {
@@ -232,10 +265,12 @@ type SyncResponse struct {
 
 func sync(cfg *Config) (*SyncResponse, error) {
 	payload := SyncRequest{
-		AgentID:            cfg.AgentID,
-		MachineFingerprint: cfg.MachineFingerprint,
-		AgentVersion:       agentVersion,
-		RunningAsRoot:      os.Getuid() == 0,
+		AgentID:             cfg.AgentID,
+		MachineFingerprint:  cfg.MachineFingerprint,
+		AgentVersion:        agentVersion,
+		RunningAsRoot:       os.Getuid() == 0,
+		DockerDetected:      probeDocker(),
+		ServiceMgmtDetected: probeServiceMgmt(),
 	}
 	var result SyncResponse
 	status, err := apiPost(cfg.APIURL, "/agent/sync", cfg.AgentToken, payload, &result)
@@ -520,6 +555,7 @@ func run(ctx context.Context) error {
 
 	log.Printf("Agent %s starting poll loop", cfg.AgentID)
 	pollSeconds := idlePollSeconds
+	syncFailed := false
 
 	for {
 		if cfg.TokenIssuedAt != "" {
@@ -554,11 +590,17 @@ func run(ctx context.Context) error {
 			if errors.Is(err, ErrPermanent) {
 				return fmt.Errorf("re-claim required: %w", err)
 			}
+			syncFailed = true
 			log.Printf("Sync error: %v - retrying in %ds", err, pollSeconds)
 			if !sleep(ctx, time.Duration(pollSeconds)*time.Second) {
 				return nil
 			}
 			continue
+		}
+
+		if syncFailed {
+			log.Printf("Sync recovered - heartbeat sent successfully")
+			syncFailed = false
 		}
 
 		pollSeconds = syncResp.NextPollSeconds

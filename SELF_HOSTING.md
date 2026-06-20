@@ -10,7 +10,7 @@ Deploy and operate your own reach backend. The CLI and agent are separate - they
 |---|---|---|---|
 | [Local machine](#option-1-local-machine) | FastAPI | PostgreSQL | Home server, spare machine, no cloud account needed |
 | [AWS Lambda](#option-2-aws-lambda) | Lambda | DynamoDB | Small teams, low cost, AWS-native |
-| [Docker / FastAPI](#option-3-docker--fastapi) | FastAPI | PostgreSQL | Any cloud, self-hosted VMs, k8s |
+| [Docker / FastAPI](#option-3-docker--fastapi) | FastAPI | PostgreSQL (or [DynamoDB on AWS](#dynamodb-on-aws)) | Any cloud, self-hosted VMs, k8s |
 
 ### Why DynamoDB with Lambda, and PostgreSQL with Docker?
 
@@ -29,7 +29,7 @@ Run the full backend on any machine you already have - no cloud account, no VMs 
 ### Prerequisites
 
 - Docker + docker compose
-- `openssl` and `curl`
+- `curl`, `openssl`, and `python3`
 - (Optional) [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/) or [ngrok](https://ngrok.com/download) to expose the backend publicly so remote agents can reach it
 
 ### Deploy
@@ -38,23 +38,48 @@ Run the full backend on any machine you already have - no cloud account, no VMs 
 curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh | bash
 ```
 
-The script will:
-- Prompt for release tag (default: `latest`)
-- Prompt for `TOKEN_PEPPER` and `ADMIN_TOKEN` (or generate them)
-- Prompt for `APPROVAL_RETENTION_DAYS` and `JOB_RETENTION_DAYS` (default: `7` each)
-- Start PostgreSQL, the reach backend, and nginx via Docker Compose
-- Optionally start a public tunnel:
-  - **cloudflared** - no account needed, URL changes on restart
-  - **ngrok** - free account required, supports static domains for a stable URL across restarts
-- Print your API URL, tokens, and next steps
+The script handles everything in one run:
 
-The API URL is what you pass to `reach login --api-url` and to the agent installer.
+1. Prompts for release tag (default: `latest`)
+2. Prompts for `ADMIN_PASSWORD` and `TOKEN_PEPPER` (or generates them)
+3. Prompts for workspace name, admin username, and admin password (your day-to-day login)
+4. Optionally prompts for data retention settings (defaults: approvals 7d, jobs 7d, audit 90d, agent history 30d)
+5. Starts PostgreSQL, the Reach backend, and nginx via Docker Compose
+6. Optionally starts a public tunnel (if cloudflared or ngrok is installed):
+   - **cloudflared** - no account needed, URL changes on restart
+   - **ngrok** - static domains, requires free account
+7. **Bootstraps your workspace automatically**: creates the tenant, admin user, and API key
+8. Optionally creates an agent (prompts for mode and capability grants)
+9. Optionally installs the CLI and logs you in - you can run `reach exec -- hostname` immediately
 
-### Tear down
+No need to open the console for initial setup - the script handles everything.
+
+### Managing the local stack
+
+After deploying, re-run the script with a subcommand to manage it. All subcommands operate on the stack in `~/.reach/local` - you can run them via `curl … | bash -s -- <flag>` or, from a checkout, `./scripts/local-setup.sh <flag>`.
+
+| Command | What it does | Data |
+|---|---|---|
+| `--status` | Check container, backend health, API-key auth, and agent state | - |
+| `--update` | Pull a newer backend image and restart. Keeps `TOKEN_PEPPER`, `ADMIN_PASSWORD`, the database, tenants, users, API keys, and agents | Kept |
+| `--rotate-password` | Set a new platform admin password and restart the backend | Kept |
+| `--rotate-session-key` | Generate a new `SESSION_SIGNING_KEY` and restart - invalidates active console sessions (users log in again), no data impact | Kept |
+| `--down` | Stop the containers but keep the Postgres data volume - restart later with no data loss | **Kept** |
+| `--reset` | Remove containers, network, the Postgres data volume, and the local env file | **Deleted** |
+| `--purge` | Everything `--reset` does, plus delete `~/.reach/local`, and prompt to uninstall the Reach CLI | **Deleted** |
 
 ```bash
+# Stop the backend but keep your data (resume later by re-running the script)
 curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh | bash -s -- --down
+
+# Permanently remove the stack and its data
+curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh | bash -s -- --reset
+
+# Remove everything, including ~/.reach/local, and optionally the CLI
+curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh | bash -s -- --purge
 ```
+
+> `--down` stops the stack but **keeps the database** - it is not a full teardown. Use `--reset` to delete the data, or `--purge` to remove the local setup directory and (optionally) the CLI as well.
 
 ---
 
@@ -70,14 +95,20 @@ curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh | bash -s -- -
 curl -fsSL https://reach-releases.s3.amazonaws.com/lambda-setup.sh | bash
 ```
 
-The script will:
-- Prompt for AWS profile (leave blank to use environment credentials) and region (default: `us-east-1`)
-- Verify credentials before proceeding
-- Prompt for stack name (default: `reach-platform`) and release tag (default: `latest`)
-- Prompt for `TOKEN_PEPPER` and `ADMIN_TOKEN` (or generate them)
-- Prompt for `APPROVAL_RETENTION_DAYS` and `JOB_RETENTION_DAYS` (default: `7` each)
-- Deploy the CloudFormation stack and wait for it to complete
-- Print your API URL, tokens, and next steps
+The script handles everything in one run:
+
+1. Prompts for AWS profile (leave blank to use environment credentials) and region (default: `us-east-1`)
+2. Verifies credentials before proceeding
+3. Prompts for stack name (default: `reach-platform`) and release tag (default: `latest`)
+4. Prompts for `ADMIN_PASSWORD` and `TOKEN_PEPPER` (or generates them)
+5. Prompts for workspace name, admin username, and admin password
+6. Prompts for grant options (systemctl/docker access, default off)
+7. Optionally prompts for data retention settings (defaults: approvals 7d, jobs 7d, audit 90d, agent history 30d)
+8. Deploys the CloudFormation stack and waits for completion
+9. **Bootstraps your workspace automatically**: creates the tenant, admin user, API key, and an agent
+10. Optionally installs the CLI and logs you in - you can run `reach exec -- hostname` immediately
+
+No need to open the console for initial setup - the script handles everything.
 
 ### Upgrade
 
@@ -85,7 +116,7 @@ The script will:
 curl -fsSL https://reach-releases.s3.amazonaws.com/lambda-setup.sh | bash -s -- --update
 ```
 
-The script lists your existing stacks, prompts for the stack name (default: `reach-platform`) and release tag (default: `latest`), and optionally rotates `ADMIN_TOKEN` or changes `APPROVAL_RETENTION_DAYS` or `JOB_RETENTION_DAYS` (leave blank to keep existing values). `TOKEN_PEPPER` is always kept - it cannot be changed. See [TOKEN_PEPPER is permanent](#token_pepper-is-permanent).
+The script lists your existing stacks, prompts for the stack name and release tag (leave blank to keep), and optionally rotates `ADMIN_PASSWORD` or changes any retention setting. `TOKEN_PEPPER` is always kept - it cannot be changed. See [TOKEN_PEPPER is permanent](#token_pepper-is-permanent).
 
 ### Tear down
 
@@ -112,7 +143,8 @@ DynamoDB tables use `DeletionPolicy: Retain` - your data is preserved even after
 docker run -d \
   -p 8000:8000 \
   -e TOKEN_PEPPER="<your-pepper>" \
-  -e ADMIN_TOKEN="<your-admin-token>" \
+  -e SESSION_SIGNING_KEY="<your-session-key>" \
+  -e ADMIN_PASSWORD="<your-admin-password>" \
   -e DATABASE_URL="postgresql://user:pass@host:5432/reach" \
   -e APPROVAL_RETENTION_DAYS="7" \
   -e JOB_RETENTION_DAYS="7" \
@@ -122,162 +154,158 @@ docker run -d \
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `TOKEN_PEPPER` | Yes | - | HMAC pepper for token hashing. Permanent - changing it invalidates all existing tokens. |
-| `ADMIN_TOKEN` | Yes | - | Bearer token for the admin API. Rotate by restarting with a new value. |
-| `DATABASE_URL` | Yes | - | PostgreSQL connection string. |
-| `APPROVAL_RETENTION_DAYS` | No | `7` | Days to retain terminal approval records (`denied`, `expired`) before they are deleted by the daily cleanup sweep. |
-| `JOB_RETENTION_DAYS` | No | `7` | Days to retain terminal job records (`SUCCEEDED`, `FAILED`, `REJECTED`, `EXPIRED`) before they are deleted by the daily cleanup sweep. |
+| `SESSION_SIGNING_KEY` | Yes | - | HMAC key for signing tenant session (login) tokens. **Safe to rotate** - only forces re-login. Use the same value across replicas if you run more than one backend instance. |
+| `ADMIN_PASSWORD` | Yes | - | Password for the platform admin console and admin API. Rotate by restarting with a new value. |
+| `DATABASE_URL` | Postgres only | - | PostgreSQL connection string. Required for the default Postgres backend; **not used** when `STORAGE_BACKEND=dynamo` (see [DynamoDB on AWS](#dynamodb-on-aws)). |
+| `APPROVAL_RETENTION_DAYS` | No | `7` | Days to retain terminal approval records (`denied`, `expired`) before deletion. |
+| `JOB_RETENTION_DAYS` | No | `7` | Days to retain terminal job records (`SUCCEEDED`, `FAILED`, `REJECTED`, `EXPIRED`) before deletion. |
+| `AUDIT_RETENTION_DAYS` | No | `90` | Days to retain audit log entries before deletion. |
+| `AGENT_HISTORY_RETENTION_DAYS` | No | `30` | Days to retain agent status history entries before deletion. |
+
+**Advanced (rarely changed).** These are baked into the image with working defaults - only override them if you self-host the agent binaries or pin a specific agent version:
+
+| Variable | Default | Description |
+|---|---|---|
+| `STORAGE_BACKEND` | `postgres` (set in the image) | Storage driver - `postgres` for this deployment, `dynamo` on Lambda. Don't change it for the Docker image. |
+| `RELEASES_S3_BASE` | `https://reach-releases.s3.amazonaws.com` | Base URL for agent binary and install-script downloads. Point this at your own mirror if you host the binaries yourself. |
+| `AGENT_VERSION` | `latest` | Agent release that generated install commands reference. Set to a specific version (e.g. `v0.1.0`) to pin agents instead of tracking `latest`. |
+| `RATE_LIMIT_STORAGE_URI` | `memory://` | Where API rate-limit counters live. In-memory is per-process - correct for a single instance. Set to a shared store (e.g. `redis://host:6379`) when running more than one backend replica. See [Running multiple replicas](#running-multiple-replicas). |
 
 On first startup, Alembic runs `alembic upgrade head` automatically and creates all tables. Subsequent restarts apply any pending migrations from new versions. The image supports `linux/amd64` and `linux/arm64` - works on AWS Graviton, Raspberry Pi, and Apple Silicon without extra flags.
 
+### Running multiple replicas
+
+The backend is stateless except for **rate-limit counters**, which default to in-memory (`memory://`) - per-process. Behind a load balancer with N replicas, each replica keeps its own counters, so a client effectively gets up to N× the configured limit depending on which replica it hits.
+
+To enforce limits correctly across replicas, give them a **shared counter store** by setting `RATE_LIMIT_STORAGE_URI` to a Redis URL (the same value on every replica):
+
+```bash
+docker run -d -p 8000:8000 \
+  -e RATE_LIMIT_STORAGE_URI="redis://your-redis-host:6379" \
+  -e TOKEN_PEPPER="..." -e SESSION_SIGNING_KEY="..." -e ADMIN_PASSWORD="..." \
+  -e DATABASE_URL="..." \
+  nabeemdev/reach:latest
+```
+
+Notes:
+- The bundled image already includes the Redis client; you only need a reachable Redis (managed ElastiCache/MemoryDB, or your own).
+- `limits` (the rate-limit backend) also supports `redis+sentinel://`, `memcached://`, and `mongodb://` URIs.
+- **Alternative:** rate limit at a single ingress instead of in the app - nginx `limit_req`, an ALB/API Gateway, or Cloudflare. That moves the shared-state problem to one chokepoint and removes the Redis dependency, at the cost of not keying off the API token the way the app does.
+- This applies only to the Docker/FastAPI deployment. On Lambda, throttling is handled by API Gateway, not by the app.
+
 **2. Put a reverse proxy in front (nginx, Caddy, ALB, etc.) for TLS.**
+
+### DynamoDB on AWS
+
+If you run the container **on AWS** (ECS/Fargate, EKS, or EC2), you can use DynamoDB instead of PostgreSQL - no RDS instance to manage, and no connection pool to tune. A long-lived FastAPI process talking to DynamoDB is fine; the connection-limit problem that rules out Lambda + PostgreSQL does not apply here.
+
+This path is **AWS-only**: the agent's boto3 client uses the standard AWS credential and region chain (task role, IRSA, instance profile, or env vars). It is not intended for off-AWS or local DynamoDB.
+
+**1. Run the container with the DynamoDB backend:**
+
+```bash
+docker run -d \
+  -p 8000:8000 \
+  -e STORAGE_BACKEND=dynamo \
+  -e AWS_REGION=us-east-1 \
+  -e TOKEN_PEPPER="<your-pepper>" \
+  -e SESSION_SIGNING_KEY="<your-session-key>" \
+  -e ADMIN_PASSWORD="<your-admin-password>" \
+  nabeemdev/reach:latest
+```
+
+- No `DATABASE_URL` is needed.
+- Provide AWS credentials the boto3 way - an ECS task role / EKS IRSA / EC2 instance profile is recommended over static keys. For local testing you can pass `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`.
+- On startup the container runs an idempotent bootstrap that creates the eight `reach-*` tables (on-demand billing) if they don't already exist - the DynamoDB equivalent of `alembic upgrade head`. Existing tables and their data are left untouched. You can also run it standalone with `python -m shared.dynamo_bootstrap`.
+- The retention env vars (`APPROVAL_RETENTION_DAYS`, etc.) work the same as the PostgreSQL path.
+
+**2. IAM policy.** The container's role needs table and index access on the `reach-*` tables. To let the bootstrap create them, include the create/describe actions:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReachData",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem",
+        "dynamodb:DeleteItem", "dynamodb:Query", "dynamodb:Scan",
+        "dynamodb:BatchGetItem", "dynamodb:BatchWriteItem"
+      ],
+      "Resource": [
+        "arn:aws:dynamodb:*:*:table/reach-*",
+        "arn:aws:dynamodb:*:*:table/reach-*/index/*"
+      ]
+    },
+    {
+      "Sid": "ReachBootstrap",
+      "Effect": "Allow",
+      "Action": ["dynamodb:CreateTable", "dynamodb:DescribeTable"],
+      "Resource": "arn:aws:dynamodb:*:*:table/reach-*"
+    }
+  ]
+}
+```
+
+Once the tables exist you can drop the `ReachBootstrap` statement if you prefer a least-privilege runtime role (the bootstrap treats already-existing tables as a no-op).
+
+DynamoDB tables created this way use no `DeletionPolicy`, so deleting them deletes their data - unlike the Lambda stack, which retains them. Back up with point-in-time recovery if needed.
 
 ---
 
 ## First-time setup
 
-Provisioning is three steps: create a tenant, create a user under it (for the CLI), and create an agent under it (for each machine).
+**Options 1 and 2 (setup scripts)** handle provisioning automatically - tenant, admin user, API key, and agent are all created by the script. You're ready to use the CLI immediately. Skip this section.
 
-**1. Create a tenant:**
+**Option 3 (Docker run directly)** requires manual setup. Open `http://<your-api-url>/ui` in a browser.
 
-```bash
-curl -s -X POST "$API_URL/admin/tenants" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"name": "XYZ Corp"}' | python3 -m json.tool
-```
+### Using the admin console
 
-Response:
+**1. Platform admin - create a tenant:**
 
-```json
-{
-  "tenant_id": "tenant_xxxxx",
-  "name": "XYZ Corp"
-}
-```
+Choose **Platform Admin** at the login screen and sign in with your `ADMIN_PASSWORD`. Go to **Tenants → New tenant**, enter a name, and click Create. The tenant appears in the list immediately.
 
-**2. Create a user under that tenant:**
+**2. Platform admin - create the first user in the tenant:**
 
-```bash
-curl -s -X POST "$API_URL/admin/tenants/tenant_xxxxx/users" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"name": "alice"}' | python3 -m json.tool
-```
+In the tenant row, click the user count or open the **Users** page, filter to your tenant, and click **Add user**. Enter a name, username, and role. The console shows the temporary password once - give it to the user and have them log in to the tenant console to set their own password.
 
-Response:
+**3. User - log in to the tenant console and create an agent:**
 
-```json
-{
-  "user_id": "user_xxxxx",
-  "tenant_id": "tenant_xxxxx",
-  "name": "alice",
-  "token": "tok_xxx...",
-  "commands": {
-    "cli_login": "reach login --api-url \"...\" --token \"tok_xxx...\""
-  }
-}
-```
+Choose **Tenant Console** at the login screen, enter the tenant name, username, and temporary password. You will be prompted to set a permanent password. Then go to **Agents → New agent**, choose a policy mode, and click Create. The console shows the install command - run it on the target machine.
 
-The `name` field is **required** - the request returns 400 if omitted or blank. Use a human-readable identifier (e.g. the person's name or username) so it's clear who the token belongs to when listing users.
+**4. User - create an API token for the CLI:**
 
-Save the `token` - it's not retrievable again. Run the `cli_login` command to set up the CLI. Repeat this step for each person who needs CLI access to this tenant - each gets their own token, so revoking one person's access never affects anyone else.
-
-**3. Create an agent under the tenant:**
+Go to **API Tokens → New token**, give it a name, and copy the token value (shown once). Run:
 
 ```bash
-curl -s -X POST "$API_URL/admin/agents" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"tenant_id": "tenant_xxxxx"}' | python3 -m json.tool
+reach login --api-url "<your-api-url>" --token "<your-api-token>"
 ```
 
-Optional body fields:
-
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `mode` | string | `"wild"` | Policy mode: `wild`, `readonly`, or `approved` |
-| `grant_service_mgmt` | bool | `true` | When `false`, adds `--no-grant-service-mgmt` to the install command (skips the sudoers entry for `systemctl`/`launchctl`) |
-| `grant_docker` | bool | `false` | When `true`, adds `--grant-docker` to the install command (adds `reach-agent` to the `docker` group) |
-
-Response:
-
-```json
-{
-  "agent_id": "agent_xxxxx",
-  "tenant_id": "tenant_xxxxx",
-  "install_token": "install_xxx...",
-  "install_token_expires_at": "2026-06-17T12:00:00+00:00",
-  "mode": "wild",
-  "commands": {
-    "cli_use": "reach agents use agent_xxxxx",
-    "agent": "curl -fsSL .../install.sh | sudo bash -s -- --api-url ... --agent-id ... --install-token ... --yes"
-  }
-}
-```
-
-Run the `agent` install command on the target machine. The script auto-detects OS and architecture - one command works everywhere:
-
-- **Linux** - installs as a systemd service, starts on boot, runs as a dedicated `reach-agent` user.
-- **macOS (foreground)** - runs in the current terminal. Stops when the terminal closes (Ctrl+C). Good for testing.
-- **macOS (background)** - add `--background` to install as a LaunchDaemon under a dedicated `reach-agent` system user. Same security model as Linux: starts on boot, minimal privileges, hidden from the login screen.
-
-The generated `agent` command always includes `--yes`, which suppresses all optional prompts and applies their defaults (service management granted, docker not granted). See the optional fields table above to control what flags are included.
-
-To uninstall (both platforms): `curl -fsSL .../install.sh | sudo bash -s -- --uninstall`
-
-Any user under the tenant can run `cli_use` on their own machine to set it as the default - all users in a tenant see the same agents.
-
-**Add another agent to the same tenant** - repeat step 3 with the same `tenant_id`.
+For automation, see [API.md](API.md) - specifically `POST /admin/login`, `POST /admin/tenants`, and `POST /admin/tenants/{id}/admin-users`.
 
 ---
 
 ## Managing users
 
-Every user gets their own token, independently revocable. Useful when multiple people share a tenant - rotating or revoking one person's access never breaks anyone else's.
+From the **platform admin console** go to **Users**, filter by tenant, and use the table actions to add, disable, or change roles. From the **tenant console**, admin-role users can manage users under **Users**.
 
-**List users in a tenant** (never exposes raw tokens - those are only shown once at creation):
+Rotating a user's API token keeps their identity and access list - only the credential changes. The new token is shown once. Revoking a user cuts access immediately; everyone else's tokens are unaffected.
 
-```bash
-curl -s "$API_URL/admin/tenants/tenant_xxxxx/users" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
-```
-
-**Rotate a user's token** (e.g. they suspect it leaked) - keeps the same `user_id`, `name`, and `created_at`, just replaces the credential:
-
-```bash
-curl -s -X POST "$API_URL/admin/tenants/tenant_xxxxx/users/user_xxxxx/rotate-token" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
-```
-
-The old token stops working immediately; the new `token` is shown once in the response. No guardrail needed here - unlike reissuing an agent's install token, rotating a user's token doesn't disconnect anything mid-flight, it just means their next CLI call needs the new token.
-
-**Revoke a user:**
-
-```bash
-curl -s -X DELETE "$API_URL/admin/tenants/tenant_xxxxx/users/user_xxxxx" \
-  -H "Authorization: Bearer $ADMIN_TOKEN"
-```
-
-That user's token stops working immediately. Everyone else's tokens are unaffected.
+For automation, see the user-management endpoints in [API.md](API.md). Platform admins use `POST /admin/tenants/{id}/admin-users` (create), `POST .../users/{user_id}/reset-password`, `POST .../users/{user_id}/disable`, and `PATCH .../users/{user_id}/role`; these require a session token from `POST /admin/login`. Tenant admins manage users within their own tenant through the `/tenant/users` endpoints using an API token.
 
 ---
 
-## Rotating the admin token
+## Rotating the admin password
 
-The `ADMIN_TOKEN` is just an environment variable - rotating it means setting a new value and restarting. The old token stops working immediately on the next request; there is no grace period. Update any scripts that use the admin API before rotating.
+`ADMIN_PASSWORD` is an environment variable - rotating it means setting a new value and restarting. Any active session tokens (8-hour JWTs signed with the old password) stop working immediately on the next request. Update any scripts that call `POST /admin/login` before rotating.
 
 **Local machine (Option 1):**
 
+Use the built-in subcommand - it generates (or prompts for) a new password, updates the env file, and restarts the backend:
+
 ```bash
-NEW_ADMIN_TOKEN=$(openssl rand -hex 32)
-
-# Update the env file
-sed -i '' "s/^ADMIN_TOKEN=.*/ADMIN_TOKEN=${NEW_ADMIN_TOKEN}/" ~/.reach/local/env
-
-# Restart the backend to pick it up
-docker compose -f ~/.reach/local/docker-compose.yml --env-file ~/.reach/local/env up -d reach
-
-echo "New ADMIN_TOKEN: $NEW_ADMIN_TOKEN"
+curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh | bash -s -- --rotate-password
 ```
 
 **AWS Lambda (Option 2):**
@@ -286,24 +314,55 @@ echo "New ADMIN_TOKEN: $NEW_ADMIN_TOKEN"
 curl -fsSL https://reach-releases.s3.amazonaws.com/lambda-setup.sh | bash -s -- --update
 ```
 
-When prompted for a new `ADMIN_TOKEN`, enter the new value (or generate one with `openssl rand -hex 32`). Leave it blank to keep the existing token and only update the release tag.
-
-CloudFormation updates each Lambda function's environment in-place. No cold start delay - the new token is active as soon as the update completes (usually under a minute).
+When prompted for a new `ADMIN_PASSWORD`, enter the new value (or generate one with `openssl rand -hex 32`). Leave it blank to keep the existing value.
 
 **Docker / FastAPI (Option 3):**
 
-Update the `ADMIN_TOKEN` environment variable however your deployment manages it (`.env` file, secrets manager, k8s secret), then restart the container:
+Update the `ADMIN_PASSWORD` environment variable however your deployment manages it (`.env` file, secrets manager, k8s secret), then restart the container:
 
 ```bash
 docker stop reach && docker run -d \
   -p 8000:8000 \
   -e TOKEN_PEPPER="<your-pepper>" \
-  -e ADMIN_TOKEN="$NEW_ADMIN_TOKEN" \
+  -e SESSION_SIGNING_KEY="<your-session-key>" \
+  -e ADMIN_PASSWORD="$NEW_ADMIN_PASSWORD" \
   -e DATABASE_URL="postgresql://user:pass@host:5432/reach" \
   nabeemdev/reach:latest
 ```
 
 `TOKEN_PEPPER` must stay the same across rotations - changing it invalidates every agent token, user token, and install token in the database simultaneously. See [TOKEN_PEPPER is permanent](#token_pepper-is-permanent).
+
+---
+
+## Rotating the session signing key
+
+`SESSION_SIGNING_KEY` signs the short-lived (8-hour) console session tokens. Unlike `TOKEN_PEPPER`, it is **safe to rotate** - the only effect is that active console sessions stop verifying, so users log in again. There is no data impact and nothing to migrate. Rotate it on a schedule, or immediately if you suspect a session token leaked.
+
+**Local machine (Option 1):**
+
+```bash
+curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh | bash -s -- --rotate-session-key
+```
+
+**AWS Lambda (Option 2):** run the update flow and answer **yes** when it asks `Rotate SESSION_SIGNING_KEY?`:
+
+```bash
+curl -fsSL https://reach-releases.s3.amazonaws.com/lambda-setup.sh | bash -s -- --update
+```
+
+**Docker / FastAPI (Option 3):** restart the container with a new `SESSION_SIGNING_KEY` value:
+
+```bash
+docker stop reach && docker run -d \
+  -p 8000:8000 \
+  -e TOKEN_PEPPER="<your-pepper>" \
+  -e SESSION_SIGNING_KEY="$(openssl rand -hex 32)" \
+  -e ADMIN_PASSWORD="<your-admin-password>" \
+  -e DATABASE_URL="postgresql://user:pass@host:5432/reach" \
+  nabeemdev/reach:latest
+```
+
+If you run multiple backend replicas, give them all the **same** new value so a session created on one verifies on the others.
 
 ---
 
@@ -325,510 +384,132 @@ The only recovery is a full credential reset: reissue install tokens for every a
 
 ## Per-user agent access
 
-By default every user in a tenant has `allowed_agent_ids: ["*"]` - they can see and use all agents. You can restrict a user to a specific subset of agents without touching anyone else's access.
+By default every user in a tenant sees all agents. From the **tenant console**, go to **Users → [user] → Agent Access** to restrict a user to specific machines.
 
-**Check a user's current access:**
+`allowed_agent_ids: ["*"]` means unrestricted access. A list of agent IDs means the user can only see and use those agents - every other agent returns 404 to them. An empty list locks them out of all agents without deleting their account.
 
-```bash
-curl -s "$API_URL/admin/tenants/tenant_xxxxx/users/user_xxxxx/agents" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
-```
+When an agent is revoked, reach automatically removes it from every user's access list in that tenant - no manual cleanup needed.
 
-```json
-{"user_id": "user_xxxxx", "allowed_agent_ids": ["*"]}
-```
-
-`["*"]` means unrestricted. A list of agent IDs means restricted to exactly those agents.
-
-**Restrict a user to specific agents** - replaces their access list entirely:
-
-```bash
-curl -s -X PUT "$API_URL/admin/tenants/tenant_xxxxx/users/user_xxxxx/agents" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"agent_ids": ["agent_staging1", "agent_staging2"]}' | python3 -m json.tool
-```
-
-The user now sees only those agents. Every other agent returns 404 to them - they can't tell other agents exist.
-
-**Restore full access:**
-
-```bash
-curl -s -X PUT "$API_URL/admin/tenants/tenant_xxxxx/users/user_xxxxx/agents" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"agent_ids": ["*"]}' | python3 -m json.tool
-```
-
-**Lock a user out entirely** (no agent access, but keep the account):
-
-```bash
-curl -s -X PUT "$API_URL/admin/tenants/tenant_xxxxx/users/user_xxxxx/agents" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"agent_ids": []}' | python3 -m json.tool
-```
-
-**Grant access to one more agent** (user must already be restricted, not `["*"]`):
-
-```bash
-curl -s -X POST "$API_URL/admin/tenants/tenant_xxxxx/users/user_xxxxx/agents/agent_prod1" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
-```
-
-Returns `409` if the user is still unrestricted - use `PUT` to set an explicit list first, then `POST`/`DELETE` to fine-tune.
-
-**Revoke one agent:**
-
-```bash
-curl -s -X DELETE "$API_URL/admin/tenants/tenant_xxxxx/users/user_xxxxx/agents/agent_prod1" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
-```
-
-Returns `409` if the user is unrestricted, `404` if the agent isn't in their list.
-
-**When an agent is revoked**, reach automatically removes it from every user's `allowed_agent_ids` in that tenant. No manual cleanup needed.
-
-**Fleet access (coming soon):** a parallel `allowed_fleet_ids` field will let you grant access to all agents in a fleet with a single assignment. Individual `allowed_agent_ids` and fleet access are OR'd - either grants access.
+For automation see `GET /tenant/users/{user_id}/agents` and `PUT /tenant/users/{user_id}/agents` in [API.md](API.md). The `PUT` replaces the whole access list - `{"agent_ids": ["*"]}` is unrestricted, `[]` locks the user out, and a list restricts them to those agents.
 
 ---
 
 ## Managing agents
 
-**List all agents for a tenant** - useful for seeing status, hostnames, and modes without needing a user token:
+From the **tenant console**, go to **Agents** to see all agents with their status, hostname, policy mode, access level, tags, and detected capabilities. Filter by tag using the search bar.
 
-```bash
-curl -s "$API_URL/admin/agents?tenant_id=tenant_xxxxx" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
-```
+`token_issued_at` in the agent record shows when the current agent token was last issued - useful for auditing which agents are approaching their 30-day auto-rotation window.
 
-Response:
-
-```json
-{
-  "agents": [
-    {
-      "agent_id": "agent_xxxxx",
-      "status": "ACTIVE",
-      "hostname": "prod-server-1",
-      "agent_version": "0.1.0",
-      "claimed_at": "2026-06-17T10:00:00+00:00",
-      "token_issued_at": "2026-06-17T10:00:00+00:00",
-      "mode": "readonly",
-      "access_level": "restricted",
-      "tags": ["env:prod", "region:us-east-1"]
-    }
-  ]
-}
-```
-
-Returns 400 if `tenant_id` is missing, 404 if the tenant doesn't exist.
-
-`token_issued_at` shows when the current agent token was last issued (claim or rotation). Useful for auditing which agents are approaching their 30-day rotation window.
-
-Add `?tag=<key:value>` to filter by a specific tag:
-
-```bash
-curl -s "$API_URL/admin/agents?tenant_id=tenant_xxxxx&tag=env:prod" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
-```
+For automation, tenant users list their own agents with `GET /agents` (filter with `?tag=key:value`); platform admins get a read-only cross-tenant view with `GET /admin/agents?tenant_id=...`. See [API.md](API.md).
 
 ---
 
 ## Agent tags
 
-Tags are `key:value` labels on agents for display and grouping. They are separate from access control - any user who can see an agent can see its tags. Tag keys and values must use lowercase letters, digits, hyphens, or underscores (format: `key:value`).
+Tags are `key:value` labels on agents for display and grouping (format: `key:value`, lowercase letters/digits/hyphens/underscores). They are separate from access control - any user who can see an agent can see its tags.
 
-**Get tags for an agent:**
-
-```bash
-curl -s "$API_URL/admin/agents/agent_xxxxx/tags" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
-```
-
-**Replace all tags (set exact list):**
+Manage tags from the **tenant console** under **Agents → [agent] → Tags**. Users can filter the agent list by tag:
 
 ```bash
-curl -s -X PUT "$API_URL/admin/agents/agent_xxxxx/tags" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"tags": ["env:prod", "region:us-east-1", "team:infra"]}'
-```
-
-**Add tags (merge, no duplicates):**
-
-```bash
-curl -s -X POST "$API_URL/admin/agents/agent_xxxxx/tags" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"tags": ["owner:alice"]}'
-```
-
-**Remove specific tags:**
-
-```bash
-curl -s -X DELETE "$API_URL/admin/agents/agent_xxxxx/tags" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"tags": ["owner:alice"]}'
-```
-
-**Clear all tags:**
-
-```bash
-curl -s -X PUT "$API_URL/admin/agents/agent_xxxxx/tags" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"tags": []}'
-```
-
-### Filtering agents by tag
-
-Users can filter the agent list to only agents carrying a specific tag:
-
-```bash
-# CLI
 reach agents list --tag env:prod
-
-# API
-curl -s "$API_URL/agents?tag=env:prod" \
-  -H "Authorization: Bearer $USER_TOKEN" | python3 -m json.tool
 ```
 
-Access control still applies - users only see agents they are allowed to access. The tag filter is an additional narrowing on top of that. If no agents match, the response is an empty `agents` list (not an error).
+Access control still applies - users only see agents they are allowed to access. The tag filter narrows on top of that. If no agents match, the result is an empty list (not an error).
+
+For automation see `PUT /tenant/agents/{id}/tags` in [API.md](API.md). It replaces the full tag list in one call - pass `{"tags": []}` to clear all tags.
 
 ---
 
-## Viewing admin job history
+## Viewing job history and audit logs
 
-`GET /admin/jobs` lets you query job history across all tenants with flexible filters. At least one filter is required.
+Reach keeps two separate records:
 
-**All jobs for a tenant:**
+- **Jobs** - every command that was submitted, with its stdout, stderr, exit code, and status. Browse them in the **tenant console** under **Jobs**. Each record includes `created_by` (the user ID of whoever submitted it).
+- **Audit log** - a structured event log of who did what: logins, user and agent management, policy changes, approvals, and token operations. View it tenant-scoped in the **tenant console** under **Audit Logs**, or platform-wide in the **platform admin console** under **Audit Logs**.
 
-```bash
-curl -s "$API_URL/admin/jobs?tenant_id=tenant_xxxxx" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
-```
+Both are paginated (jobs default 20 / max 100; audit logs default 100 / max 200); subsequent pages use the `next_cursor` from the previous response.
 
-**All jobs run on a specific agent:**
-
-```bash
-curl -s "$API_URL/admin/jobs?agent_id=agent_xxxxx" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
-```
-
-**All jobs submitted by a specific user:**
-
-```bash
-curl -s "$API_URL/admin/jobs?created_by=user_xxxxx" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
-```
-
-Filters can be combined. Use `?limit=N` to cap results (default 20, max 100).
-
-When there are more results, the response includes `next_cursor`. Pass it as `?cursor=<value>` on the next request to get the next page:
-
-Response includes `created_by` on every job record - the `user_id` of the CLI user who submitted it. When there are more pages, `next_cursor` is included:
-
-```json
-{
-  "jobs": [
-    {
-      "job_id": "job_xxxxx",
-      "agent_id": "agent_xxxxx",
-      "tenant_id": "tenant_xxxxx",
-      "created_by": "user_xxxxx",
-      "command": "docker ps",
-      "status": "SUCCEEDED",
-      "exit_code": 0,
-      "created_at": "2026-06-17T10:05:00+00:00"
-    }
-  ],
-  "next_cursor": "MjAyNi0wNi0xN1QxMDowNTowMCswMDowMA=="
-}
-```
-
-Pass `?cursor=<next_cursor>` on the next request to fetch the next page. The cursor encodes the `created_at` of the last returned item - absent when you've reached the last page.
+For automation, users list their own jobs with `GET /jobs` (filters: `?agent_id=`, `?limit=`, `?cursor=`); tenant admins read the audit log with `GET /tenant/audit-logs` and platform admins with `GET /admin/audit-logs`. See [API.md](API.md).
 
 
 ---
 
 ## Reissuing an install token
 
-If an install token expires before the agent was set up, or the machine needs to be reimaged and re-registered, reissue a fresh install token for the same `agent_id` instead of bootstrapping a new one:
+If an install token expires before the agent was set up, or a machine needs to be reimaged, reissue a fresh install token from the **tenant console** under **Agents → [agent] → Reissue install token**. This resets the agent back to `CREATED` with a new install token - the same `agent_id` is kept, so aliases and job history stay intact.
 
-```bash
-curl -s -X POST "$API_URL/admin/agents/agent_xxxxx/reissue-install-token" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
-```
+**This is a hard cutover, not a live rotation.** If the agent is currently `ACTIVE`, its existing token is invalidated immediately and the agent goes dormant on its next poll. There is no in-band recovery - the agent must be reinstalled.
 
-This resets the agent back to `CREATED` status with a new install token - the same `agent_id` is kept, so any aliases or job history pointing at it stay intact.
+The console blocks reissue for `ACTIVE` agents unless you confirm. For `CREATED`, `INACTIVE`, and `REVOKED` agents it proceeds without a prompt - there is no live connection to break. `REVOKED` is the recommended path before reissuing on a machine you plan to re-register.
 
-**This is a hard cutover, not a live rotation.** If the agent is currently running and connected, its existing `agent_token` is invalidated immediately (the machine fingerprint and claim are cleared). The agent will stop syncing on its next poll and go dormant rather than retry forever - it needs to be re-installed with the new install token to come back online. There's no in-band way to recover it remotely once this happens.
-
-It's allowed without confirmation for `CREATED` (never claimed), `INACTIVE` (already lost contact), and `REVOKED` agents - there's no live connection to break in those states. `REVOKED` is the recommended path before reissuing on a machine you plan to re-register.
-
-For `ACTIVE` agents the server blocks it with `409` to prevent accidental disconnects:
-
-```json
-{"error": "agent is currently ACTIVE - reissuing will disconnect it immediately with no in-band recovery. Revoke first with POST /admin/agents/{id}/revoke, or pass {\"force\": true} to proceed anyway."}
-```
-
-To force it through on an `ACTIVE` agent (e.g. a suspected compromised token), pass `force`:
-
-```bash
-curl -s -X POST "$API_URL/admin/agents/agent_xxxxx/reissue-install-token" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"force": true}' | python3 -m json.tool
-```
-
-Returns `409` for `DELETED` agents - remove and create a new agent instead.
+`DELETED` agents cannot have their install token reissued - create a new agent instead.
 
 ---
 
 ## Decommissioning an agent
 
-Removing an agent is a three-step sequence. Each step requires the previous one to have been completed - this prevents accidental hard-deletes.
+Removing an agent is a three-step sequence from the **tenant console** under **Agents → [agent] → Decommission**. Each step requires the previous one to complete - this prevents accidental hard-deletes.
 
-### Step 1 - Revoke
+**Step 1 - Revoke**: cuts sync access immediately. The agent's next poll returns `403` and it goes dormant. The agent is also removed from every user's access list in the tenant. Works on `CREATED`, `ACTIVE`, and `INACTIVE` agents. A revoke can be undone - see [Reissuing an install token](#reissuing-an-install-token).
 
-Cuts sync access immediately. The agent's next poll returns `403` and it goes dormant. The agent is also removed from every user's `allowed_agent_ids` in that tenant at this point.
+**Step 2 - Soft-delete**: marks the agent `DELETED`. The record stays in the database for audit. Requires `REVOKED` status.
 
-```bash
-curl -s -X POST "$API_URL/admin/agents/agent_xxxxx/revoke" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
-```
-
-Returns `409` if the agent is already `REVOKED` or `DELETED`. Works on `CREATED`, `ACTIVE`, and `INACTIVE` agents without any `force` flag.
-
-A revoke can be undone - see [Reissuing an install token](#reissuing-an-install-token) below.
-
-### Step 2 - Soft-delete
-
-Marks the agent `DELETED`. The record stays in the database for audit purposes. Requires `REVOKED` status.
-
-```bash
-curl -s -X DELETE "$API_URL/admin/agents/agent_xxxxx" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
-```
-
-Returns `409` if the agent is not `REVOKED` (with a message pointing to the revoke endpoint).
-
-### Step 3 - Remove
-
-Permanently deletes the record from the database. Job history referencing the `agent_id` is unaffected, but `GET /agents/{id}` will 404 afterward. Requires `DELETED` status.
-
-```bash
-curl -s -X DELETE "$API_URL/admin/agents/agent_xxxxx/remove" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
-```
-
-Returns `409` if the agent is not `DELETED`.
+**Step 3 - Remove**: permanently deletes the record. Job history referencing the agent ID is unaffected. Requires `DELETED` status.
 
 ---
 
 ## Policy management
 
-Policies are managed via the admin API, authenticated with your `ADMIN_TOKEN`.
+Set an agent's policy mode from the **tenant console** under **Agents → [agent] → Policy**. Choose `wild`, `readonly`, or `approved`.
 
-**View policy** (returns current mode and list of effective approved commands):
-
-```bash
-curl -s "$API_URL/admin/agents/agent_xxxxx/policy" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
-```
-
-**Set mode** (`wild` / `readonly` / `approved`):
-
-```bash
-curl -s -X PUT "$API_URL/admin/agents/agent_xxxxx/policy/mode" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"mode": "approved"}'
-```
-
-In `approved` mode, commands are not pre-configured by the admin. Instead they are approved on demand through the approval workflow - commands that get blocked by the agent create pending approval records, and the admin reviews them. See [Approvals](#approvals).
+In `approved` mode, write commands are not pre-configured - they're approved on demand. When a write is blocked it creates a pending approval record; admins and operators review these in the console under **Approvals**. See [Approvals](#approvals).
 
 ---
 
 ## Approvals
 
-When an agent runs in `approved` mode and a write command is not yet approved, the agent blocks it and the backend creates a pending approval record. The admin reviews these records and approves or denies them.
+When an agent runs in `approved` mode and a write command is not yet approved, the agent blocks it and the backend creates a pending approval record.
 
-Read commands always run in approved mode. Only write commands need approval.
+Read commands always run. Only write commands need approval.
 
-**Pre-approve a command** (without waiting for a block to occur):
+**Reviewing approvals**: admins and operators use the **tenant console → Approvals** to see pending requests and approve or deny them. You can approve permanently or with a time limit.
 
-```bash
-# Single command, permanent
-curl -s -X POST "$API_URL/admin/approvals" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"agent_id": "agent_xxxxx", "command": "docker restart app"}'
+**Pre-approving commands**: before first use, go to **Agents → [agent] → Approvals → Add** to approve commands without waiting for a block. Useful for provisioning a new agent.
 
-# Single command, time-limited
-curl -s -X POST "$API_URL/admin/approvals" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"agent_id": "agent_xxxxx", "command": "docker restart app", "duration": "8h"}'
+**Approval durations**: `permanent`, `1h`, `8h`, `24h`, `7d`, `30d`, `90d`, or custom `Nh`/`Nd`. Set `now` to instantly expire an approved record.
 
-# Bulk - provision multiple commands at once
-curl -s -X POST "$API_URL/admin/approvals" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "agent_id": "agent_xxxxx",
-    "commands": ["docker ps", "docker logs app", "kubectl get pods -A"],
-    "duration": "permanent"
-  }'
-```
-
-Single-command form: record created in `approved` state immediately; returns `409` if already active.
-
-Bulk form (`commands: [...]`): idempotent - commands that already have an active approval are skipped, not errored. Response:
-
-```json
-{
-  "created": [{ "approval_id": "appr_...", "command": "docker logs app", ... }],
-  "skipped": [{ "command": "docker ps", "reason": "already_approved" }]
-}
-```
-
-All pre-approved commands are included in the agent's approved list on the next sync (within 2–15 seconds). Useful for provisioning a new agent before first use.
-
-**List pending approvals** (all agents, or filter by agent or tenant):
+**Users** check their own approval status via the CLI:
 
 ```bash
-curl -s "$API_URL/admin/approvals?status=pending" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
+reach approvals                    # effective approved commands for the default agent
+reach approvals --pending          # my pending requests
+reach approvals --denied           # my denied requests
+reach approvals --expired          # my expired approvals
+reach approvals --agent prod       # any of the above for a specific agent
 ```
-
-Filter by agent:
-```bash
-curl -s "$API_URL/admin/approvals?agent_id=agent_xxxxx&status=pending" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
-```
-
-Results are paginated (default 20, max 100). When more records exist, the response includes `next_cursor`:
-
-```bash
-# First page
-curl -s "$API_URL/admin/approvals?tenant_id=tenant_xxxxx&status=pending&limit=20" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
-
-# Next page
-curl -s "$API_URL/admin/approvals?tenant_id=tenant_xxxxx&status=pending&limit=20&cursor=<next_cursor>" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -m json.tool
-```
-
-**Approve a pending request** - permanently by default, or with a time limit:
-
-```bash
-# Approve permanently
-curl -s -X PUT "$API_URL/admin/approvals/appr_xxxxx/approve" \
-  -H "Authorization: Bearer $ADMIN_TOKEN"
-
-# Approve for a limited time
-curl -s -X PUT "$API_URL/admin/approvals/appr_xxxxx/approve" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"duration": "8h"}'
-```
-
-Supported durations for initial approval:
-
-| Value | Meaning |
-|---|---|
-| `permanent` (default) | Never expires |
-| `1h` | 1 hour |
-| `8h` | 8 hours |
-| `24h` | 24 hours |
-| `7d` | 7 days |
-| `Nh` / `Nd` | Custom N hours or N days |
-
-When a time-limited approval expires, its status transitions to `expired` (via lazy expiry on the next read or the hourly scheduler sweep). The record stays in the database for history and is visible via `--expired`. The next blocked attempt creates a new pending record.
-
-**Deny a pending request:**
-
-```bash
-curl -s -X PUT "$API_URL/admin/approvals/appr_xxxxx/deny" \
-  -H "Authorization: Bearer $ADMIN_TOKEN"
-```
-
-`denied` is terminal - a denied record cannot be updated. Delete it and let the next block create a fresh pending record if re-approval is ever needed.
-
-**Update the duration on an active (approved) approval:**
-
-```bash
-# Extend or shorten to 24 hours from now
-curl -s -X PUT "$API_URL/admin/approvals/appr_xxxxx/approve" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"duration": "24h"}'
-
-# Make an expiring approval permanent
-curl -s -X PUT "$API_URL/admin/approvals/appr_xxxxx/approve" \
-  -H "Authorization: Bearer $ADMIN_TOKEN"
-```
-
-Only `approved` records can have their duration updated. `pending`, `denied`, and `expired` records return 409. The same duration values are valid as for initial approval, plus `now` to instantly expire:
-
-| Value | Meaning |
-|---|---|
-| `permanent` (default) | Never expires - clears any existing `expires_at` |
-| `1h` / `8h` / `24h` / `7d` | Relative from now |
-| `Nh` / `Nd` | Custom N hours or N days from now |
-| `now` | Instantly expire - sets status to `expired` immediately |
-
-**Instantly expire an approved command** (cuts access on next agent sync without leaving a denied record):
-
-```bash
-curl -s -X PUT "$API_URL/admin/approvals/appr_xxxxx/approve" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"duration": "now"}'
-```
-
-This immediately sets the record's status to `expired` and `expires_at` to the current timestamp. The agent stops including it in the approved list on the next sync (within 2–15 seconds).
 
 ### Approval lifecycle
 
 | Current status | approve | deny |
 |---|---|---|
-| `pending` | ✓ initial approval (any duration except `now`) | ✓ → `denied` |
-| `approved` | ✓ updates `expires_at`; `duration=now` → status becomes `expired` | 409 |
+| `pending` | initial approval (any duration except `now`) | → `denied` |
+| `approved` | updates `expires_at`; `duration=now` → immediately `expired` | 409 |
 | `denied` | 409 | 409 - terminal |
 | `expired` | 409 | 409 - terminal |
 
+`denied` is terminal - delete the record and let the next block create a fresh `pending` record if re-approval is needed.
+
 ### Automatic expiry and cleanup
 
-Expiry and cleanup happen automatically - no manual intervention needed:
+**Lazy expiry on read** - when the approved list is fetched (agent sync, `reach approvals`), any record with `expires_at ≤ now` is immediately marked `expired`.
 
-**Lazy expiry on read** - when the approved list is fetched (agent sync, policy check, CLI `reach approvals`), any record with `expires_at <= now` is immediately marked `expired` before the response is returned. This keeps the effective list accurate without waiting for a scheduled sweep.
+**Hourly sweep** - the scheduler marks all `approved` records with `expires_at < now` as `expired` in bulk.
 
-**Hourly sweep** - at the top of every hour the scheduler marks all `approved` records with `expires_at < now` as `expired` in bulk. Catches any records not yet caught by lazy expiry.
+**Daily cleanup** - at midnight UTC the scheduler deletes `denied` and `expired` approval records older than `APPROVAL_RETENTION_DAYS` (default 7), and terminal job records older than `JOB_RETENTION_DAYS` (default 7).
 
-**Daily cleanup** - at midnight UTC the scheduler deletes `denied` and `expired` approval records older than `APPROVAL_RETENTION_DAYS` (default 7), and terminal job records (`SUCCEEDED`, `FAILED`, `REJECTED`, `EXPIRED`) older than `JOB_RETENTION_DAYS` (default 7). Prevents unbounded table growth over time.
+Deleting an approved record immediately removes the command from the agent's allowed list on the next sync.
 
-**Delete an approval record** (permanently removes it - use to clean up stale duplicates or erase records from history):
-
-```bash
-curl -s -X DELETE "$API_URL/admin/approvals/appr_xxxxx" \
-  -H "Authorization: Bearer $ADMIN_TOKEN"
-```
-
-Returns `{"deleted": true}`. Works on records in any status. Deleting an approved record immediately removes the command from the agent's allowed list (same effect as denying, but without leaving a denied record behind).
-
-**Users can check their own approval status** via the CLI:
-
-```bash
-reach approvals                    # effective approved commands for the default agent
-reach approvals --pending          # my pending requests (awaiting review)
-reach approvals --denied           # my denied requests
-reach approvals --expired          # my expired approvals
-reach approvals --agent prod       # any of the above for a specific agent
-```
+For automation see the approvals endpoints in [API.md](API.md).
 
 ---
 
@@ -840,9 +521,11 @@ Three token types - none stored raw, only `HMAC-SHA256(TOKEN_PEPPER, token)` has
 |---|---|---|---|
 | `install_` | install token | Agent (once) | One-time claim to register the agent |
 | `agent_` | agent token | Agent (ongoing) | Poll for jobs, post results, heartbeat |
-| `tok_` | user token | CLI | Create jobs, read results, list agents |
+| `tok_` | API token | CLI / MCP | Create jobs, read results, list agents |
 
-User tokens belong to individuals, not the tenant as a whole - each person under a tenant gets their own, and revoking one doesn't affect anyone else's. By default all users in a tenant see all agents, but access can be restricted per user - see [Per-user agent access](#per-user-agent-access).
+API tokens are named, per-user credentials created in the tenant console under **API Tokens → New token**. Each person gets their own, and revoking one doesn't affect anyone else. By default all users in a tenant see all agents, but access can be restricted per user - see [Per-user agent access](#per-user-agent-access).
+
+Users authenticate to the tenant console with a username and password (separate from API tokens). API tokens are only for CLI and MCP server use.
 
 ---
 
@@ -867,8 +550,8 @@ An agent starts as `CREATED`. On first run it calls `POST /agent/claim` with the
 - **CREATED** - registered, install token valid for 24 hours. Never claimed.
 - **ACTIVE** - claimed and syncing normally.
 - **INACTIVE** - missed heartbeats. Auto-recovers to ACTIVE on next successful sync.
-- **REVOKED** - access cut. Sync returns 403. Removed from all user access lists. Can be reset to CREATED via `POST /admin/agents/{id}/reissue-install-token`.
-- **DELETED** - soft-deleted. Record stays in the database. Cannot sync or be reissued. Hidden from tenant-facing endpoints (`GET /agents`, `GET /agents/{id}` return 404); visible to the admin API so the remove step can be completed.
+- **REVOKED** - access cut. Sync returns 403. Removed from all user access lists. Can be reset to CREATED via `POST /tenant/agents/{id}/reissue-install-token`.
+- **DELETED** - soft-deleted. Record stays in the database. Cannot sync or be reissued. Hidden from the user-facing endpoints (`GET /agents`, `GET /agents/{id}` return 404); still actionable by tenant admins so the remove step can be completed.
 - **[gone]** - permanently removed via the remove action.
 
 The heartbeat checker runs every minute (EventBridge on Lambda, APScheduler on FastAPI) and marks agents `INACTIVE` if no sync has been received in the last 45 seconds. The agent auto-reactivates on its next successful sync. The same check also sweeps PENDING jobs older than 1 hour and marks them `EXPIRED` - so if an agent goes offline after a job is submitted, the job status resolves within an hour rather than lingering indefinitely.
@@ -887,20 +570,13 @@ Agents upgraded from a version without this field will skip rotation until they 
 
 If the config write fails after the server has issued the new token (e.g. disk full), the agent continues the current session in memory but logs a warning - a restart without fixing disk will cause a 401 and the agent will need manual reclaim.
 
-#### Admin-initiated rotation
+#### Tenant-initiated rotation
 
-If you want to rotate an agent token out-of-band (e.g. suspected credential exposure) without disconnecting the agent, use:
+To rotate an agent token out-of-band (e.g. suspected credential exposure) without disconnecting the agent, go to the **tenant console → Agents → [agent] → Request rotation**.
 
-```bash
-curl -s -X POST "$API_URL/admin/agents/agent_xxxxx/rotate-token" \
-  -H "Authorization: Bearer $ADMIN_TOKEN"
-```
+This sets a `rotation_requested` flag on the agent record. On its next sync the agent self-rotates and the flag is cleared. The agent remains connected throughout - no lockout window.
 
-This sets a `rotation_requested` flag on the agent record. On its next sync the agent receives `"rotate_token": true` in the response and immediately self-rotates using `POST /agent/rotate-token` with its current still-valid token. The flag is cleared atomically when the new token is stored. The agent remains connected throughout - there is no lockout window.
-
-Only ACTIVE and INACTIVE agents can be flagged for rotation (CREATED, REVOKED, and DELETED return 409).
-
-To confirm the rotation completed, poll `GET /admin/agents?tenant_id=...` and check that `token_issued_at` has advanced - there is no dedicated status field in the list response for the flag itself.
+Only ACTIVE and INACTIVE agents can be flagged for rotation. To confirm completion, check that `token_issued_at` has advanced in the agent detail view.
 
 ---
 
@@ -957,7 +633,7 @@ curl -fsSL .../install.sh | sudo bash -s -- \
   --yes --no-grant-service-mgmt
 ```
 
-The install command returned by `POST /admin/agents` always includes `--yes`. Pass `"grant_service_mgmt": false` in the request body to also include `--no-grant-service-mgmt`.
+The install command returned by `POST /tenant/agents` always includes `--yes`. Pass `"grant_service_mgmt": false` in the request body to also include `--no-grant-service-mgmt` in the generated command.
 
 If you skipped it or want to add it after the fact:
 
@@ -1015,14 +691,7 @@ curl -fsSL .../install.sh | sudo bash -s -- \
   --yes --grant-docker
 ```
 
-To include `--grant-docker` in the API-generated install command, pass `"grant_docker": true` when creating the agent:
-
-```bash
-curl -s -X POST "$API_URL/admin/agents" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"tenant_id": "tenant_xxxxx", "grant_docker": true}' | python3 -m json.tool
-```
+To include `--grant-docker` in the install command from the console, enable **Grant Docker access** when creating the agent.
 
 If you skipped it or Docker wasn't installed yet, add it manually after Docker is installed:
 
@@ -1041,63 +710,31 @@ launchctl load /Library/LaunchDaemons/com.reach-agent.plist
 
 ---
 
-## API reference
+## Agent configuration (environment variables)
 
-### Agent endpoints
+The agent reads a few optional environment variables. The installer sets the timeout and output cap to their defaults in the service definition, so you only touch these if you want to override them.
 
-| Method | Path | Auth | Description |
-|---|---|---|---|
-| `POST` | `/agent/claim` | install token | One-time agent registration |
-| `POST` | `/agent/sync` | agent token | Poll for jobs + record heartbeat |
-| `POST` | `/agent/jobs/{id}/result` | agent token | Post command result |
-| `POST` | `/agent/rotate-token` | agent token | Self-service token rotation (called by agent, not CLI) |
+| Variable | Default | Description |
+|---|---|---|
+| `REACH_COMMAND_TIMEOUT_SECONDS` | `60` | Max wall-clock time for a single command before the agent kills it and returns a timeout result. |
+| `REACH_MAX_OUTPUT_BYTES` | `50000` | Max bytes of `stdout`/`stderr` captured per command. Output beyond this is truncated. |
+| `REACH_CONFIG_PATH` | `/etc/reach-agent/config.json` | Path to the agent config file. Mainly for local development; the installer manages this path for you. |
 
-### User (CLI) endpoints
+To change the timeout or output cap on an installed agent, edit the service definition and restart:
 
-| Method | Path | Auth | Description |
-|---|---|---|---|
-| `GET` | `/me` | user token | Get current user identity (user_id, tenant_id, name) |
-| `POST` | `/jobs` | user token | Create a job |
-| `GET` | `/jobs` | user token | List your own jobs (`?agent_id=` `?limit=` `?cursor=`) |
-| `GET` | `/jobs/{id}` | user token | Get job result and output |
-| `GET` | `/agents` | user token | List accessible agents (`?tag=key:value` to filter) |
-| `GET` | `/agents/{id}` | user token | Get agent details, policy, and tags |
-| `GET` | `/agents/{id}/approved-commands` | user token | Approval records for an agent (`?status=approved\|pending\|denied\|expired`; default `approved` returns agent-wide effective list; others return your own records) |
-| `GET` | `/approvals/pending` | user token | Your pending approval requests across all agents (`?agent_id=` to filter) |
+**Linux (systemd):** edit the `Environment=` lines in `/etc/systemd/system/reach-agent.service`, then:
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart reach-agent
+```
 
-### Admin endpoints
+**macOS (background mode):** edit the `EnvironmentVariables` dict in `/Library/LaunchDaemons/com.reach-agent.plist`, then:
+```bash
+sudo launchctl unload /Library/LaunchDaemons/com.reach-agent.plist
+sudo launchctl load /Library/LaunchDaemons/com.reach-agent.plist
+```
 
-| Method | Path | Auth | Description |
-|---|---|---|---|
-| `POST` | `/admin/tenants` | ADMIN_TOKEN | Create a tenant |
-| `GET` | `/admin/tenants` | ADMIN_TOKEN | List tenants |
-| `POST` | `/admin/tenants/{id}/users` | ADMIN_TOKEN | Create a user under a tenant (issues their token); body: `{"name": "..."}` - required |
-| `GET` | `/admin/tenants/{id}/users` | ADMIN_TOKEN | List users in a tenant (no raw tokens) |
-| `POST` | `/admin/tenants/{id}/users/{user_id}/rotate-token` | ADMIN_TOKEN | Rotate one user's token (keeps identity, swaps credential) |
-| `DELETE` | `/admin/tenants/{id}/users/{user_id}` | ADMIN_TOKEN | Revoke one user's token |
-| `GET` | `/admin/tenants/{id}/users/{user_id}/agents` | ADMIN_TOKEN | Get user's current agent access list |
-| `PUT` | `/admin/tenants/{id}/users/{user_id}/agents` | ADMIN_TOKEN | Replace user's access list (`["*"]` = unrestricted, `[]` = locked out) |
-| `POST` | `/admin/tenants/{id}/users/{user_id}/agents/{agent_id}` | ADMIN_TOKEN | Grant one agent to a restricted user |
-| `DELETE` | `/admin/tenants/{id}/users/{user_id}/agents/{agent_id}` | ADMIN_TOKEN | Revoke one agent from a restricted user |
-| `GET` | `/admin/agents` | ADMIN_TOKEN | List all agents for a tenant (`?tenant_id=` required, `?tag=` optional) |
-| `POST` | `/admin/agents` | ADMIN_TOKEN | Create an agent under a tenant |
-| `POST` | `/admin/agents/{id}/revoke` | ADMIN_TOKEN | Revoke agent (CREATED/ACTIVE/INACTIVE → REVOKED). Cuts sync access, removes from user access lists. Undoable via reissue. |
-| `DELETE` | `/admin/agents/{id}` | ADMIN_TOKEN | Soft-delete agent (REVOKED → DELETED). Record stays in database. Requires prior revoke. |
-| `DELETE` | `/admin/agents/{id}/remove` | ADMIN_TOKEN | Permanently remove agent record (DELETED only). Irreversible. |
-| `POST` | `/admin/agents/{id}/reissue-install-token` | ADMIN_TOKEN | Reissue install token - resets to CREATED (allowed for CREATED/INACTIVE/REVOKED; blocked for ACTIVE without `force`, blocked for DELETED) |
-| `POST` | `/admin/agents/{id}/rotate-token` | ADMIN_TOKEN | Request an out-of-band token rotation. Sets a flag on the agent; the agent picks it up on its next sync and self-rotates. Only allowed for ACTIVE or INACTIVE agents. |
-| `GET` | `/admin/agents/{id}/tags` | ADMIN_TOKEN | Get agent's current tag list |
-| `PUT` | `/admin/agents/{id}/tags` | ADMIN_TOKEN | Replace tag list entirely |
-| `POST` | `/admin/agents/{id}/tags` | ADMIN_TOKEN | Add tags (merge, no duplicates) |
-| `DELETE` | `/admin/agents/{id}/tags` | ADMIN_TOKEN | Remove specific tags |
-| `GET` | `/admin/agents/{id}/policy` | ADMIN_TOKEN | Get agent policy (mode + effective approved commands) |
-| `PUT` | `/admin/agents/{id}/policy/mode` | ADMIN_TOKEN | Set policy mode (`wild` / `readonly` / `approved`) |
-| `GET` | `/admin/jobs` | ADMIN_TOKEN | List jobs (`?agent_id=` `?tenant_id=` `?created_by=` `?limit=` `?cursor=`) |
-| `GET` | `/admin/approvals` | ADMIN_TOKEN | List approval records (`?agent_id=` `?tenant_id=` `?status=pending\|approved\|denied\|expired` `?limit=` `?cursor=`). Paginated - default 20, max 100. |
-| `POST` | `/admin/approvals` | ADMIN_TOKEN | Pre-approve without a prior block. Single: `{"agent_id": "...", "command": "...", "duration": "8h"}` → returns approval object (409 if already active). Bulk: `{"agent_id": "...", "commands": [...]}` → returns `{"created": [...], "skipped": [...]}`, idempotent. |
-| `PUT` | `/admin/approvals/{id}/approve` | ADMIN_TOKEN | Approve (`pending` only) or update duration (`approved` only; `duration=now` immediately expires). Returns 409 on `denied` or `expired`. |
-| `PUT` | `/admin/approvals/{id}/deny` | ADMIN_TOKEN | Deny a pending request (`pending` only). Returns 409 on `approved`, `denied`, or `expired`. |
-| `DELETE` | `/admin/approvals/{id}` | ADMIN_TOKEN | Permanently delete an approval record. Works on any status; removing an approved record takes effect on the next agent sync. |
+These are agent-side limits enforced on the remote machine, independent of the backend.
 
 ---
 
@@ -1125,7 +762,7 @@ Notable columns on the `agents` table:
 |---|---|---|
 | `agent_token_hash` | string | HMAC-SHA256 of the current agent token |
 | `token_issued_at` | string | ISO timestamp of when the current agent token was issued (claim or rotation) |
-| `rotation_requested` | boolean | Set by `POST /admin/agents/{id}/rotate-token`; cleared automatically when the agent self-rotates |
+| `rotation_requested` | boolean | Set by `POST /tenant/agents/{id}/request-rotation`; cleared automatically when the agent self-rotates |
 | `machine_fingerprint` | string | SHA-256 of `machine-id + install_id`; token replay from a different machine is rejected |
 | `active_until` | integer | Unix timestamp until which the agent is considered active (extended by `reach exec`) |
 
@@ -1156,12 +793,17 @@ These are rejected regardless of the agent's policy mode:
 
 | Command | Reason |
 |---|---|
-| `rm -rf /` | Recursive root delete |
-| `mkfs` | Filesystem format |
+| `rm -rf /`, `rm --no-preserve-root` | Recursive root filesystem delete |
+| `mkfs`, `wipefs` | Filesystem format / wipe |
 | `dd if=` | Raw disk write |
-| `shutdown`, `reboot`, `poweroff` | System power control |
-| `init 0`, `init 6` | SysV runlevel changes |
+| `shred /dev/` | Raw device destruction |
 | Fork bomb (`: () { :|: & }`) | Process exhaustion |
+| `docker run --privileged`, `docker run --pid=host`, `docker run --network=host` | Container host escape |
+| `nsenter --target 1` | Namespace / host escape |
+| `chroot /` | Chroot host escape |
+| `kubectl run --privileged` | Privileged pod escape |
+| `env \| curl` | Credential exfiltration |
+| `/dev/tcp/`, `/dev/udp/`, `nc -e`, `ncat -e`, `socat exec:` | Reverse shell |
 
 ### Blocked in readonly mode
 
@@ -1171,15 +813,18 @@ In addition to the always-blocked list, readonly mode also blocks:
 |---|---|
 | File writes / deletes | `rm`, `mv`, `chmod`, `chown`, `truncate`, `shred`, `tee`, `sed -i`, `>` redirect |
 | Process control | `kill`, `killall`, `pkill` |
+| System power / init | `reboot`, `shutdown`, `poweroff`, `halt`, `init 0`, `init 6`, `systemctl reboot/poweroff/halt` |
 | Service management | `systemctl start/stop/restart`, `service start/stop` |
 | Containers | `docker run/stop/rm/pull/build`, `docker-compose up/down`, `kubectl apply/delete/exec` |
 | Package managers | `apt install`, `yum`, `dnf`, `pacman`, `apk`, `snap`, `flatpak`, `brew install`, `pip install`, `npm install`, `yarn add`, `gem install`, `cargo install` |
 | File download | `wget`, `curl -o` |
-| Disk / filesystem | `dd`, `mkfs`, `fdisk`, `parted`, `mount`, `umount` |
-| Firewall | `iptables`, `ufw allow/deny` |
-| User management | `useradd`, `userdel`, `usermod`, `passwd`, `su` |
+| Disk / filesystem | `dd`, `mkfs`, `fdisk`, `parted`, `gdisk`, `mount`, `umount` |
+| Firewall | `iptables`, `ip6tables`, `ufw allow/deny/enable/disable` |
+| User management | `useradd`, `userdel`, `usermod`, `groupadd`, `groupdel`, `passwd`, `su` |
 | Scheduled jobs | `crontab` |
 | Privilege escalation | `sudo` |
+| IaC destroy | `terraform destroy`, `pulumi destroy`, `cdk destroy` |
+| Cloud destructive | `aws ec2 terminate-instances`, `aws rds delete-db-instance`, `aws s3 rb --force`, `gcloud instances delete`, `az vm delete` |
 
 ### Approved mode
 
@@ -1190,52 +835,15 @@ Write commands are checked against the agent's approved list. If the command mat
 - **Linux** - runs under Landlock sandbox. If the kernel blocks the write, the agent returns `blocked=true`.
 - **macOS** - uses the server-supplied `is_write` flag. If the command is a write and not approved, the agent refuses it immediately without running it.
 
-In both cases the backend creates a pending approval record. The admin reviews it via `GET /admin/approvals?status=pending`, then approves or denies via `PUT /admin/approvals/{id}/approve` (with optional duration) or `PUT /admin/approvals/{id}/deny`. Once approved, the command prefix is included in the approved list on the next sync and runs without restriction. See [Approvals](#approvals).
+In both cases the backend creates a pending approval record. Admins and operators review it in the **tenant console → Approvals**, then approve or deny. Once approved, the command prefix is included in the approved list on the next sync and runs without restriction. See [Approvals](#approvals).
 
 The match is prefix-based with a word boundary: approving `docker logs` permits `docker logs myapp --tail 100` but not `docker rm myapp`.
 
 ---
 
-## Rate limits
+## API reference
 
-Rate limiting applies to the **Docker / FastAPI** deployment only. The key function uses the Bearer token if present, falling back to the client IP - so one misbehaving agent or user cannot affect others.
-
-**Agent endpoints**
-
-| Endpoint | Limit |
-|---|---|
-| `POST /agent/claim` | 5/hour per IP (no auth token at claim time) |
-| `POST /agent/sync` | 60/minute per agent token |
-| `POST /agent/jobs/{id}/result` | 60/minute per agent token |
-| `POST /agent/rotate-token` | 10/hour per agent token |
-
-**User (tenant) endpoints**
-
-| Endpoint | Limit |
-|---|---|
-| `POST /jobs` | 30/minute per user token |
-| `GET /me`, `GET /jobs/{id}`, `GET /agents/{id}` | 120/minute per user token |
-| `GET /jobs`, `GET /agents`, `GET /approvals/pending`, `GET /agents/{id}/approved-commands` | 60/minute per user token |
-
-**Admin endpoints**
-
-| Endpoint | Limit |
-|---|---|
-| All `GET /admin/*` reads | 120/minute per admin token |
-| `PUT /admin/approvals/{id}/approve`, `PUT /admin/approvals/{id}/deny` | 60/minute per admin token |
-| `POST /admin/approvals`, `POST/PUT/DELETE` tag/policy/access/lifecycle writes | 30/minute per admin token |
-| `POST /admin/agents`, `POST /admin/tenants`, `POST /admin/tenants/{id}/users` | 20/minute per admin token |
-| `POST /admin/agents/{id}/reissue-install-token`, `POST /admin/agents/{id}/rotate-token`, `POST /admin/tenants/{id}/users/{id}/rotate-token` | 10/minute per admin token |
-
-**Health**
-
-| Endpoint | Limit |
-|---|---|
-| `GET /health` | 120/minute per IP |
-
-Exceeding a limit returns `429` with `{"error": "rate limit exceeded"}`. The agent's sync loop treats 429 the same as a transient error and retries on the next poll interval.
-
-The Lambda deployment relies on API Gateway's built-in concurrency controls rather than per-token limits.
+See [API.md](API.md) for the complete endpoint reference, rate limits, and automation examples.
 
 ---
 
@@ -1248,5 +856,5 @@ The Lambda deployment relies on API Gateway's built-in concurrency controls rath
 - Agent token automatically rotates every 30 days via self-service rotation (no lockout window)
 - Config files written with `0600` permissions
 - Commands are checked against a policy blocklist before execution
-- Command timeout: 60 seconds
-- Max output: 50 KB per command
+- Command timeout: 60 seconds (default; configurable via `REACH_COMMAND_TIMEOUT_SECONDS` - see [Agent configuration](#agent-configuration-environment-variables))
+- Max output: 50 KB per command (default; configurable via `REACH_MAX_OUTPUT_BYTES`)

@@ -16,6 +16,8 @@ def handle_me(raw_token: str) -> dict:
         "user_id": user["user_id"],
         "tenant_id": user["tenant_id"],
         "name": user.get("name"),
+        "username": user.get("username"),
+        "role": user.get("role"),
         "created_at": user.get("created_at"),
     })
 

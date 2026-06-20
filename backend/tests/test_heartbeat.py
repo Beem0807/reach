@@ -1,7 +1,7 @@
 from datetime import datetime, timezone, timedelta
 from unittest.mock import patch, MagicMock, call
 
-from handlers.heartbeat import handle_heartbeat_check
+from handlers.heartbeat import handle_heartbeat_check, heartbeat_handler
 
 
 def _make_dt(hour=12, minute=30):
@@ -172,3 +172,128 @@ class TestHeartbeatApprovalScheduling:
         now_dt = datetime.fromisoformat(now_arg)
         diff = abs((now_dt - fixed_dt).total_seconds())
         assert diff < 2
+
+
+class TestHeartbeatCleanupExtended:
+    """Tests for audit log and agent history cleanup added alongside APPROVAL/JOB retention."""
+
+    def _call_midnight(self, env=None):
+        fixed_dt = _make_dt(hour=0, minute=0)
+        fixed_ts = fixed_dt.timestamp()
+        with patch("handlers.heartbeat.agents_repo") as ar, \
+             patch("handlers.heartbeat.jobs_repo") as jr, \
+             patch("handlers.heartbeat.approvals_repo") as apr, \
+             patch("handlers.heartbeat.audit_repo") as audr, \
+             patch("handlers.heartbeat.agent_history_repo") as ahr, \
+             patch("handlers.heartbeat._now", return_value=fixed_ts), \
+             patch.dict("os.environ", env or {}, clear=False):
+            ar.scan_stale_active.return_value = []
+            ar.mark_inactive.return_value = True
+            jr.expire_stale.return_value = 0
+            apr.mark_expired.return_value = 0
+            apr.delete_stale.return_value = 0
+            jr.delete_stale.return_value = 0
+            audr.delete_stale.return_value = 0
+            ahr.delete_stale.return_value = 0
+            result = handle_heartbeat_check()
+            return result, fixed_dt, audr, ahr
+
+    def test_midnight_calls_audit_delete_stale(self):
+        _, _, audr, _ = self._call_midnight()
+        audr.delete_stale.assert_called_once()
+
+    def test_midnight_calls_agent_history_delete_stale(self):
+        _, _, _, ahr = self._call_midnight()
+        ahr.delete_stale.assert_called_once()
+
+    def test_result_includes_deleted_audit_logs(self):
+        with patch("handlers.heartbeat.agents_repo") as ar, \
+             patch("handlers.heartbeat.jobs_repo") as jr, \
+             patch("handlers.heartbeat.approvals_repo") as apr, \
+             patch("handlers.heartbeat.audit_repo") as audr, \
+             patch("handlers.heartbeat.agent_history_repo") as ahr, \
+             patch("handlers.heartbeat._now", return_value=_make_dt(hour=0, minute=0).timestamp()):
+            ar.scan_stale_active.return_value = []
+            ar.mark_inactive.return_value = True
+            jr.expire_stale.return_value = 0
+            apr.mark_expired.return_value = 0
+            apr.delete_stale.return_value = 0
+            jr.delete_stale.return_value = 0
+            audr.delete_stale.return_value = 7
+            ahr.delete_stale.return_value = 3
+            result = handle_heartbeat_check()
+        assert result["deleted_audit_logs"] == 7
+        assert result["deleted_agent_history"] == 3
+
+    def test_audit_retention_uses_env(self):
+        _, fixed_dt, audr, _ = self._call_midnight(env={"AUDIT_RETENTION_DAYS": "30"})
+        before_arg = audr.delete_stale.call_args[0][0]
+        before_dt = datetime.fromisoformat(before_arg)
+        expected = fixed_dt - timedelta(days=30)
+        assert abs((before_dt - expected).total_seconds()) < 2
+
+    def test_audit_retention_defaults_to_90_days(self):
+        import os
+        os.environ.pop("AUDIT_RETENTION_DAYS", None)
+        _, fixed_dt, audr, _ = self._call_midnight()
+        before_arg = audr.delete_stale.call_args[0][0]
+        before_dt = datetime.fromisoformat(before_arg)
+        expected = fixed_dt - timedelta(days=90)
+        assert abs((before_dt - expected).total_seconds()) < 2
+
+    def test_agent_history_retention_uses_env(self):
+        _, fixed_dt, _, ahr = self._call_midnight(env={"AGENT_HISTORY_RETENTION_DAYS": "14"})
+        before_arg = ahr.delete_stale.call_args[0][0]
+        before_dt = datetime.fromisoformat(before_arg)
+        expected = fixed_dt - timedelta(days=14)
+        assert abs((before_dt - expected).total_seconds()) < 2
+
+    def test_agent_history_retention_defaults_to_30_days(self):
+        import os
+        os.environ.pop("AGENT_HISTORY_RETENTION_DAYS", None)
+        _, fixed_dt, _, ahr = self._call_midnight()
+        before_arg = ahr.delete_stale.call_args[0][0]
+        before_dt = datetime.fromisoformat(before_arg)
+        expected = fixed_dt - timedelta(days=30)
+        assert abs((before_dt - expected).total_seconds()) < 2
+
+    def test_non_midnight_does_not_cleanup_audit(self):
+        fixed_dt = _make_dt(hour=12, minute=0)
+        fixed_ts = fixed_dt.timestamp()
+        with patch("handlers.heartbeat.agents_repo") as ar, \
+             patch("handlers.heartbeat.jobs_repo") as jr, \
+             patch("handlers.heartbeat.approvals_repo") as apr, \
+             patch("handlers.heartbeat.audit_repo") as audr, \
+             patch("handlers.heartbeat.agent_history_repo") as ahr, \
+             patch("handlers.heartbeat._now", return_value=fixed_ts):
+            ar.scan_stale_active.return_value = []
+            ar.mark_inactive.return_value = True
+            jr.expire_stale.return_value = 0
+            apr.mark_expired.return_value = 0
+            result = handle_heartbeat_check()
+        audr.delete_stale.assert_not_called()
+        ahr.delete_stale.assert_not_called()
+        assert result["deleted_audit_logs"] == 0
+        assert result["deleted_agent_history"] == 0
+
+    def test_mark_inactive_writes_agent_history(self):
+        stale = [{"agent_id": "agent_x", "tenant_id": "t1", "last_heartbeat_at": "2026-01-01T00:00:00"}]
+        fixed_dt = _make_dt()
+        fixed_ts = fixed_dt.timestamp()
+        with patch("handlers.heartbeat.agents_repo") as ar, \
+             patch("handlers.heartbeat.jobs_repo") as jr, \
+             patch("handlers.heartbeat.approvals_repo") as apr, \
+             patch("handlers.heartbeat.audit_repo") as audr, \
+             patch("handlers.heartbeat.agent_history_repo") as ahr, \
+             patch("handlers.heartbeat._now", return_value=fixed_ts):
+            ar.scan_stale_active.return_value = stale
+            ar.mark_inactive.return_value = True
+            jr.expire_stale.return_value = 0
+            apr.mark_expired.return_value = 0
+            handle_heartbeat_check()
+        ahr.create.assert_called_once()
+        call_args = ahr.create.call_args[0][0]
+        assert call_args["agent_id"] == "agent_x"
+        assert call_args["from_status"] == "ACTIVE"
+        assert call_args["to_status"] == "INACTIVE"
+        assert call_args["triggered_by"] == "heartbeat"

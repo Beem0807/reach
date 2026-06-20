@@ -3,9 +3,11 @@ import json
 import logging
 import secrets
 
+import secrets
+
 from shared.auth import AGENT_TOKEN_PREFIX, _hmac_token
 from shared.response import _err, _iso, _now, _ok
-from shared.store import agents_repo
+from shared.store import agent_history_repo, agents_repo
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -42,6 +44,17 @@ def handle_agent_claim(body: dict) -> dict:
         "claimed_at": now_iso,
         "active_until": _now() + 120,
         "token_issued_at": now_iso,
+    })
+
+    agent_history_repo.create({
+        "history_id": "agenthistory_" + secrets.token_urlsafe(8),
+        "agent_id": agent_id,
+        "tenant_id": agent.get("tenant_id", ""),
+        "from_status": "CREATED",
+        "to_status": "ACTIVE",
+        "triggered_by": "agent",
+        "note": hostname or None,
+        "created_at": now_iso,
     })
 
     return _ok({"agent_token": raw_agent_token, "mode": agent.get("mode", "wild")})

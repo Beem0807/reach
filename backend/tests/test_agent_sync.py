@@ -1,8 +1,8 @@
 import json
 from datetime import datetime, timezone, timedelta
-from unittest.mock import patch
+from unittest.mock import MagicMock, call, patch
 
-from handlers.agent_sync import handle_agent_sync
+from handlers.agent_sync import _audit_capability_changes, handle_agent_sync
 
 AGENT_ID = "agent_a"
 FP = "fp_abc123"
@@ -140,3 +140,154 @@ class TestAgentSync:
         agent_no_flag = {**_AGENT_ACTIVE, "rotation_requested": False}
         r = self._call(agent=agent_no_flag)
         assert "rotate_token" not in json.loads(r["body"])
+
+    def test_docker_detected_passed_to_update_heartbeat(self):
+        body = {**_VALID_BODY, "docker_detected": True}
+        with patch("handlers.agent_sync._verify_agent_token", return_value=_AGENT_ACTIVE), \
+             patch("handlers.agent_sync.agents_repo") as ar, \
+             patch("handlers.agent_sync.approvals_repo"), \
+             patch("handlers.agent_sync.jobs_repo") as jr, \
+             patch("handlers.agent_sync.audit"):
+            jr.get_pending_for_agent.return_value = []
+            handle_agent_sync(body, "tok")
+        _, kwargs = ar.update_heartbeat.call_args
+        assert kwargs.get("docker_detected") is True
+
+    def test_service_mgmt_detected_passed_to_update_heartbeat(self):
+        body = {**_VALID_BODY, "service_mgmt_detected": False}
+        with patch("handlers.agent_sync._verify_agent_token", return_value=_AGENT_ACTIVE), \
+             patch("handlers.agent_sync.agents_repo") as ar, \
+             patch("handlers.agent_sync.approvals_repo"), \
+             patch("handlers.agent_sync.jobs_repo") as jr, \
+             patch("handlers.agent_sync.audit"):
+            jr.get_pending_for_agent.return_value = []
+            handle_agent_sync(body, "tok")
+        _, kwargs = ar.update_heartbeat.call_args
+        assert kwargs.get("service_mgmt_detected") is False
+
+    def test_non_bool_docker_detected_treated_as_none(self):
+        body = {**_VALID_BODY, "docker_detected": "yes"}
+        with patch("handlers.agent_sync._verify_agent_token", return_value=_AGENT_ACTIVE), \
+             patch("handlers.agent_sync.agents_repo") as ar, \
+             patch("handlers.agent_sync.approvals_repo"), \
+             patch("handlers.agent_sync.jobs_repo") as jr, \
+             patch("handlers.agent_sync.audit"):
+            jr.get_pending_for_agent.return_value = []
+            handle_agent_sync(body, "tok")
+        _, kwargs = ar.update_heartbeat.call_args
+        assert kwargs.get("docker_detected") is None
+
+    def test_absent_capability_fields_sent_as_none(self):
+        with patch("handlers.agent_sync._verify_agent_token", return_value=_AGENT_ACTIVE), \
+             patch("handlers.agent_sync.agents_repo") as ar, \
+             patch("handlers.agent_sync.approvals_repo"), \
+             patch("handlers.agent_sync.jobs_repo") as jr, \
+             patch("handlers.agent_sync.audit"):
+            jr.get_pending_for_agent.return_value = []
+            handle_agent_sync(_VALID_BODY, "tok")
+        _, kwargs = ar.update_heartbeat.call_args
+        assert kwargs.get("docker_detected") is None
+        assert kwargs.get("service_mgmt_detected") is None
+
+
+# ---------------------------------------------------------------------------
+# _audit_capability_changes
+# ---------------------------------------------------------------------------
+
+_BASE_AGENT = {
+    "agent_id": AGENT_ID,
+    "tenant_id": "tenant_1",
+    "hostname": "myhost",
+    "grant_docker": False,
+    "grant_service_mgmt": False,
+    "docker_detected": None,
+    "service_mgmt_detected": None,
+}
+
+
+class TestAuditCapabilityChanges:
+    def _call(self, agent, docker=None, service=None):
+        with patch("handlers.agent_sync.audit") as mock_audit:
+            _audit_capability_changes(agent, docker, service)
+        return mock_audit
+
+    # --- None inputs are skipped entirely ---
+
+    def test_none_docker_no_audit(self):
+        mock = self._call(_BASE_AGENT, docker=None, service=None)
+        mock.write.assert_not_called()
+
+    # --- First detection: prev=None, detected=True, not granted → out-of-band ---
+
+    def test_first_docker_detection_out_of_band_writes_audit(self):
+        agent = {**_BASE_AGENT, "docker_detected": None, "grant_docker": False}
+        mock = self._call(agent, docker=True)
+        mock.write.assert_called_once()
+        meta = mock.write.call_args[1]["metadata"]
+        assert meta["capability"] == "docker"
+        assert meta["detected"] is True
+        assert meta["out_of_band"] is True
+
+    def test_first_service_mgmt_detection_out_of_band_writes_audit(self):
+        agent = {**_BASE_AGENT, "service_mgmt_detected": None, "grant_service_mgmt": False}
+        mock = self._call(agent, service=True)
+        mock.write.assert_called_once()
+        meta = mock.write.call_args[1]["metadata"]
+        assert meta["capability"] == "service_mgmt"
+        assert meta["out_of_band"] is True
+
+    # --- First detection: prev=None, detected=False → no audit (no change, not out-of-band) ---
+
+    def test_first_detection_false_no_audit(self):
+        agent = {**_BASE_AGENT, "docker_detected": None, "grant_docker": False}
+        mock = self._call(agent, docker=False)
+        mock.write.assert_not_called()
+
+    # --- Detected=True, granted=True, prev=None → audit (first time, but NOT out-of-band) ---
+
+    def test_first_detection_granted_writes_audit_not_out_of_band(self):
+        agent = {**_BASE_AGENT, "docker_detected": None, "grant_docker": True}
+        mock = self._call(agent, docker=True)
+        mock.write.assert_called_once()
+        meta = mock.write.call_args[1]["metadata"]
+        assert meta["out_of_band"] is False
+
+    # --- Value unchanged → no audit ---
+
+    def test_unchanged_true_no_audit(self):
+        agent = {**_BASE_AGENT, "docker_detected": True, "grant_docker": True}
+        mock = self._call(agent, docker=True)
+        mock.write.assert_not_called()
+
+    def test_unchanged_false_no_audit(self):
+        agent = {**_BASE_AGENT, "docker_detected": False, "grant_docker": False}
+        mock = self._call(agent, docker=False)
+        mock.write.assert_not_called()
+
+    # --- Value changed True→False → audit ---
+
+    def test_docker_reverted_writes_audit(self):
+        agent = {**_BASE_AGENT, "docker_detected": True, "grant_docker": False}
+        mock = self._call(agent, docker=False)
+        mock.write.assert_called_once()
+        meta = mock.write.call_args[1]["metadata"]
+        assert meta["detected"] is False
+        assert meta["previously_detected"] is True
+
+    # --- Persistent out-of-band (prev=True, grant=False, detected=True) → no audit (unchanged) ---
+
+    def test_persistent_out_of_band_no_repeated_audit(self):
+        # State hasn't changed - docker was already detected out-of-band last heartbeat.
+        # Must NOT re-audit on every subsequent heartbeat.
+        agent = {**_BASE_AGENT, "docker_detected": True, "grant_docker": False}
+        mock = self._call(agent, docker=True)
+        mock.write.assert_not_called()
+
+    # --- Both capabilities at once ---
+
+    def test_both_capabilities_write_separate_audit_entries(self):
+        agent = {**_BASE_AGENT}
+        mock = self._call(agent, docker=True, service=True)
+        assert mock.write.call_count == 2
+        caps = {c[1]["metadata"]["capability"] for c in mock.write.call_args_list}
+        assert caps == {"docker", "service_mgmt"}

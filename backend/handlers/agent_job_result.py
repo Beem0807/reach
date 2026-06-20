@@ -3,6 +3,7 @@ import logging
 import secrets
 
 from shared.auth import _bearer, _verify_agent_token
+from shared.redact import redact
 from shared.response import _err, _iso, _ok
 from shared.store import approvals_repo, jobs_repo, users_repo
 
@@ -45,6 +46,9 @@ def handle_agent_job_result(job_id: str, body: dict, raw_token: str) -> dict:
         stdout = stdout.encode()[:max_bytes].decode(errors="replace") + "\n[TRUNCATED]"
     if len(stderr.encode()) > max_bytes:
         stderr = stderr.encode()[:max_bytes].decode(errors="replace") + "\n[TRUNCATED]"
+
+    stdout = redact(stdout)
+    stderr = redact(stderr)
 
     jobs_repo.set_result(job_id, {
         "status": status,

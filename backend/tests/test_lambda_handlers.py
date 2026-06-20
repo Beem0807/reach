@@ -60,122 +60,137 @@ class TestAdminTenantHandlers:
         r = list_tenants_handler(_evt(headers={}), None)
         assert r["statusCode"] == 401
 
+    def test_delete_tenant_handler_delegates(self):
+        from handlers.admin_tenants import delete_tenant_handler
+        with patch("handlers.admin_tenants.handle_delete_tenant", return_value=_OK) as h:
+            r = delete_tenant_handler(_evt(path={"tenant_id": "tenant_1"}), None)
+        h.assert_called_once_with("tenant_1", ADMIN)
+        assert r == _OK
+
+    def test_delete_tenant_handler_missing_auth(self):
+        from handlers.admin_tenants import delete_tenant_handler
+        r = delete_tenant_handler(_evt(headers={}, path={"tenant_id": "tenant_1"}), None)
+        assert r["statusCode"] == 401
+
+    def test_disable_tenant_handler_delegates(self):
+        from handlers.admin_tenants import disable_tenant_handler
+        with patch("handlers.admin_tenants.handle_disable_tenant", return_value=_OK) as h:
+            disable_tenant_handler(_evt(path={"tenant_id": "tenant_1"}), None)
+        h.assert_called_once_with("tenant_1", ADMIN)
+
+    def test_disable_tenant_handler_missing_auth(self):
+        from handlers.admin_tenants import disable_tenant_handler
+        r = disable_tenant_handler(_evt(headers={}, path={"tenant_id": "tenant_1"}), None)
+        assert r["statusCode"] == 401
+
+    def test_enable_tenant_handler_delegates(self):
+        from handlers.admin_tenants import enable_tenant_handler
+        with patch("handlers.admin_tenants.handle_enable_tenant", return_value=_OK) as h:
+            enable_tenant_handler(_evt(path={"tenant_id": "tenant_1"}), None)
+        h.assert_called_once_with("tenant_1", ADMIN)
+
+    def test_enable_tenant_handler_missing_auth(self):
+        from handlers.admin_tenants import enable_tenant_handler
+        r = enable_tenant_handler(_evt(headers={}, path={"tenant_id": "tenant_1"}), None)
+        assert r["statusCode"] == 401
+
+    def test_create_admin_user_handler_delegates(self):
+        from handlers.admin_tenants import create_admin_user_handler
+        with patch("handlers.admin_tenants.handle_create_tenant_admin_user", return_value=_OK) as h:
+            create_admin_user_handler(_evt(body={"username": "alice"}, path={"tenant_id": "tenant_1"}), None)
+        assert h.call_args[0][0] == "tenant_1"
+        assert h.call_args[0][1] == {"username": "alice"}
+        assert h.call_args[0][2] == ADMIN
+
+    def test_create_admin_user_handler_missing_auth(self):
+        from handlers.admin_tenants import create_admin_user_handler
+        r = create_admin_user_handler(_evt(headers={}, path={"tenant_id": "tenant_1"}), None)
+        assert r["statusCode"] == 401
+
+    def test_create_admin_user_handler_invalid_json(self):
+        from handlers.admin_tenants import create_admin_user_handler
+        evt = _evt(path={"tenant_id": "tenant_1"}); evt["body"] = "bad"
+        r = create_admin_user_handler(evt, None)
+        assert r["statusCode"] == 400
+
+    def test_platform_reset_password_handler_delegates(self):
+        from handlers.admin_tenants import platform_reset_password_handler
+        with patch("handlers.admin_tenants.handle_platform_reset_user_password", return_value=_OK) as h:
+            platform_reset_password_handler(_evt(path={"tenant_id": "t1", "user_id": "u1"}), None)
+        assert h.call_args[0][:2] == ("t1", "u1")
+
+    def test_platform_reset_password_handler_missing_auth(self):
+        from handlers.admin_tenants import platform_reset_password_handler
+        r = platform_reset_password_handler(_evt(headers={}, path={"tenant_id": "t1", "user_id": "u1"}), None)
+        assert r["statusCode"] == 401
+
+    def test_platform_disable_user_handler_delegates(self):
+        from handlers.admin_tenants import platform_disable_user_handler
+        with patch("handlers.admin_tenants.handle_platform_disable_user", return_value=_OK) as h:
+            platform_disable_user_handler(_evt(path={"tenant_id": "t1", "user_id": "u1"}), None)
+        assert h.call_args[0][:2] == ("t1", "u1")
+
+    def test_platform_disable_user_handler_missing_auth(self):
+        from handlers.admin_tenants import platform_disable_user_handler
+        r = platform_disable_user_handler(_evt(headers={}, path={"tenant_id": "t1", "user_id": "u1"}), None)
+        assert r["statusCode"] == 401
+
+    def test_platform_set_role_handler_delegates(self):
+        from handlers.admin_tenants import platform_set_role_handler
+        with patch("handlers.admin_tenants.handle_platform_set_user_role", return_value=_OK) as h:
+            platform_set_role_handler(_evt(body={"role": "operator"}, path={"tenant_id": "t1", "user_id": "u1"}), None)
+        assert h.call_args[0][:2] == ("t1", "u1")
+        assert h.call_args[0][2] == {"role": "operator"}
+
+    def test_platform_set_role_handler_missing_auth(self):
+        from handlers.admin_tenants import platform_set_role_handler
+        r = platform_set_role_handler(_evt(headers={}, path={"tenant_id": "t1", "user_id": "u1"}), None)
+        assert r["statusCode"] == 401
+
+    def test_platform_set_role_handler_invalid_json(self):
+        from handlers.admin_tenants import platform_set_role_handler
+        evt = _evt(path={"tenant_id": "t1", "user_id": "u1"}); evt["body"] = "bad"
+        r = platform_set_role_handler(evt, None)
+        assert r["statusCode"] == 400
+
+    def test_platform_update_name_handler_delegates(self):
+        from handlers.admin_tenants import platform_update_name_handler
+        with patch("handlers.admin_tenants.handle_platform_update_user_name", return_value=_OK) as h:
+            platform_update_name_handler(_evt(body={"name": "Alice"}, path={"tenant_id": "t1", "user_id": "u1"}), None)
+        assert h.call_args[0][:2] == ("t1", "u1")
+        assert h.call_args[0][2] == {"name": "Alice"}
+
+    def test_platform_update_name_handler_missing_auth(self):
+        from handlers.admin_tenants import platform_update_name_handler
+        r = platform_update_name_handler(_evt(headers={}, path={"tenant_id": "t1", "user_id": "u1"}), None)
+        assert r["statusCode"] == 401
+
+    def test_platform_update_name_handler_invalid_json(self):
+        from handlers.admin_tenants import platform_update_name_handler
+        evt = _evt(path={"tenant_id": "t1", "user_id": "u1"}); evt["body"] = "bad"
+        r = platform_update_name_handler(evt, None)
+        assert r["statusCode"] == 400
+
 
 # ---------------------------------------------------------------------------
-# admin_users
+# admin_users (list only)
 # ---------------------------------------------------------------------------
 
 class TestAdminUserHandlers:
-    def _path(self, **kw):
-        return {"tenant_id": "tenant_1", "user_id": "user_1", **kw}
-
-    def test_create_user_handler_delegates(self):
-        from handlers.admin_users import create_user_handler
-        evt = {**_evt(body={"name": "alice"}, path=self._path()),
-               "headers": {**_BEARER, "host": "api.example.com"}}
-        with patch("handlers.admin_users.handle_create_user", return_value=_OK) as h:
-            create_user_handler(evt, None)
-        assert h.call_args[0][0] == "tenant_1"
-        assert h.call_args[0][1] == {"name": "alice"}
-
-    def test_create_user_handler_missing_auth(self):
-        from handlers.admin_users import create_user_handler
-        r = create_user_handler(_evt(headers={}, path=self._path()), None)
-        assert r["statusCode"] == 401
-
-    def test_create_user_handler_invalid_json(self):
-        from handlers.admin_users import create_user_handler
-        evt = _evt(path=self._path()); evt["body"] = "bad"
-        r = create_user_handler(evt, None)
-        assert r["statusCode"] == 400
-
     def test_list_users_handler_delegates(self):
         from handlers.admin_users import list_users_handler
         with patch("handlers.admin_users.handle_list_users", return_value=_OK) as h:
-            list_users_handler(_evt(path=self._path()), None)
+            list_users_handler(_evt(path={"tenant_id": "tenant_1"}), None)
         h.assert_called_once_with("tenant_1", ADMIN)
 
     def test_list_users_handler_missing_auth(self):
         from handlers.admin_users import list_users_handler
-        r = list_users_handler(_evt(headers={}, path=self._path()), None)
-        assert r["statusCode"] == 401
-
-    def test_delete_user_handler_delegates(self):
-        from handlers.admin_users import delete_user_handler
-        with patch("handlers.admin_users.handle_delete_user", return_value=_OK) as h:
-            delete_user_handler(_evt(path=self._path()), None)
-        h.assert_called_once_with("tenant_1", "user_1", ADMIN)
-
-    def test_delete_user_handler_missing_auth(self):
-        from handlers.admin_users import delete_user_handler
-        r = delete_user_handler(_evt(headers={}, path=self._path()), None)
-        assert r["statusCode"] == 401
-
-    def test_rotate_user_token_handler_delegates(self):
-        from handlers.admin_users import rotate_user_token_handler
-        evt = {**_evt(path=self._path()), "headers": {**_BEARER, "host": "api.example.com"}}
-        with patch("handlers.admin_users.handle_rotate_user_token", return_value=_OK) as h:
-            rotate_user_token_handler(evt, None)
-        assert h.call_args[0][:2] == ("tenant_1", "user_1")
-
-    def test_rotate_user_token_handler_missing_auth(self):
-        from handlers.admin_users import rotate_user_token_handler
-        r = rotate_user_token_handler(_evt(headers={}, path=self._path()), None)
-        assert r["statusCode"] == 401
-
-    def test_get_user_agents_handler_delegates(self):
-        from handlers.admin_users import get_user_agents_handler
-        with patch("handlers.admin_users.handle_get_user_agents", return_value=_OK) as h:
-            get_user_agents_handler(_evt(path=self._path()), None)
-        h.assert_called_once_with("tenant_1", "user_1", ADMIN)
-
-    def test_get_user_agents_handler_missing_auth(self):
-        from handlers.admin_users import get_user_agents_handler
-        r = get_user_agents_handler(_evt(headers={}, path=self._path()), None)
-        assert r["statusCode"] == 401
-
-    def test_set_user_agents_handler_delegates(self):
-        from handlers.admin_users import set_user_agents_handler
-        with patch("handlers.admin_users.handle_set_user_agents", return_value=_OK) as h:
-            set_user_agents_handler(_evt(body={"agent_ids": ["a"]}, path=self._path()), None)
-        assert h.call_args[0][:2] == ("tenant_1", "user_1")
-
-    def test_set_user_agents_handler_missing_auth(self):
-        from handlers.admin_users import set_user_agents_handler
-        r = set_user_agents_handler(_evt(headers={}, path=self._path()), None)
-        assert r["statusCode"] == 401
-
-    def test_set_user_agents_handler_invalid_json(self):
-        from handlers.admin_users import set_user_agents_handler
-        evt = _evt(path=self._path()); evt["body"] = "bad"
-        r = set_user_agents_handler(evt, None)
-        assert r["statusCode"] == 400
-
-    def test_grant_agent_access_handler_delegates(self):
-        from handlers.admin_users import grant_agent_access_handler
-        with patch("handlers.admin_users.handle_grant_agent_access", return_value=_OK) as h:
-            grant_agent_access_handler(_evt(path={**self._path(), "agent_id": "agent_a"}), None)
-        h.assert_called_once_with("tenant_1", "user_1", "agent_a", ADMIN)
-
-    def test_grant_agent_access_handler_missing_auth(self):
-        from handlers.admin_users import grant_agent_access_handler
-        r = grant_agent_access_handler(_evt(headers={}, path={**self._path(), "agent_id": "a"}), None)
-        assert r["statusCode"] == 401
-
-    def test_revoke_agent_access_handler_delegates(self):
-        from handlers.admin_users import revoke_agent_access_handler
-        with patch("handlers.admin_users.handle_revoke_agent_access", return_value=_OK) as h:
-            revoke_agent_access_handler(_evt(path={**self._path(), "agent_id": "agent_a"}), None)
-        h.assert_called_once_with("tenant_1", "user_1", "agent_a", ADMIN)
-
-    def test_revoke_agent_access_handler_missing_auth(self):
-        from handlers.admin_users import revoke_agent_access_handler
-        r = revoke_agent_access_handler(_evt(headers={}, path={**self._path(), "agent_id": "a"}), None)
+        r = list_users_handler(_evt(headers={}, path={"tenant_id": "tenant_1"}), None)
         assert r["statusCode"] == 401
 
 
 # ---------------------------------------------------------------------------
-# admin_agents
+# admin_agents (read-only list only)
 # ---------------------------------------------------------------------------
 
 class TestAdminAgentHandlers:
@@ -188,210 +203,6 @@ class TestAdminAgentHandlers:
     def test_list_agents_admin_handler_missing_auth(self):
         from handlers.admin_agents import list_agents_admin_handler
         r = list_agents_admin_handler(_evt(headers={}), None)
-        assert r["statusCode"] == 401
-
-    def test_create_agent_handler_delegates(self):
-        from handlers.admin_agents import create_agent_handler
-        with patch("handlers.admin_agents.handle_create_agent", return_value=_OK) as h:
-            create_agent_handler(_evt(body={"tenant_id": "t1"}), None)
-        assert h.call_args[0][0] == {"tenant_id": "t1"}
-
-    def test_create_agent_handler_invalid_json(self):
-        from handlers.admin_agents import create_agent_handler
-        evt = _evt(); evt["body"] = "bad"
-        r = create_agent_handler(evt, None)
-        assert r["statusCode"] == 400
-
-    def test_reissue_install_token_handler_delegates(self):
-        from handlers.admin_agents import reissue_install_token_handler
-        with patch("handlers.admin_agents.handle_reissue_install_token", return_value=_OK) as h:
-            reissue_install_token_handler(_evt(path={"agent_id": "agent_a"}), None)
-        assert h.call_args[0][0] == "agent_a"
-
-    def test_delete_agent_handler_delegates(self):
-        from handlers.admin_agents import delete_agent_handler
-        with patch("handlers.admin_agents.handle_delete_agent", return_value=_OK) as h:
-            delete_agent_handler(_evt(path={"agent_id": "agent_a"}), None)
-        h.assert_called_once_with("agent_a", ADMIN)
-
-    def test_get_agent_tags_handler_delegates(self):
-        from handlers.admin_agents import get_agent_tags_handler
-        with patch("handlers.admin_agents.handle_get_agent_tags", return_value=_OK) as h:
-            get_agent_tags_handler(_evt(path={"agent_id": "agent_a"}), None)
-        h.assert_called_once_with("agent_a", ADMIN)
-
-    def test_set_agent_tags_handler_delegates(self):
-        from handlers.admin_agents import set_agent_tags_handler
-        with patch("handlers.admin_agents.handle_set_agent_tags", return_value=_OK) as h:
-            set_agent_tags_handler(_evt(body={"tags": ["env:prod"]}, path={"agent_id": "agent_a"}), None)
-        assert h.call_args[0][0] == "agent_a"
-        assert h.call_args[0][1] == {"tags": ["env:prod"]}
-
-    def test_add_agent_tags_handler_delegates(self):
-        from handlers.admin_agents import add_agent_tags_handler
-        with patch("handlers.admin_agents.handle_add_agent_tags", return_value=_OK) as h:
-            add_agent_tags_handler(_evt(body={"tags": ["env:prod"]}, path={"agent_id": "agent_a"}), None)
-        assert h.call_args[0][0] == "agent_a"
-
-    def test_remove_agent_tags_handler_delegates(self):
-        from handlers.admin_agents import remove_agent_tags_handler
-        with patch("handlers.admin_agents.handle_remove_agent_tags", return_value=_OK) as h:
-            remove_agent_tags_handler(_evt(body={"tags": ["env:prod"]}, path={"agent_id": "agent_a"}), None)
-        assert h.call_args[0][0] == "agent_a"
-
-    def test_create_agent_handler_missing_auth(self):
-        from handlers.admin_agents import create_agent_handler
-        r = create_agent_handler(_evt(headers={}), None)
-        assert r["statusCode"] == 401
-
-    def test_reissue_install_token_missing_auth(self):
-        from handlers.admin_agents import reissue_install_token_handler
-        r = reissue_install_token_handler(_evt(headers={}, path={"agent_id": "a"}), None)
-        assert r["statusCode"] == 401
-
-    def test_reissue_install_token_invalid_json(self):
-        from handlers.admin_agents import reissue_install_token_handler
-        evt = _evt(path={"agent_id": "a"}); evt["body"] = "bad"
-        r = reissue_install_token_handler(evt, None)
-        assert r["statusCode"] == 400
-
-    def test_delete_agent_missing_auth(self):
-        from handlers.admin_agents import delete_agent_handler
-        r = delete_agent_handler(_evt(headers={}, path={"agent_id": "a"}), None)
-        assert r["statusCode"] == 401
-
-    def test_revoke_agent_handler_delegates(self):
-        from handlers.admin_agents import revoke_agent_handler
-        with patch("handlers.admin_agents.handle_revoke_agent", return_value=_OK) as h:
-            revoke_agent_handler(_evt(path={"agent_id": "agent_a"}), None)
-        h.assert_called_once_with("agent_a", ADMIN)
-
-    def test_revoke_agent_missing_auth(self):
-        from handlers.admin_agents import revoke_agent_handler
-        r = revoke_agent_handler(_evt(headers={}, path={"agent_id": "a"}), None)
-        assert r["statusCode"] == 401
-
-    def test_remove_agent_handler_delegates(self):
-        from handlers.admin_agents import remove_agent_handler
-        with patch("handlers.admin_agents.handle_remove_agent", return_value=_OK) as h:
-            remove_agent_handler(_evt(path={"agent_id": "agent_a"}), None)
-        h.assert_called_once_with("agent_a", ADMIN)
-
-    def test_remove_agent_missing_auth(self):
-        from handlers.admin_agents import remove_agent_handler
-        r = remove_agent_handler(_evt(headers={}, path={"agent_id": "a"}), None)
-        assert r["statusCode"] == 401
-
-    def test_get_agent_tags_missing_auth(self):
-        from handlers.admin_agents import get_agent_tags_handler
-        r = get_agent_tags_handler(_evt(headers={}), None)
-        assert r["statusCode"] == 401
-
-    def test_set_agent_tags_missing_auth(self):
-        from handlers.admin_agents import set_agent_tags_handler
-        r = set_agent_tags_handler(_evt(headers={}, path={"agent_id": "a"}), None)
-        assert r["statusCode"] == 401
-
-    def test_set_agent_tags_invalid_json(self):
-        from handlers.admin_agents import set_agent_tags_handler
-        evt = _evt(path={"agent_id": "a"}); evt["body"] = "bad"
-        r = set_agent_tags_handler(evt, None)
-        assert r["statusCode"] == 400
-
-    def test_add_agent_tags_missing_auth(self):
-        from handlers.admin_agents import add_agent_tags_handler
-        r = add_agent_tags_handler(_evt(headers={}, path={"agent_id": "a"}), None)
-        assert r["statusCode"] == 401
-
-    def test_add_agent_tags_invalid_json(self):
-        from handlers.admin_agents import add_agent_tags_handler
-        evt = _evt(path={"agent_id": "a"}); evt["body"] = "bad"
-        r = add_agent_tags_handler(evt, None)
-        assert r["statusCode"] == 400
-
-    def test_remove_agent_tags_missing_auth(self):
-        from handlers.admin_agents import remove_agent_tags_handler
-        r = remove_agent_tags_handler(_evt(headers={}, path={"agent_id": "a"}), None)
-        assert r["statusCode"] == 401
-
-    def test_remove_agent_tags_invalid_json(self):
-        from handlers.admin_agents import remove_agent_tags_handler
-        evt = _evt(path={"agent_id": "a"}); evt["body"] = "bad"
-        r = remove_agent_tags_handler(evt, None)
-        assert r["statusCode"] == 400
-
-
-# ---------------------------------------------------------------------------
-# admin_policy
-# ---------------------------------------------------------------------------
-
-class TestAdminPolicyHandlers:
-    def test_get_policy_handler_delegates(self):
-        from handlers.admin_policy import get_policy_handler
-        with patch("handlers.admin_policy.handle_get_policy", return_value=_OK) as h:
-            get_policy_handler(_evt(path={"agent_id": "agent_a"}), None)
-        h.assert_called_once_with("agent_a", ADMIN)
-
-    def test_get_policy_handler_missing_auth(self):
-        from handlers.admin_policy import get_policy_handler
-        r = get_policy_handler(_evt(headers={}), None)
-        assert r["statusCode"] == 401
-
-    def test_set_mode_handler_delegates(self):
-        from handlers.admin_policy import set_mode_handler
-        with patch("handlers.admin_policy.handle_set_mode", return_value=_OK) as h:
-            set_mode_handler(_evt(body={"mode": "readonly"}, path={"agent_id": "agent_a"}), None)
-        h.assert_called_once_with("agent_a", {"mode": "readonly"}, ADMIN)
-
-    def test_set_mode_handler_missing_auth(self):
-        from handlers.admin_policy import set_mode_handler
-        r = set_mode_handler(_evt(headers={}, path={"agent_id": "a"}), None)
-        assert r["statusCode"] == 401
-
-    def test_set_mode_handler_invalid_json(self):
-        from handlers.admin_policy import set_mode_handler
-        evt = _evt(path={"agent_id": "a"}); evt["body"] = "bad"
-        r = set_mode_handler(evt, None)
-        assert r["statusCode"] == 400
-
-
-# ---------------------------------------------------------------------------
-# admin_approvals
-# ---------------------------------------------------------------------------
-
-class TestAdminApprovalHandlers:
-    def test_list_approvals_handler_delegates(self):
-        from handlers.admin_approvals import list_approvals_handler
-        with patch("handlers.admin_approvals.handle_list_approvals", return_value=_OK) as h:
-            list_approvals_handler(_evt(qs={"tenant_id": "t1"}), None)
-        h.assert_called_once_with({"tenant_id": "t1"}, ADMIN)
-
-    def test_list_approvals_handler_missing_auth(self):
-        from handlers.admin_approvals import list_approvals_handler
-        r = list_approvals_handler(_evt(headers={}), None)
-        assert r["statusCode"] == 401
-
-    def test_review_approval_handler_delegates_approve(self):
-        from handlers.admin_approvals import review_approval_handler
-        with patch("handlers.admin_approvals.handle_review_approval", return_value=_OK) as h:
-            review_approval_handler(
-                _evt(body={"duration": "8h"}, path={"approval_id": "appr_1", "action": "approve"}),
-                None,
-            )
-        h.assert_called_once_with("appr_1", "approve", ADMIN, {"duration": "8h"})
-
-    def test_review_approval_handler_delegates_deny(self):
-        from handlers.admin_approvals import review_approval_handler
-        with patch("handlers.admin_approvals.handle_review_approval", return_value=_OK) as h:
-            review_approval_handler(
-                _evt(path={"approval_id": "appr_1", "action": "deny"}),
-                None,
-            )
-        h.assert_called_once_with("appr_1", "deny", ADMIN, {})
-
-    def test_review_approval_handler_missing_auth(self):
-        from handlers.admin_approvals import review_approval_handler
-        r = review_approval_handler(_evt(headers={}, path={"approval_id": "a", "action": "approve"}), None)
         assert r["statusCode"] == 401
 
 
@@ -435,29 +246,180 @@ class TestTenantApprovalHandlers:
         r = list_agent_approved_handler(_evt(headers={}, path={"agent_id": "a"}), None)
         assert r["statusCode"] == 401
 
+    def test_list_all_approvals_handler_delegates(self):
+        from handlers.tenant_approvals import list_all_approvals_handler
+        with patch("handlers.tenant_approvals.handle_tenant_list_all_approvals", return_value=_OK) as h:
+            list_all_approvals_handler({**_evt(qs={"status": "pending"}), "headers": {"authorization": "Bearer user-tok"}}, None)
+        h.assert_called_once_with({"status": "pending"}, "user-tok")
 
-# ---------------------------------------------------------------------------
-# admin_jobs
-# ---------------------------------------------------------------------------
-
-class TestAdminJobsHandlers:
-    def test_list_jobs_admin_handler_delegates(self):
-        from handlers.admin_jobs import list_jobs_admin_handler
-        with patch("handlers.admin_jobs.handle_list_jobs_admin", return_value=_OK) as h:
-            list_jobs_admin_handler(_evt(qs={"tenant_id": "t1", "limit": "10"}), None)
-        assert h.call_args[0][2] == "t1"  # tenant_id
-        assert h.call_args[0][4] == 10    # limit
-
-    def test_list_jobs_admin_handler_missing_auth(self):
-        from handlers.admin_jobs import list_jobs_admin_handler
-        r = list_jobs_admin_handler(_evt(headers={}), None)
+    def test_list_all_approvals_handler_missing_auth(self):
+        from handlers.tenant_approvals import list_all_approvals_handler
+        r = list_all_approvals_handler(_evt(headers={}), None)
         assert r["statusCode"] == 401
 
-    def test_list_jobs_admin_handler_bad_limit_defaults(self):
-        from handlers.admin_jobs import list_jobs_admin_handler
-        with patch("handlers.admin_jobs.handle_list_jobs_admin", return_value=_OK) as h:
-            list_jobs_admin_handler(_evt(qs={"tenant_id": "t1", "limit": "bad"}), None)
-        assert h.call_args[0][4] == 20  # falls back to default
+    def test_pre_approve_handler_delegates(self):
+        from handlers.tenant_approvals import pre_approve_handler
+        with patch("handlers.tenant_approvals.handle_tenant_create_approval", return_value=_OK) as h:
+            pre_approve_handler({**_evt(body={"agent_id": "a", "command": "ls"}), "headers": {"authorization": "Bearer user-tok"}}, None)
+        assert h.call_args[0][0] == {"agent_id": "a", "command": "ls"}
+
+    def test_pre_approve_handler_missing_auth(self):
+        from handlers.tenant_approvals import pre_approve_handler
+        r = pre_approve_handler(_evt(headers={}), None)
+        assert r["statusCode"] == 401
+
+    def test_pre_approve_handler_invalid_json(self):
+        from handlers.tenant_approvals import pre_approve_handler
+        evt = {**_evt(), "headers": {"authorization": "Bearer tok"}}; evt["body"] = "bad"
+        r = pre_approve_handler(evt, None)
+        assert r["statusCode"] == 400
+
+    def test_review_approval_handler_delegates(self):
+        from handlers.tenant_approvals import review_approval_handler
+        with patch("handlers.tenant_approvals.handle_tenant_review_approval", return_value=_OK) as h:
+            review_approval_handler(
+                {**_evt(body={"duration": "8h"}, path={"approval_id": "appr_1", "action": "approve"}),
+                 "headers": {"authorization": "Bearer user-tok"}},
+                None,
+            )
+        h.assert_called_once_with("appr_1", "approve", "user-tok", {"duration": "8h"})
+
+    def test_review_approval_handler_missing_auth(self):
+        from handlers.tenant_approvals import review_approval_handler
+        r = review_approval_handler(_evt(headers={}, path={"approval_id": "a", "action": "approve"}), None)
+        assert r["statusCode"] == 401
+
+    def test_delete_approval_handler_delegates(self):
+        from handlers.tenant_approvals import delete_approval_handler
+        with patch("handlers.tenant_approvals.handle_tenant_delete_approval", return_value=_OK) as h:
+            delete_approval_handler({**_evt(path={"approval_id": "appr_1"}), "headers": {"authorization": "Bearer user-tok"}}, None)
+        h.assert_called_once_with("appr_1", "user-tok")
+
+    def test_delete_approval_handler_missing_auth(self):
+        from handlers.tenant_approvals import delete_approval_handler
+        r = delete_approval_handler(_evt(headers={}, path={"approval_id": "a"}), None)
+        assert r["statusCode"] == 401
+
+
+# ---------------------------------------------------------------------------
+# tenant_agents
+# ---------------------------------------------------------------------------
+
+TENANT_TOK = "user-jwt-tok"
+_TEVT_PATH = {"agent_id": "agent_a"}
+
+class TestTenantAgentHandlers:
+    def _evt_t(self, body=None, path=None, qs=None):
+        return {
+            "headers": {"authorization": f"Bearer {TENANT_TOK}", "host": "api.example.com"},
+            "body": json.dumps(body) if body is not None else None,
+            "pathParameters": path or {},
+            "queryStringParameters": qs or {},
+        }
+
+    def test_create_agent_handler_delegates(self):
+        from handlers.tenant_agents import create_tenant_agent_handler
+        with patch("handlers.tenant_agents.handle_create_tenant_agent", return_value=_OK) as h:
+            create_tenant_agent_handler(self._evt_t(body={"mode": "wild"}), None)
+        assert h.call_args[0][0] == {"mode": "wild"}
+        assert h.call_args[0][1] == TENANT_TOK
+
+    def test_create_agent_handler_missing_auth(self):
+        from handlers.tenant_agents import create_tenant_agent_handler
+        r = create_tenant_agent_handler({**self._evt_t(), "headers": {}}, None)
+        assert r["statusCode"] == 401
+
+    def test_create_agent_handler_invalid_json(self):
+        from handlers.tenant_agents import create_tenant_agent_handler
+        evt = self._evt_t(); evt["body"] = "bad"
+        r = create_tenant_agent_handler(evt, None)
+        assert r["statusCode"] == 400
+
+    def test_reissue_install_token_handler_delegates(self):
+        from handlers.tenant_agents import reissue_tenant_install_token_handler
+        with patch("handlers.tenant_agents.handle_reissue_tenant_install_token", return_value=_OK) as h:
+            reissue_tenant_install_token_handler(self._evt_t(path=_TEVT_PATH), None)
+        assert h.call_args[0][0] == "agent_a"
+        assert h.call_args[0][2] == TENANT_TOK
+
+    def test_reissue_install_token_handler_missing_auth(self):
+        from handlers.tenant_agents import reissue_tenant_install_token_handler
+        r = reissue_tenant_install_token_handler({**self._evt_t(path=_TEVT_PATH), "headers": {}}, None)
+        assert r["statusCode"] == 401
+
+    def test_reissue_install_token_handler_invalid_json(self):
+        from handlers.tenant_agents import reissue_tenant_install_token_handler
+        evt = self._evt_t(path=_TEVT_PATH); evt["body"] = "bad"
+        r = reissue_tenant_install_token_handler(evt, None)
+        assert r["statusCode"] == 400
+
+    def test_revoke_agent_handler_delegates(self):
+        from handlers.tenant_agents import revoke_tenant_agent_handler
+        with patch("handlers.tenant_agents.handle_revoke_tenant_agent", return_value=_OK) as h:
+            revoke_tenant_agent_handler(self._evt_t(path=_TEVT_PATH), None)
+        h.assert_called_once_with("agent_a", TENANT_TOK)
+
+    def test_revoke_agent_handler_missing_auth(self):
+        from handlers.tenant_agents import revoke_tenant_agent_handler
+        r = revoke_tenant_agent_handler({**self._evt_t(path=_TEVT_PATH), "headers": {}}, None)
+        assert r["statusCode"] == 401
+
+    def test_delete_agent_handler_delegates(self):
+        from handlers.tenant_agents import delete_tenant_agent_handler
+        with patch("handlers.tenant_agents.handle_delete_tenant_agent", return_value=_OK) as h:
+            delete_tenant_agent_handler(self._evt_t(path=_TEVT_PATH), None)
+        h.assert_called_once_with("agent_a", TENANT_TOK)
+
+    def test_delete_agent_handler_missing_auth(self):
+        from handlers.tenant_agents import delete_tenant_agent_handler
+        r = delete_tenant_agent_handler({**self._evt_t(path=_TEVT_PATH), "headers": {}}, None)
+        assert r["statusCode"] == 401
+
+    def test_remove_agent_handler_delegates(self):
+        from handlers.tenant_agents import remove_tenant_agent_handler
+        with patch("handlers.tenant_agents.handle_remove_tenant_agent", return_value=_OK) as h:
+            remove_tenant_agent_handler(self._evt_t(path=_TEVT_PATH), None)
+        h.assert_called_once_with("agent_a", TENANT_TOK)
+
+    def test_remove_agent_handler_missing_auth(self):
+        from handlers.tenant_agents import remove_tenant_agent_handler
+        r = remove_tenant_agent_handler({**self._evt_t(path=_TEVT_PATH), "headers": {}}, None)
+        assert r["statusCode"] == 401
+
+    def test_set_tags_handler_delegates(self):
+        from handlers.tenant_agents import set_tenant_agent_tags_handler
+        with patch("handlers.tenant_agents.handle_set_tenant_agent_tags", return_value=_OK) as h:
+            set_tenant_agent_tags_handler(self._evt_t(body={"tags": ["env:prod"]}, path=_TEVT_PATH), None)
+        assert h.call_args[0][0] == "agent_a"
+        assert h.call_args[0][1] == {"tags": ["env:prod"]}
+
+    def test_set_tags_handler_missing_auth(self):
+        from handlers.tenant_agents import set_tenant_agent_tags_handler
+        r = set_tenant_agent_tags_handler({**self._evt_t(path=_TEVT_PATH), "headers": {}}, None)
+        assert r["statusCode"] == 401
+
+    def test_set_tags_handler_invalid_json(self):
+        from handlers.tenant_agents import set_tenant_agent_tags_handler
+        evt = self._evt_t(path=_TEVT_PATH); evt["body"] = "bad"
+        r = set_tenant_agent_tags_handler(evt, None)
+        assert r["statusCode"] == 400
+
+    def test_set_mode_handler_delegates(self):
+        from handlers.tenant_agents import set_tenant_agent_mode_handler
+        with patch("handlers.tenant_agents.handle_set_tenant_agent_mode", return_value=_OK) as h:
+            set_tenant_agent_mode_handler(self._evt_t(body={"mode": "readonly"}, path=_TEVT_PATH), None)
+        h.assert_called_once_with("agent_a", {"mode": "readonly"}, TENANT_TOK)
+
+    def test_set_mode_handler_missing_auth(self):
+        from handlers.tenant_agents import set_tenant_agent_mode_handler
+        r = set_tenant_agent_mode_handler({**self._evt_t(path=_TEVT_PATH), "headers": {}}, None)
+        assert r["statusCode"] == 401
+
+    def test_set_mode_handler_invalid_json(self):
+        from handlers.tenant_agents import set_tenant_agent_mode_handler
+        evt = self._evt_t(path=_TEVT_PATH); evt["body"] = "bad"
+        r = set_tenant_agent_mode_handler(evt, None)
+        assert r["statusCode"] == 400
 
 
 # ---------------------------------------------------------------------------
@@ -681,7 +643,7 @@ class TestMeHandler:
 class TestHeartbeatHandler:
     def test_delegates_and_returns_result(self):
         from handlers.heartbeat import heartbeat_handler
-        result = {"marked_inactive": 2, "expired_jobs": 1, "expired_approvals": 0, "deleted_approvals": 0}
+        result = {"marked_inactive": 2, "expired_jobs": 1, "expired_approvals": 0, "deleted_approvals": 0, "deleted_jobs": 0, "deleted_audit_logs": 0, "deleted_agent_history": 0}
         with patch("handlers.heartbeat.handle_heartbeat_check", return_value=result):
             r = heartbeat_handler({}, None)
         assert r == result
