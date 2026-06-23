@@ -7,6 +7,16 @@ reach exec -- hostname
 reach exec --agent prod -- docker ps
 ```
 
+> ### ⚠️ What Reach is — and isn't
+>
+> Reach gives AI agents **controlled, audited** command execution on machines you own. It is **not a sandbox for arbitrary untrusted commands.**
+>
+> - **`wild` mode can damage machines** — reboots, deletes, package installs all run. Use it only on personal/dev boxes where you're the sole user.
+> - **For production, use `approved` mode** — only commands you've allowlisted execute; everything else is blocked and queued for review.
+> - Reach is **not a security boundary against the machine's own owner/root** — whoever controls the host can read the agent's token.
+>
+> See **[SECURITY.md](SECURITY.md)** for the full threat model: exactly what Reach does and does not protect against.
+
 ---
 
 ## What can I use this for?
@@ -109,7 +119,7 @@ pip install https://reach-releases.s3.amazonaws.com/cli/v0.1.0/reach-0.1.0-py3-n
 Log in with an API token from the tenant console (**API Tokens → New token**):
 
 ```bash
-reach login --api-url "<your-api-url>" --token "<your-api-token>"
+reach login --api-url "<your-api-url>" --api-key "<your-api-token>"
 ```
 
 ---
@@ -180,8 +190,8 @@ reach alias list
 If you access more than one reach deployment (e.g. a home server and a work server), use profiles to hold multiple credentials:
 
 ```bash
-reach login --profile home --api-url "<home-url>" --token "<home-token>"
-reach login --profile work --api-url "<work-url>" --token "<work-token>"
+reach login --profile home --api-url "<home-url>" --api-key "<home-token>"
+reach login --profile work --api-url "<work-url>" --api-key "<work-token>"
 
 reach profile list       # see all profiles, active one is marked
 reach profile use home   # switch to home deployment
@@ -381,8 +391,8 @@ Wild mode is for personal machines, dev environments, and break-glass access. Do
 | Command | Description |
 |---|---|
 | **Auth & setup** | |
-| `reach login --api-url <url> --token <token>` | Store credentials (saves to `default` profile) |
-| `reach login --api-url <url> --token <token> --profile <name>` | Store credentials under a named profile |
+| `reach login --api-url <url> --api-key <token>` | Store credentials (saves to `default` profile) |
+| `reach login --api-url <url> --api-key <token> --profile <name>` | Store credentials under a named profile |
 | `reach profile list` | List all profiles |
 | `reach profile use <name>` | Switch active profile |
 | `reach profile rename <old> <new>` | Rename a profile |

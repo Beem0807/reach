@@ -78,7 +78,7 @@ def config_show():
 @app.command()
 def login(
     api_url: str = typer.Option(..., "--api-url", help="Backend API URL"),
-    api_key: str = typer.Option(..., "--api-key", "--token", help="API key (from the tenant console → API Tokens)"),
+    api_key: str = typer.Option(..., "--api-key", help="API key (from the tenant console → API Tokens)"),
     profile: str = typer.Option("default", "--profile", "-p", help="Profile name to save under"),
 ):
     """Store API URL and API key. Use --profile to manage multiple tenants."""

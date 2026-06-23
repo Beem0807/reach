@@ -85,7 +85,7 @@ def _client() -> tuple[ReachClient, str]:
     token = cfg.get("tenant_token")
     if not api_url or not token:
         raise RuntimeError(
-            "reach is not configured. Run 'reach login --api-url <url> --token <tok>' first."
+            "reach is not configured. Run 'reach login --api-url <url> --api-key <key>' first."
         )
     default_agent = cfg.get("default_agent_id", "")
     return ReachClient(api_url, token), default_agent

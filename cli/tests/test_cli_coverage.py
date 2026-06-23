@@ -109,7 +109,7 @@ class TestLoginOverwriteCancel:
                    return_value={"active_profile": "default", "profiles": {"default": existing}}), \
              patch("reach.main.cfg_module.save") as mock_save:
             result = runner.invoke(
-                app, ["login", "--api-url", "https://new.com", "--token", "tok_new"],
+                app, ["login", "--api-url", "https://new.com", "--api-key", "tok_new"],
                 input="n\n",
             )
         assert result.exit_code == 0

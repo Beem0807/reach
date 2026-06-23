@@ -138,7 +138,7 @@ class TestLogin:
     def test_saves_new_profile(self):
         with patch("reach.main.cfg_module.load", return_value={"active_profile": "default", "profiles": {}}), \
              patch("reach.main.cfg_module.save") as mock_save:
-            result = runner.invoke(app, ["login", "--api-url", "https://api.example.com", "--token", "tok_abc"])
+            result = runner.invoke(app, ["login", "--api-url", "https://api.example.com", "--api-key", "tok_abc"])
         assert result.exit_code == 0
         assert "Logged in" in result.output
         mock_save.assert_called_once()
@@ -149,7 +149,7 @@ class TestLogin:
             saved.update(data)
         with patch("reach.main.cfg_module.load", return_value={"active_profile": "default", "profiles": {}}), \
              patch("reach.main.cfg_module.save", side_effect=_save):
-            runner.invoke(app, ["login", "--api-url", "https://api.example.com/", "--token", "tok"])
+            runner.invoke(app, ["login", "--api-url", "https://api.example.com/", "--api-key", "tok"])
         assert saved["profiles"]["default"]["api_url"] == "https://api.example.com"
 
     def test_saves_api_key_not_tenant_token(self):
@@ -158,7 +158,7 @@ class TestLogin:
             saved.update(data)
         with patch("reach.main.cfg_module.load", return_value={"active_profile": "default", "profiles": {}}), \
              patch("reach.main.cfg_module.save", side_effect=_save):
-            runner.invoke(app, ["login", "--api-url", "https://api.example.com", "--token", "tok_abc"])
+            runner.invoke(app, ["login", "--api-url", "https://api.example.com", "--api-key", "tok_abc"])
         profile = saved["profiles"]["default"]
         assert profile.get("api_key") == "tok_abc"
         assert "tenant_token" not in profile
@@ -170,7 +170,7 @@ class TestLogin:
         existing = {"api_url": "https://old.example.com", "tenant_token": "old_tok"}
         with patch("reach.main.cfg_module.load", return_value={"active_profile": "default", "profiles": {"default": existing}}), \
              patch("reach.main.cfg_module.save", side_effect=_save):
-            runner.invoke(app, ["login", "--api-url", "https://api.example.com", "--token", "new_tok"], input="y\n")
+            runner.invoke(app, ["login", "--api-url", "https://api.example.com", "--api-key", "new_tok"], input="y\n")
         profile = saved["profiles"]["default"]
         assert "tenant_token" not in profile
         assert profile.get("api_key") == "new_tok"
@@ -181,7 +181,7 @@ class TestLogin:
             saved.update(data)
         with patch("reach.main.cfg_module.load", return_value={"active_profile": "default", "profiles": {}}), \
              patch("reach.main.cfg_module.save", side_effect=_save):
-            runner.invoke(app, ["login", "--api-url", "https://api.example.com", "--token", "tok", "--profile", "prod"])
+            runner.invoke(app, ["login", "--api-url", "https://api.example.com", "--api-key", "tok", "--profile", "prod"])
         assert "prod" in saved.get("profiles", {})
 
 

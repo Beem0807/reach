@@ -37,6 +37,10 @@ if [[ -z "$VERSION" ]]; then
 fi
 echo "==> Version: $VERSION"
 
+# Build metadata stamped into the image's OCI labels.
+VCS_REF=$(git -C "$ROOT_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)
+BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
 # ---------------------------------------------------------------------------
 # Dependency checks
 # ---------------------------------------------------------------------------
@@ -61,7 +65,7 @@ echo "==> Running backend tests..."
 (
   cd "$ROOT_DIR/backend"
   STORAGE_BACKEND=postgres DATABASE_URL="sqlite:///:memory:" \
-    ADMIN_TOKEN=test-admin-token TOKEN_PEPPER=test-pepper \
+    ADMIN_PASSWORD=test-password TOKEN_PEPPER=test-pepper SESSION_SIGNING_KEY=test-signing-key \
     "${UV:-$(command -v uv || echo uv)}" run --with-requirements requirements-dev.txt pytest tests/ -q --tb=short
 )
 
@@ -80,6 +84,9 @@ if [[ "$PUSH" == true ]]; then
   docker buildx build \
     --platform linux/amd64,linux/arm64 \
     $NO_CACHE \
+    --build-arg VERSION="$VERSION" \
+    --build-arg VCS_REF="$VCS_REF" \
+    --build-arg BUILD_DATE="$BUILD_DATE" \
     -t "$IMAGE:$VERSION" \
     -t "$IMAGE:latest" \
     --push \
@@ -93,6 +100,9 @@ else
   docker buildx build \
     --platform "linux/$NATIVE" \
     $NO_CACHE \
+    --build-arg VERSION="$VERSION" \
+    --build-arg VCS_REF="$VCS_REF" \
+    --build-arg BUILD_DATE="$BUILD_DATE" \
     -t "$IMAGE:$VERSION" \
     -t "$IMAGE:latest" \
     --load \

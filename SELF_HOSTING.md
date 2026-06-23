@@ -279,7 +279,7 @@ Choose **Tenant Console** at the login screen, enter the tenant name, username, 
 Go to **API Tokens → New token**, give it a name, and copy the token value (shown once). Run:
 
 ```bash
-reach login --api-url "<your-api-url>" --token "<your-api-token>"
+reach login --api-url "<your-api-url>" --api-key "<your-api-token>"
 ```
 
 For automation, see [API.md](API.md) - specifically `POST /admin/login`, `POST /admin/tenants`, and `POST /admin/tenants/{id}/admin-users`.
