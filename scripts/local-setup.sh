@@ -54,7 +54,8 @@
 #   - docker + docker compose
 #   - curl
 #   - openssl
-#   - python3
+#   - jq
+#   - python3 3.10+  (only for the optional Reach CLI install; setup itself does not need it)
 #
 # Optional (for exposing the backend publicly):
 #
@@ -137,9 +138,16 @@ prompt_yes_no() {
   local label="$1"
   local default="${2:-N}"
   local value=""
+  local hint
+
+  # Show the default with the standard [Y/n] / [y/N] convention (capital = default).
+  case "$default" in
+    y|Y|yes|YES) hint="[Y/n]" ;;
+    *)           hint="[y/N]" ;;
+  esac
 
   while true; do
-    read -rp "  $label [$default]: " value < /dev/tty
+    read -rp "  $label $hint: " value < /dev/tty
     value="${value:-$default}"
 
     case "$value" in
@@ -214,7 +222,7 @@ prompt_username() {
     else
       read -rp "  $label: " value < /dev/tty
     fi
-    value="${value,,}"  # lowercase
+    value="$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')"  # lowercase (portable; macOS ships bash 3.2)
     [[ -z "$value" ]] && { echo "    Username cannot be empty." > /dev/tty; continue; }
     [[ ${#value} -lt 2 ]]  && { echo "    Username must be at least 2 characters." > /dev/tty; continue; }
     [[ ${#value} -gt 32 ]] && { echo "    Username must be 32 characters or fewer." > /dev/tty; continue; }
@@ -226,26 +234,20 @@ prompt_username() {
   done
 }
 
+# Build a flat JSON object from key/value pairs using jq. "true"/"false" become
+# JSON booleans; everything else is a JSON string (jq handles all escaping).
 mkjson() {
-  python3 -c '
-import json, sys
-d = {}
-args = sys.argv[1:]
-for i in range(0, len(args), 2):
-    k = args[i]
-    v = args[i + 1]
-    if v.lower() == "true":
-        d[k] = True
-    elif v.lower() == "false":
-        d[k] = False
-    else:
-        d[k] = v
-print(json.dumps(d))
-' "$@"
+  jq -nc '
+    reduce range(0; ($ARGS.positional | length); 2) as $i
+      ({}; .[$ARGS.positional[$i]] =
+        ($ARGS.positional[$i + 1]
+          | if . == "true" then true elif . == "false" then false else . end))
+  ' --args "$@"
 }
 
+# Extract a value from JSON on stdin with a jq filter, e.g. json_get '.token'.
 json_get() {
-  python3 -c "import sys,json; print(json.load(sys.stdin)$1)"
+  jq -r "$1"
 }
 
 load_env_file() {
@@ -263,6 +265,12 @@ load_env_file() {
   : "${JOB_RETENTION_DAYS:?JOB_RETENTION_DAYS missing from env file}"
   : "${AUDIT_RETENTION_DAYS:?AUDIT_RETENTION_DAYS missing from env file}"
   : "${AGENT_HISTORY_RETENTION_DAYS:?AGENT_HISTORY_RETENTION_DAYS missing from env file}"
+
+  # Version pins were added later; default them for older env files so downstream
+  # refs are safe and unset means "track latest / newest chart".
+  AGENT_VERSION="${AGENT_VERSION:-latest}"
+  CHART_VERSION="${CHART_VERSION:-}"
+  RELEASES_CHART_REPO="${RELEASES_CHART_REPO:-}"
 
   # SESSION_SIGNING_KEY was added after the initial release; generate and persist
   # one for older env files so session tokens aren't signed with a weak default.
@@ -296,6 +304,11 @@ NGINXEOF
 }
 
 write_compose_file() {
+  # Only emit RELEASES_CHART_REPO when set; an empty value would override the
+  # backend's default (derived from RELEASES_S3_BASE) with an empty string.
+  local chart_repo_env=""
+  [[ -n "${RELEASES_CHART_REPO:-}" ]] && chart_repo_env="
+      RELEASES_CHART_REPO: \"${RELEASES_CHART_REPO}\""
   cat > "$COMPOSE_FILE" <<EOF
 services:
   db:
@@ -324,6 +337,8 @@ services:
       JOB_RETENTION_DAYS: "$JOB_RETENTION_DAYS"
       AUDIT_RETENTION_DAYS: "$AUDIT_RETENTION_DAYS"
       AGENT_HISTORY_RETENTION_DAYS: "$AGENT_HISTORY_RETENTION_DAYS"
+      AGENT_VERSION: "${AGENT_VERSION:-latest}"
+      CHART_VERSION: "${CHART_VERSION:-}"${chart_repo_env}
     depends_on:
       db:
         condition: service_healthy
@@ -353,12 +368,16 @@ APPROVAL_RETENTION_DAYS=${APPROVAL_RETENTION_DAYS}
 JOB_RETENTION_DAYS=${JOB_RETENTION_DAYS}
 AUDIT_RETENTION_DAYS=${AUDIT_RETENTION_DAYS}
 AGENT_HISTORY_RETENTION_DAYS=${AGENT_HISTORY_RETENTION_DAYS}
+AGENT_VERSION=${AGENT_VERSION:-latest}
+CHART_VERSION=${CHART_VERSION:-}
+RELEASES_CHART_REPO=${RELEASES_CHART_REPO:-}
 TENANT_ID=${TENANT_ID:-}
 TENANT_NAME=${SETUP_TENANT:-${TENANT_NAME:-}}
 USERNAME=${SETUP_USERNAME:-${USERNAME:-}}
 API_KEY=${API_KEY:-}
 CREATE_AGENT=${CREATE_AGENT:-}
 AGENT_ID=${AGENT_ID:-}
+AGENT_TYPE=${AGENT_TYPE:-}
 AGENT_MODE=${AGENT_MODE:-}
 GRANT_DOCKER=${GRANT_DOCKER:-}
 GRANT_SERVICE_MGMT=${GRANT_SERVICE_MGMT:-}
@@ -518,17 +537,12 @@ case "${1:-}" in
     # Docker containers
     ALL_RUNNING=true
     for svc in db backend nginx; do
+      # compose --format json is JSONL (one object per line) or a single array;
+      # -s slurp + flatten handles both, then pick this service's State.
       state=$($COMPOSE -f "$COMPOSE_FILE" ps --format json 2>/dev/null \
-        | python3 -c "
-import sys,json
-lines=[l for l in sys.stdin.read().strip().splitlines() if l]
-for line in lines:
-    d=json.loads(line)
-    if d.get('Service') == '$svc':
-        print(d.get('State','unknown'))
-        sys.exit(0)
-print('missing')
-" 2>/dev/null || echo "unknown")
+        | jq -rs --arg s "$svc" 'flatten | map(select(.Service == $s)) | (.[0].State // "missing")' \
+        2>/dev/null || echo "unknown")
+      [[ -z "$state" ]] && state="unknown"
       if [[ "$state" == "running" ]]; then
         ok "container: $svc ($state)"
       else
@@ -559,7 +573,7 @@ print('missing')
     if [[ -n "${API_KEY:-}" && -n "${API_URL:-}" ]]; then
       me_resp=$(curl -sf -H "Authorization: Bearer $API_KEY" "$LOCAL_URL/me" 2>/dev/null || true)
       if [[ -n "$me_resp" ]]; then
-        username=$(echo "$me_resp" | python3 -c "import sys,json; print(json.load(sys.stdin).get('username','?'))" 2>/dev/null || echo "?")
+        username=$(echo "$me_resp" | jq -r '.username // "?"' 2>/dev/null || echo "?")
         ok "API key: valid (user: $username)"
       else
         warn "API key: auth check failed"
@@ -580,8 +594,8 @@ print('missing')
     if [[ -n "${AGENT_ID:-}" ]]; then
       agent_resp=$(curl -sf -H "Authorization: Bearer ${API_KEY:-}" "$LOCAL_URL/agents/$AGENT_ID" 2>/dev/null || true)
       if [[ -n "$agent_resp" ]]; then
-        status=$(echo "$agent_resp" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status','?'))" 2>/dev/null || echo "?")
-        hostname=$(echo "$agent_resp" | python3 -c "import sys,json; print(json.load(sys.stdin).get('hostname') or 'not claimed')" 2>/dev/null || echo "?")
+        status=$(echo "$agent_resp" | jq -r '.status // "?"' 2>/dev/null || echo "?")
+        hostname=$(echo "$agent_resp" | jq -r '.hostname // "not claimed"' 2>/dev/null || echo "?")
         if [[ "$status" == "ACTIVE" ]]; then
           ok "agent: $AGENT_ID ($hostname, $status)"
         else
@@ -691,6 +705,15 @@ print('missing')
     echo ""
     ok "Updating backend image to: $IMAGE"
 
+    echo ""
+    echo "  Agent / chart version pins (blank keeps current):"
+    read -rp "  Host agent version       [${AGENT_VERSION}]: " _av < /dev/tty
+    [[ -n "$_av" ]] && AGENT_VERSION="$_av"
+    read -rp "  K8s chart version        [${CHART_VERSION:-newest}]: " _cv < /dev/tty
+    [[ -n "$_cv" ]] && CHART_VERSION="$_cv"
+    read -rp "  Chart repo URL           [${RELEASES_CHART_REPO:-derived}]: " _cr < /dev/tty
+    [[ -n "$_cr" ]] && RELEASES_CHART_REPO="$_cr"
+
     write_nginx_config
     write_compose_file
 
@@ -715,6 +738,7 @@ print('missing')
     echo "    Database volume"
     echo "    Tenant/users/API keys/agents"
     echo "    Retention settings"
+    echo "    Agent/chart version pins"
     echo ""
     echo "  Logs:"
     echo "    $COMPOSE -f $COMPOSE_FILE logs -f"
@@ -740,10 +764,11 @@ MISSING=0
 command -v docker   &>/dev/null || { warn "docker missing  →  https://docs.docker.com/get-docker/"; MISSING=1; }
 command -v curl     &>/dev/null || { warn "curl missing";   MISSING=1; }
 command -v openssl  &>/dev/null || { warn "openssl missing"; MISSING=1; }
-command -v python3  &>/dev/null || { warn "python3 missing"; MISSING=1; }
+command -v jq       &>/dev/null || { warn "jq missing  →  https://jqlang.github.io/jq/download/"; MISSING=1; }
 
-# Reach CLI requires Python 3.10+ (mcp dependency); check early so the user
-# knows before setup starts, not after waiting for Docker.
+# python3 is NOT needed for setup (JSON is handled by jq). It is only used to
+# install the Reach CLI (a Python package requiring 3.10+). If it's missing or
+# too old, we skip the optional CLI install rather than failing setup.
 if command -v python3 &>/dev/null; then
   PY_VERSION=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
   PY_MAJOR=$(python3 -c 'import sys; print(sys.version_info.major)')
@@ -754,6 +779,9 @@ if command -v python3 &>/dev/null; then
   else
     CLI_PYTHON_OK=true
   fi
+else
+  warn "python3 not found - Reach CLI install will be skipped (setup itself does not need it)."
+  CLI_PYTHON_OK=false
 fi
 
 if docker compose version &>/dev/null 2>&1; then
@@ -802,10 +830,23 @@ SETUP_PASSWORD=$(prompt_password)
 # Agent
 echo ""
 CREATE_AGENT=$(prompt_yes_no "Create an agent?" "Y")
+AGENT_TYPE="host"
 AGENT_MODE="wild"
 GRANT_DOCKER="false"
 GRANT_SERVICE_MGMT="false"
 if [[ "$CREATE_AGENT" == "true" ]]; then
+  echo ""
+  echo "    host - a machine (Linux/macOS), installed via install.sh"
+  echo "    k8s  - a Kubernetes cluster, installed via Helm"
+  echo ""
+  while true; do
+    read -rp "  Agent type [host/k8s] (default: host): " AGENT_TYPE < /dev/tty
+    AGENT_TYPE="${AGENT_TYPE:-host}"
+    case "$AGENT_TYPE" in
+      host|k8s) break ;;
+      *) echo "    Enter host or k8s." ;;
+    esac
+  done
   echo ""
   echo "    wild     - run any command"
   echo "    readonly - read-only commands only"
@@ -819,8 +860,11 @@ if [[ "$CREATE_AGENT" == "true" ]]; then
       *) echo "    Enter wild, readonly, or approved." ;;
     esac
   done
-  GRANT_DOCKER=$(prompt_yes_no "Grant Docker access?" "N")
-  GRANT_SERVICE_MGMT=$(prompt_yes_no "Grant systemctl access?" "N")
+  # Docker / service-management grants are host-only; k8s access is governed by RBAC.
+  if [[ "$AGENT_TYPE" == "host" ]]; then
+    GRANT_DOCKER=$(prompt_yes_no "Grant Docker access?" "N")
+    GRANT_SERVICE_MGMT=$(prompt_yes_no "Grant systemctl access?" "N")
+  fi
 fi
 
 # Tunnel
@@ -836,7 +880,7 @@ if [[ "$HAS_CLOUDFLARED" == true || "$HAS_NGROK" == true ]]; then
   echo "    none        - local only"
   echo ""
   while true; do
-    read -rp "  Tunnel [cloudflared/ngrok/none]: " tunnel_choice < /dev/tty
+    read -rp "  Tunnel [cloudflared/ngrok/none] (default: none): " tunnel_choice < /dev/tty
     tunnel_choice="${tunnel_choice:-none}"
     case "$tunnel_choice" in
       cloudflared)
@@ -887,6 +931,19 @@ else
   AGENT_HISTORY_RETENTION_DAYS=30
 fi
 
+# Agent / chart version pinning (advanced). Defaults track latest / newest chart;
+# a pre-exported env var (e.g. CHART_VERSION=0.1.3 ./local-setup.sh) is honoured.
+echo ""
+AGENT_VERSION="${AGENT_VERSION:-latest}"; CHART_VERSION="${CHART_VERSION:-}"; RELEASES_CHART_REPO="${RELEASES_CHART_REPO:-}"
+PIN_VERSIONS=$(prompt_yes_no "Pin agent / chart versions? (default: latest host agent, newest chart)" "N")
+if [[ "$PIN_VERSIONS" == "true" ]]; then
+  echo ""
+  echo "  Leave blank for the default shown:"
+  AGENT_VERSION=$(prompt "Host agent version       (S3 agent/<ver>/install.sh)" "$AGENT_VERSION")
+  read -rp "  K8s chart version        (blank = newest chart): " CHART_VERSION < /dev/tty
+  read -rp "  Chart repo URL           (blank = derive from releases base): " RELEASES_CHART_REPO < /dev/tty
+fi
+
 # CLI
 echo ""
 INSTALL_CLI="false"
@@ -907,7 +964,7 @@ echo "  ────────────────────────
 echo "  Image:     $IMAGE"
 echo "  Workspace: $SETUP_TENANT"
 echo "  User:      $SETUP_USERNAME"
-echo "  Agent:     ${CREATE_AGENT} $([ "$CREATE_AGENT" = "true" ] && echo "($AGENT_MODE mode)" || true)"
+echo "  Agent:     ${CREATE_AGENT} $([ "$CREATE_AGENT" = "true" ] && echo "($AGENT_TYPE, $AGENT_MODE mode)" || true)"
 echo "  Tunnel:    ${TUNNEL_CMD:-none}"
 echo "  ────────────────────────────────────────────"
 echo ""
@@ -950,7 +1007,7 @@ if [[ "$USE_TUNNEL" == true ]]; then
       ngrok http "$API_PORT" --log=stdout > /tmp/reach-tunnel.log 2>&1 &
       for i in $(seq 1 20); do
         PUBLIC_URL=$(curl -sf http://localhost:4040/api/tunnels 2>/dev/null \
-          | python3 -c "import sys,json; print(next(x['public_url'] for x in json.load(sys.stdin)['tunnels'] if x['proto']=='https'))" 2>/dev/null || true)
+          | jq -r 'first(.tunnels[] | select(.proto == "https") | .public_url) // empty' 2>/dev/null || true)
         [[ -n "$PUBLIC_URL" ]] && break
         sleep 2
       done
@@ -970,29 +1027,25 @@ ok "Bootstrapping workspace..."
 ADMIN_TOKEN=$(request_json POST "$API_URL/admin/login" \
   "$(mkjson password "$ADMIN_PASSWORD")" \
   -H "Content-Type: application/json" \
-  | json_get "['token']")
+  | json_get '.token')
 
 TENANT_RESP=$(request_json POST "$API_URL/admin/tenants" \
   "$(mkjson name "$SETUP_TENANT")" \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "Content-Type: application/json")
-TENANT_ID=$(echo "$TENANT_RESP" | json_get "['tenant_id']")
+TENANT_ID=$(echo "$TENANT_RESP" | json_get '.tenant_id')
 
 USER_RESP=$(request_json POST "$API_URL/admin/tenants/${TENANT_ID}/admin-users" \
   "$(mkjson username "$SETUP_USERNAME" role admin)" \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "Content-Type: application/json")
 
-TEMP_PASS=$(echo "$USER_RESP" | python3 -c '
-import sys,json; d=json.load(sys.stdin)
-print(d.get("temp_password") or d.get("temporary_password") or d.get("password")
-      or d.get("user",{}).get("temp_password") or d.get("user",{}).get("temporary_password") or "")
-')
+TEMP_PASS=$(echo "$USER_RESP" | json_get '.temp_password // .temporary_password // .password // .user.temp_password // .user.temporary_password // empty')
 [[ -n "$TEMP_PASS" ]] || fail "Admin user created but no temp password returned. Response: $USER_RESP"
 
 TEMP_TOKEN=$(request_json POST "$API_URL/tenant/login" \
   "$(mkjson tenant_name "$SETUP_TENANT" username "$SETUP_USERNAME" password "$TEMP_PASS")" \
-  -H "Content-Type: application/json" | json_get "['token']")
+  -H "Content-Type: application/json" | json_get '.token')
 
 request_json POST "$API_URL/tenant/me/password" \
   "$(mkjson current_password "$TEMP_PASS" new_password "$SETUP_PASSWORD")" \
@@ -1001,12 +1054,12 @@ request_json POST "$API_URL/tenant/me/password" \
 
 USER_TOKEN=$(request_json POST "$API_URL/tenant/login" \
   "$(mkjson tenant_name "$SETUP_TENANT" username "$SETUP_USERNAME" password "$SETUP_PASSWORD")" \
-  -H "Content-Type: application/json" | json_get "['token']")
+  -H "Content-Type: application/json" | json_get '.token')
 
 API_KEY=$(request_json POST "$API_URL/tenant/api-tokens" \
   "$(mkjson name "default-cli")" \
   -H "Authorization: Bearer $USER_TOKEN" \
-  -H "Content-Type: application/json" | json_get "['token']")
+  -H "Content-Type: application/json" | json_get '.token')
 
 AGENT_ID=""
 INSTALL_AGENT=""
@@ -1014,16 +1067,13 @@ CLI_USE_CMD=""
 
 if [[ "$CREATE_AGENT" == "true" ]]; then
   AGENT_RESP=$(request_json POST "$API_URL/tenant/agents" \
-    "$(mkjson mode "$AGENT_MODE" grant_service_mgmt "$GRANT_SERVICE_MGMT" grant_docker "$GRANT_DOCKER")" \
+    "$(mkjson type "$AGENT_TYPE" mode "$AGENT_MODE" grant_service_mgmt "$GRANT_SERVICE_MGMT" grant_docker "$GRANT_DOCKER")" \
     -H "Authorization: Bearer $USER_TOKEN" \
     -H "Content-Type: application/json")
-  AGENT_ID=$(echo "$AGENT_RESP" | json_get "['agent_id']")
-  INSTALL_AGENT=$(echo "$AGENT_RESP" | python3 -c '
-import sys,json; d=json.load(sys.stdin)
-print(d.get("commands",{}).get("agent",""))' 2>/dev/null || true)
-  CLI_USE_CMD=$(echo "$AGENT_RESP" | python3 -c '
-import sys,json; d=json.load(sys.stdin)
-print(d.get("commands",{}).get("cli_use",""))' 2>/dev/null || true)
+  AGENT_ID=$(echo "$AGENT_RESP" | json_get '.agent_id')
+  # host agents return commands.agent (install.sh); k8s agents return commands.helm.
+  INSTALL_AGENT=$(echo "$AGENT_RESP" | json_get '.commands.helm // .commands.agent // empty')
+  CLI_USE_CMD=$(echo "$AGENT_RESP" | json_get '.commands.cli_use // empty')
 fi
 
 ok "Workspace bootstrapped"
@@ -1097,11 +1147,19 @@ echo "    $ENV_FILE"
 echo ""
 
 if [[ "$CREATE_AGENT" == "true" ]]; then
-  echo "  ── Install agent on remote machine ─────────────────────────"
+  if [[ "$AGENT_TYPE" == "k8s" ]]; then
+    echo "  ── Install agent on your Kubernetes cluster ────────────────"
+  else
+    echo "  ── Install agent on a host machine ─────────────────────────"
+  fi
   echo ""
 
   if [[ -n "$INSTALL_AGENT" ]]; then
-    echo "  Run this on the remote machine:"
+    if [[ "$AGENT_TYPE" == "k8s" ]]; then
+      echo "  Run this against your cluster (from the repo root):"
+    else
+      echo "  Run this on the host machine:"
+    fi
     echo ""
     echo "    $INSTALL_AGENT"
     echo ""

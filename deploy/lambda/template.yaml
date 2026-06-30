@@ -16,6 +16,14 @@ Globals:
         ADMIN_PASSWORD: !Ref AdminPassword
         STORAGE_BACKEND: dynamo
         RELEASES_S3_BASE: !Ref ReleasesS3Base
+        AGENT_VERSION: !Ref AgentVersion
+        CHART_VERSION: !Ref ChartVersion
+        # Empty ReleasesChartRepo derives the repo from ReleasesS3Base rather than
+        # setting an empty env var (which would override the backend's default).
+        RELEASES_CHART_REPO: !If
+          - HasChartRepo
+          - !Ref ReleasesChartRepo
+          - !Sub "${ReleasesS3Base}/charts/reach-agent"
         APPROVAL_RETENTION_DAYS: !Ref ApprovalRetentionDays
         JOB_RETENTION_DAYS: !Ref JobRetentionDays
         AUDIT_RETENTION_DAYS: !Ref AuditRetentionDays
@@ -52,6 +60,18 @@ Parameters:
     Type: String
     Default: "https://reach-releases.s3.amazonaws.com"
     Description: Base URL for agent binary downloads (override if self-hosting binaries)
+  AgentVersion:
+    Type: String
+    Default: "latest"
+    Description: Host agent release the generated host install command references (S3 path agent/<this>/install.sh). "latest" tracks the newest.
+  ChartVersion:
+    Type: String
+    Default: ""
+    Description: Pins the k8s Helm chart in the generated helm command (--version <this>). Empty installs the latest chart in the repo.
+  ReleasesChartRepo:
+    Type: String
+    Default: ""
+    Description: Helm chart repo URL for the generated k8s helm command. Empty derives it from ReleasesS3Base (<base>/charts/reach-agent).
   ApprovalRetentionDays:
     Type: Number
     Default: 7
@@ -69,6 +89,10 @@ Parameters:
     Default: 30
     Description: Days to retain agent heartbeat and status history records before the daily cleanup deletes them
 
+Conditions:
+  # Chart repo explicitly set vs. derived from ReleasesS3Base.
+  HasChartRepo: !Not [!Equals [!Ref ReleasesChartRepo, ""]]
+
 Resources:
   # -----------------------------------------------------------------------
   # DynamoDB tables
@@ -85,6 +109,10 @@ Resources:
           AttributeType: S
         - AttributeName: tenant_id
           AttributeType: S
+        - AttributeName: install_token_hash
+          AttributeType: S
+        - AttributeName: agent_token_hash
+          AttributeType: S
       KeySchema:
         - AttributeName: agent_id
           KeyType: HASH
@@ -92,6 +120,20 @@ Resources:
         - IndexName: tenant-index
           KeySchema:
             - AttributeName: tenant_id
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+        # Credential-only auth: agents are resolved by token hash, not agent_id.
+        # The install token identifies the agent at claim, the agent token after.
+        - IndexName: install-token-hash-index
+          KeySchema:
+            - AttributeName: install_token_hash
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+        - IndexName: agent-token-hash-index
+          KeySchema:
+            - AttributeName: agent_token_hash
               KeyType: HASH
           Projection:
             ProjectionType: ALL

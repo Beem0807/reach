@@ -33,6 +33,8 @@ def handle_list_agents(raw_token: str, tag: Optional[str] = None) -> dict:
             "mode": a.get("mode", "wild"),
             "access_level": a.get("access_level") or "open",
             "running_as_root": a.get("running_as_root"),
+            "k8s_permissions_reported": bool(a.get("k8s_permissions_hash")),
+            "k8s_permissions_drift": a.get("k8s_permissions_drift", False),
             "tags": a.get("tags") or [],
             "grant_service_mgmt": a.get("grant_service_mgmt", False),
             "grant_docker": a.get("grant_docker", False),

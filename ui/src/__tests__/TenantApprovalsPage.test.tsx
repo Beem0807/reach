@@ -42,6 +42,17 @@ const APPROVAL_2: Approval = {
   created_at: '2026-06-01T11:00:00Z',
 };
 
+const K8S_APPROVAL: Approval = {
+  approval_id: 'appr_k1',
+  agent_id: 'agent_k8s',
+  agent_hostname: 'cluster-1',
+  tenant_id: 'tenant_1',
+  command: 'kubectl delete pods -n team-a',
+  k8s_rule: { verb: 'delete', resource: 'pods', namespace: 'team-a', name: '*' },
+  status: 'pending',
+  created_at: '2026-06-01T12:00:00Z',
+};
+
 function renderOperator(approvals: Approval[] = [APPROVAL_1, APPROVAL_2]) {
   vi.spyOn(api, 'listTenantAgents').mockResolvedValue({ agents: [] });
   vi.spyOn(api, 'listAllTenantApprovals').mockResolvedValue({ approvals });
@@ -49,6 +60,95 @@ function renderOperator(approvals: Approval[] = [APPROVAL_1, APPROVAL_2]) {
 }
 
 beforeEach(() => { vi.restoreAllMocks(); });
+
+// ---------------------------------------------------------------------------
+// Kubernetes/Host toggle - one kind at a time
+// ---------------------------------------------------------------------------
+
+// Server-side behavior: mock the API to honor status/type/q/limit/offset like
+// the backend does, so we exercise the real request-driven UI.
+function renderServer(all: Approval[]) {
+  vi.spyOn(api, 'listTenantAgents').mockResolvedValue({ agents: [] });
+  vi.spyOn(api, 'listAllTenantApprovals').mockImplementation((_u, _t, params: Record<string, string> = {}) => {
+    let rows = all;
+    if (params.status) rows = rows.filter(a => (a.status ?? 'pending') === params.status);
+    if (params.type) rows = rows.filter(a => (a.k8s_rule ? 'k8s' : 'host') === params.type);
+    if (params.q) {
+      const q = params.q.toLowerCase();
+      rows = rows.filter(a =>
+        (a.command ?? '').toLowerCase().includes(q) ||
+        (a.k8s_rule ? Object.values(a.k8s_rule).join(' ').toLowerCase().includes(q) : false));
+    }
+    const total = rows.length;
+    const offset = parseInt(params.offset ?? '0', 10);
+    const limit = parseInt(params.limit ?? '20', 10);
+    return Promise.resolve({ approvals: rows.slice(offset, offset + limit), total });
+  });
+  return render(<TenantApprovalsPage config={CONFIG} />);
+}
+
+describe('host/k8s separation (server-driven)', () => {
+  it('defaults to Host and hides k8s rules until toggled', async () => {
+    renderServer([APPROVAL_1, K8S_APPROVAL]);
+    expect(await screen.findByText('docker restart app')).toBeInTheDocument();
+    expect(screen.queryByText('team-a')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Kubernetes' }));
+    expect(await screen.findByText('team-a')).toBeInTheDocument();
+    expect(screen.queryByText('docker restart app')).not.toBeInTheDocument();
+  });
+
+  it('paginates each kind independently (10 per page)', async () => {
+    const hosts = Array.from({ length: 12 }, (_, i) => ({
+      ...APPROVAL_1, approval_id: `h_${i}`, command: `host-cmd-${i}`,
+    }));
+    const k8ss = Array.from({ length: 12 }, (_, i) => ({
+      ...K8S_APPROVAL, approval_id: `k_${i}`,
+      k8s_rule: { verb: 'delete', resource: 'pods', namespace: `ns-${i}`, name: '*' },
+    }));
+    renderServer([...hosts, ...k8ss]);
+
+    expect(await screen.findByText('host-cmd-0')).toBeInTheDocument();
+    expect(screen.queryByText('host-cmd-10')).not.toBeInTheDocument();
+    expect(screen.getByText(/Showing 1–10 of 12/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    expect(await screen.findByText('host-cmd-10')).toBeInTheDocument();
+    expect(screen.getByText(/Showing 11–12 of 12/)).toBeInTheDocument();
+
+    // Kubernetes keeps its own page 1, independent of host's page 2.
+    fireEvent.click(screen.getByRole('button', { name: 'Kubernetes' }));
+    expect(await screen.findByText('ns-0')).toBeInTheDocument();
+    expect(screen.getByText(/Showing 1–10 of 12/)).toBeInTheDocument();
+  });
+
+  it('default view is the recent page; Search fetches matches across all pages', async () => {
+    const hosts = Array.from({ length: 12 }, (_, i) => ({
+      ...APPROVAL_1, approval_id: `h_${i}`, command: `host-cmd-${i}`,
+    }));
+    renderServer(hosts);
+    await screen.findByText('host-cmd-0');
+    expect(screen.queryByText('host-cmd-11')).not.toBeInTheDocument(); // page 2
+
+    // Type, then click Search (not live) - matches surface regardless of page.
+    fireEvent.change(screen.getByPlaceholderText(/Search command/i), { target: { value: 'cmd-11' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Search' }));
+    expect(await screen.findByText('host-cmd-11')).toBeInTheDocument();
+    expect(screen.queryByText('host-cmd-0')).not.toBeInTheDocument();
+  });
+
+  it('k8s Search matches on rule fields like namespace', async () => {
+    const k8ss = Array.from({ length: 3 }, (_, i) => ({
+      ...K8S_APPROVAL, approval_id: `k_${i}`,
+      k8s_rule: { verb: 'delete', resource: 'pods', namespace: `ns-${i}`, name: '*' },
+    }));
+    renderServer(k8ss);
+    fireEvent.click(await screen.findByRole('button', { name: 'Kubernetes' }));
+    fireEvent.change(screen.getByPlaceholderText(/Search verb, resource/i), { target: { value: 'ns-2' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Search' }));
+    expect(await screen.findByText('ns-2')).toBeInTheDocument();
+    expect(screen.queryByText('ns-0')).not.toBeInTheDocument();
+  });
+});
 
 // ---------------------------------------------------------------------------
 // Basic rendering
@@ -63,7 +163,7 @@ describe('operator view rendering', () => {
 
   it('shows empty state when no approvals', async () => {
     renderOperator([]);
-    expect(await screen.findByText(/No pending approvals/i)).toBeInTheDocument();
+    expect(await screen.findByText(/No host pending approvals/i)).toBeInTheDocument();
   });
 
   it('shows per-row Approve/Deny action buttons in pending tab', async () => {
@@ -150,7 +250,7 @@ describe('per-row checkboxes in pending tab', () => {
       Promise.resolve({ approvals: params?.status === 'approved' ? [{ ...APPROVAL_1, status: 'approved' as const }] : [] }),
     );
     render(<TenantApprovalsPage config={CONFIG} />);
-    await screen.findByText(/No pending/i);
+    await screen.findByText(/No host pending/i);
     fireEvent.click(screen.getByRole('button', { name: /^approved$/i }));
     await screen.findByText('docker restart app');
     expect(screen.queryAllByRole('checkbox')).toHaveLength(0);
@@ -286,5 +386,47 @@ describe('developer view', () => {
     vi.spyOn(api, 'listTenantApprovals').mockResolvedValue({ approvals: [] });
     render(<TenantApprovalsPage config={DEV_CONFIG} />);
     expect(await screen.findByRole('button', { name: /Request approval/i })).toBeInTheDocument();
+  });
+
+  // Server-driven: mock /approvals/pending to honor type/q/limit/offset.
+  function renderDevServer(all: Approval[]) {
+    vi.spyOn(api, 'listTenantAgents').mockResolvedValue({ agents: [] });
+    vi.spyOn(api, 'listTenantApprovals').mockImplementation((_u, _t, params: Record<string, string> = {}) => {
+      let rows = all;
+      if (params.type) rows = rows.filter(a => (a.k8s_rule ? 'k8s' : 'host') === params.type);
+      if (params.q) {
+        const q = params.q.toLowerCase();
+        rows = rows.filter(a =>
+          (a.command ?? '').toLowerCase().includes(q) ||
+          (a.k8s_rule ? Object.values(a.k8s_rule).join(' ').toLowerCase().includes(q) : false));
+      }
+      const total = rows.length;
+      const offset = parseInt(params.offset ?? '0', 10);
+      const limit = parseInt(params.limit ?? '20', 10);
+      return Promise.resolve({ approvals: rows.slice(offset, offset + limit), total });
+    });
+    return render(<TenantApprovalsPage config={DEV_CONFIG} />);
+  }
+
+  it('developer view separates host/k8s server-side via the toggle', async () => {
+    renderDevServer([APPROVAL_1, K8S_APPROVAL]);
+    expect(await screen.findByText('docker restart app')).toBeInTheDocument();
+    expect(screen.queryByText('team-a')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Kubernetes' }));
+    expect(await screen.findByText('team-a')).toBeInTheDocument();
+    expect(screen.queryByText('docker restart app')).not.toBeInTheDocument();
+  });
+
+  it('developer Search fetches matches across all pages', async () => {
+    const hosts = Array.from({ length: 12 }, (_, i) => ({
+      ...APPROVAL_1, approval_id: `h_${i}`, command: `host-cmd-${i}`,
+    }));
+    renderDevServer(hosts);
+    await screen.findByText('host-cmd-0');
+    expect(screen.queryByText('host-cmd-11')).not.toBeInTheDocument(); // page 2
+    fireEvent.change(screen.getByPlaceholderText(/Search command/i), { target: { value: 'cmd-11' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Search' }));
+    expect(await screen.findByText('host-cmd-11')).toBeInTheDocument();
+    expect(screen.queryByText('host-cmd-0')).not.toBeInTheDocument();
   });
 });

@@ -69,7 +69,7 @@ All limits below are **per session token**.
 
 | Method | Path | Rate limit | Description |
 |---|---|---|---|
-| `GET` | `/admin/audit-logs` | 60/min | Platform-wide audit log across **all** tenants (there is no tenant filter). Filters: `?action=` (e.g. `agent.created`), `?actor=` (actor id), `?resource=` (resource id), `?ip=`, `?since=`/`?until=` (ISO timestamps), `?limit=`, `?cursor=`. Default limit 100, max 200. |
+| `GET` | `/admin/audit-logs` | 60/min | Platform-wide audit log across **all** tenants (there is no tenant filter). Filters: `?action=` (exact, e.g. `agent.created`), `?actor=` (actor **name**, case-insensitive substring), `?resource=` (resource id, case-insensitive substring), `?ip=` (case-insensitive substring), `?since=`/`?until=` (ISO timestamps), `?limit=`, `?cursor=`. Default limit 100, max 200. |
 
 ---
 
@@ -111,7 +111,7 @@ All limits below are **per API token**.
 
 | Method | Path | Auth | Rate limit | Description |
 |---|---|---|---|---|
-| `POST` | `/tenant/agents` | API token (admin) | 20/min | Create an agent. Body: `{"mode": "wild\|readonly\|approved", "grant_service_mgmt": true, "grant_docker": false}` |
+| `POST` | `/tenant/agents` | API token (admin) | 20/min | Create an agent. Body: `{"type": "host\|k8s", "mode": "wild\|readonly\|approved", "grant_service_mgmt": true, "grant_docker": false}`. `type` defaults to `host`; `grant_service_mgmt`/`grant_docker` are host-only and forced off for `k8s` (access is RBAC-driven). Returns the install command for the chosen type. |
 | `POST` | `/tenant/agents/{id}/reissue-install-token` | API token (admin) | 10/min | Reissue install token - resets to CREATED. Blocked for ACTIVE agents without `{"force": true}`. Blocked for DELETED. |
 | `POST` | `/tenant/agents/{id}/revoke` | API token (admin) | 30/min | Revoke agent (CREATED/ACTIVE/INACTIVE → REVOKED). Cuts sync, removes from user access lists. |
 | `DELETE` | `/tenant/agents/{id}` | API token (admin) | 30/min | Soft-delete (REVOKED → DELETED). Record stays in database. |
@@ -126,8 +126,8 @@ All limits below are **per API token**.
 
 | Method | Path | Auth | Rate limit | Description |
 |---|---|---|---|---|
-| `GET` | `/tenant/approvals` | API token (operator+) | 60/min | List approvals in the tenant. Filters: `?agent_id=` `?status=pending\|approved\|denied\|expired` `?limit=` `?cursor=`. Paginated - default 20, max 100. |
-| `POST` | `/tenant/approvals` | API token (operator+) | 30/min | Pre-approve a command. Single: `{"agent_id": "...", "command": "...", "duration": "8h"}`. Bulk: `{"agent_id": "...", "commands": [...]}` → idempotent, returns `{"created": [...], "skipped": [...]}`. |
+| `GET` | `/tenant/approvals` | API token (operator+) | 60/min | List/search approvals in the tenant. Server-side filters: `?agent_id=` `?status=pending\|approved\|denied\|expired` `?type=host\|k8s` (host = command approvals, k8s = structured rules) `?q=` (case-insensitive `LIKE` over the command/rule text and requester). Pagination: `?limit=` (default 20, max 100) `?offset=`. Response: `{"approvals": [...], "total": N, "limit": L, "offset": O}` where `total` is the full match count for the current filters. |
+| `POST` | `/tenant/approvals` | API token (developer+) | 30/min | Create an approval for an agent. **Developers** create a `pending` request; **operators/admins** create an `approved` record directly (and support bulk + `duration`). **Host agents** use a command: single `{"agent_id","command","duration":"8h"}`, bulk `{"agent_id","commands":[...]}`. **k8s agents** use a structured rule: single `{"agent_id","k8s_rule":{"verb","resource","namespace","name"}}`, bulk `{"agent_id","k8s_rules":[...]}`. Rule fields accept `*` (wildcard); `verb` is required and must be a write verb - a single verb like `scale`/`delete`, a compound "double verb" like `rollout restart` or `auth reconcile`, or `*`. Bulk is idempotent → `{"created":[...],"skipped":[...]}`. |
 | `PUT` | `/tenant/approvals/{id}/approve` | API token (operator+) | 60/min | Approve (`pending`) or update duration (`approved`). Body: `{"duration": "permanent\|1h\|8h\|24h\|7d\|Nh\|Nd\|now"}`. Named presets are `1h`, `8h`, `24h`, `7d`; any other window is expressed as `Nh`/`Nd` (e.g. `30d`, `90d`). `duration=now` instantly expires an already-approved record. |
 | `PUT` | `/tenant/approvals/{id}/deny` | API token (operator+) | 60/min | Deny a pending approval. Terminal - cannot be reversed. |
 | `DELETE` | `/tenant/approvals/{id}` | API token (operator+) | 30/min | Permanently delete an approval record. Removing an approved record takes effect on the next agent sync. |
@@ -145,7 +145,7 @@ All limits below are **per API token**.
 
 | Method | Path | Auth | Rate limit | Description |
 |---|---|---|---|---|
-| `GET` | `/tenant/audit-logs` | API token (admin) | 60/min | Tenant-scoped audit log, automatically limited to the caller's tenant. Same filter params as `/admin/audit-logs` (`?action=` `?actor=` `?resource=` `?ip=` `?since=` `?until=` `?limit=` `?cursor=`). Default limit 100, max 200. |
+| `GET` | `/tenant/audit-logs` | API token (admin) | 60/min | Tenant-scoped audit log, automatically limited to the caller's tenant. Same filter params as `/admin/audit-logs`: `?action=` (exact), `?actor=`/`?resource=`/`?ip=` (case-insensitive substring), `?since=` `?until=` `?limit=` `?cursor=`. Default limit 100, max 200. |
 
 ---
 
@@ -162,7 +162,7 @@ Authenticated with an API token. These are the endpoints the CLI and MCP server 
 | `GET` | `/agents` | 60/min | List accessible agents. Filter: `?tag=key:value` |
 | `GET` | `/agents/{id}` | 120/min | Get agent details, policy, and tags |
 | `GET` | `/agents/{id}/approved-commands` | 60/min | Approval records. `?status=approved` (default) returns agent-wide effective list. Other statuses return only your own records. |
-| `GET` | `/approvals/pending` | 60/min | Your pending approval requests across all agents. Filter: `?agent_id=` |
+| `GET` | `/approvals/pending` | 60/min | Your pending approval requests across all agents. Server-side filters/pagination like `/tenant/approvals`: `?agent_id=` `?type=host\|k8s` `?q=` `?limit=` `?offset=`; response `{"approvals":[...], "total": N, "limit": L, "offset": O}`. Scoped to requests you submitted. |
 
 ---
 
@@ -176,6 +176,8 @@ Called by the agent process automatically - not intended for manual use.
 | `POST` | `/agent/sync` | agent token | 60/min per agent token | Poll for jobs, record heartbeat, receive policy updates |
 | `POST` | `/agent/jobs/{id}/result` | agent token | 60/min per agent token | Post command result |
 | `POST` | `/agent/rotate-token` | agent token | 10/hour per agent token | Self-service token rotation (called automatically every 30 days) |
+
+These are **credential-only**: the agent never sends an `agent_id`. `claim` carries the **install token** (the backend resolves the agent by `install_token_hash`), a `machine_fingerprint`, and `type` (`host` or `k8s`), and returns the long-lived **agent token**. Every later call carries that agent token as the Bearer credential, and the backend resolves the agent by `agent_token_hash` - so identity is never taken from a client-supplied field. In `k8s` mode `sync` also reports the agent's effective RBAC (for acknowledge/drift in the console).
 
 ---
 

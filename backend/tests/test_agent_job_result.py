@@ -36,10 +36,6 @@ class TestAgentJobResult:
         r = self._call({**_VALID_BODY, "status": "DONE"})
         assert r["statusCode"] == 400
 
-    def test_missing_agent_id(self):
-        r = self._call({**_VALID_BODY, "agent_id": ""})
-        assert r["statusCode"] == 400
-
     def test_missing_fingerprint(self):
         r = self._call({**_VALID_BODY, "machine_fingerprint": ""})
         assert r["statusCode"] == 400

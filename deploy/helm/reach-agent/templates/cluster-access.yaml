@@ -1,0 +1,81 @@
+{{- if .Values.clusterAccess.enabled }}
+{{- $fullname := include "reach-agent.fullname" . }}
+{{- $sa := include "reach-agent.serviceAccountName" . }}
+{{- $useCustom := gt (len .Values.clusterAccess.rules) 0 }}
+{{- $roleName := .Values.clusterAccess.roleName }}
+{{- if and (not $useCustom) (not $roleName) }}
+{{- fail "clusterAccess.enabled is true but neither clusterAccess.roleName nor clusterAccess.rules is set" }}
+{{- end }}
+{{- /* roleRef is IMMUTABLE on an existing (Cluster)RoleBinding, so encode the
+       bound role into the binding NAME. Changing roleName (e.g. view->edit) or
+       switching built-in<->custom then yields a differently-named resource:
+       Helm creates the new binding and prunes the old one, instead of trying to
+       mutate roleRef in place (which the API server rejects on upgrade). */ -}}
+{{- $roleKey := ternary "custom" (toString $roleName) $useCustom }}
+{{- if eq .Values.clusterAccess.scope "cluster" }}
+{{- /* Cluster-wide grant. */ -}}
+{{- if $useCustom }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $fullname }}-access
+  labels:
+    {{- include "reach-agent.labels" . | nindent 4 }}
+rules:
+{{ toYaml .Values.clusterAccess.rules }}
+---
+{{- end }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $fullname }}-access-{{ $roleKey }}
+  labels:
+    {{- include "reach-agent.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ if $useCustom }}{{ $fullname }}-access{{ else }}{{ $roleName }}{{ end }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $sa }}
+    namespace: {{ .Release.Namespace }}
+{{- else if eq .Values.clusterAccess.scope "namespaces" }}
+{{- /* Per-namespace grant (least privilege). A RoleBinding may reference a
+       ClusterRole to grant its permissions only within that namespace. */ -}}
+{{- if not .Values.clusterAccess.namespaces }}
+{{- fail "clusterAccess.scope is \"namespaces\" but clusterAccess.namespaces is empty" }}
+{{- end }}
+{{- range $ns := .Values.clusterAccess.namespaces }}
+{{- if $useCustom }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $fullname }}-access
+  namespace: {{ $ns }}
+  labels:
+    {{- include "reach-agent.labels" $ | nindent 4 }}
+rules:
+{{ toYaml $.Values.clusterAccess.rules }}
+---
+{{- end }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $fullname }}-access-{{ $roleKey }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "reach-agent.labels" $ | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: {{ if $useCustom }}Role{{ else }}ClusterRole{{ end }}
+  name: {{ if $useCustom }}{{ $fullname }}-access{{ else }}{{ $roleName }}{{ end }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $sa }}
+    namespace: {{ $.Release.Namespace }}
+---
+{{- end }}
+{{- else }}
+{{- fail (printf "clusterAccess.scope must be \"cluster\" or \"namespaces\", got %q" .Values.clusterAccess.scope) }}
+{{- end }}
+{{- end }}

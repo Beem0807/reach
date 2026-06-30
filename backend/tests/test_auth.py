@@ -97,29 +97,32 @@ def test_verify_tenant_token_user_not_found():
 
 
 def test_verify_agent_token_valid():
+    # Credential-only: the agent is resolved by hashing the bearer token and
+    # looking it up - no agent_id is supplied.
     from shared.auth import _verify_agent_token
     raw = "agent_secret"
     agent = {"agent_id": "agent_a", "agent_token_hash": _hmac_token(raw)}
     with patch("shared.store.agents_repo") as mock:
-        mock.get.return_value = agent
-        result = _verify_agent_token(raw, "agent_a")
+        mock.get_by_agent_token_hash.return_value = agent
+        result = _verify_agent_token(raw)
     assert result == agent
+    mock.get_by_agent_token_hash.assert_called_once_with(_hmac_token(raw))
 
 
 def test_verify_agent_token_wrong_hash():
     from shared.auth import _verify_agent_token
-    agent = {"agent_id": "agent_a", "agent_token_hash": _hmac_token("correct")}
     with patch("shared.store.agents_repo") as mock:
-        mock.get.return_value = agent
-        result = _verify_agent_token("wrong", "agent_a")
+        # No agent has this token hash -> lookup returns nothing.
+        mock.get_by_agent_token_hash.return_value = None
+        result = _verify_agent_token("wrong")
     assert result is None
 
 
 def test_verify_agent_token_agent_not_found():
     from shared.auth import _verify_agent_token
     with patch("shared.store.agents_repo") as mock:
-        mock.get.return_value = None
-        result = _verify_agent_token("tok", "agent_a")
+        mock.get_by_agent_token_hash.return_value = None
+        result = _verify_agent_token("tok")
     assert result is None
 
 

@@ -29,15 +29,18 @@ class _Agent(_Base):
     machine_fingerprint = Column(String)
     mode = Column(String, nullable=False, default="wild")
     running_as_root = Column(String)  # "true" | "false" | None until first sync
-    agent_token_hash = Column(String)
-    install_token_hash = Column(String)
+    # Both hashes are looked up directly (credential-only auth): the agent never
+    # sends its agent_id - the install token identifies it at claim, the agent
+    # token on every call after. Unique so a hash maps to exactly one agent.
+    agent_token_hash = Column(String, index=True, unique=True)
+    install_token_hash = Column(String, index=True, unique=True)
     install_token_expires_at = Column(Integer)
     claimed_at = Column(String)
     last_heartbeat_at = Column(String)
     active_until = Column(Integer)
     token_issued_at = Column(String)
     rotation_requested = Column(Boolean, default=False)
-    type = Column(String, default="manual")
+    type = Column(String, default="host")
     fleet_id = Column(String)
     tags = Column(JSON, default=list)
     created_at = Column(String)
@@ -45,6 +48,12 @@ class _Agent(_Base):
     grant_docker = Column(Boolean, default=False)
     service_mgmt_detected = Column(Boolean)
     docker_detected = Column(Boolean)
+    # k8s effective RBAC (self-reported via SelfSubjectRulesReview). The raw rule
+    # set, its hash, and the hash the operator last acknowledged. Drift = the
+    # current hash differs from the acknowledged one (computed in _enrich_agent).
+    k8s_permissions = Column(JSON)
+    k8s_permissions_hash = Column(String)
+    k8s_permissions_acked_hash = Column(String)
 
 
 class _Approval(_Base):
@@ -53,6 +62,10 @@ class _Approval(_Base):
     tenant_id = Column(String, nullable=False, index=True)
     agent_id = Column(String, nullable=False, index=True)
     command = Column(Text)
+    # Structured rule for k8s agents ({verb, resource, namespace, name}); None for
+    # host agents, which match on the command text above. none_as_null keeps host
+    # rows as SQL NULL (not JSON 'null') so the kind filter's IS NULL works.
+    k8s_rule = Column(JSON(none_as_null=True))
     requested_by = Column(String)
     requester_name = Column(String)
     job_id = Column(String)
@@ -170,6 +183,10 @@ def _enrich_agent(d: Optional[dict]) -> Optional[dict]:
         docker_detected=bool(d.get("docker_detected")),
         service_mgmt_detected=bool(d.get("service_mgmt_detected")),
     )
+    # k8s permission drift: the agent has reported permissions whose hash differs
+    # from the one the operator acknowledged (or has never been acknowledged).
+    cur = d.get("k8s_permissions_hash")
+    d["k8s_permissions_drift"] = bool(cur) and cur != d.get("k8s_permissions_acked_hash")
     return d
 
 
@@ -177,6 +194,24 @@ class AgentRepo:
     def get(self, agent_id: str) -> Optional[dict]:
         with SessionLocal() as db:
             return _enrich_agent(_to_dict(db.get(_Agent, agent_id)))
+
+    def get_by_install_token_hash(self, install_token_hash: str) -> Optional[dict]:
+        if not install_token_hash:
+            return None
+        with SessionLocal() as db:
+            row = db.execute(
+                select(_Agent).where(_Agent.install_token_hash == install_token_hash)
+            ).scalar_one_or_none()
+            return _enrich_agent(_to_dict(row)) if row else None
+
+    def get_by_agent_token_hash(self, agent_token_hash: str) -> Optional[dict]:
+        if not agent_token_hash:
+            return None
+        with SessionLocal() as db:
+            row = db.execute(
+                select(_Agent).where(_Agent.agent_token_hash == agent_token_hash)
+            ).scalar_one_or_none()
+            return _enrich_agent(_to_dict(row)) if row else None
 
     def claim(self, agent_id: str, fields: dict) -> None:
         with SessionLocal() as db:
@@ -193,6 +228,10 @@ class AgentRepo:
                     active_until=fields["active_until"],
                     last_heartbeat_at=fields["claimed_at"],
                     token_issued_at=fields["token_issued_at"],
+                    # The agent reports its environment at claim time: "k8s" when
+                    # running in a cluster, else "host". The agent record's id is
+                    # the cluster's identity - no separate cluster_id needed.
+                    type=fields.get("type") or "host",
                 )
             )
             db.commit()
@@ -217,6 +256,24 @@ class AgentRepo:
             values["service_mgmt_detected"] = service_mgmt_detected
         with SessionLocal() as db:
             db.execute(update(_Agent).where(_Agent.agent_id == agent_id).values(**values))
+            db.commit()
+
+    def set_k8s_permissions(self, agent_id: str, permissions: dict, perm_hash: str) -> None:
+        with SessionLocal() as db:
+            db.execute(
+                update(_Agent).where(_Agent.agent_id == agent_id).values(
+                    k8s_permissions=permissions, k8s_permissions_hash=perm_hash
+                )
+            )
+            db.commit()
+
+    def acknowledge_k8s_permissions(self, agent_id: str, perm_hash: str) -> None:
+        with SessionLocal() as db:
+            db.execute(
+                update(_Agent).where(_Agent.agent_id == agent_id).values(
+                    k8s_permissions_acked_hash=perm_hash
+                )
+            )
             db.commit()
 
     def set_active_until(self, agent_id: str, active_until: int) -> None:
@@ -616,6 +673,46 @@ class ApprovalRepo:
                 results = self._lazy_expire(results, db)
                 results = self._dedup_by_command(results, db)
             return results
+
+    def search_by_tenant(self, tenant_id: str, *, status: Optional[str] = None, agent_id: Optional[str] = None,
+                         requested_by: Optional[str] = None, kind: Optional[str] = None, q: Optional[str] = None,
+                         limit: int = 20, offset: int = 0) -> tuple:
+        """Server-side search + pagination for the tenant/developer approvals views.
+
+        Filters run in SQL: status, agent, requester, kind (host = no rule, k8s =
+        has rule), and a case-insensitive LIKE over the command and requester. For
+        the `approved` status the effective-list expire/dedup is applied before
+        paginating, so `total` reflects what the user actually sees. Returns
+        (page_items, total).
+        """
+        from sqlalchemy import desc, or_
+        with SessionLocal() as db:
+            stmt = select(_Approval).where(_Approval.tenant_id == tenant_id)
+            if agent_id is not None:
+                stmt = stmt.where(_Approval.agent_id == agent_id)
+            if status is not None:
+                stmt = stmt.where(_Approval.status == status)
+            if requested_by is not None:
+                stmt = stmt.where(_Approval.requested_by == requested_by)
+            if kind == "k8s":
+                stmt = stmt.where(_Approval.k8s_rule.isnot(None))
+            elif kind == "host":
+                stmt = stmt.where(_Approval.k8s_rule.is_(None))
+            if q:
+                like = f"%{q}%"
+                stmt = stmt.where(or_(
+                    _Approval.command.ilike(like),
+                    _Approval.requester_name.ilike(like),
+                ))
+            stmt = stmt.order_by(desc(_Approval.created_at))
+            rows = db.execute(stmt).scalars().all()
+            results = [_to_dict(r) for r in rows]
+            if status == "approved":
+                results = self._lazy_expire(results, db)
+                results = self._dedup_by_command(results, db)
+            total = len(results)
+            page = results[offset: offset + limit] if limit else results[offset:]
+            return page, total
 
     def exists_pending(self, agent_id: str, command: str) -> bool:
         with SessionLocal() as db:

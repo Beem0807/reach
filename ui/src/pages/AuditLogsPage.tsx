@@ -170,7 +170,6 @@ export function AuditLogsPage({ mode, apiUrl, token }: Props) {
   const [error, setError] = useState('');
   const cursorRef = useRef<string | undefined>(undefined);
   const seqRef = useRef(0);
-  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const [filterAction, setFilterAction] = useState('');
   const [filterActor, setFilterActor] = useState('');
@@ -214,36 +213,20 @@ export function AuditLogsPage({ mode, apiUrl, token }: Props) {
 
   useEffect(() => { load(true); }, [load]);
 
-  function changeAction(v: string) {
-    setFilterAction(v);
-    filterRefs.current.action = v;
+  // Filters are staged in input state and only sent when the user hits Search
+  // (the default view is the recent page). Enter in any text box also searches.
+  function applyFilters() {
+    filterRefs.current = {
+      action: filterAction, actor: filterActor, resource: filterResource,
+      ip: filterIp, since: filterSince, until: filterUntil,
+    };
     load(true);
-  }
-
-  function changeSince(v: string) {
-    setFilterSince(v);
-    filterRefs.current.since = v;
-    load(true);
-  }
-
-  function changeUntil(v: string) {
-    setFilterUntil(v);
-    filterRefs.current.until = v;
-    load(true);
-  }
-
-  function changeText(key: 'actor' | 'resource' | 'ip', setter: (v: string) => void, v: string) {
-    setter(v);
-    filterRefs.current[key] = v;
-    if (debounceRef.current) clearTimeout(debounceRef.current);
-    debounceRef.current = setTimeout(() => load(true), 400);
   }
 
   function clearFilters() {
     setFilterAction(''); setFilterActor(''); setFilterResource(''); setFilterIp('');
     setFilterSince(''); setFilterUntil('');
     filterRefs.current = { action: '', actor: '', resource: '', ip: '', since: '', until: '' };
-    if (debounceRef.current) clearTimeout(debounceRef.current);
     load(true);
   }
 
@@ -275,7 +258,7 @@ export function AuditLogsPage({ mode, apiUrl, token }: Props) {
       <div className="flex flex-wrap items-center gap-2 mb-4">
         <select
           value={filterAction}
-          onChange={e => changeAction(e.target.value)}
+          onChange={e => setFilterAction(e.target.value)}
           className="text-sm border border-gray-300 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-orange-400 bg-white w-52"
         >
           <option value="">All actions</option>
@@ -285,19 +268,22 @@ export function AuditLogsPage({ mode, apiUrl, token }: Props) {
         </select>
         <input
           value={filterActor}
-          onChange={e => changeText('actor', setFilterActor, e.target.value)}
+          onChange={e => setFilterActor(e.target.value)}
+          onKeyDown={e => e.key === 'Enter' && applyFilters()}
           placeholder="Actor…"
           className="text-sm border border-gray-300 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-orange-400 w-36"
         />
         <input
           value={filterResource}
-          onChange={e => changeText('resource', setFilterResource, e.target.value)}
+          onChange={e => setFilterResource(e.target.value)}
+          onKeyDown={e => e.key === 'Enter' && applyFilters()}
           placeholder="Resource…"
           className="text-sm border border-gray-300 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-orange-400 w-44"
         />
         <input
           value={filterIp}
-          onChange={e => changeText('ip', setFilterIp, e.target.value)}
+          onChange={e => setFilterIp(e.target.value)}
+          onKeyDown={e => e.key === 'Enter' && applyFilters()}
           placeholder="IP…"
           className="text-sm border border-gray-300 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-orange-400 w-32"
         />
@@ -305,7 +291,7 @@ export function AuditLogsPage({ mode, apiUrl, token }: Props) {
           <input
             type="date"
             value={filterSince}
-            onChange={e => changeSince(e.target.value)}
+            onChange={e => setFilterSince(e.target.value)}
             title="From date"
             className="text-sm border border-gray-300 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-orange-400"
           />
@@ -313,11 +299,17 @@ export function AuditLogsPage({ mode, apiUrl, token }: Props) {
           <input
             type="date"
             value={filterUntil}
-            onChange={e => changeUntil(e.target.value)}
+            onChange={e => setFilterUntil(e.target.value)}
             title="To date"
             className="text-sm border border-gray-300 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-orange-400"
           />
         </div>
+        <button
+          onClick={applyFilters}
+          className="text-sm font-semibold px-3 py-1.5 rounded-lg bg-orange-600 text-white hover:bg-orange-700 transition-colors shadow-sm"
+        >
+          Search
+        </button>
         {activeFilters > 0 && (
           <button
             onClick={clearFilters}

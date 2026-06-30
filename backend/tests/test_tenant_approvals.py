@@ -55,11 +55,12 @@ def _patch(agent=_AGENT, user=_USER):
 
 class TestHandleListMyPending:
     def _call(self, query=None, user=_USER, approvals=None, agent=_AGENT):
+        items = approvals or [_PENDING]
         with patch("handlers.tenant_approvals._verify_tenant_token", return_value=user), \
              patch("handlers.tenant_approvals.agents_repo") as agr, \
              patch("handlers.tenant_approvals.approvals_repo") as ar:
             agr.get.return_value = agent
-            ar.list_by_tenant.return_value = approvals or [_PENDING]
+            ar.search_by_tenant.return_value = (items, len(items))
             return handle_list_my_pending(query or {}, "tok"), ar
 
     def test_unauthorized(self):
@@ -72,24 +73,29 @@ class TestHandleListMyPending:
         body = json.loads(r["body"])
         assert len(body["approvals"]) == 1
         assert body["approvals"][0]["status"] == "pending"
+        assert body["total"] == 1
 
-    def test_filters_by_requested_by(self):
+    def test_scopes_to_requester_and_pending(self):
         r, ar = self._call()
-        ar.list_by_tenant.assert_called_once_with(
-            TENANT_ID,
-            agent_id=None,
-            status="pending",
-            requested_by=USER_ID,
-        )
+        ar.search_by_tenant.assert_called_once_with(
+            TENANT_ID, status="pending", agent_id=None, requested_by=USER_ID,
+            kind=None, q=None, limit=20, offset=0)
 
     def test_agent_id_filter_passed_through(self):
         r, ar = self._call(query={"agent_id": AGENT_ID})
-        ar.list_by_tenant.assert_called_once_with(
-            TENANT_ID,
-            agent_id=AGENT_ID,
-            status="pending",
-            requested_by=USER_ID,
-        )
+        ar.search_by_tenant.assert_called_once_with(
+            TENANT_ID, status="pending", agent_id=AGENT_ID, requested_by=USER_ID,
+            kind=None, q=None, limit=20, offset=0)
+
+    def test_type_search_and_paging_passed_through(self):
+        r, ar = self._call(query={"type": "k8s", "q": "team-a", "limit": "5", "offset": "10"})
+        ar.search_by_tenant.assert_called_once_with(
+            TENANT_ID, status="pending", agent_id=None, requested_by=USER_ID,
+            kind="k8s", q="team-a", limit=5, offset=10)
+
+    def test_invalid_type_returns_400(self):
+        r, _ = self._call(query={"type": "vm"})
+        assert r["statusCode"] == 400
 
     def test_agent_id_not_found_returns_404(self):
         with patch("handlers.tenant_approvals._verify_tenant_token", return_value=_USER), \
@@ -107,33 +113,6 @@ class TestHandleListMyPending:
             agr.get.return_value = _AGENT
             r = handle_list_my_pending({"agent_id": AGENT_ID}, "tok")
         assert r["statusCode"] == 404
-
-    def test_no_agent_filter_excludes_inaccessible_agents(self):
-        restricted_user = {**_USER, "allowed_agent_ids": ["agent_other"]}
-        pending_on_other = {**_PENDING, "agent_id": "agent_other"}
-        pending_on_a = {**_PENDING, "agent_id": AGENT_ID}
-        def fake_get(aid):
-            return {"agent_id": aid, "tenant_id": TENANT_ID}
-        with patch("handlers.tenant_approvals._verify_tenant_token", return_value=restricted_user), \
-             patch("handlers.tenant_approvals.agents_repo") as agr, \
-             patch("handlers.tenant_approvals.approvals_repo") as ar:
-            agr.get.side_effect = fake_get
-            ar.list_by_tenant.return_value = [pending_on_a, pending_on_other]
-            r = handle_list_my_pending({}, "tok")
-        body = json.loads(r["body"])
-        ids = [a["agent_id"] for a in body["approvals"]]
-        assert "agent_other" in ids
-        assert AGENT_ID not in ids
-
-    def test_no_agent_filter_unrestricted_user_sees_all(self):
-        with patch("handlers.tenant_approvals._verify_tenant_token", return_value=_USER), \
-             patch("handlers.tenant_approvals.agents_repo") as agr, \
-             patch("handlers.tenant_approvals.approvals_repo") as ar:
-            agr.get.return_value = _AGENT
-            ar.list_by_tenant.return_value = [_PENDING]
-            r = handle_list_my_pending({}, "tok")
-        body = json.loads(r["body"])
-        assert len(body["approvals"]) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -299,10 +278,11 @@ _FULL_APPROVAL = {
 
 class TestHandleTenantListAllApprovals:
     def _call(self, user=_OPERATOR, query=None, approvals=None, agent=_AGENT):
+        items = approvals if approvals is not None else [_FULL_APPROVAL]
         with patch("handlers.tenant_approvals._verify_tenant_token", return_value=user), \
              patch("handlers.tenant_approvals.approvals_repo") as ar, \
              patch("handlers.tenant_approvals.agents_repo") as agr:
-            ar.list_by_tenant.return_value = approvals if approvals is not None else [_FULL_APPROVAL]
+            ar.search_by_tenant.return_value = (items, len(items))
             agr.get.return_value = agent
             r = handle_tenant_list_all_approvals(query or {}, "tok")
         return r, ar
@@ -328,11 +308,27 @@ class TestHandleTenantListAllApprovals:
 
     def test_status_filter_passed_to_repo(self):
         r, ar = self._call(query={"status": "approved"}, approvals=[_APPROVED])
-        ar.list_by_tenant.assert_called_once_with(TENANT_ID, agent_id=None, status="approved")
+        ar.search_by_tenant.assert_called_once_with(
+            TENANT_ID, status="approved", agent_id=None, kind=None, q=None, limit=20, offset=0)
 
     def test_no_status_filter_passes_none(self):
         r, ar = self._call(query={})
-        ar.list_by_tenant.assert_called_once_with(TENANT_ID, agent_id=None, status=None)
+        ar.search_by_tenant.assert_called_once_with(
+            TENANT_ID, status=None, agent_id=None, kind=None, q=None, limit=20, offset=0)
+
+    def test_type_and_search_and_paging_passed_to_repo(self):
+        r, ar = self._call(query={"type": "k8s", "q": "team-a", "limit": "10", "offset": "20"})
+        ar.search_by_tenant.assert_called_once_with(
+            TENANT_ID, status=None, agent_id=None, kind="k8s", q="team-a", limit=10, offset=20)
+
+    def test_invalid_type_returns_400(self):
+        r, _ = self._call(query={"type": "vm"})
+        assert r["statusCode"] == 400
+
+    def test_total_returned_in_body(self):
+        r, _ = self._call(query={"limit": "5"}, approvals=[_FULL_APPROVAL])
+        body = json.loads(r["body"])
+        assert body["total"] == 1 and body["limit"] == 5 and body["offset"] == 0
 
     def test_agent_hostname_enriched(self):
         agent_with_host = {**_AGENT, "hostname": "prod-01.local"}
@@ -340,7 +336,7 @@ class TestHandleTenantListAllApprovals:
         with patch("handlers.tenant_approvals._verify_tenant_token", return_value=_OPERATOR), \
              patch("handlers.tenant_approvals.approvals_repo") as ar, \
              patch("handlers.tenant_approvals.agents_repo") as agr:
-            ar.list_by_tenant.return_value = [approval_with_agent]
+            ar.search_by_tenant.return_value = ([approval_with_agent], 1)
             agr.get.return_value = agent_with_host
             r = handle_tenant_list_all_approvals({}, "tok")
         body = json.loads(r["body"])
@@ -350,7 +346,7 @@ class TestHandleTenantListAllApprovals:
         with patch("handlers.tenant_approvals._verify_tenant_token", return_value=_OPERATOR), \
              patch("handlers.tenant_approvals.approvals_repo") as ar, \
              patch("handlers.tenant_approvals.agents_repo") as agr:
-            ar.list_by_tenant.return_value = [_FULL_APPROVAL]
+            ar.search_by_tenant.return_value = ([_FULL_APPROVAL], 1)
             agr.get.return_value = None
             r = handle_tenant_list_all_approvals({}, "tok")
         body = json.loads(r["body"])
@@ -668,6 +664,53 @@ class TestHandleTenantCreateApproval:
             agent=other_tenant_agent,
         )
         assert r["statusCode"] == 404
+
+    # --- k8s structured rules ---------------------------------------------
+    _AGENT_K8S = {"agent_id": AGENT_ID, "tenant_id": TENANT_ID, "type": "k8s"}
+    _RULE = {"verb": "delete", "resource": "pods", "namespace": "team-a", "name": "*"}
+
+    def test_k8s_developer_requires_rule_not_command(self):
+        r, _ = self._call(user=_DEV, agent=self._AGENT_K8S, body={"agent_id": AGENT_ID, "command": "kubectl delete pod x"})
+        assert r["statusCode"] == 400
+
+    def test_k8s_developer_creates_pending_with_rule(self):
+        r, ar = self._call(user=_DEV, agent=self._AGENT_K8S, body={"agent_id": AGENT_ID, "k8s_rule": self._RULE})
+        assert r["statusCode"] == 201
+        stored = ar.create.call_args[0][0]
+        assert stored["status"] == "pending"
+        assert stored["k8s_rule"] == self._RULE
+
+    def test_k8s_operator_preapproves_rule(self):
+        r, ar = self._call(agent=self._AGENT_K8S, body={"agent_id": AGENT_ID, "k8s_rule": self._RULE})
+        assert r["statusCode"] == 200
+        stored = ar.create.call_args[0][0]
+        assert stored["status"] == "approved"
+        assert stored["k8s_rule"] == self._RULE
+
+    def test_k8s_operator_missing_rule_returns_400(self):
+        r, _ = self._call(agent=self._AGENT_K8S, body={"agent_id": AGENT_ID})
+        assert r["statusCode"] == 400
+
+    def test_k8s_operator_read_verb_rule_rejected(self):
+        r, _ = self._call(agent=self._AGENT_K8S, body={"agent_id": AGENT_ID, "k8s_rule": {"verb": "get"}})
+        assert r["statusCode"] == 400
+
+    def test_k8s_operator_bulk_rules(self):
+        rules = [self._RULE, {"verb": "create", "resource": "pods", "namespace": "team-a", "name": "*"}]
+        r, ar = self._call(agent=self._AGENT_K8S, body={"agent_id": AGENT_ID, "k8s_rules": rules})
+        assert r["statusCode"] == 200
+        assert len(json.loads(r["body"])["created"]) == 2
+
+    def test_k8s_operator_skips_already_approved_rule(self):
+        existing = {**_APPROVED, "command": "kubectl delete pods -n team-a", "k8s_rule": self._RULE}
+        r, _ = self._call(agent=self._AGENT_K8S, body={"agent_id": AGENT_ID, "k8s_rule": self._RULE}, active_approvals=[existing])
+        assert r["statusCode"] == 409
+
+    def test_k8s_wildcard_rule_accepted(self):
+        rule = {"verb": "*", "resource": "*", "namespace": "team-a", "name": "*"}
+        r, ar = self._call(agent=self._AGENT_K8S, body={"agent_id": AGENT_ID, "k8s_rule": rule})
+        assert r["statusCode"] == 200
+        assert ar.create.call_args[0][0]["k8s_rule"] == rule
 
 
 # ---------------------------------------------------------------------------

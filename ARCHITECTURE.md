@@ -48,7 +48,7 @@ The agent never accepts inbound connections. It makes outbound HTTPS requests to
 A command goes through five steps:
 
 ```
-1. Submit    CLI / MCP  →  POST /jobs                    →  Backend stores job (PENDING, is_write annotated)
+1. Submit    CLI / MCP  →  POST /jobs                     →  Backend stores job (PENDING, is_write annotated)
 2. Poll      Agent      →  POST /agent/sync               →  Backend returns pending job + is_write flag
 3. Execute   Agent runs the command; enforcement depends on mode and OS (see Policy enforcement)
 4. Result    Agent      →  POST /agent/jobs/{id}/result   →  Backend redacts secrets, stores output (SUCCEEDED / FAILED)
@@ -65,7 +65,7 @@ The CLI and MCP server both poll `GET /jobs/{id}` until the job reaches a termin
               macOS  - unapproved write detected via server-supplied is_write flag; blocked early
 3b. Result   Agent posts result with blocked=true, is_write=true
 3c. Record   Backend updates is_write on the job; creates a pending approval record
-3d. Notify   User sees it via `reach approvals --pending`; an operator or admin approves or denies in the tenant console (or via `PUT /tenant/approvals/{id}/approve`)
+3d. Notify   User sees it via `reach approvals list --pending`; an operator or admin approves or denies in the tenant console (or via `PUT /tenant/approvals/{id}/approve`)
 ```
 
 ---
@@ -108,13 +108,29 @@ A background scheduler (APScheduler on FastAPI, EventBridge on Lambda) runs ever
 
 ### Agent (`agent/`)
 
-A Go binary installed via `install.sh`. On Linux it runs as a systemd service under a dedicated `reach-agent` system user. On macOS it runs as a foreground process by default (stops when the terminal closes), or with `--background` as a LaunchDaemon under the same dedicated `reach-agent` system user (starts on boot, same security model as Linux). On startup it claims itself using an install token, then enters a poll loop:
+A single dependency-light Go binary (standard library only - no `client-go`) that
+runs in one of two auto-detected modes. The poll loop is the same in both: claim
+(if needed) → `sync` (heartbeat + receive jobs) → execute → `POST /agent/jobs/{id}/result`.
+See [agent/README.md](agent/README.md) for the full design; the short version:
 
-1. `POST /agent/sync` - sends heartbeat and `running_as_root` flag, receives pending job (if any) with `is_write` flag and the list of approved commands
-2. Runs the command, optionally under a Landlock sandbox on Linux or via `is_write` enforcement on macOS (see [Policy enforcement](#policy-enforcement))
-3. `POST /agent/jobs/{id}/result` - posts stdout, stderr, exit code, whether the command was blocked, and `is_write` (set to `true` if blocked)
+- **Host (Linux/macOS)** - installed via `install.sh` as a systemd service or
+  (macOS) a foreground process / LaunchDaemon under a dedicated `reach-agent` user.
+  Identity is a machine fingerprint. Jobs run via `/bin/bash -lc`, sandboxed with
+  **Landlock** on Linux in readonly/approved mode.
+- **Kubernetes** - installed via Helm (`deploy/helm/reach-agent`) as a Deployment
+  running the `nabeemdev/reach-agent` image. Identity is derived from the
+  `kube-system` namespace UID, so every replica is the **same** agent; a
+  `coordination.k8s.io/Lease` elects one active leader. The agent token lives in a
+  managed Secret (nothing on disk). Jobs run **without a shell** - parsed into a
+  pipeline, restricted to an allowlist (`kubectl` + read-only filters), with
+  local-file reads blocked. The agent self-reports its cluster-wide RBAC for
+  drift/acknowledge in the console.
 
-The agent self-rotates its token every 30 days. Tenant admins can also trigger an out-of-band rotation via `POST /tenant/agents/{id}/request-rotation`, which sets a `rotation_requested` flag; the agent picks it up on its next sync and self-rotates without any connection interruption. See [SELF_HOSTING.md](SELF_HOSTING.md) for the full agent lifecycle.
+The agent **never sends or stores an agent id** (credential-only - see [Token
+model](#token-model)). It self-rotates its token every 30 days; tenant admins can
+also request an immediate rotation via `POST /tenant/agents/{id}/request-rotation`,
+which the agent picks up on its next sync. See [SELF_HOSTING.md](SELF_HOSTING.md)
+for the full agent lifecycle.
 
 ---
 
@@ -140,7 +156,15 @@ Three token types, none stored raw - only `HMAC-SHA256(TOKEN_PEPPER, token)` has
 | Agent token | `agent_` | Backend (at claim) | Agent (every sync) | 30 days, auto-rotated |
 | API token | `tok_` | `POST /tenant/api-tokens` (any tenant user) | CLI / MCP server | Until revoked |
 
-The install token is one-time use and is cleared from disk after a successful claim. The agent token is bound to a machine fingerprint - a token replayed from a different machine is rejected. The agent rotates its own token every 30 days with no lockout window (old token is valid until the new one is persisted). Tenant admins can also request an immediate rotation via `POST /tenant/agents/{id}/request-rotation`; the flag is cleared atomically by `update_agent_token_hash` when the new token is stored.
+The install token is one-time use and is cleared after a successful claim. The agent token is bound to a machine fingerprint - a token replayed from a different machine is rejected. The agent rotates its own token every 30 days with no lockout window (old token is valid until the new one is persisted). Tenant admins can also request an immediate rotation via `POST /tenant/agents/{id}/request-rotation`; the flag is cleared atomically by `update_agent_token_hash` when the new token is stored.
+
+**Credential-only identity.** The agent never sends or stores an `agent_id`. At
+claim it presents the **install token**, and the backend looks the agent up by
+`install_token_hash`; on every later call it presents the **agent token**, resolved
+by `agent_token_hash`. Both hashes are uniquely indexed (Postgres) / GSI'd
+(DynamoDB), so a hash maps to exactly one agent. An `agent_id` still exists on the
+backend as the record key and operator handle (`reach exec --agent <id>`, access
+lists), but it is never trusted from - or even known to - the agent process.
 
 ---
 
@@ -235,6 +259,38 @@ When the agent receives a job in approved mode, it also receives the current app
 
 The match is prefix-based with a word boundary: an approved entry of `docker logs` permits `docker logs myapp --tail 100` but not `docker rm myapp`. Matching checks `cmd == approved` or `cmd.startswith(approved + " ")`.
 
+### Kubernetes agents
+
+For `type=k8s` agents the model is different - Landlock (a filesystem sandbox) is irrelevant to `kubectl`'s API calls, so policy mode is enforced **server-side at job submission** instead:
+
+- The backend classifies the `kubectl` verb (default-deny: any verb that isn't a known read verb - including `exec`/`cp`/`port-forward` and unknown verbs - is a write). `readonly` rejects writes outright; `approved` records a `REJECTED` job and raises a pending approval (the command never dispatches); pre-approved writes and reads dispatch normally.
+- Approvals for k8s agents are **structured rules** `{verb, resource, namespace, name}` (each field wildcardable with `*`), not command text. A submitted write is permitted when some approved rule matches every field; a blocked write's rule is **derived** from the command onto the pending approval for the operator to review. See [Approvals](#approvals).
+- The **agent** adds two compromise-resistant bounds that are agent-local (not job data, so a malicious backend can't relax them): jobs run **without a shell**, every pipeline stage's binary must be allow-listed (`kubectl` + read-only filters), and arguments that resolve to a local file are rejected (no reading the mounted ServiceAccount token).
+- The **API server** enforces **RBAC** as the unbypassable floor.
+
+So three layers compose - RBAC (what's possible) ∩ policy mode (what's allowed) ∩ allowlist/no-shell (blast-radius bound). The agent reports its effective cluster-wide RBAC (`SelfSubjectRulesReview` across all namespaces) for acknowledge/drift; see [agent/README.md](agent/README.md).
+
+#### How `kubectl` commands are classified
+
+Write-ness is decided from the `kubectl` verb, **fail-closed** - anything that isn't a known read is a write (so an unrecognized or future verb is gated, never silently allowed). Authoritative in `backend/shared/policy.py` (`_K8S_READ_VERBS`, `_K8S_WRITE_VERBS`, `_K8S_COMPOUND_*`, `is_k8s_write`).
+
+- **Reads** run in every mode and never need approval: `get`, `describe`, `logs`, `top`, `explain`, `events`, `diff`, `wait`, `api-resources`, `api-versions`, `version`, `cluster-info`. Plus **cluster-inert utilities** that only render/print locally or touch the local kubeconfig - which the agent never uses for auth (it authenticates via its in-cluster ServiceAccount) and can't write (read-only rootfs): `kustomize`, `options`, `completion`, `plugin`, `config` (all subcommands).
+- **Writes** are blocked (`readonly`) or held for approval (`approved`): `create`, `apply`, `delete`, `edit`, `patch`, `replace`, `scale`, `autoscale`, `expose`, `run`, `label`, `annotate`, `drain`, `cordon`/`uncordon`, `taint`, `exec`, `attach`, `cp`, `port-forward`, `proxy`, `debug`, … and anything unrecognized.
+- **Dry runs are reads.** A `--dry-run=client|server` (or the deprecated bare `--dry-run`) makes an otherwise-mutating command non-mutating, so it's classified as a read. `--dry-run=none` really applies and stays a write.
+- **Double verbs** - where the real operation is `base + sub` (and the sub can flip read↔write) - are keyed as the compound `"<base> <sub>"`, so reads and writes are distinguished and each write is **separately approvable** (e.g. allow `certificate approve` but not `certificate deny`):
+
+  | Command | Reads | Writes |
+  |---|---|---|
+  | `rollout` | `status`, `history` | `restart`, `undo`, `pause`, `resume` |
+  | `auth` | `can-i`, `whoami` | `reconcile` (edits RBAC) |
+  | `apply` | `view-last-applied` | `set-last-applied`, `edit-last-applied` |
+  | `set` | - | `image`, `env`, `resources`, `selector`, `serviceaccount`, `subject` |
+  | `certificate` | - | `approve`, `deny` |
+
+  An unrecognized sub of a known base is treated as a write (fail-closed). The compound verb lands in the structured rule's `verb` field - e.g. blocking `kubectl rollout restart deploy/web` derives `{verb: "rollout restart", resource: "deployments", name: "web", namespace: "*"}` - so no extra column is needed. The UI approval form offers the same write set, and a backend test (`test_ui_verb_dropdown_mirrors_backend_write_verbs`) keeps the two in lockstep.
+
+  **Namespace inference:** an unqualified command is attributed to `default` (the `-n`/`--all-namespaces` value otherwise). In-cluster `kubectl` would otherwise silently target the agent's *own* pod namespace, so the **agent injects `--namespace=default`** into any kubectl stage that doesn't select one (overridable per install via `REACH_K8S_DEFAULT_NAMESPACE`) - making the command run exactly where the backend classified it. Scope approvals precisely with `-n`, or use the `namespace: *` rule.
+
 ---
 
 ## Approvals
@@ -246,7 +302,8 @@ approvals table:
   approval_id    - unique ID (appr_xxx)
   tenant_id      - which tenant
   agent_id       - which agent blocked the command
-  command        - the exact command that was blocked
+  command        - the command text (host agents), or a readable rendering of the rule (k8s)
+  k8s_rule       - structured rule {verb, resource, namespace, name} for k8s agents; null for host
   requested_by   - user_id of the submitter
   requester_name - display name of the submitter
   job_id         - the job that triggered this record
@@ -289,7 +346,7 @@ approvals table:
 | `denied` | 409 | 409 | Terminal - delete and let a new block create a fresh one |
 | `expired` | 409 | 409 | Terminal - delete and let a new block create a fresh one |
 
-Operators and admins manage approvals via `GET /tenant/approvals`, `PUT /tenant/approvals/{id}/approve`, `PUT /tenant/approvals/{id}/deny`, and `DELETE /tenant/approvals/{id}`. `DELETE /tenant/approvals/{id}` permanently removes a record of any status - useful for cleaning up stale pending records or removing an approved command from the effective list immediately. Users manage approvals through `reach approvals` with status flags: default shows effective approved commands (agent-wide); `--pending`, `--denied`, and `--expired` show the current user's own records for the agent.
+Operators and admins manage approvals via `GET /tenant/approvals`, `PUT /tenant/approvals/{id}/approve`, `PUT /tenant/approvals/{id}/deny`, and `DELETE /tenant/approvals/{id}`. `DELETE /tenant/approvals/{id}` permanently removes a record of any status - useful for cleaning up stale pending records or removing an approved command from the effective list immediately. Users manage approvals through `reach approvals list` with status flags: default shows effective approved commands (agent-wide); `--pending`, `--denied`, and `--expired` show the current user's own records for the agent.
 
 Only one pending record is created per `(agent_id, command)` pair at a time. If a command is blocked and a pending record already exists for that exact command on that agent, no duplicate is created. Once the existing record is approved or denied, the next block creates a fresh pending record.
 
@@ -311,7 +368,7 @@ When approving a `pending` record or updating duration on an `approved` record, 
 
 Once a record reaches `expired` status, the command is no longer in the effective approved list and the next blocked attempt creates a new pending record.
 
-`reach approvals` shows the expiry (or "permanent") for each effective entry. `reach approvals --expired` shows the current user's own records with `status=expired`.
+`reach approvals list` shows the expiry (or "permanent") for each effective entry. `reach approvals list --expired` shows the current user's own records with `status=expired`.
 
 ### Automatic expiry and cleanup
 
@@ -332,7 +389,7 @@ The lazy expiry and the hourly sweep are idempotent and safe to run concurrently
 
 The agent detects whether it is running as root (`os.Getuid() == 0`) and includes `running_as_root: true/false` in each sync request. The backend stores this on the agent record.
 
-`access_level` is a computed label combining the agent's current mode and privilege. It is injected into agent responses at read time - not stored separately.
+`access_level` is a computed label combining the agent's current mode and privilege. It is injected into agent responses at read time - not stored separately (`compute_access_level(mode, running_as_root)` in `shared/policy.py`).
 
 | access_level | Mode | running_as_root |
 |---|---|---|
@@ -342,6 +399,8 @@ The agent detects whether it is running as root (`os.Getuid() == 0`) and include
 | `restricted` | readonly | false |
 
 This label is shown in `reach agents list` and `reach status`, and is included in the `GET /agents` and `GET /agents/{id}` API responses so MCP clients receive it directly. It is a factual descriptor of how the agent is configured, not a risk score.
+
+**This table is host-oriented.** `compute_access_level` does not branch on agent type, so a `type=k8s` agent is also labelled - but the k8s pod runs non-root with a read-only root filesystem, so `running_as_root` is always `false` and the label can only ever be `elevated` / `managed` / `restricted`, never `open`. Root is not what bounds a Kubernetes agent (the console shows it as `n/a`); **cluster RBAC** is. For k8s, treat `access_level` as a reflection of policy mode only, and read the acknowledged RBAC (the chart's `clusterAccess`, self-reported and drift-tracked) as the real privilege bound.
 
 ---
 
@@ -384,23 +443,30 @@ Artifacts are published to S3 under component-specific prefixes:
 
 ```
 s3://reach-releases/
-  cli/
+  cli/                          (CLI wheel)
     v0.1.0/reach-0.1.0-py3-none-any.whl
     latest/reach-0.1.0-py3-none-any.whl
-  agent/
-    v0.1.0/reach-agent-linux-amd64
-    v0.1.0/reach-agent-linux-arm64
-    v0.1.0/reach-agent-darwin-arm64
-    v0.1.0/reach-agent-darwin-amd64
-    v0.1.0/install.sh        (handles install + uninstall via --uninstall flag)
+  agent/                        (host install artifacts)
+    v0.1.0/reach-agent-{linux,darwin}-{amd64,arm64}
+    v0.1.0/install.sh           (install + uninstall via --uninstall)
     latest/  (same files)
+  charts/reach-agent/           (Helm repo for the Kubernetes agent)
+    index.yaml
+    reach-agent-0.1.0.tgz       (one tarball per published chart version)
   lambda/
-    code/     (SAM-packaged function zips, content-addressed)
+    code/                       (SAM-packaged function zips, content-addressed)
     v0.1.0/template.yaml
     latest/template.yaml
   local-setup.sh
+  lambda-setup.sh
 ```
 
-Docker image: `nabeemdev/reach:{version}` and `nabeemdev/reach:latest`.
+Docker images:
+- `nabeemdev/reach:{version}` / `:latest` - the **backend** (FastAPI in Docker, or the Lambda image).
+- `nabeemdev/reach-agent:{version}` / `:latest` - the **Kubernetes agent**, pulled by the Helm chart; the chart's `appVersion` selects the tag (see [POLICIES.md](POLICIES.md) / the chart README for the versioning model).
 
-Each component is versioned independently. Release scripts: `scripts/release_cli.sh`, `scripts/release_agent.sh`, `scripts/release_backend.sh` (covers Docker + Lambda).
+Each component is versioned independently. Release scripts:
+- `scripts/release_cli.sh` - the CLI wheel → `cli/`.
+- `scripts/release_agent.sh` - host binaries → `agent/`, plus the multi-arch k8s image → the registry.
+- `scripts/release_agent_chart.sh` - the Helm chart → `charts/reach-agent/` (refuses to overwrite an existing version unless `--force`).
+- `scripts/release_backend.sh` - the backend Docker image and the Lambda template → `lambda/`.

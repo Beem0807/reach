@@ -7,6 +7,9 @@ const CONFIG: Record<string, BadgeConfig> = {
   CREATED:   { cls: 'bg-sky-50 text-sky-700 ring-sky-600/20',            dot: 'bg-sky-500' },
   REVOKED:   { cls: 'bg-red-50 text-red-600 ring-red-600/20',            dot: 'bg-red-500' },
   DELETED:   { cls: 'bg-gray-100 text-gray-500 ring-gray-500/20',        dot: 'bg-gray-400' },
+  // Agent type
+  k8s:       { cls: 'bg-blue-50 text-blue-700 ring-blue-600/20',         dot: 'bg-blue-500' },
+  host:      { cls: 'bg-slate-50 text-slate-600 ring-slate-500/20',      dot: 'bg-slate-400' },
   // Mode
   wild:      { cls: 'bg-orange-50 text-orange-700 ring-orange-600/20',   dot: 'bg-orange-400' },
   readonly:  { cls: 'bg-sky-50 text-sky-700 ring-sky-600/20',            dot: 'bg-sky-400' },

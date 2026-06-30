@@ -1,0 +1,69 @@
+{{- if .Values.rbac.create }}
+# Cluster-scoped, read-only on namespaces:
+#  - get kube-system: the namespace UID is the stable cluster identity (the anchor
+#    for the agent's fingerprint, so every replica converges on one agent).
+#  - list: the agent enumerates every namespace to self-review its effective RBAC
+#    cluster-wide (it reports access in namespaces nobody configured, and drift
+#    flags any grant sneaked in later). list returns only namespace names.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "reach-agent.fullname" . }}-clusterid
+  labels:
+    {{- include "reach-agent.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "reach-agent.fullname" . }}-clusterid
+  labels:
+    {{- include "reach-agent.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "reach-agent.fullname" . }}-clusterid
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "reach-agent.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+---
+# Namespaced: leader-election Lease + the Secret the agent uses to persist and
+# share its claimed agent token. Scoped to this namespace only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "reach-agent.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "reach-agent.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update", "watch"]
+  # The agent creates its token Secret on first claim and updates it on rotation.
+  # `create` cannot be name-restricted; to tighten, pre-create the Secret and drop
+  # `create` here (keep get/update with resourceNames: [<tokenSecretName>]).
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "reach-agent.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "reach-agent.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "reach-agent.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "reach-agent.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

@@ -1,5 +1,18 @@
+import os
+import re
+
 import pytest
-from shared.policy import _is_approved, _is_blocked, _is_readonly_blocked, compute_access_level
+from shared.policy import (
+    _is_approved,
+    _is_blocked,
+    _is_readonly_blocked,
+    _K8S_COMPOUND_WRITES,
+    _K8S_WRITE_VERBS,
+    compute_access_level,
+    is_k8s_write,
+    normalize_k8s_rule,
+    parse_kubectl,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -252,3 +265,137 @@ def test_compute_access_level_ignores_extra_kwargs():
         docker_detected=True, service_mgmt_detected=True,
     )
     assert result == "open"
+
+
+# ---------------------------------------------------------------------------
+# UI / backend parity: the approval form's verb dropdown must offer exactly the
+# backend write verbs, or an operator can't pre-approve a write the backend gates.
+# ---------------------------------------------------------------------------
+
+def test_ui_verb_dropdown_mirrors_backend_write_verbs():
+    ui_path = os.path.join(
+        os.path.dirname(__file__), "..", "..", "ui", "src", "components", "K8sRuleForm.tsx"
+    )
+    if not os.path.exists(ui_path):
+        pytest.skip("UI component not present (backend built standalone)")
+    with open(ui_path, encoding="utf-8") as f:
+        src = f.read()
+    m = re.search(r"K8S_WRITE_VERBS\s*=\s*\[(.*?)\]", src, re.DOTALL)
+    assert m, "could not find K8S_WRITE_VERBS in K8sRuleForm.tsx"
+    ui_verbs = set(re.findall(r"'([^']+)'", m.group(1)))
+    ui_verbs.discard("*")  # UI adds an any-write wildcard; the backend sets have no "*"
+    backend_verbs = set(_K8S_WRITE_VERBS) | set(_K8S_COMPOUND_WRITES)
+    assert ui_verbs == backend_verbs, (
+        "approval verb dropdown out of sync with backend approvable writes "
+        "(_K8S_WRITE_VERBS + _K8S_COMPOUND_WRITES) - "
+        f"only in UI: {sorted(ui_verbs - backend_verbs)}; "
+        f"only in backend: {sorted(backend_verbs - ui_verbs)}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Double verbs: read/write classification depends on the sub-subcommand, and the
+# rule verb is the compound "<base> <sub>".
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("cmd", [
+    "kubectl rollout status deploy/web",
+    "kubectl rollout history deployment/web -n team-a",
+    "kubectl auth can-i create pods",
+    "kubectl auth whoami",
+])
+def test_double_verb_reads_not_flagged_write(cmd):
+    assert not is_k8s_write(cmd)
+
+
+@pytest.mark.parametrize("cmd", [
+    "kubectl rollout restart deploy/web",
+    "kubectl rollout undo deployment/web",
+    "kubectl rollout pause deploy/web",
+    "kubectl auth reconcile -f rbac.yaml",  # the security fix: was misread as read
+])
+def test_double_verb_writes_flagged_write(cmd):
+    assert is_k8s_write(cmd)
+
+
+def test_double_verb_parses_compound_verb_and_resource():
+    rule = parse_kubectl(["kubectl", "rollout", "restart", "deployment/web", "-n", "team-a"])
+    assert rule == {"verb": "rollout restart", "resource": "deployments", "namespace": "team-a", "name": "web"}
+
+
+def test_compound_write_verb_is_approvable():
+    # A derived/edited rule with a compound verb survives normalization.
+    assert normalize_k8s_rule({"verb": "rollout restart", "resource": "deployments"}) == {
+        "verb": "rollout restart", "resource": "deployments", "namespace": "*", "name": "*",
+    }
+    assert normalize_k8s_rule({"verb": "auth reconcile"})["verb"] == "auth reconcile"
+    assert normalize_k8s_rule({"verb": "apply set-last-applied"})["verb"] == "apply set-last-applied"
+    # A read/unknown compound verb is not a storable write rule.
+    assert normalize_k8s_rule({"verb": "rollout status"}) is None
+
+
+@pytest.mark.parametrize("cmd", [
+    # Cluster-inert utilities (render/print locally or local-kubeconfig only).
+    "kubectl kustomize ./overlays/prod",
+    "kubectl options",
+    "kubectl plugin list",
+    "kubectl config view",
+    "kubectl config current-context",
+    "kubectl config set-context --current --namespace=team-a",  # local kubeconfig, not cluster
+    # apply's read sub-subcommand.
+    "kubectl apply view-last-applied -f deploy.yaml",
+])
+def test_cluster_inert_and_apply_reads_not_flagged_write(cmd):
+    assert not is_k8s_write(cmd)
+
+
+@pytest.mark.parametrize("cmd", [
+    "kubectl apply -f deploy.yaml",
+    "kubectl apply -k ./overlays/prod",
+    "kubectl apply set-last-applied -f deploy.yaml",
+    "kubectl apply edit-last-applied deployment/web",
+])
+def test_apply_writes_flagged_write(cmd):
+    assert is_k8s_write(cmd)
+
+
+# --dry-run makes a write non-mutating -> read (but --dry-run=none really applies).
+
+@pytest.mark.parametrize("cmd", [
+    "kubectl delete pod x -n team-a --dry-run=client",
+    "kubectl apply -f deploy.yaml --dry-run=server",
+    "kubectl scale deploy/web --replicas=3 --dry-run",       # deprecated bare form = client
+    "kubectl set image deploy/web app=nginx --dry-run=client",
+])
+def test_dry_run_is_read(cmd):
+    assert not is_k8s_write(cmd)
+
+
+@pytest.mark.parametrize("cmd", [
+    "kubectl delete pod x -n team-a --dry-run=none",         # none actually deletes
+    "kubectl apply -f deploy.yaml",
+])
+def test_dry_run_none_still_write(cmd):
+    assert is_k8s_write(cmd)
+
+
+# set / certificate: distinct sub-subcommands are separately classified & approvable.
+
+def test_set_and_certificate_compound_verbs():
+    assert is_k8s_write("kubectl set image deploy/web app=nginx:1.2 -n prod")
+    assert is_k8s_write("kubectl certificate approve my-csr")
+    assert parse_kubectl(["kubectl", "set", "image", "deployment/web", "app=nginx", "-n", "prod"]) == {
+        "verb": "set image", "resource": "deployments", "namespace": "prod", "name": "web"}
+    # Each write is separately approvable, so `certificate approve` need not imply `deny`.
+    assert normalize_k8s_rule({"verb": "certificate approve"})["verb"] == "certificate approve"
+    assert normalize_k8s_rule({"verb": "set env"})["verb"] == "set env"
+
+
+# Namespace inference (documents the assumption flagged in ARCHITECTURE): an
+# unqualified command is attributed to "default" - which must match the namespace
+# the in-cluster agent's kubectl actually targets. -n / -A override it.
+
+def test_namespace_inference():
+    assert parse_kubectl(["kubectl", "delete", "pod", "x"])["namespace"] == "default"
+    assert parse_kubectl(["kubectl", "delete", "pod", "x", "-n", "team-a"])["namespace"] == "team-a"
+    assert parse_kubectl(["kubectl", "delete", "pods", "--all-namespaces"])["namespace"] == "*"

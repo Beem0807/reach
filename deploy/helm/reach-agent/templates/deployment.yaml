@@ -1,0 +1,142 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "reach-agent.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "reach-agent.labels" . | nindent 4 }}
+spec:
+  # Fungible replicas; a Lease elects one active leader. Not a StatefulSet:
+  # all replicas share ONE identity rather than each having a distinct one.
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "reach-agent.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "reach-agent.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "reach-agent.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: agent
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          env:
+            # --- claim bootstrap (from the tenant console) ---
+            - name: REACH_API_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "reach-agent.bootstrapSecretName" . }}
+                  key: api-url
+            - name: REACH_INSTALL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "reach-agent.bootstrapSecretName" . }}
+                  key: install-token
+            # --- kubernetes mode (auto-detected; these name the resources it manages) ---
+            - name: REACH_K8S_TOKEN_SECRET
+              value: {{ include "reach-agent.tokenSecretName" . | quote }}
+            - name: REACH_K8S_LEASE
+              value: {{ include "reach-agent.leaseName" . | quote }}
+            - name: REACH_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: REACH_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            {{- with .Values.allowedBinaries }}
+            # Replaces the default allowlist (lock-down). Jobs run without a shell.
+            - name: REACH_K8S_ALLOWED_BINARIES
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- with .Values.extraAllowedBinaries }}
+            # Added to the default allowlist (kubectl + filters are kept).
+            - name: REACH_K8S_EXTRA_BINARIES
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- with .Values.permissionReviewIntervalSeconds }}
+            - name: REACH_K8S_REVIEW_INTERVAL_SECONDS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if .Values.livenessProbe.enabled }}
+            - name: REACH_HEALTH_FILE
+              value: /tmp/healthy
+            {{- end }}
+            {{- if .Values.metrics.enabled }}
+            # Opt-in Prometheus endpoint. This is the agent's ONLY inbound port -
+            # keep it locked down with the NetworkPolicy (metrics.networkPolicy).
+            - name: REACH_METRICS_ADDR
+              value: ":{{ .Values.metrics.port }}"
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- if .Values.metrics.enabled }}
+          ports:
+            - name: metrics
+              containerPort: {{ .Values.metrics.port }}
+              protocol: TCP
+          {{- end }}
+          {{- if .Values.livenessProbe.enabled }}
+          # The agent has no server; it touches /tmp/healthy each poll iteration.
+          # If the loop wedges, the file goes stale and the pod is restarted.
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - 'test $(( $(date +%s) - $(stat -c %Y /tmp/healthy 2>/dev/null || echo 0) )) -lt {{ .Values.livenessProbe.staleSeconds }}'
+            initialDelaySeconds: {{ .Values.livenessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.livenessProbe.periodSeconds }}
+            failureThreshold: {{ .Values.livenessProbe.failureThreshold }}
+          {{- end }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            # kubectl writes its discovery cache under $HOME (/tmp); back it with
+            # an emptyDir so the read-only root filesystem stays read-only.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

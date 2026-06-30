@@ -102,6 +102,72 @@ class TestCreateJob:
         r = self._call({"agent_id": AGENT_ID, "command": "ls"}, user=restricted_user)
         assert r["statusCode"] == 404
 
+
+_AGENT_K8S_READONLY = {"agent_id": AGENT_ID, "tenant_id": TENANT, "status": "ACTIVE", "mode": "readonly", "type": "k8s"}
+_AGENT_K8S_APPROVED = {"agent_id": AGENT_ID, "tenant_id": TENANT, "status": "ACTIVE", "mode": "approved", "type": "k8s"}
+
+
+class TestCreateJobK8s:
+    """k8s agents are gated at submission (verb-aware, default-deny)."""
+
+    def _call(self, command, agent, approved=None):
+        # `approved` is a list of structured k8s rules ({verb, resource, namespace, name}).
+        with patch("handlers.create_job._verify_tenant_token", return_value=USER), \
+             patch("handlers.create_job.agents_repo") as ar, \
+             patch("handlers.create_job.jobs_repo") as jr, \
+             patch("handlers.create_job.approvals_repo") as apr, \
+             patch("handlers.create_job.users_repo") as ur:
+            ar.get.return_value = agent
+            apr.list_by_agent.return_value = [{"command": "", "k8s_rule": rule} for rule in (approved or [])]
+            apr.exists_pending.return_value = False
+            ur.get.return_value = {"name": "Alice"}
+            r = handle_create_job({"agent_id": AGENT_ID, "command": command}, "tok")
+            return r, jr, apr
+
+    def test_readonly_allows_kubectl_read(self):
+        r, _, _ = self._call("kubectl get pods", _AGENT_K8S_READONLY)
+        assert r["statusCode"] == 201
+
+    def test_readonly_blocks_write_the_old_regex_missed(self):
+        # `cordon` is not in the legacy regex; the verb classifier catches it.
+        r, _, _ = self._call("kubectl cordon node-1", _AGENT_K8S_READONLY)
+        assert r["statusCode"] == 403
+
+    def test_readonly_blocks_pipeline_with_write_stage(self):
+        r, _, _ = self._call("kubectl get x -o yaml | kubectl apply -f -", _AGENT_K8S_READONLY)
+        assert r["statusCode"] == 403
+
+    def test_approved_read_dispatches(self):
+        r, jr, _ = self._call("kubectl get pods | grep x", _AGENT_K8S_APPROVED)
+        assert json.loads(r["body"])["status"] == "PENDING"
+
+    def test_approved_unapproved_write_is_rejected_and_raises_approval(self):
+        r, jr, apr = self._call("kubectl delete pod x", _AGENT_K8S_APPROVED)
+        body = json.loads(r["body"])
+        assert body["status"] == "REJECTED"
+        assert body["approval_required"] is True
+        apr.create.assert_called_once()
+        # The recorded job is REJECTED, never dispatched.
+        assert jr.create.call_args[0][0]["status"] == "REJECTED"
+
+    def test_approved_preapproved_write_dispatches(self):
+        # A rule permitting delete pods in the default namespace (any name) covers this.
+        rule = {"verb": "delete", "resource": "pods", "namespace": "default", "name": "*"}
+        r, jr, apr = self._call("kubectl delete pod x", _AGENT_K8S_APPROVED, approved=[rule])
+        assert json.loads(r["body"])["status"] == "PENDING"
+        apr.create.assert_not_called()
+
+    def test_approved_rule_for_other_namespace_does_not_match(self):
+        rule = {"verb": "delete", "resource": "pods", "namespace": "team-a", "name": "*"}
+        r, jr, apr = self._call("kubectl delete pod x -n team-b", _AGENT_K8S_APPROVED, approved=[rule])
+        assert json.loads(r["body"])["status"] == "REJECTED"
+
+    def test_derived_rule_stored_on_pending_approval(self):
+        r, jr, apr = self._call("kubectl delete pod nginx -n team-a", _AGENT_K8S_APPROVED)
+        assert json.loads(r["body"])["status"] == "REJECTED"
+        created = apr.create.call_args[0][0]
+        assert created["k8s_rule"] == {"verb": "delete", "resource": "pods", "namespace": "team-a", "name": "nginx"}
+
     def test_write_command_annotated_is_write_true(self):
         with patch("handlers.create_job._verify_tenant_token", return_value=USER), \
              patch("handlers.create_job.agents_repo") as ar, \

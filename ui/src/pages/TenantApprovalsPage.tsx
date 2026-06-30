@@ -1,12 +1,15 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import type { TenantConfig, Approval, Agent } from '../types';
+import type { TenantConfig, Approval, Agent, K8sRule } from '../types';
 import {
   listAllTenantApprovals, listTenantApprovals, approveTenantApproval, denyTenantApproval,
-  deleteTenantApproval, tenantPreApprove, listTenantAgents,
+  deleteTenantApproval, tenantPreApprove, tenantPreApproveRule, listTenantAgents,
 } from '../api';
 import { Modal } from '../components/Modal';
 import { Spinner } from '../components/Spinner';
 import { CopyButton } from '../components/CopyButton';
+import { ApprovalTarget } from '../components/ApprovalTarget';
+import { K8sRuleForm, EMPTY_RULE } from '../components/K8sRuleForm';
+
 
 function useColumnResize(count: number) {
   const [minWidths, setMinWidths] = useState<number[]>(() => Array(count).fill(0));
@@ -36,9 +39,31 @@ type StatusTab = 'pending' | 'approved' | 'denied' | 'expired';
 const DURATIONS = ['permanent', '1h', '8h', '24h', '7d', '30d', '90d'] as const;
 type Duration = typeof DURATIONS[number];
 
+const PAGE_SIZE = 10;
+
+// Prev/next pager shown below a table. `total` is the full count for the current
+// kind; page is 0-based. Hidden when everything fits on one page.
+function Pager({ page, total, onPage }: { page: number; total: number; onPage: (p: number) => void }) {
+  const pageCount = Math.ceil(total / PAGE_SIZE);
+  if (pageCount <= 1) return null;
+  const from = page * PAGE_SIZE + 1;
+  const to = Math.min(total, (page + 1) * PAGE_SIZE);
+  const btn = 'px-2.5 py-1 text-sm rounded-md border border-gray-300 disabled:opacity-40 disabled:cursor-not-allowed hover:bg-gray-50 transition-colors';
+  return (
+    <div className="flex items-center justify-between px-4 py-3 border-t border-gray-100 bg-gray-50/50">
+      <span className="text-xs text-gray-500">Showing {from}–{to} of {total}</span>
+      <div className="flex items-center gap-2">
+        <button className={btn} onClick={() => onPage(page - 1)} disabled={page <= 0}>Prev</button>
+        <span className="text-xs text-gray-500">Page {page + 1} of {pageCount}</span>
+        <button className={btn} onClick={() => onPage(page + 1)} disabled={page >= pageCount - 1}>Next</button>
+      </div>
+    </div>
+  );
+}
+
 function fmtDate(iso: string) {
   return new Date(iso).toLocaleString(undefined, {
-    month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+    month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit',
   });
 }
 
@@ -48,7 +73,7 @@ function fmtExpiry(iso?: string) {
   if (d.getTime() < Date.now()) return 'expired';
   return d.toLocaleString(undefined, {
     month: 'short', day: 'numeric',
-    hour: '2-digit', minute: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
   });
 }
 
@@ -90,9 +115,20 @@ function DeveloperApprovalsView({ config }: { config: TenantConfig }) {
   );
   const [agents, setAgents] = useState<Agent[]>([]);
   const [approvals, setApprovals] = useState<Approval[]>([]);
+  const [total, setTotal] = useState(0);
+  const [kindFilter, setKindFilter] = useState<'k8s' | 'host'>('host');
+  const [search, setSearch] = useState('');            // input box
+  const [appliedSearch, setAppliedSearch] = useState(''); // last submitted via Search
+  const [pages, setPages] = useState<{ k8s: number; host: number }>({ k8s: 0, host: 0 });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [showModal, setShowModal] = useState(false);
+  // Kind, search, and paging all run server-side; default view is the 10 most
+  // recent. `approvals` is the current server page. Each kind keeps its own page.
+  const page = pages[kindFilter];
+  const setPage = (p: number) => setPages(prev => ({ ...prev, [kindFilter]: p }));
+  const applySearch = () => { setAppliedSearch(search.trim()); setPage(0); };
+  const loadSeqRef = useRef(0);
 
   useEffect(() => {
     listTenantAgents(apiUrl, tenantToken)
@@ -101,18 +137,30 @@ function DeveloperApprovalsView({ config }: { config: TenantConfig }) {
   }, [apiUrl, tenantToken]);
 
   const load = useCallback(() => {
+    const seq = ++loadSeqRef.current;
     setLoading(true);
     setError('');
-    listTenantApprovals(apiUrl, tenantToken)
-      .then(r => setApprovals(r.approvals ?? []))
-      .catch(() => setError('Failed to load your approval requests'))
-      .finally(() => setLoading(false));
-  }, [apiUrl, tenantToken]);
+    const params: Record<string, string> = {
+      type: kindFilter,
+      limit: String(PAGE_SIZE),
+      offset: String(page * PAGE_SIZE),
+    };
+    if (appliedSearch) params.q = appliedSearch;
+    listTenantApprovals(apiUrl, tenantToken, params)
+      .then(r => {
+        if (loadSeqRef.current !== seq) return;
+        setApprovals(r.approvals ?? []);
+        setTotal(r.total ?? (r.approvals ?? []).length);
+      })
+      .catch(() => { if (loadSeqRef.current === seq) setError('Failed to load your approval requests'); })
+      .finally(() => { if (loadSeqRef.current === seq) setLoading(false); });
+  }, [apiUrl, tenantToken, kindFilter, appliedSearch, page]);
 
   useEffect(() => { load(); }, [load]);
 
-  const handleSubmit = async (agentId: string, command: string) => {
-    await tenantPreApprove(apiUrl, tenantToken, agentId, command);
+  const handleSubmit = async (agentId: string, payload: { command?: string; rule?: K8sRule }) => {
+    if (payload.rule) await tenantPreApproveRule(apiUrl, tenantToken, agentId, payload.rule);
+    else await tenantPreApprove(apiUrl, tenantToken, agentId, payload.command ?? '');
     setShowModal(false);
     load();
   };
@@ -148,6 +196,44 @@ function DeveloperApprovalsView({ config }: { config: TenantConfig }) {
           </div>
         )}
 
+        <div className="flex items-center gap-3 flex-wrap">
+          <div className="inline-flex rounded-lg border border-gray-300 bg-white shadow-sm overflow-hidden">
+            {(['k8s', 'host'] as const).map(k => (
+              <button
+                key={k}
+                onClick={() => setKindFilter(k)}
+                className={`px-3 py-1.5 text-sm font-medium transition-colors ${
+                  kindFilter === k ? 'bg-indigo-600 text-white' : 'text-gray-600 hover:bg-gray-50'
+                }`}
+              >
+                {k === 'k8s' ? 'Kubernetes' : 'Host'}
+              </button>
+            ))}
+          </div>
+          <div className="relative">
+            <svg className="w-4 h-4 text-gray-400 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-5.197-5.197m0 0A7.5 7.5 0 105.196 5.196a7.5 7.5 0 0010.607 10.607z" />
+            </svg>
+            <input
+              value={search}
+              onChange={e => setSearch(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && applySearch()}
+              placeholder={kindFilter === 'k8s' ? 'Search verb, resource, namespace…' : 'Search command, agent…'}
+              className="w-64 border border-gray-300 rounded-lg pl-8 pr-7 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent shadow-sm"
+            />
+            {search && (
+              <button onClick={() => { setSearch(''); if (appliedSearch) { setAppliedSearch(''); setPage(0); } }} className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 text-sm">✕</button>
+            )}
+          </div>
+          <button
+            onClick={applySearch}
+            className="text-sm font-semibold px-3 py-1.5 rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 transition-colors shadow-sm"
+          >
+            Search
+          </button>
+          {appliedSearch && <span className="text-xs text-gray-500">Filtered by “{appliedSearch}”</span>}
+        </div>
+
         {loading ? (
           <div className="flex justify-center py-20"><Spinner /></div>
         ) : (
@@ -155,7 +241,7 @@ function DeveloperApprovalsView({ config }: { config: TenantConfig }) {
             <table className="w-full text-sm">
               <thead>
                 <tr className="border-b border-gray-200 bg-gray-50">
-                  {devTh('Command', 0)}
+                  {devTh('Command / rule', 0)}
                   {devTh('Agent', 1)}
                   {devTh('Requested', 2)}
                   {devTh('Status', 3)}
@@ -171,7 +257,12 @@ function DeveloperApprovalsView({ config }: { config: TenantConfig }) {
                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 12.75L11.25 15 15 9.75m-3-7.036A11.959 11.959 0 013.598 6 11.99 11.99 0 003 9.749c0 5.592 3.824 10.29 9 11.623 5.176-1.332 9-6.03 9-11.622 0-1.31-.21-2.571-.598-3.751h-.152c-3.196 0-6.1-1.248-8.25-3.285z" />
                           </svg>
                         </div>
-                        <p className="text-sm font-medium text-gray-500">No pending requests</p>
+                        <p className="text-sm font-medium text-gray-500">
+                          {appliedSearch
+                            ? `No ${kindFilter === 'k8s' ? 'Kubernetes' : 'host'} requests match “${appliedSearch}”`
+                            : `No pending ${kindFilter === 'k8s' ? 'Kubernetes' : 'host'} requests`}
+                        </p>
+                        {!appliedSearch && (
                         <p className="text-xs text-gray-400 mt-1">
                           Use{' '}
                           <button onClick={() => setShowModal(true)} className="text-indigo-600 hover:underline">
@@ -179,15 +270,15 @@ function DeveloperApprovalsView({ config }: { config: TenantConfig }) {
                           </button>{' '}
                           to ask an operator to permit a command.
                         </p>
+                        )}
                       </div>
                     </td>
                   </tr>
-                ) : approvals.map(a => (
+                ) : approvals.map(a => {
+                  return (
                   <tr key={a.approval_id} className="hover:bg-slate-50/80 transition-colors">
-                    <td className="px-4 py-3.5 max-w-[280px]">
-                      <span className="font-mono text-sm text-gray-800 bg-gray-100 px-2 py-0.5 rounded block truncate">
-                        {a.command}
-                      </span>
+                    <td className="px-4 py-3.5 max-w-[360px]">
+                      <ApprovalTarget approval={a} />
                     </td>
                     <td className="px-4 py-3.5">
                       <div className="flex items-center gap-1.5">
@@ -208,9 +299,11 @@ function DeveloperApprovalsView({ config }: { config: TenantConfig }) {
                       <StatusBadge status={a.status} />
                     </td>
                   </tr>
-                ))}
+                  );
+                })}
               </tbody>
             </table>
+            <Pager page={page} total={total} onPage={setPage} />
           </div>
         )}
       </div>
@@ -244,7 +337,18 @@ function OperatorApprovalsView({ config }: { config: TenantConfig }) {
   const [tab, setTab] = useState<StatusTab>('pending');
   const [agents, setAgents] = useState<Agent[]>([]);
   const [agentFilter, setAgentFilter] = useState('');
+  const [kindFilter, setKindFilter] = useState<'k8s' | 'host'>('host');
+  const [search, setSearch] = useState('');          // the input box
+  const [appliedSearch, setAppliedSearch] = useState(''); // what was last submitted via Search
+  // Kind, search, and paging all run server-side (SQL type/LIKE/limit+offset).
+  // Default view is the 10 most recent (server orders by created_at desc).
+  // Each kind keeps its own page; `approvals` is the current server page.
+  const [pages, setPages] = useState<{ k8s: number; host: number }>({ k8s: 0, host: 0 });
   const [approvals, setApprovals] = useState<Approval[]>([]);
+  const [total, setTotal] = useState(0);
+  const page = pages[kindFilter];
+  const setPage = (p: number) => setPages(prev => ({ ...prev, [kindFilter]: p }));
+  const applySearch = () => { setAppliedSearch(search.trim()); setPage(0); };
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [bulking, setBulking] = useState<'approve' | 'deny' | null>(null);
@@ -273,19 +377,24 @@ function OperatorApprovalsView({ config }: { config: TenantConfig }) {
       .catch(() => {});
   }, [apiUrl, tenantToken]);
 
-  const load = useCallback((reset = true) => {
+  const load = useCallback(() => {
     const seq = ++loadSeqRef.current;
     setLoading(true);
     setError('');
-    const params: Record<string, string> = { status: tab };
+    const params: Record<string, string> = {
+      status: tab,
+      type: kindFilter,
+      limit: String(PAGE_SIZE),
+      offset: String(page * PAGE_SIZE),
+    };
     if (agentFilter) params.agent_id = agentFilter;
+    if (appliedSearch) params.q = appliedSearch;
 
     listAllTenantApprovals(apiUrl, tenantToken, params)
       .then(r => {
         if (loadSeqRef.current !== seq) return;
-        const list = r.approvals ?? [];
-        setApprovals(prev => reset ? list : [...prev, ...list]);
-        setTabCounts(prev => ({ ...prev, [tab]: list.length }));
+        setApprovals(r.approvals ?? []);
+        setTotal(r.total ?? (r.approvals ?? []).length);
       })
       .catch(() => {
         if (loadSeqRef.current !== seq) return;
@@ -295,22 +404,22 @@ function OperatorApprovalsView({ config }: { config: TenantConfig }) {
         if (loadSeqRef.current !== seq) return;
         setLoading(false);
       });
-  }, [apiUrl, tenantToken, tab, agentFilter]);
+  }, [apiUrl, tenantToken, tab, agentFilter, kindFilter, appliedSearch, page]);
 
-  useEffect(() => { load(true); }, [load]);
+  useEffect(() => { load(); }, [load]);
 
   useEffect(() => { setSelectedIds(new Set()); }, [tab]);
 
+  // Tab badges show the per-status total for the currently selected kind.
   useEffect(() => {
     (['pending', 'approved', 'expired'] as StatusTab[]).forEach(s => {
-      listAllTenantApprovals(apiUrl, tenantToken, { status: s })
-        .then(r => setTabCounts(prev => ({ ...prev, [s]: (r.approvals ?? []).length })))
+      listAllTenantApprovals(apiUrl, tenantToken, { status: s, type: kindFilter, limit: '1' })
+        .then(r => setTabCounts(prev => ({ ...prev, [s]: r.total ?? 0 })))
         .catch(() => {});
     });
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [apiUrl, tenantToken]);
+  }, [apiUrl, tenantToken, kindFilter]);
 
-  const reload = useCallback(() => load(true), [load]);
+  const reload = useCallback(() => load(), [load]);
 
   const toggleSelect = (id: string) => {
     setSelectedIds(prev => {
@@ -321,6 +430,7 @@ function OperatorApprovalsView({ config }: { config: TenantConfig }) {
   };
 
   const toggleSelectAll = () => {
+    // Select-all applies to the current page (server-returned rows).
     if (selectedIds.size === approvals.length && approvals.length > 0) {
       setSelectedIds(new Set());
     } else {
@@ -346,8 +456,9 @@ function OperatorApprovalsView({ config }: { config: TenantConfig }) {
     setApprovals(prev => prev.filter(a => a.approval_id !== id));
   };
 
-  const doAddApproval = async (agentId: string, command: string, duration?: string) => {
-    await tenantPreApprove(apiUrl, tenantToken, agentId, command, duration);
+  const doAddApproval = async (agentId: string, payload: { command?: string; rule?: K8sRule }, duration?: string) => {
+    if (payload.rule) await tenantPreApproveRule(apiUrl, tenantToken, agentId, payload.rule, duration);
+    else await tenantPreApprove(apiUrl, tenantToken, agentId, payload.command ?? '', duration);
     setModal(null);
     setTab('approved');
     reload();
@@ -466,9 +577,46 @@ function OperatorApprovalsView({ config }: { config: TenantConfig }) {
               </option>
             ))}
           </select>
+          <div className="inline-flex rounded-lg border border-gray-300 bg-white shadow-sm overflow-hidden">
+            {(['k8s', 'host'] as const).map(k => (
+              <button
+                key={k}
+                onClick={() => { setKindFilter(k); setSelectedIds(new Set()); }}
+                className={`px-3 py-1.5 text-sm font-medium transition-colors ${
+                  kindFilter === k ? 'bg-indigo-600 text-white' : 'text-gray-600 hover:bg-gray-50'
+                }`}
+              >
+                {k === 'k8s' ? 'Kubernetes' : 'Host'}
+              </button>
+            ))}
+          </div>
+          <div className="relative">
+            <svg className="w-4 h-4 text-gray-400 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-5.197-5.197m0 0A7.5 7.5 0 105.196 5.196a7.5 7.5 0 0010.607 10.607z" />
+            </svg>
+            <input
+              value={search}
+              onChange={e => setSearch(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && applySearch()}
+              placeholder={kindFilter === 'k8s' ? 'Search verb, resource, namespace…' : 'Search command, agent…'}
+              className="w-64 border border-gray-300 rounded-lg pl-8 pr-7 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent shadow-sm"
+            />
+            {search && (
+              <button onClick={() => { setSearch(''); if (appliedSearch) { setAppliedSearch(''); setPage(0); } }} className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 text-sm">✕</button>
+            )}
+          </div>
+          <button
+            onClick={applySearch}
+            className="text-sm font-semibold px-3 py-1.5 rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 transition-colors shadow-sm"
+          >
+            Search
+          </button>
+          {appliedSearch && (
+            <span className="text-xs text-gray-500">Filtered by “{appliedSearch}”</span>
+          )}
           {agentFilter && (
             <button onClick={() => setAgentFilter('')} className="text-sm text-indigo-600 hover:text-indigo-800">
-              Clear filter
+              Clear agent filter
             </button>
           )}
           {tab === 'pending' && selectedIds.size > 0 && (
@@ -546,7 +694,7 @@ function OperatorApprovalsView({ config }: { config: TenantConfig }) {
                       />
                     </th>
                   )}
-                  {opTh('Command', 0)}
+                  {opTh('Command / rule', 0)}
                   {opTh('Agent', 1)}
                   {opTh('Requested by', 2)}
                   {opTh('Created', 3)}
@@ -573,8 +721,12 @@ function OperatorApprovalsView({ config }: { config: TenantConfig }) {
                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 12.75L11.25 15 15 9.75m-3-7.036A11.959 11.959 0 013.598 6 11.99 11.99 0 003 9.749c0 5.592 3.824 10.29 9 11.623 5.176-1.332 9-6.03 9-11.622 0-1.31-.21-2.571-.598-3.751h-.152c-3.196 0-6.1-1.248-8.25-3.285z" />
                           </svg>
                         </div>
-                        <p className="text-sm font-medium text-gray-500">No {tab} approvals</p>
-                        {tab === 'pending' && canAdd && (
+                        <p className="text-sm font-medium text-gray-500">
+                          {appliedSearch
+                            ? `No ${kindFilter === 'k8s' ? 'Kubernetes' : 'host'} ${tab} approvals match “${appliedSearch}”`
+                            : `No ${kindFilter === 'k8s' ? 'Kubernetes' : 'host'} ${tab} approvals`}
+                        </p>
+                        {tab === 'pending' && canAdd && !appliedSearch && (
                           <p className="text-xs text-gray-400 mt-1">
                             Use{' '}
                             <button onClick={() => setModal({ type: 'add' })} className="text-indigo-600 hover:underline">
@@ -586,7 +738,8 @@ function OperatorApprovalsView({ config }: { config: TenantConfig }) {
                       </div>
                     </td>
                   </tr>
-                ) : approvals.map(a => (
+                ) : approvals.map(a => {
+                  return (
                   <tr key={a.approval_id} className={`hover:bg-slate-50/80 transition-colors group ${tab === 'pending' && selectedIds.has(a.approval_id) ? 'bg-indigo-50/40' : ''}`}>
                     {tab === 'pending' && (
                       <td className="w-10 pl-4 pr-2 py-3.5">
@@ -599,10 +752,8 @@ function OperatorApprovalsView({ config }: { config: TenantConfig }) {
                         />
                       </td>
                     )}
-                    <td className="px-4 py-3.5 max-w-[280px]">
-                      <span className="font-mono text-sm text-gray-800 bg-gray-100 group-hover:bg-gray-200 transition-colors px-2 py-0.5 rounded block truncate">
-                        {a.command}
-                      </span>
+                    <td className="px-4 py-3.5 max-w-[360px]">
+                      <ApprovalTarget approval={a} />
                     </td>
                     <td className="px-4 py-3.5">
                       <div className="flex items-center gap-1.5">
@@ -689,9 +840,11 @@ function OperatorApprovalsView({ config }: { config: TenantConfig }) {
                       </div>
                     </td>
                   </tr>
-                ))}
+                  );
+                })}
               </tbody>
             </table>
+            <Pager page={page} total={total} onPage={setPage} />
           </div>
         )}
       </div>
@@ -808,17 +961,21 @@ function RequestApprovalModal({
 }: {
   agents: Agent[];
   onClose: () => void;
-  onSubmit: (agentId: string, command: string) => Promise<void>;
+  onSubmit: (agentId: string, payload: { command?: string; rule?: K8sRule }) => Promise<void>;
 }) {
   const [agentId, setAgentId] = useState('');
   const [command, setCommand] = useState('');
+  const [rule, setRule] = useState<K8sRule>(EMPTY_RULE);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
+  const isK8s = agents.find(a => a.agent_id === agentId)?.type === 'k8s';
+
   const submit = async () => {
-    if (!agentId || !command.trim()) { setError('Agent and command are required.'); return; }
+    if (!agentId) { setError('Select an agent.'); return; }
+    if (!isK8s && !command.trim()) { setError('Command is required.'); return; }
     setLoading(true); setError('');
-    try { await onSubmit(agentId, command.trim()); }
+    try { await onSubmit(agentId, isK8s ? { rule } : { command: command.trim() }); }
     catch (e) { setError((e as Error).message); setLoading(false); }
   };
 
@@ -829,7 +986,7 @@ function RequestApprovalModal({
       <div className="space-y-4">
         <div className="bg-indigo-50 border border-indigo-200 rounded-lg px-3 py-2.5">
           <p className="text-xs text-indigo-700">
-            Your request will go to <strong>pending</strong> - an operator or admin must approve it before the agent can run the command.
+            Your request will go to <strong>pending</strong> - an operator or admin must approve it before the agent can run it.
           </p>
         </div>
         <div>
@@ -843,11 +1000,17 @@ function RequestApprovalModal({
             <option value="">Select agent…</option>
             {activeAgents.map(a => (
               <option key={a.agent_id} value={a.agent_id}>
-                {a.hostname ?? a.agent_id}
+                {a.hostname ?? a.agent_id}{a.type === 'k8s' ? ' (k8s)' : ''}
               </option>
             ))}
           </select>
         </div>
+        {isK8s ? (
+          <div>
+            <label className="block text-sm font-semibold text-gray-700 mb-1.5">Cluster rule</label>
+            <K8sRuleForm value={rule} onChange={setRule} />
+          </div>
+        ) : (
         <div>
           <label className="block text-sm font-semibold text-gray-700 mb-1.5">Command</label>
           <input
@@ -861,6 +1024,7 @@ function RequestApprovalModal({
             Prefix match - approving "docker restart" also permits "docker restart app".
           </p>
         </div>
+        )}
         {error && <p className="text-sm text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2">{error}</p>}
         <div className="flex justify-end gap-3 pt-1">
           <button onClick={onClose} className="text-sm text-gray-500 hover:text-gray-700 px-3 py-2">Cancel</button>
@@ -1099,19 +1263,24 @@ function AddApprovalModal({
 }: {
   agents: Agent[];
   onClose: () => void;
-  onSubmit: (agentId: string, command: string, duration?: string) => Promise<void>;
+  onSubmit: (agentId: string, payload: { command?: string; rule?: K8sRule }, duration?: string) => Promise<void>;
 }) {
   const [agentId, setAgentId] = useState('');
   const [command, setCommand] = useState('');
+  const [rule, setRule] = useState<K8sRule>(EMPTY_RULE);
   const [duration, setDuration] = useState<Duration>('permanent');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
+  const isK8s = agents.find(a => a.agent_id === agentId)?.type === 'k8s';
+
   const submit = async () => {
-    if (!agentId || !command.trim()) { setError('Agent and command are required.'); return; }
+    if (!agentId) { setError('Select an agent.'); return; }
+    if (!isK8s && !command.trim()) { setError('Command is required.'); return; }
     setLoading(true); setError('');
-    try { await onSubmit(agentId, command.trim(), duration === 'permanent' ? undefined : duration); }
-    catch (e) { setError((e as Error).message); setLoading(false); }
+    try {
+      await onSubmit(agentId, isK8s ? { rule } : { command: command.trim() }, duration === 'permanent' ? undefined : duration);
+    } catch (e) { setError((e as Error).message); setLoading(false); }
   };
 
   const activeAgents = agents.filter(a => a.status === 'ACTIVE' || a.status === 'INACTIVE');
@@ -1121,7 +1290,7 @@ function AddApprovalModal({
       <div className="space-y-4">
         <div className="bg-indigo-50 border border-indigo-200 rounded-lg px-3 py-2.5">
           <p className="text-xs text-indigo-700">
-            Creates an <strong>approved</strong> record directly - the agent can run the command immediately without a pending request.
+            Creates an <strong>approved</strong> record directly - the agent can run it immediately without a pending request.
           </p>
         </div>
         <div>
@@ -1135,11 +1304,17 @@ function AddApprovalModal({
             <option value="">Select agent…</option>
             {activeAgents.map(a => (
               <option key={a.agent_id} value={a.agent_id}>
-                {a.hostname ?? a.agent_id}
+                {a.hostname ?? a.agent_id}{a.type === 'k8s' ? ' (k8s)' : ''}
               </option>
             ))}
           </select>
         </div>
+        {isK8s ? (
+          <div>
+            <label className="block text-sm font-semibold text-gray-700 mb-1.5">Cluster rule</label>
+            <K8sRuleForm value={rule} onChange={setRule} />
+          </div>
+        ) : (
         <div>
           <label className="block text-sm font-semibold text-gray-700 mb-1.5">Command</label>
           <input
@@ -1153,6 +1328,7 @@ function AddApprovalModal({
             Prefix match - "docker restart" also permits "docker restart app".
           </p>
         </div>
+        )}
         <div>
           <label className="block text-sm font-semibold text-gray-700 mb-2">Duration</label>
           <div className="flex flex-wrap gap-2">

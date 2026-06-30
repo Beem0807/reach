@@ -1,12 +1,13 @@
 import json
 import logging
+import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import shared.audit as audit
 from shared.auth import _bearer, _verify_agent_token
 from shared.response import _err, _iso, _now, _ok
-from shared.store import agents_repo, approvals_repo, jobs_repo
+from shared.store import agent_history_repo, agents_repo, approvals_repo, jobs_repo
 
 TOKEN_MAX_AGE_DAYS = 30
 
@@ -53,19 +54,20 @@ def _audit_capability_changes(agent: dict, docker_detected: Optional[bool], serv
 
 
 def handle_agent_sync(body: dict, raw_token: str) -> dict:
-    agent_id = body.get("agent_id", "").strip()
     machine_fp = body.get("machine_fingerprint", "").strip()
     agent_version = body.get("agent_version", "").strip() or None
     running_as_root = body.get("running_as_root")  # bool from agent, None if old agent
     docker_detected = body.get("docker_detected")          # bool, None if old agent
     service_mgmt_detected = body.get("service_mgmt_detected")  # bool, None if old agent
 
-    if not agent_id or not machine_fp:
-        return _err("agent_id and machine_fingerprint required")
+    if not machine_fp:
+        return _err("machine_fingerprint required")
 
-    agent = _verify_agent_token(raw_token, agent_id)
+    # Credential-only: the agent token identifies the agent; no agent_id is sent.
+    agent = _verify_agent_token(raw_token)
     if not agent:
         return _err("unauthorized", 401)
+    agent_id = agent["agent_id"]
 
     agent_status = agent.get("status")
     if agent_status not in ("ACTIVE", "INACTIVE"):
@@ -97,6 +99,16 @@ def handle_agent_sync(body: dict, raw_token: str) -> dict:
     )
 
     if reactivating:
+        agent_history_repo.create({
+            "history_id": "agenthistory_" + secrets.token_urlsafe(8),
+            "agent_id": agent_id,
+            "tenant_id": agent.get("tenant_id", ""),
+            "from_status": "INACTIVE",
+            "to_status": "ACTIVE",
+            "triggered_by": "heartbeat",
+            "note": "heartbeat resumed",
+            "created_at": _iso(),
+        })
         audit.write(
             "agent.recovered",
             tenant_id=agent.get("tenant_id", ""),
@@ -110,6 +122,14 @@ def handle_agent_sync(body: dict, raw_token: str) -> dict:
         logger.info("Agent %s recovered (was INACTIVE, now ACTIVE)", agent_id)
 
     _audit_capability_changes(agent, docker_detected_bool, service_mgmt_detected_bool)
+
+    # k8s effective RBAC: the agent only sends the full rule set on change, so
+    # store whatever it sends. Drift vs the acknowledged hash is computed on read.
+    k8s_permissions = body.get("k8s_permissions")
+    if isinstance(k8s_permissions, dict):
+        perm_hash = (k8s_permissions.get("hash") or "").strip()
+        if perm_hash and perm_hash != agent.get("k8s_permissions_hash"):
+            agents_repo.set_k8s_permissions(agent_id, k8s_permissions, perm_hash)
 
     pending_jobs = jobs_repo.get_pending_for_agent(agent_id)
     approved_commands: list = []

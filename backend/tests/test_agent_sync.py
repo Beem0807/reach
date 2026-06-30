@@ -30,14 +30,9 @@ class TestAgentSync:
             apr.list_by_agent.return_value = []
             return handle_agent_sync(body or _VALID_BODY, "agent_tok")
 
-    def test_missing_agent_id(self):
-        with patch("handlers.agent_sync._verify_agent_token", return_value=_AGENT_ACTIVE):
-            r = handle_agent_sync({"machine_fingerprint": FP}, "tok")
-        assert r["statusCode"] == 400
-
     def test_missing_fingerprint(self):
         with patch("handlers.agent_sync._verify_agent_token", return_value=_AGENT_ACTIVE):
-            r = handle_agent_sync({"agent_id": AGENT_ID}, "tok")
+            r = handle_agent_sync({}, "tok")
         assert r["statusCode"] == 400
 
     def test_unauthorized(self):
@@ -91,6 +86,50 @@ class TestAgentSync:
         ar.update_heartbeat.assert_called_once()
         _, kwargs = ar.update_heartbeat.call_args
         assert kwargs.get("reactivate") is True or ar.update_heartbeat.call_args[0][1] is True
+
+    def test_reactivation_writes_agent_recovered_audit(self):
+        with patch("handlers.agent_sync._verify_agent_token", return_value=_AGENT_INACTIVE), \
+             patch("handlers.agent_sync.agents_repo") as ar, \
+             patch("handlers.agent_sync.approvals_repo") as apr, \
+             patch("handlers.agent_sync.jobs_repo") as jr, \
+             patch("handlers.agent_sync.agent_history_repo"), \
+             patch("handlers.agent_sync.audit") as audit:
+            jr.get_pending_for_agent.return_value = []
+            jr.set_running.return_value = True
+            apr.list_by_agent.return_value = []
+            handle_agent_sync(_VALID_BODY, "tok")
+        # INACTIVE -> ACTIVE must be audited as agent.recovered.
+        actions = [c.args[0] for c in audit.write.call_args_list]
+        assert "agent.recovered" in actions
+
+    def test_reactivation_records_agent_history(self):
+        with patch("handlers.agent_sync._verify_agent_token", return_value=_AGENT_INACTIVE), \
+             patch("handlers.agent_sync.agents_repo"), \
+             patch("handlers.agent_sync.approvals_repo") as apr, \
+             patch("handlers.agent_sync.jobs_repo") as jr, \
+             patch("handlers.agent_sync.agent_history_repo") as hist, \
+             patch("handlers.agent_sync.audit"):
+            jr.get_pending_for_agent.return_value = []
+            jr.set_running.return_value = True
+            apr.list_by_agent.return_value = []
+            handle_agent_sync(_VALID_BODY, "tok")
+        hist.create.assert_called_once()
+        entry = hist.create.call_args[0][0]
+        assert entry["from_status"] == "INACTIVE" and entry["to_status"] == "ACTIVE"
+        assert entry["triggered_by"] == "heartbeat"
+
+    def test_active_agent_sync_does_not_write_recovered_audit(self):
+        with patch("handlers.agent_sync._verify_agent_token", return_value=_AGENT_ACTIVE), \
+             patch("handlers.agent_sync.agents_repo") as ar, \
+             patch("handlers.agent_sync.approvals_repo") as apr, \
+             patch("handlers.agent_sync.jobs_repo") as jr, \
+             patch("handlers.agent_sync.audit") as audit:
+            jr.get_pending_for_agent.return_value = []
+            jr.set_running.return_value = True
+            apr.list_by_agent.return_value = []
+            handle_agent_sync(_VALID_BODY, "tok")
+        actions = [c.args[0] for c in audit.write.call_args_list]
+        assert "agent.recovered" not in actions
 
     def test_is_write_included_in_dispatched_job(self):
         job_with_write = {**_JOB_PENDING, "is_write": True}

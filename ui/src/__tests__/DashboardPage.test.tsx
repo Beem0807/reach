@@ -73,12 +73,15 @@ beforeEach(() => { vi.restoreAllMocks(); });
 // ---------------------------------------------------------------------------
 
 describe('loading state', () => {
-  it('shows spinner before data loads', () => {
+  it('shows spinner before data loads', async () => {
     vi.spyOn(api, 'listTenantAgents').mockResolvedValue({ agents: [] });
     vi.spyOn(api, 'listAllTenantApprovals').mockResolvedValue({ approvals: [] });
     vi.spyOn(api, 'listTenantAuditLogs').mockResolvedValue({ logs: [] });
     render(<DashboardPage config={CONFIG} />);
     expect(document.querySelector('[class*="animate"]')).toBeInTheDocument();
+    // Flush the pending fetch so its state updates settle inside act(); otherwise
+    // they fire after the test ends and React warns about updates outside act().
+    await screen.findByText('Active agents');
   });
 });
 

@@ -321,3 +321,60 @@ describe('CapabilityCell hover tooltips', () => {
     expect(screen.queryByText(/Capability status legend/i)).not.toBeInTheDocument();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Agent type: filter, n/a host-grants for k8s, drift indicator
+// ---------------------------------------------------------------------------
+
+describe('Agent type column and filter', () => {
+  const HOST_AGENT: Agent = { ...BASE_AGENT, agent_id: 'agent_host', hostname: 'host-1', type: 'host' };
+  const K8S_AGENT: Agent = {
+    ...BASE_AGENT, agent_id: 'agent_k8s', hostname: 'cluster-1', type: 'k8s',
+  };
+
+  it('filters the table to the selected type', async () => {
+    renderPage([HOST_AGENT, K8S_AGENT]);
+    await screen.findByText('host-1');
+    expect(screen.getByText('cluster-1')).toBeInTheDocument();
+
+    await userEvent.selectOptions(screen.getByDisplayValue('All types'), 'k8s');
+    expect(screen.getByText('cluster-1')).toBeInTheDocument();
+    expect(screen.queryByText('host-1')).not.toBeInTheDocument();
+  });
+
+  it('shows n/a for docker and service-mgmt on k8s agents', async () => {
+    renderPage([K8S_AGENT]);
+    await screen.findByText('cluster-1');
+    const table = document.querySelector('table')!;
+    expect(within(table).getAllByText('n/a').length).toBe(2);
+  });
+
+  it('shows a clickable drift indicator on k8s agents with permission drift', async () => {
+    renderPage([{ ...K8S_AGENT, k8s_permissions_drift: true }]);
+    await screen.findByText('cluster-1');
+    const btn = screen.getByRole('button', { name: /cluster rbac needs review/i });
+    expect(btn).toBeInTheDocument();
+    // Hover reason is rendered (tooltip text), and clicking opens the RBAC detail modal.
+    expect(screen.getByText(/needs acknowledgement/i)).toBeInTheDocument();
+    await userEvent.click(btn);
+    // "Claimed at" is a detail-modal-only field label, confirming the modal opened.
+    expect(await screen.findByText('Claimed at')).toBeInTheDocument();
+  });
+
+  it('shows n/a in the Cluster RBAC column for host agents', async () => {
+    renderPage([HOST_AGENT]);
+    await screen.findByText('host-1');
+    const table = document.querySelector('table')!;
+    // host: docker + service-mgmt show CapabilityCell, Cluster RBAC shows n/a
+    expect(within(table).getByText('n/a')).toBeInTheDocument();
+  });
+
+  it('renders running-as-root as n/a (with the two-axis note) in the k8s detail', async () => {
+    renderPage([K8S_AGENT]);
+    await screen.findByText('cluster-1');
+    fireEvent.click(screen.getByText('cluster-1'));  // open detail modal
+    expect(await screen.findByText('Running as root')).toBeInTheDocument();
+    expect(screen.getByTitle(/non-root/i)).toHaveTextContent('n/a');
+    expect(screen.getByText(/Reflects policy mode/i)).toBeInTheDocument();
+  });
+});

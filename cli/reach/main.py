@@ -23,18 +23,33 @@ POLL_INTERVAL_SECONDS = 2
 
 
 # ---------------------------------------------------------------------------
-# reach version
+# Version - exposed as the flag `reach --version` / `-V`
 # ---------------------------------------------------------------------------
-@app.command()
-def version():
-    """Show the CLI version."""
+def _cli_version() -> str:
     try:
         from importlib.metadata import version as _pkg_version
-        v = _pkg_version("reach")
+        return _pkg_version("reach")
     except Exception:
         from reach import __version__
-        v = __version__
-    console.print(f"reach {v}")
+        return __version__
+
+
+def _version_callback(value: bool):
+    if value:
+        console.print(f"reach {_cli_version()}")
+        raise typer.Exit()
+
+
+@app.callback()
+def _root(
+    version: Optional[bool] = typer.Option(
+        None, "--version", "-V",
+        help="Show the CLI version and exit.",
+        callback=_version_callback,
+        is_eager=True,
+    ),
+):
+    """CLI for remote machine agents."""
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +165,7 @@ def status():
 
     table.add_row("Agent ID", agent.get("agent_id", ""))
     table.add_row("Status", _status_color(agent.get("status", "")))
+    table.add_row("Type", _type_label(agent.get("type")))
     table.add_row("Hostname", agent.get("hostname") or "-")
     table.add_row("Version", agent.get("agent_version") or "-")
     table.add_row("Fingerprint", (agent.get("machine_fingerprint") or "-")[:24] + "...")
@@ -197,6 +213,7 @@ def agents_list(
     table.add_column("Agent ID")
     table.add_column("Alias")
     table.add_column("Status")
+    table.add_column("Type")
     table.add_column("Mode")
     table.add_column("Access")
     table.add_column("Hostname")
@@ -223,6 +240,7 @@ def agents_list(
             aid + marker,
             alias_label,
             _status_color(a.get("status", "")),
+            _type_label(a.get("type")),
             _mode_colors.get(mode, mode),
             _access_colors.get(al, al),
             a.get("hostname") or "-",
@@ -473,8 +491,12 @@ def _expires_label(record: dict) -> str:
         return f"[dim]{raw[:19].replace('T', ' ')}[/dim]"
 
 
-@app.command()
-def approvals(
+approvals_app = typer.Typer(help="View approval records for an agent.", no_args_is_help=True)
+app.add_typer(approvals_app, name="approvals")
+
+
+@approvals_app.command("list")
+def approvals_list(
     agent: Optional[str] = typer.Option(None, "--agent", "-a", help="Agent ID or alias (default: default agent)"),
     pending: bool = typer.Option(False, "--pending", help="Show your pending requests for this agent"),
     denied: bool = typer.Option(False, "--denied", help="Show your denied requests for this agent"),
@@ -484,6 +506,9 @@ def approvals(
 
     Default: currently effective approved commands (agent-wide).
     --pending / --denied / --expired: your own records filtered by status.
+
+    Host agents show the command; Kubernetes agents show the structured rule
+    (verb / resource / namespace / name, where ✱ means "any").
     """
     flags = [pending, denied, expired]
     if sum(flags) > 1:
@@ -521,21 +546,46 @@ def approvals(
         console.print(f"[yellow]{_STATUS_EMPTY.get(status, 'No records.')}[/yellow]")
         return
 
+    # A single agent is one type, so the result set is homogeneous. Kubernetes
+    # approvals are structured rules - render verb/resource/namespace/name as
+    # columns; host approvals render the command string.
+    is_k8s = any(a.get("k8s_rule") for a in items)
     show_status = status != "approved"
+
+    if is_k8s:
+        console.print("[dim]Kubernetes agent - showing structured rules (✱ = any)[/dim]")
+
     table = Table(show_header=True, header_style="bold cyan", box=None, padding=(0, 1))
-    table.add_column("Command")
+    if is_k8s:
+        table.add_column("Verb")
+        table.add_column("Resource")
+        table.add_column("Namespace")
+        table.add_column("Name")
+    else:
+        table.add_column("Command")
     table.add_column("Requested by", style="dim")
     if show_status:
         table.add_column("Status")
     table.add_column("At", style="dim")
     table.add_column("Expires")
 
+    def _rule_cell(v) -> str:
+        # Show a wildcard as a dim asterisk so it reads as "any".
+        return "[dim]✱[/dim]" if v in ("*", "", None) else str(v)
+
     for a in items:
         at = (a.get("reviewed_at") or a.get("created_at") or "")[:19].replace("T", " ")
-        row = [
-            a.get("command", ""),
-            a.get("requester_name") or a.get("requested_by") or "-",
-        ]
+        if is_k8s:
+            rule = a.get("k8s_rule") or {}
+            row = [
+                _rule_cell(rule.get("verb")),
+                _rule_cell(rule.get("resource")),
+                _rule_cell(rule.get("namespace")),
+                _rule_cell(rule.get("name")),
+            ]
+        else:
+            row = [a.get("command", "")]
+        row.append(a.get("requester_name") or a.get("requested_by") or "-")
         if show_status:
             st = a.get("status", "")
             style = _STATUS_STYLE.get(st, "")
@@ -758,7 +808,7 @@ Each agent has a **mode** and an **access_level**. Check both with `reach status
 **Mode** - what the server allows:
 - `wild`: all commands run (except a small global blocklist of catastrophic operations like `rm -rf /`, `mkfs`, fork bombs).
 - `readonly`: write and destructive commands are rejected by the server before the agent ever receives them. Reads always pass. Do not attempt writes.
-- `approved`: reads always run. Write commands only run if pre-approved by an admin. If a write is not on the approved list the agent blocks it and creates a pending approval record - the command does NOT run silently. Use `reach approvals --pending` to see it, then tell the user admin approval is required. Do not retry.
+- `approved`: reads always run. Write commands only run if pre-approved by an admin. If a write is not on the approved list the agent blocks it and creates a pending approval record - the command does NOT run silently. Use `reach approvals list --pending` to see it, then tell the user admin approval is required. Do not retry.
 
 **Access level** - mode combined with whether the agent runs as root:
 - `open`: wild + root. Maximum blast radius. Every command runs with full system privileges. Treat all writes as irreversible. Always explain before acting.
@@ -797,6 +847,14 @@ def _status_color(status: str) -> str:
         "DISABLED": "[red]DISABLED[/red]",
     }
     return colors.get(status, status)
+
+
+def _type_label(agent_type: Optional[str]) -> str:
+    colors = {
+        "k8s": "[blue]k8s[/blue]",
+        "host": "[cyan]host[/cyan]",
+    }
+    return colors.get(agent_type or "", "-")
 
 
 def _print_job_result(result: dict) -> None:
@@ -932,7 +990,7 @@ def man():
         ("reach login --api-url <url> --api-key <key>",      "Save credentials (default profile)"),
         ("reach login --profile <name> ...",                  "Save credentials under a named profile"),
         ("reach whoami",                                      "Show current user, tenant, and API URL"),
-        ("reach version",                                     "Show CLI version"),
+        ("reach --version  (or -V)",                          "Show CLI version"),
         ("reach config show",                                 "Show active profile, default agent, and aliases"),
     ])
 
@@ -965,13 +1023,13 @@ def man():
         ("reach history --cursor <cursor>",                  "Fetch the next page"),
     ])
 
-    section("Approvals  (approved mode)", [
-        ("reach approvals",                                  "Show effective approved commands for the default agent"),
-        ("reach approvals --agent <id|alias>",               "Show effective approved commands for a specific agent"),
-        ("reach approvals --pending",                        "Show your pending requests for the default agent"),
-        ("reach approvals --denied",                         "Show your denied requests for the default agent"),
-        ("reach approvals --expired",                        "Show your expired approvals for the default agent"),
-        ("reach approvals --agent <id|alias> --pending",     "Filter any of the above to a specific agent"),
+    section("Approvals  (approved mode; host shows commands, k8s shows rules)", [
+        ("reach approvals list",                             "Show effective approved commands/rules for the default agent"),
+        ("reach approvals list --agent <id|alias>",          "Show effective approved commands/rules for a specific agent"),
+        ("reach approvals list --pending",                   "Show your pending requests for the default agent"),
+        ("reach approvals list --denied",                    "Show your denied requests for the default agent"),
+        ("reach approvals list --expired",                   "Show your expired approvals for the default agent"),
+        ("reach approvals list --agent <id|alias> --pending", "Filter any of the above to a specific agent"),
     ])
 
     section("AI integration", [

@@ -1,0 +1,154 @@
+# Default values for reach-agent.
+#
+# Deploys ONE logical Reach agent for the whole cluster: the agent auto-detects
+# Kubernetes, derives a stable identity from the kube-system namespace UID, and a
+# Lease elects a single active leader across replicas. The backend tags it
+# type=k8s automatically. See README for the full flow.
+
+# -- Number of agent replicas. Replicas are fungible - a Lease elects one active leader, the rest stand by for failover.
+replicaCount: 2
+
+image:
+  # -- Agent image repository.
+  repository: nabeemdev/reach-agent
+  # -- Image tag. Defaults to the chart's `appVersion` when empty.
+  tag: ""
+  # -- Image pull policy.
+  pullPolicy: IfNotPresent
+
+# -- Image pull secrets for private registries.
+imagePullSecrets: []
+
+reach:
+  # -- Backend API URL, e.g. `https://reach.example.com`.
+  apiUrl: ""
+  # -- One-time install token from the tenant console (`install_...`). Consumed on first claim.
+  installToken: ""
+  # -- Use a pre-existing Secret (keys: `api-url`, `install-token`) instead of the two values above.
+  existingSecret: ""
+
+# -- Name of the Secret the agent creates/updates to persist and share its claimed agent token (shared across replicas, survives restarts/rotation). Defaults to `<release>-token`.
+tokenSecretName: ""
+
+# -- Add binaries to the default allowlist (the safe way to extend it). E.g. `[helm, kustomize]` keeps `kubectl` + the default read-only filters AND adds these. Jobs run connected by pipes, with no shell.
+extraAllowedBinaries: []
+# -- REPLACE the entire allowlist (lock-down / full control). When non-empty this is the exact set - the default (`kubectl` + grep, jq, head, tail, wc, sort, uniq, cut, tr) is dropped. Use `[kubectl]` to restrict to kubectl only. Prefer `extraAllowedBinaries` unless you specifically need to remove defaults.
+allowedBinaries: []
+
+# -- How often (seconds) the agent re-reviews its cluster-wide RBAC. Empty uses the agent default (300s / 5 min). Lower = faster drift detection; higher = less API load on very large clusters (cost scales with namespace count). Floored at 30s.
+permissionReviewIntervalSeconds: ""
+
+leaderElection:
+  # -- Lease name used for leader election. Defaults to `<release>`.
+  leaseName: ""
+
+livenessProbe:
+  # -- Restart the pod if the agent's poll loop wedges. The agent touches `/tmp/healthy` each iteration; the probe fails when it goes stale.
+  enabled: true
+  # -- Max age (seconds) of `/tmp/healthy` before the probe fails. Keep well above the server-driven poll interval (normally <=15s).
+  staleSeconds: 120
+  # -- Seconds before the first liveness check.
+  initialDelaySeconds: 30
+  # -- How often to run the liveness check.
+  periodSeconds: 30
+  # -- Consecutive failures before the pod is restarted.
+  failureThreshold: 3
+
+serviceAccount:
+  # -- Create a ServiceAccount for the agent.
+  create: true
+  # -- ServiceAccount name. Defaults to the chart fullname.
+  name: ""
+  # -- Annotations for the ServiceAccount (e.g. an IRSA/Workload Identity role).
+  annotations: {}
+
+rbac:
+  # -- Create the agent's own operational RBAC (read kube-system for the cluster id, leases for election, the token Secret).
+  create: true
+
+# clusterAccess controls what the agent can DO in the cluster - separate from the
+# operational RBAC above. The agent can only run commands its ServiceAccount is
+# permitted to perform. Defaults to read-only, cluster-wide. Pair with the Reach
+# policy mode (readonly/approved/wild) for defense in depth.
+clusterAccess:
+  # -- Grant the agent permission to operate the cluster. When false, bind your own RBAC to the ServiceAccount out of band.
+  enabled: true
+  # -- Existing ClusterRole to bind: `view` (read-only, safe default), `edit`, `admin`, or `cluster-admin` (avoid - effectively root). Ignored when `rules` is set.
+  roleName: view
+  # -- Binding scope: `cluster` (every namespace) or `namespaces` (only those in `namespaces` below - least privilege).
+  scope: cluster
+  # -- Namespaces to grant access in when `scope: namespaces`.
+  namespaces: []
+  # -- Inline custom RBAC rules. If non-empty, the chart creates and binds a Role/ClusterRole built from these (overrides `roleName`).
+  rules: []
+  #  - apiGroups: [""]
+  #    resources: ["pods", "pods/log"]
+  #    verbs: ["get", "list", "watch"]
+
+# -- Pod resource requests and limits (the agent is lightweight).
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    memory: 128Mi
+
+# -- Pod-level security context. Runs non-root by default.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+# -- Container security context. Read-only root filesystem, all capabilities dropped.
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+# -- Extra annotations for the agent pods.
+podAnnotations: {}
+# -- Extra labels for the agent pods.
+podLabels: {}
+# -- Node selector for pod scheduling.
+nodeSelector: {}
+# -- Tolerations for pod scheduling.
+tolerations: []
+# -- Affinity rules for pod scheduling.
+affinity: {}
+# -- Topology spread constraints - spread replicas across nodes/zones so the standby survives a node loss.
+topologySpreadConstraints: []
+# -- Extra environment variables for the agent container.
+extraEnv: []
+
+# Prometheus metrics. OPT-IN and OFF by default: the agent is otherwise strictly
+# outbound-only (no listening port). Enabling this opens one read-only inbound
+# port serving counters (no secrets), locked to the Prometheus namespace via a
+# NetworkPolicy by default. Scrapes hit every replica; each exports
+# `reach_agent_is_leader` so you can distinguish the active leader from standbys.
+metrics:
+  # -- Expose Prometheus metrics at :port/metrics (opens the agent's only inbound port).
+  enabled: false
+  # -- Port the agent serves /metrics on.
+  port: 9090
+  serviceMonitor:
+    # -- Create a Prometheus Operator ServiceMonitor (only when metrics.enabled).
+    enabled: true
+    # -- Scrape interval.
+    interval: 30s
+    # -- Scrape timeout.
+    scrapeTimeout: 10s
+    # -- Namespace for the ServiceMonitor. Empty uses the release namespace.
+    namespace: ""
+    # -- Extra labels so your Prometheus selects it, e.g. {release: kube-prometheus-stack}.
+    labels: {}
+  networkPolicy:
+    # -- Restrict ingress to the metrics port to Prometheus only (recommended).
+    enabled: true
+    # -- Namespace Prometheus runs in (matched by kubernetes.io/metadata.name).
+    prometheusNamespace: monitoring
+    # -- Advanced: full NetworkPolicyPeer list; overrides prometheusNamespace when set.
+    from: []

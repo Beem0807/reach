@@ -80,6 +80,43 @@ class TestHandleCreateTenantAgent:
         r, _ = self._call(body={"mode": "readonly"})
         assert json.loads(r["body"])["mode"] == "readonly"
 
+    def test_default_type_is_host_with_curl_command(self):
+        r, ar = self._call(body={"mode": "wild"})
+        body = json.loads(r["body"])
+        assert body["type"] == "host"
+        assert "agent" in body["commands"]  # curl installer
+        assert "helm" not in body["commands"]
+        assert ar.create.call_args[0][0]["type"] == "host"
+
+    def test_k8s_type_returns_helm_command(self):
+        r, ar = self._call(body={"mode": "wild", "type": "k8s"})
+        body = json.loads(r["body"])
+        assert body["type"] == "k8s"
+        assert "helm" in body["commands"]
+        assert "agent" not in body["commands"]
+        helm = body["commands"]["helm"]
+        # Installs from the published Helm repo (not a local path). The image is
+        # not pinned separately - it resolves from the chart's appVersion, so the
+        # command carries no --set image.tag.
+        assert "helm repo add reach" in helm
+        assert "helm install reach-agent reach/reach-agent" in helm
+        assert "deploy/helm/reach-agent" not in helm
+        assert "--set image.tag=" not in helm
+        assert "reach.installToken" in helm
+        assert ar.create.call_args[0][0]["type"] == "k8s"
+
+    def test_k8s_ignores_host_grants(self):
+        # Docker / service-mgmt are host-only; a k8s agent must not carry them.
+        r, ar = self._call(body={"mode": "wild", "type": "k8s",
+                                 "grant_docker": True, "grant_service_mgmt": True})
+        created = ar.create.call_args[0][0]
+        assert created["grant_docker"] is False
+        assert created["grant_service_mgmt"] is False
+
+    def test_invalid_type_returns_400(self):
+        r, _ = self._call(body={"mode": "wild", "type": "vm"})
+        assert r["statusCode"] == 400
+
     def test_approved_mode_accepted(self):
         r, _ = self._call(body={"mode": "approved"})
         assert r["statusCode"] == 201

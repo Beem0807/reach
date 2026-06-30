@@ -11,6 +11,17 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 
+def _human_ts(iso: str) -> str:
+    """Readable UTC timestamp (to the second, no microseconds) for human-facing
+    notes. Falls back to the raw value if it can't be parsed."""
+    if not iso:
+        return "unknown time"
+    try:
+        return datetime.fromisoformat(iso).strftime("%Y-%m-%d %H:%M:%S UTC")
+    except (ValueError, TypeError):
+        return iso
+
+
 def handle_heartbeat_check() -> dict:
     now = _now()
     now_dt = datetime.fromtimestamp(now, tz=timezone.utc)
@@ -32,7 +43,7 @@ def handle_heartbeat_check() -> dict:
                 "from_status": "ACTIVE",
                 "to_status": "INACTIVE",
                 "triggered_by": "heartbeat",
-                "note": f"no heartbeat since {agent.get('last_heartbeat_at')}",
+                "note": f"no heartbeat since {_human_ts(agent.get('last_heartbeat_at'))}",
                 "created_at": now_iso,
             })
             audit.write(

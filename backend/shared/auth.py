@@ -62,14 +62,15 @@ def _verify_tenant_payload(raw: str) -> Optional[dict]:
     return payload
 
 
-def _verify_agent_token(raw: str, agent_id: str) -> Optional[dict]:
+def _verify_agent_token(raw: str) -> Optional[dict]:
+    # Credential-only: the agent token identifies the agent. We hash the bearer
+    # token and look the agent up by that hash, so no client-supplied agent_id is
+    # needed (or trusted). Hashing first means the lookup carries no timing oracle
+    # on the secret.
     from .store import agents_repo
-    agent = agents_repo.get(agent_id)
-    if not agent:
+    if not raw:
         return None
-    if not hmac.compare_digest(_hmac_token(raw), agent.get("agent_token_hash") or ""):
-        return None
-    return agent
+    return agents_repo.get_by_agent_token_hash(_hmac_token(raw))
 
 
 def _bearer(event: dict) -> Optional[str]:

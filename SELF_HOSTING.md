@@ -167,9 +167,13 @@ docker run -d \
 | Variable | Default | Description |
 |---|---|---|
 | `STORAGE_BACKEND` | `postgres` (set in the image) | Storage driver - `postgres` for this deployment, `dynamo` on Lambda. Don't change it for the Docker image. |
-| `RELEASES_S3_BASE` | `https://reach-releases.s3.amazonaws.com` | Base URL for agent binary and install-script downloads. Point this at your own mirror if you host the binaries yourself. |
-| `AGENT_VERSION` | `latest` | Agent release that generated install commands reference. Set to a specific version (e.g. `v0.1.0`) to pin agents instead of tracking `latest`. |
+| `RELEASES_S3_BASE` | `https://reach-releases.s3.amazonaws.com` | Base URL for agent binary and install-script downloads (host agents) and the default Helm chart repo (k8s agents). Point this at your own mirror if you host the artifacts yourself. |
+| `AGENT_VERSION` | `latest` | **Host agents only.** The agent release the generated host install command references - it sets the binary/install-script S3 path. Set to a specific version to pin host agents instead of tracking `latest`. (The k8s agent image is not set here; it rides the chart's `appVersion` - pin it via `CHART_VERSION` below.) |
+| `RELEASES_CHART_REPO` | `<RELEASES_S3_BASE>/charts/reach-agent` | Helm chart repo URL used in the generated k8s `helm install` command (`helm repo add reach <this>`). Override if you host the chart repo elsewhere (e.g. gh-pages or an OCI registry base). |
+| `CHART_VERSION` | _(empty)_ | Pin the chart version in the generated k8s command (`--version <this>`). Empty installs the latest chart in the repo. Independent of `AGENT_VERSION` - the chart and agent version move separately. |
 | `RATE_LIMIT_STORAGE_URI` | `memory://` | Where API rate-limit counters live. In-memory is per-process - correct for a single instance. Set to a shared store (e.g. `redis://host:6379`) when running more than one backend replica. See [Running multiple replicas](#running-multiple-replicas). |
+
+On the **Docker** image you can set these directly as environment variables. The setup scripts also prompt for them interactively (the prompts read from your terminal even over `curl … | bash`): both the local and Lambda installers ask whether to **pin agent / chart versions** at create time and let you change them on `--update` - the local one writes them into the generated compose file, the Lambda one into CloudFormation parameters (`AGENT_VERSION`, `CHART_VERSION`, `RELEASES_CHART_REPO`). For a non-interactive run, export the variable **for the piped shell**, e.g. `curl -fsSL …/local-setup.sh | CHART_VERSION=0.1.3 bash` (a prefix before `curl` would set it for curl, not the shell). Empty `RELEASES_CHART_REPO` derives from `RELEASES_S3_BASE`.
 
 On first startup, Alembic runs `alembic upgrade head` automatically and creates all tables. Subsequent restarts apply any pending migrations from new versions. The image supports `linux/amd64` and `linux/arm64` - works on AWS Graviton, Raspberry Pi, and Apple Silicon without extra flags.
 
@@ -394,9 +398,38 @@ For automation see `GET /tenant/users/{user_id}/agents` and `PUT /tenant/users/{
 
 ---
 
+## Kubernetes agents
+
+Agents come in two **types**, chosen when you create the agent (**Agents → New agent → Host / Kubernetes**):
+
+- **Host** - a machine or VM. Installed with the `curl … install.sh …` command (see [README → Add a machine](README.md#add-a-machine)).
+- **Kubernetes** - a cluster. Installed with the `helm install …` command the console generates.
+
+A Kubernetes agent is **one logical agent per cluster**: it derives a stable identity from the `kube-system` namespace UID, so any number of replicas appear as a single agent, with a `Lease` electing one active leader. Install it from the published Helm repo (the console generates this, pre-filled and with the chart `--version` pinned):
+
+```bash
+helm repo add reach https://reach-releases.s3.amazonaws.com/charts/reach-agent --force-update
+helm install reach-agent reach/reach-agent \
+  --namespace reach --create-namespace \
+  --set reach.apiUrl=https://reach.example.com \
+  --set reach.installToken=install_xxx
+```
+
+Pin the chart with `--version <chartVersion>`; the agent image comes from that chart's `appVersion`, so pinning the chart pins the image (no separate `image.tag`). For Argo CD / Flux, use `reach.existingSecret` instead of the raw token - see [the chart's GitOps section](deploy/helm/reach-agent#gitops-argo-cd--flux).
+
+Key differences from a host agent:
+
+- **Access is Kubernetes RBAC.** What the agent can do in the cluster is the `clusterAccess` you bind in the chart (defaults to read-only `view`); the host-only Docker / service-management grants don't apply. The agent **auto-discovers and reports its effective cluster-wide RBAC**, which you **acknowledge** in the console - and any permission added later (in any namespace) shows up as **drift** to re-acknowledge.
+- **Execution is gated, no shell.** Jobs run as `kubectl` (plus a few read-only filters) connected by pipes - no arbitrary shell. Tune the allowlist with `extraAllowedBinaries` / `allowedBinaries`.
+- **Policy mode still applies** (`readonly` / `approved` / `wild`), enforced by the backend per `kubectl` verb.
+
+The chart's image (`nabeemdev/reach-agent`) and all values are documented in [deploy/helm/reach-agent](deploy/helm/reach-agent); how the agent itself works is in [agent/README.md](agent/README.md).
+
+---
+
 ## Managing agents
 
-From the **tenant console**, go to **Agents** to see all agents with their status, hostname, policy mode, access level, tags, and detected capabilities. Filter by tag using the search bar.
+From the **tenant console**, go to **Agents** to see all agents with their status, hostname, type, policy mode, access level, tags, and detected capabilities. Filter by type or tag using the toolbar.
 
 `token_issued_at` in the agent record shows when the current agent token was last issued - useful for auditing which agents are approaching their 30-day auto-rotation window.
 
@@ -472,21 +505,25 @@ When an agent runs in `approved` mode and a write command is not yet approved, t
 
 Read commands always run. Only write commands need approval.
 
+**Host vs Kubernetes.** Host approvals are **command text** (prefix match). Kubernetes approvals are **structured rules** - `{verb, resource, namespace, name}`, any field wildcardable with `*` - so one rule (e.g. `delete pods` in `team-a`) covers every matching object without re-approving each one. The console shows the two kinds **separately** (a Host/Kubernetes toggle), defaults to the 10 most recent, and has a case-insensitive **Search**. See [POLICIES → Kubernetes approvals are structured rules](POLICIES.md#kubernetes-approvals-are-structured-rules).
+
 **Reviewing approvals**: admins and operators use the **tenant console → Approvals** to see pending requests and approve or deny them. You can approve permanently or with a time limit.
 
-**Pre-approving commands**: before first use, go to **Agents → [agent] → Approvals → Add** to approve commands without waiting for a block. Useful for provisioning a new agent.
+**Pre-approving**: before first use, go to **Agents → [agent] → Approvals → Add** (or the **Approvals** page) to approve a command (host) or author a rule (k8s) without waiting for a block. Useful for provisioning a new agent.
 
 **Approval durations**: `permanent`, `1h`, `8h`, `24h`, `7d`, `30d`, `90d`, or custom `Nh`/`Nd`. Set `now` to instantly expire an approved record.
 
 **Users** check their own approval status via the CLI:
 
 ```bash
-reach approvals                    # effective approved commands for the default agent
-reach approvals --pending          # my pending requests
-reach approvals --denied           # my denied requests
-reach approvals --expired          # my expired approvals
-reach approvals --agent prod       # any of the above for a specific agent
+reach approvals list                    # effective approved commands/rules for the default agent
+reach approvals list --pending          # my pending requests
+reach approvals list --denied           # my denied requests
+reach approvals list --expired          # my expired approvals
+reach approvals list --agent prod       # any of the above for a specific agent
 ```
+
+The output adapts to the agent type: **host** agents show the command, **Kubernetes** agents show the structured rule (`verb / resource / namespace / name`, `✱` = any).
 
 ### Approval lifecycle
 
@@ -501,7 +538,7 @@ reach approvals --agent prod       # any of the above for a specific agent
 
 ### Automatic expiry and cleanup
 
-**Lazy expiry on read** - when the approved list is fetched (agent sync, `reach approvals`), any record with `expires_at ≤ now` is immediately marked `expired`.
+**Lazy expiry on read** - when the approved list is fetched (agent sync, `reach approvals list`), any record with `expires_at ≤ now` is immediately marked `expired`.
 
 **Hourly sweep** - the scheduler marks all `approved` records with `expires_at < now` as `expired` in bulk.
 
@@ -532,17 +569,22 @@ Users authenticate to the tenant console with a username and password (separate 
 ## Agent lifecycle
 
 ```
-CREATED ──(claim)──► ACTIVE ──(heartbeat gap)──► INACTIVE
-   ▲                    │                              │
-   │               (revoke)                       (revoke)
-   │                    │                              │
-   │                    ▼                              │
-   └──(reissue     REVOKED ◄─────────────────────────┘
-      install           │
-      token)       (delete)
-                        │
-                        ▼
-                   DELETED ──(remove)──► [gone]
+   CREATED
+      │  claim
+      ▼
+   ACTIVE  ◄──── sync resumes ────┐
+      │                           │
+      │  heartbeat gap            │
+      ▼                           │
+   INACTIVE ──────────────────────┘
+      │
+      │  revoke   (or directly from ACTIVE)
+      ▼
+   REVOKED ──── reissue install token ────►  back to CREATED
+      │
+      │  delete
+      ▼
+   DELETED ──── remove ────►  [gone]
 ```
 
 An agent starts as `CREATED`. On first run it calls `POST /agent/claim` with the install token, transitions to `ACTIVE`, and receives a permanent `agent_token`. The install token is then cleared from disk.
@@ -621,7 +663,7 @@ sudo bash install.sh --no-grant-service-mgmt
 
 ```bash
 curl -fsSL .../install.sh | sudo bash -s -- \
-  --api-url ... --agent-id ... --install-token ... \
+  --api-url ... --install-token ... \
   --yes
 ```
 
@@ -629,7 +671,7 @@ To skip service management in a non-interactive install, add `--no-grant-service
 
 ```bash
 curl -fsSL .../install.sh | sudo bash -s -- \
-  --api-url ... --agent-id ... --install-token ... \
+  --api-url ... --install-token ... \
   --yes --no-grant-service-mgmt
 ```
 
@@ -687,7 +729,7 @@ sudo bash install.sh --no-grant-docker
 
 ```bash
 curl -fsSL .../install.sh | sudo bash -s -- \
-  --api-url ... --agent-id ... --install-token ... \
+  --api-url ... --install-token ... \
   --yes --grant-docker
 ```
 
@@ -719,6 +761,7 @@ The agent reads a few optional environment variables. The installer sets the tim
 | `REACH_COMMAND_TIMEOUT_SECONDS` | `60` | Max wall-clock time for a single command before the agent kills it and returns a timeout result. |
 | `REACH_MAX_OUTPUT_BYTES` | `50000` | Max bytes of `stdout`/`stderr` captured per command. Output beyond this is truncated. |
 | `REACH_CONFIG_PATH` | `/etc/reach-agent/config.json` | Path to the agent config file. Mainly for local development; the installer manages this path for you. |
+| `REACH_METRICS_ADDR` | _(unset)_ | Opt-in: serve Prometheus `/metrics` on this address. **Unset by default** - the agent otherwise opens no inbound port. On a host there is no NetworkPolicy to contain it, so bind to loopback (`127.0.0.1:9090`) and scrape with a co-located collector. On Kubernetes the Helm chart wires this for you (`metrics.enabled=true`) with a Service, ServiceMonitor, and NetworkPolicy. See [SECURITY.md → Optional metrics endpoint](SECURITY.md#optional-metrics-endpoint). |
 
 To change the timeout or output cap on an installed agent, edit the service definition and restart:
 
@@ -838,6 +881,8 @@ Write commands are checked against the agent's approved list. If the command mat
 In both cases the backend creates a pending approval record. Admins and operators review it in the **tenant console → Approvals**, then approve or deny. Once approved, the command prefix is included in the approved list on the next sync and runs without restriction. See [Approvals](#approvals).
 
 The match is prefix-based with a word boundary: approving `docker logs` permits `docker logs myapp --tail 100` but not `docker rm myapp`.
+
+> **Kubernetes agents work differently.** The blocklist tables above are the regex classifier used for **host** agents. A `type=k8s` agent has no shell, so write-ness is classified from the `kubectl` **verb** (default-deny: anything that isn't a known read verb - including `exec`/`cp`/`port-forward` and unknown verbs - is a write), and the policy decision is made **at the backend on submission**, not on the agent. "Double verbs" whose sub-subcommand changes read/write are classified on the pair - e.g. `rollout status`/`history` and `auth can-i` are reads, while `rollout restart`/`undo` and `auth reconcile` are writes - and cluster-inert utilities (`kustomize`, `options`, `plugin`, `config`, …) count as reads. In approved mode an unapproved k8s write never dispatches: it is recorded as a `REJECTED` job and a pending approval is raised. There is no Landlock or `is_write`-flag step on a k8s agent. See [ARCHITECTURE.md → How `kubectl` commands are classified](ARCHITECTURE.md#kubernetes-agents) for the full model.
 
 ---
 

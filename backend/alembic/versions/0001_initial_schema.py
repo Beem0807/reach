@@ -65,7 +65,10 @@ def upgrade() -> None:
         sa.Column('last_heartbeat_at', sa.String(), nullable=True),
         sa.Column('active_until', sa.Integer(), nullable=True),
         sa.Column('token_issued_at', sa.String(), nullable=True),
-        sa.Column('type', sa.String(), nullable=True, server_default='manual'),
+        sa.Column('type', sa.String(), nullable=True, server_default='host'),
+        sa.Column('k8s_permissions', sa.JSON(), nullable=True),
+        sa.Column('k8s_permissions_hash', sa.String(), nullable=True),
+        sa.Column('k8s_permissions_acked_hash', sa.String(), nullable=True),
         sa.Column('fleet_id', sa.String(), nullable=True),
         sa.Column('tags', sa.JSON(), nullable=True),
         sa.Column('created_at', sa.String(), nullable=True),
@@ -77,6 +80,10 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint('agent_id'),
     )
     op.create_index('ix_agents_tenant_id', 'agents', ['tenant_id'])
+    # Credential-only auth: agents are looked up by token hash, never by a
+    # client-supplied agent_id. Unique so each hash maps to one agent.
+    op.create_index('ix_agents_install_token_hash', 'agents', ['install_token_hash'], unique=True)
+    op.create_index('ix_agents_agent_token_hash', 'agents', ['agent_token_hash'], unique=True)
 
     op.create_table(
         'jobs',
@@ -109,6 +116,7 @@ def upgrade() -> None:
         sa.Column('tenant_id', sa.String(), nullable=False),
         sa.Column('agent_id', sa.String(), nullable=False),
         sa.Column('command', sa.Text(), nullable=False),
+        sa.Column('k8s_rule', sa.JSON(), nullable=True),
         sa.Column('requested_by', sa.String(), nullable=False),
         sa.Column('requester_name', sa.String(), nullable=True),
         sa.Column('job_id', sa.String(), nullable=True),

@@ -28,6 +28,8 @@ def _enrich_agent(d: Optional[dict]) -> Optional[dict]:
         docker_detected=bool(d.get("docker_detected")),
         service_mgmt_detected=bool(d.get("service_mgmt_detected")),
     )
+    cur = d.get("k8s_permissions_hash")
+    d["k8s_permissions_drift"] = bool(cur) and cur != d.get("k8s_permissions_acked_hash")
     return d
 
 
@@ -35,15 +37,37 @@ class AgentRepo:
     def get(self, agent_id: str) -> Optional[dict]:
         return _enrich_agent(_TABLE_AGENTS.get_item(Key={"agent_id": agent_id}).get("Item"))
 
+    def get_by_install_token_hash(self, install_token_hash: str) -> Optional[dict]:
+        if not install_token_hash:
+            return None
+        items = _TABLE_AGENTS.query(
+            IndexName="install-token-hash-index",
+            KeyConditionExpression=DKey("install_token_hash").eq(install_token_hash),
+            Limit=1,
+        ).get("Items", [])
+        return _enrich_agent(items[0]) if items else None
+
+    def get_by_agent_token_hash(self, agent_token_hash: str) -> Optional[dict]:
+        if not agent_token_hash:
+            return None
+        items = _TABLE_AGENTS.query(
+            IndexName="agent-token-hash-index",
+            KeyConditionExpression=DKey("agent_token_hash").eq(agent_token_hash),
+            Limit=1,
+        ).get("Items", [])
+        return _enrich_agent(items[0]) if items else None
+
     def claim(self, agent_id: str, fields: dict) -> None:
         _TABLE_AGENTS.update_item(
             Key={"agent_id": agent_id},
             UpdateExpression=(
                 "SET #st = :s, agent_token_hash = :h, machine_fingerprint = :fp,"
                 " hostname = :hn, agent_version = :av, claimed_at = :ca,"
-                " active_until = :au, last_heartbeat_at = :hb, token_issued_at = :ti"
+                " active_until = :au, last_heartbeat_at = :hb, token_issued_at = :ti,"
+                " #ty = :ty"
             ),
-            ExpressionAttributeNames={"#st": "status"},
+            # "type" and "status" are DynamoDB reserved words.
+            ExpressionAttributeNames={"#st": "status", "#ty": "type"},
             ExpressionAttributeValues={
                 ":s": "ACTIVE",
                 ":h": fields["agent_token_hash"],
@@ -54,6 +78,8 @@ class AgentRepo:
                 ":au": fields["active_until"],
                 ":hb": fields["claimed_at"],
                 ":ti": fields["token_issued_at"],
+                # k8s agents report "k8s", everything else "host".
+                ":ty": fields.get("type") or "host",
             },
         )
 
@@ -91,6 +117,20 @@ class AgentRepo:
         if names:
             kwargs["ExpressionAttributeNames"] = names
         _TABLE_AGENTS.update_item(**kwargs)
+
+    def set_k8s_permissions(self, agent_id: str, permissions: dict, perm_hash: str) -> None:
+        _TABLE_AGENTS.update_item(
+            Key={"agent_id": agent_id},
+            UpdateExpression="SET k8s_permissions = :p, k8s_permissions_hash = :h",
+            ExpressionAttributeValues={":p": permissions, ":h": perm_hash},
+        )
+
+    def acknowledge_k8s_permissions(self, agent_id: str, perm_hash: str) -> None:
+        _TABLE_AGENTS.update_item(
+            Key={"agent_id": agent_id},
+            UpdateExpression="SET k8s_permissions_acked_hash = :h",
+            ExpressionAttributeValues={":h": perm_hash},
+        )
 
     def set_active_until(self, agent_id: str, active_until: int) -> None:
         _TABLE_AGENTS.update_item(
@@ -510,7 +550,12 @@ class UserRepo:
 
 class ApprovalRepo:
     def create(self, approval: dict) -> None:
-        _TABLE_APPROVALS.put_item(Item=approval)
+        item = dict(approval)
+        # Lowercased shadow fields so `contains` search is case-insensitive
+        # (DynamoDB has no ILIKE). The SQL repo uses ILIKE and stores neither.
+        item["command_lc"] = (item.get("command") or "").lower()
+        item["requester_name_lc"] = (item.get("requester_name") or "").lower()
+        _TABLE_APPROVALS.put_item(Item=item)
 
     def get(self, approval_id: str) -> Optional[dict]:
         return _TABLE_APPROVALS.get_item(Key={"approval_id": approval_id}).get("Item")
@@ -576,6 +621,58 @@ class ApprovalRepo:
         if limit is not None:
             results = results[:limit]
         return results
+
+    def search_by_tenant(self, tenant_id: str, *, status: Optional[str] = None, agent_id: Optional[str] = None,
+                         requested_by: Optional[str] = None, kind: Optional[str] = None, q: Optional[str] = None,
+                         limit: int = 20, offset: int = 0) -> tuple:
+        """Server-side search + pagination for DynamoDB.
+
+        DynamoDB has no LIKE and no OFFSET. Status/agent/requester and the text
+        query (`contains`, which is case-sensitive) are pushed into a
+        FilterExpression so the filtering happens in Dynamo, not after transfer.
+        Kind is applied in Python on the deserialized `k8s_rule` (robust to how
+        None is stored) and offset/limit are sliced after the effective-list
+        dedup. Returns (page_items, total).
+        """
+        kce = DKey("tenant_id").eq(tenant_id)
+        kwargs: dict = {
+            "IndexName": "tenant-approvals-index",
+            "KeyConditionExpression": kce,
+            "ScanIndexForward": False,
+        }
+        filters = []
+        if agent_id is not None:
+            filters.append(Attr("agent_id").eq(agent_id))
+        if status is not None:
+            filters.append(Attr("status").eq(status))
+        if requested_by is not None:
+            filters.append(Attr("requested_by").eq(requested_by))
+        if q:
+            # Match the lowercased shadow fields for case-insensitive search.
+            ql = q.lower()
+            filters.append(Attr("command_lc").contains(ql) | Attr("requester_name_lc").contains(ql))
+        if filters:
+            expr = filters[0]
+            for f in filters[1:]:
+                expr = expr & f
+            kwargs["FilterExpression"] = expr
+        results = []
+        while True:
+            resp = _TABLE_APPROVALS.query(**kwargs)
+            results.extend(resp.get("Items", []))
+            if "LastEvaluatedKey" not in resp:
+                break
+            kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+        if status == "approved":
+            results = self._lazy_expire(results)
+            results = self._dedup_by_command(results)
+        if kind == "k8s":
+            results = [r for r in results if r.get("k8s_rule")]
+        elif kind == "host":
+            results = [r for r in results if not r.get("k8s_rule")]
+        total = len(results)
+        page = results[offset: offset + limit] if limit else results[offset:]
+        return page, total
 
     def _lazy_expire(self, records: list) -> list:
         now = _iso()
@@ -779,7 +876,12 @@ class AgentHistoryRepo:
 
 class AuditRepo:
     def create(self, entry: dict) -> None:
-        _TABLE_AUDIT_LOGS.put_item(Item=entry)
+        item = dict(entry)
+        # Lowercased shadow fields so `contains` search is case-insensitive
+        # (DynamoDB has no ILIKE). The SQL repo uses ILIKE and stores none of these.
+        for field in ("actor_name", "resource_id", "ip_address"):
+            item[f"{field}_lc"] = (item.get(field) or "").lower()
+        _TABLE_AUDIT_LOGS.put_item(Item=item)
 
     def list_platform(self, limit: int = 100, cursor: Optional[str] = None,
                       action: Optional[str] = None, actor: Optional[str] = None,
@@ -793,11 +895,11 @@ class AuditRepo:
         if action:
             fe = fe & Attr("action").eq(action)
         if actor:
-            fe = fe & Attr("actor_name").contains(actor)
+            fe = fe & Attr("actor_name_lc").contains(actor.lower())
         if resource:
-            fe = fe & Attr("resource_id").contains(resource)
+            fe = fe & Attr("resource_id_lc").contains(resource.lower())
         if ip:
-            fe = fe & Attr("ip_address").contains(ip)
+            fe = fe & Attr("ip_address_lc").contains(ip.lower())
         resp = _TABLE_AUDIT_LOGS.scan(FilterExpression=fe, Limit=limit * 5)
         items = resp.get("Items", [])
         items.sort(key=lambda x: x.get("created_at", ""), reverse=True)
@@ -818,11 +920,14 @@ class AuditRepo:
         if action:
             fe = fe & Attr("action").eq(action) if fe else Attr("action").eq(action)
         if actor:
-            fe = fe & Attr("actor_name").contains(actor) if fe else Attr("actor_name").contains(actor)
+            _f = Attr("actor_name_lc").contains(actor.lower())
+            fe = fe & _f if fe else _f
         if resource:
-            fe = fe & Attr("resource_id").contains(resource) if fe else Attr("resource_id").contains(resource)
+            _f = Attr("resource_id_lc").contains(resource.lower())
+            fe = fe & _f if fe else _f
         if ip:
-            fe = fe & Attr("ip_address").contains(ip) if fe else Attr("ip_address").contains(ip)
+            _f = Attr("ip_address_lc").contains(ip.lower())
+            fe = fe & _f if fe else _f
         kwargs: dict = {
             "IndexName": "tenant-created-index",
             "KeyConditionExpression": kce,

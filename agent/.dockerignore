@@ -1,0 +1,11 @@
+# Prebuilt host binaries (the image builds its own static binary)
+reach-agent-darwin-amd64
+reach-agent-darwin-arm64
+reach-agent-linux-amd64
+reach-agent-linux-arm64
+agent
+# Host-only artifacts
+install.sh
+reach-agent.service
+Dockerfile
+.dockerignore

@@ -17,6 +17,13 @@ logger.setLevel(logging.INFO)
 _S3_BASE = os.environ.get("RELEASES_S3_BASE", "https://reach-releases.s3.amazonaws.com")
 _AGENT_VERSION = os.environ.get("AGENT_VERSION", "latest")
 _S3_VERSIONED = f"{_S3_BASE}/agent/{_AGENT_VERSION}"
+# Kubernetes release artifact, independent of the host's AGENT_VERSION above.
+# The Helm chart repo serves index.yaml + reach-agent-<version>.tgz.
+# Single-version model: chart version == appVersion == agent image, released
+# together. CHART_VERSION pins the chart via --version; the image then follows the
+# chart's appVersion (no --set image.tag). Empty = install the latest chart.
+_CHART_REPO_URL = os.environ.get("RELEASES_CHART_REPO", f"{_S3_BASE}/charts/reach-agent")
+_CHART_VERSION = os.environ.get("CHART_VERSION", "").strip()
 INSTALL_TOKEN_TTL = 86400
 VALID_MODES = ("wild", "readonly", "approved")
 _ROLE_RANK = {"admin": 3, "operator": 2, "developer": 1}
@@ -37,12 +44,26 @@ def _build_install_commands(
     api_url: str,
     agent_id: str,
     raw_install_token: str,
+    agent_type: str = "host",
     grant_service_mgmt: bool = True,
     grant_docker: bool = False,
 ) -> dict:
+    # Kubernetes agents install via Helm; access is controlled by RBAC, so the
+    # host-only docker / service-management grants do not apply.
+    if agent_type == "k8s":
+        version_flag = f" --version {_CHART_VERSION}" if _CHART_VERSION else ""
+        helm = (
+            f"helm repo add reach {_CHART_REPO_URL} --force-update && "
+            "helm install reach-agent reach/reach-agent "
+            "--namespace reach --create-namespace"
+            f"{version_flag} "
+            f'--set reach.apiUrl="{api_url}" '
+            f'--set reach.installToken="{raw_install_token}"'
+        )
+        return {"helm": helm, "cli_use": f"reach agents use {agent_id}"}
+
     flags = (
         f'--api-url "{api_url}" '
-        f'--agent-id "{agent_id}" '
         f'--install-token "{raw_install_token}" '
         f"--yes --force"
     )
@@ -66,8 +87,17 @@ def handle_create_tenant_agent(body: dict, raw_token: str, api_url: str) -> dict
     mode = body.get("mode", "wild").strip()
     if mode not in VALID_MODES:
         return _err("mode must be wild, readonly, or approved")
-    grant_service_mgmt = bool(body.get("grant_service_mgmt", False))
-    grant_docker = bool(body.get("grant_docker", False))
+
+    agent_type = (body.get("type") or "host").strip().lower()
+    if agent_type not in ("host", "k8s"):
+        return _err("type must be host or k8s")
+    # Docker / service-management grants are host-only; k8s access is RBAC-driven.
+    if agent_type == "k8s":
+        grant_service_mgmt = False
+        grant_docker = False
+    else:
+        grant_service_mgmt = bool(body.get("grant_service_mgmt", False))
+        grant_docker = bool(body.get("grant_docker", False))
 
     agent_id = "agent_" + secrets.token_urlsafe(12)
     raw_install_token = INSTALL_TOKEN_PREFIX + secrets.token_urlsafe(32)
@@ -77,7 +107,7 @@ def handle_create_tenant_agent(body: dict, raw_token: str, api_url: str) -> dict
         "agent_id": agent_id,
         "tenant_id": user["tenant_id"],
         "status": "CREATED",
-        "type": "manual",
+        "type": agent_type,
         "fleet_id": None,
         "mode": mode,
         "install_token_hash": _hmac_token(raw_install_token),
@@ -95,16 +125,17 @@ def handle_create_tenant_agent(body: dict, raw_token: str, api_url: str) -> dict
         actor_role=user.get("role", ""),
         resource_type="agent",
         resource_id=agent_id,
-        metadata={"mode": mode, "grant_service_mgmt": grant_service_mgmt, "grant_docker": grant_docker},
+        metadata={"mode": mode, "type": agent_type, "grant_service_mgmt": grant_service_mgmt, "grant_docker": grant_docker},
     )
-    logger.info("Created agent=%s tenant=%s by user=%s", agent_id, user["tenant_id"], user.get("user_id"))
+    logger.info("Created agent=%s type=%s tenant=%s by user=%s", agent_id, agent_type, user["tenant_id"], user.get("user_id"))
     return _ok({
         "agent_id": agent_id,
         "tenant_id": user["tenant_id"],
+        "type": agent_type,
         "install_token": raw_install_token,
         "install_token_expires_at": _iso_offset(INSTALL_TOKEN_TTL),
         "mode": mode,
-        "commands": _build_install_commands(api_url, agent_id, raw_install_token, grant_service_mgmt, grant_docker),
+        "commands": _build_install_commands(api_url, agent_id, raw_install_token, agent_type, grant_service_mgmt, grant_docker),
     }, 201)
 
 
@@ -166,7 +197,10 @@ def handle_reissue_tenant_install_token(agent_id: str, body: dict, raw_token: st
         "agent_id": agent_id,
         "install_token": raw_install_token,
         "install_token_expires_at": _iso_offset(INSTALL_TOKEN_TTL),
-        "commands": _build_install_commands(api_url, agent_id, raw_install_token, grant_service_mgmt, grant_docker),
+        "commands": _build_install_commands(
+            api_url, agent_id, raw_install_token,
+            agent.get("type", "host"), grant_service_mgmt, grant_docker,
+        ),
     })
 
 
@@ -377,11 +411,19 @@ def handle_acknowledge_capability(agent_id: str, body: dict, raw_token: str) -> 
     if not agent:
         return _err("agent not found", 404)
     capability = body.get("capability", "").strip()
-    if capability not in ("docker", "service_mgmt"):
-        return _err("capability must be docker or service_mgmt")
+    if capability not in ("docker", "service_mgmt", "k8s_permissions"):
+        return _err("capability must be docker, service_mgmt, or k8s_permissions")
     if capability == "docker":
         agents_repo.update_grants(agent_id, grant_docker=True)
         label = "Docker"
+    elif capability == "k8s_permissions":
+        # Acknowledge the agent's currently-reported RBAC: pin the acked hash to
+        # the current one, so drift clears until the permissions change again.
+        cur = agent.get("k8s_permissions_hash")
+        if not cur:
+            return _err("no reported permissions to acknowledge")
+        agents_repo.acknowledge_k8s_permissions(agent_id, cur)
+        label = "Kubernetes permissions"
     else:
         agents_repo.update_grants(agent_id, grant_service_mgmt=True)
         label = "service management"

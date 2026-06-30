@@ -117,6 +117,7 @@ def get_context() -> dict:
             result["default_agent"] = {
                 "agent_id": agent.get("agent_id"),
                 "status": agent.get("status"),
+                "type": agent.get("type"),
                 "hostname": agent.get("hostname"),
                 "mode": agent.get("mode"),
                 "access_level": agent.get("access_level"),

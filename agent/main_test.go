@@ -260,16 +260,13 @@ func TestLoadConfig(t *testing.T) {
 		restore := setConfigPath(t)
 		defer restore()
 
-		os.WriteFile(configPath, []byte(`{"api_url":"https://api.example.com","agent_id":"agent_a","agent_token":"tok"}`), 0600)
+		os.WriteFile(configPath, []byte(`{"api_url":"https://api.example.com","agent_token":"tok"}`), 0600)
 		cfg, err := loadConfig()
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		if cfg.APIURL != "https://api.example.com" {
 			t.Errorf("api_url = %q", cfg.APIURL)
-		}
-		if cfg.AgentID != "agent_a" {
-			t.Errorf("agent_id = %q", cfg.AgentID)
 		}
 		if cfg.AgentToken != "tok" {
 			t.Errorf("agent_token = %q", cfg.AgentToken)
@@ -287,18 +284,9 @@ func TestLoadConfig(t *testing.T) {
 	t.Run("missing api_url returns error", func(t *testing.T) {
 		restore := setConfigPath(t)
 		defer restore()
-		os.WriteFile(configPath, []byte(`{"agent_id":"agent_a"}`), 0600)
+		os.WriteFile(configPath, []byte(`{"agent_token":"tok"}`), 0600)
 		if _, err := loadConfig(); err == nil {
 			t.Error("expected error for missing api_url")
-		}
-	})
-
-	t.Run("missing agent_id returns error", func(t *testing.T) {
-		restore := setConfigPath(t)
-		defer restore()
-		os.WriteFile(configPath, []byte(`{"api_url":"https://x"}`), 0600)
-		if _, err := loadConfig(); err == nil {
-			t.Error("expected error for missing agent_id")
 		}
 	})
 
@@ -317,7 +305,7 @@ func TestSaveConfig(t *testing.T) {
 		restore := setConfigPath(t)
 		defer restore()
 
-		cfg := &Config{APIURL: "https://api.example.com", AgentID: "agent_a", AgentToken: "tok_abc"}
+		cfg := &Config{APIURL: "https://api.example.com", AgentToken: "tok_abc"}
 		if err := saveConfig(cfg); err != nil {
 			t.Fatalf("saveConfig: %v", err)
 		}
@@ -334,7 +322,7 @@ func TestSaveConfig(t *testing.T) {
 		restore := setConfigPath(t)
 		defer restore()
 
-		saveConfig(&Config{APIURL: "https://x", AgentID: "a"})
+		saveConfig(&Config{APIURL: "https://x", AgentToken: "tok"})
 		info, _ := os.Stat(configPath)
 		if info.Mode().Perm() != 0600 {
 			t.Errorf("mode = %o, want 0600", info.Mode().Perm())
@@ -516,7 +504,6 @@ func TestAPIPost(t *testing.T) {
 func claimCfg(apiURL string) *Config {
 	return &Config{
 		APIURL:       apiURL,
-		AgentID:      "agent_a",
 		InstallToken: "install_tok",
 	}
 }
@@ -606,9 +593,6 @@ func TestClaim(t *testing.T) {
 		if gotPath != "/agent/claim" {
 			t.Errorf("path = %q, want /agent/claim", gotPath)
 		}
-		if gotBody.AgentID != "agent_a" {
-			t.Errorf("agent_id = %q", gotBody.AgentID)
-		}
 		if gotBody.MachineFingerprint != "fp_test" {
 			t.Errorf("machine_fingerprint = %q", gotBody.MachineFingerprint)
 		}
@@ -625,7 +609,6 @@ func TestClaim(t *testing.T) {
 func syncCfg(apiURL string) *Config {
 	return &Config{
 		APIURL:             apiURL,
-		AgentID:            "agent_a",
 		AgentToken:         "tok_abc",
 		MachineFingerprint: "fp_abc",
 	}
@@ -909,9 +892,6 @@ func TestPostResult(t *testing.T) {
 		defer srv.Close()
 
 		postResult(syncCfg(srv.URL), "job_1", CommandResult{})
-		if gotBody.AgentID != "agent_a" {
-			t.Errorf("agent_id = %q, want 'agent_a'", gotBody.AgentID)
-		}
 		if gotBody.MachineFingerprint != "fp_abc" {
 			t.Errorf("machine_fingerprint = %q, want 'fp_abc'", gotBody.MachineFingerprint)
 		}
@@ -1096,4 +1076,36 @@ func TestSleep(t *testing.T) {
 			t.Error("expected false when context cancelled mid-sleep")
 		}
 	})
+}
+
+func TestPermReviewInterval(t *testing.T) {
+	t.Setenv("REACH_K8S_REVIEW_INTERVAL_SECONDS", "")
+	if got := permReviewInterval(); got != defaultPermReviewInterval {
+		t.Fatalf("default = %s, want %s", got, defaultPermReviewInterval)
+	}
+	t.Setenv("REACH_K8S_REVIEW_INTERVAL_SECONDS", "120")
+	if got := permReviewInterval(); got != 120*time.Second {
+		t.Fatalf("override = %s, want 2m", got)
+	}
+	// Floored at 30s.
+	t.Setenv("REACH_K8S_REVIEW_INTERVAL_SECONDS", "5")
+	if got := permReviewInterval(); got != 30*time.Second {
+		t.Fatalf("floor = %s, want 30s", got)
+	}
+	// Garbage falls back to default.
+	t.Setenv("REACH_K8S_REVIEW_INTERVAL_SECONDS", "abc")
+	if got := permReviewInterval(); got != defaultPermReviewInterval {
+		t.Fatalf("garbage = %s, want default", got)
+	}
+}
+
+func TestTouchHealthFile(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "healthy")
+	touchHealthFile(p)
+	if _, err := os.Stat(p); err != nil {
+		t.Fatalf("expected health file written: %v", err)
+	}
+	// Empty path is a no-op (no panic, nothing created).
+	touchHealthFile("")
 }

@@ -24,7 +24,6 @@
 #
 #   sudo bash install.sh \
 #     --api-url https://api.example.com \
-#     --agent-id agent_xxx \
 #     --install-token install_xxx \
 #     --yes
 #
@@ -62,7 +61,6 @@ MACOS_AGENT_USER="reach-agent"
 # Args
 # ---------------------------------------------------------------------------
 API_URL=""
-AGENT_ID=""
 INSTALL_TOKEN=""
 FORCE=false
 UNINSTALL=false
@@ -74,14 +72,13 @@ GRANT_DOCKER_SET=false
 YES=false
 
 usage() {
-  echo "Usage: $0 [--api-url <url>] [--agent-id <id>] [--install-token <token>] [--force] [--background] [--grant-service-mgmt] [--no-grant-service-mgmt] [--grant-docker] [--no-grant-docker] [--yes] [--uninstall]"
+  echo "Usage: $0 [--api-url <url>] [--install-token <token>] [--force] [--background] [--grant-service-mgmt] [--no-grant-service-mgmt] [--grant-docker] [--no-grant-docker] [--yes] [--uninstall]"
   exit 1
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --api-url)               API_URL="$2";                                     shift 2 ;;
-    --agent-id)              AGENT_ID="$2";                                    shift 2 ;;
     --install-token)         INSTALL_TOKEN="$2";                               shift 2 ;;
     --force)                 FORCE=true;                                        shift ;;
     --background)            BACKGROUND=true;                                   shift ;;
@@ -240,7 +237,6 @@ _prompt() {
 }
 
 [[ -z "$API_URL" ]]       && _prompt API_URL       "API URL (e.g. https://api.example.com)"
-[[ -z "$AGENT_ID" ]]      && _prompt AGENT_ID      "Agent ID (e.g. agent_abc)"
 [[ -z "$INSTALL_TOKEN" ]] && _prompt INSTALL_TOKEN "Install token (install_xxx)"
 
 if [[ "$OS" == "Darwin" ]] && [[ "$IS_TTY" == true ]] && [[ "$YES" == false ]] && [[ "$BACKGROUND" == false ]]; then
@@ -331,8 +327,8 @@ echo "    Installed to $BIN_PATH"
 if [[ "$WRITE_CONFIG" == true ]]; then
   echo "==> Writing config..."
   mkdir -p "$CONFIG_DIR"
-  printf '{\n  "api_url": "%s",\n  "agent_id": "%s",\n  "install_token": "%s"\n}\n' \
-    "$API_URL" "$AGENT_ID" "$INSTALL_TOKEN" > "$CONFIG_FILE"
+  printf '{\n  "api_url": "%s",\n  "install_token": "%s"\n}\n' \
+    "$API_URL" "$INSTALL_TOKEN" > "$CONFIG_FILE"
   chmod 600 "$CONFIG_FILE"
   chmod 700 "$CONFIG_DIR"
   echo "    Config written to $CONFIG_FILE"

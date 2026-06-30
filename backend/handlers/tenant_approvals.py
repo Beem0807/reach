@@ -7,6 +7,7 @@ from typing import Optional, Tuple
 import shared.audit as audit
 from shared.access import can_access_agent
 from shared.auth import _bearer, _verify_tenant_token
+from shared.policy import normalize_k8s_rule, rule_to_command
 from shared.response import _err, _iso, _ok
 from shared.store import agents_repo, approvals_repo
 
@@ -39,35 +40,43 @@ def _parse_expires_at(duration: str) -> Tuple[bool, Optional[str]]:
 
 
 def handle_list_my_pending(query: dict, raw_token: str) -> dict:
-    """Current user's pending approval requests, optionally filtered by agent."""
+    """Current user's pending approval requests - server-side kind filter, text
+    search (LIKE), and pagination. `requested_by` scopes to the user's own
+    requests, so they can always see what they submitted."""
     user = _verify_tenant_token(raw_token)
     if not user:
         return _err("unauthorized", 401)
 
     agent_id = (query.get("agent_id") or "").strip() or None
+    kind = (query.get("type") or "").strip().lower() or None
+    if kind not in (None, "host", "k8s"):
+        return _err("type must be host or k8s", 400)
+    q = (query.get("q") or "").strip() or None
 
     if agent_id:
         agent = agents_repo.get(agent_id)
         if not agent or not can_access_agent(user, agent):
             return _err("agent not found", 404)
 
-    items = approvals_repo.list_by_tenant(
+    try:
+        limit = int(query.get("limit") or 20)
+        offset = int(query.get("offset") or 0)
+    except (TypeError, ValueError):
+        return _err("limit and offset must be integers", 400)
+    limit = max(1, min(limit, 100))
+    offset = max(0, offset)
+
+    items, total = approvals_repo.search_by_tenant(
         user["tenant_id"],
-        agent_id=agent_id,
         status="pending",
+        agent_id=agent_id,
         requested_by=user["user_id"],
+        kind=kind,
+        q=q,
+        limit=limit,
+        offset=offset,
     )
-
-    if not agent_id:
-        _cache: dict = {}
-        def _can_access(aid: str) -> bool:
-            if aid not in _cache:
-                a = agents_repo.get(aid)
-                _cache[aid] = a is not None and can_access_agent(user, a)
-            return _cache[aid]
-        items = [r for r in items if _can_access(r["agent_id"])]
-
-    return _ok({"approvals": items})
+    return _ok({"approvals": items, "total": total, "limit": limit, "offset": offset})
 
 
 def handle_list_agent_approved(agent_id: str, raw_token: str, status: str = "approved") -> dict:
@@ -108,8 +117,22 @@ def handle_tenant_list_all_approvals(query: dict, raw_token: str) -> dict:
 
     agent_id = (query.get("agent_id") or "").strip() or None
     status = (query.get("status") or "").strip() or None
+    kind = (query.get("type") or "").strip().lower() or None
+    if kind not in (None, "host", "k8s"):
+        return _err("type must be host or k8s", 400)
+    q = (query.get("q") or "").strip() or None
 
-    approvals = approvals_repo.list_by_tenant(user["tenant_id"], agent_id=agent_id, status=status)
+    try:
+        limit = int(query.get("limit") or 20)
+        offset = int(query.get("offset") or 0)
+    except (TypeError, ValueError):
+        return _err("limit and offset must be integers", 400)
+    limit = max(1, min(limit, 100))
+    offset = max(0, offset)
+
+    approvals, total = approvals_repo.search_by_tenant(
+        user["tenant_id"], status=status, agent_id=agent_id, kind=kind, q=q, limit=limit, offset=offset,
+    )
     _cache: dict = {}
     def _hostname(aid: str):
         if aid not in _cache:
@@ -117,7 +140,7 @@ def handle_tenant_list_all_approvals(query: dict, raw_token: str) -> dict:
             _cache[aid] = (a or {}).get("hostname")
         return _cache[aid]
     enriched = [{**a, "agent_hostname": _hostname(a["agent_id"])} for a in approvals]
-    return _ok({"approvals": enriched})
+    return _ok({"approvals": enriched, "total": total, "limit": limit, "offset": offset})
 
 
 def handle_tenant_review_approval(approval_id: str, action: str, raw_token: str, body: Optional[dict] = None) -> dict:
@@ -183,19 +206,33 @@ def handle_tenant_create_approval(body: dict, raw_token: str) -> dict:
     if not agent or agent.get("tenant_id") != user["tenant_id"]:
         return _err("agent not found", 404)
 
+    is_k8s = (agent.get("type") or "host") == "k8s"
+
     if not _require_role(user, "operator"):
-        # Developer path: single command → pending
-        command = (body or {}).get("command", "").strip()
-        if not command:
-            return _err("command is required", 400)
+        # Developer path: single command/rule → pending
+        if is_k8s:
+            k8s_rule = normalize_k8s_rule((body or {}).get("k8s_rule") or {})
+            if not k8s_rule:
+                return _err("k8s_rule with a valid write verb is required for k8s agents", 400)
+            command = rule_to_command(k8s_rule)
+        else:
+            k8s_rule = None
+            command = (body or {}).get("command", "").strip()
+            if not command:
+                return _err("command is required", 400)
+
+        def _same(a):
+            return a.get("k8s_rule") == k8s_rule if is_k8s else a.get("command") == command
 
         active = approvals_repo.list_by_agent(agent_id, status="approved")
-        if any(a["command"] == command for a in active):
-            return _err("command already has an active approval for this agent", 409)
+        if any(_same(a) for a in active):
+            return _err("an equivalent rule already has an active approval for this agent"
+                        if is_k8s else "command already has an active approval for this agent", 409)
 
         pending = approvals_repo.list_by_agent(agent_id, status="pending", requested_by=user["user_id"])
-        if any(a["command"] == command for a in pending):
-            return _err("you already have a pending request for this command", 409)
+        if any(_same(a) for a in pending):
+            return _err("you already have a pending request for this rule"
+                        if is_k8s else "you already have a pending request for this command", 409)
 
         now = _iso()
         requester = user.get("username") or user.get("user_id", "")
@@ -204,6 +241,7 @@ def handle_tenant_create_approval(body: dict, raw_token: str) -> dict:
             "tenant_id": user["tenant_id"],
             "agent_id": agent_id,
             "command": command,
+            "k8s_rule": k8s_rule,
             "requested_by": user.get("user_id", ""),
             "requester_name": requester,
             "job_id": None,
@@ -227,21 +265,44 @@ def handle_tenant_create_approval(body: dict, raw_token: str) -> dict:
         logger.info("Approval request (pending) created for agent=%s command=%s by user=%s", agent_id, command, user.get("user_id"))
         return _ok(approval, 201)
 
-    # Operator/admin path: create directly as approved, supports bulk + duration
-    single_command = (body or {}).get("command", "").strip()
-    command_list = (body or {}).get("commands")
-    if command_list is not None:
-        if not isinstance(command_list, list) or not command_list:
-            return _err("commands must be a non-empty list", 400)
-        commands = [c.strip() for c in command_list if isinstance(c, str) and c.strip()]
-        if not commands:
-            return _err("commands must contain at least one non-empty string", 400)
-        bulk = True
-    elif single_command:
-        commands = [single_command]
-        bulk = False
+    # Operator/admin path: create directly as approved, supports bulk + duration.
+    # k8s agents pre-approve structured rules ({verb, resource, namespace, name});
+    # host agents pre-approve command strings. Each item is {command, k8s_rule}.
+    if is_k8s:
+        rule_list = (body or {}).get("k8s_rules")
+        single_rule = (body or {}).get("k8s_rule")
+        if rule_list is not None:
+            if not isinstance(rule_list, list) or not rule_list:
+                return _err("k8s_rules must be a non-empty list", 400)
+            raw_rules = rule_list
+            bulk = True
+        elif single_rule is not None:
+            raw_rules = [single_rule]
+            bulk = False
+        else:
+            return _err("k8s_rule or k8s_rules is required for k8s agents", 400)
+        items = []
+        for raw in raw_rules:
+            rule = normalize_k8s_rule(raw)
+            if not rule:
+                return _err("each k8s_rule needs a valid write verb (verb, resource, namespace, name)", 400)
+            items.append({"command": rule_to_command(rule), "k8s_rule": rule})
     else:
-        return _err("command or commands is required", 400)
+        single_command = (body or {}).get("command", "").strip()
+        command_list = (body or {}).get("commands")
+        if command_list is not None:
+            if not isinstance(command_list, list) or not command_list:
+                return _err("commands must be a non-empty list", 400)
+            commands = [c.strip() for c in command_list if isinstance(c, str) and c.strip()]
+            if not commands:
+                return _err("commands must contain at least one non-empty string", 400)
+            bulk = True
+        elif single_command:
+            commands = [single_command]
+            bulk = False
+        else:
+            return _err("command or commands is required", 400)
+        items = [{"command": c, "k8s_rule": None} for c in commands]
 
     duration = (body or {}).get("duration")
     if duration == "now":
@@ -250,14 +311,18 @@ def handle_tenant_create_approval(body: dict, raw_token: str) -> dict:
     if not ok:
         return _err(f"invalid duration '{duration}'; use 1h, 8h, 24h, 7d, permanent, or Nh/Nd", 400)
 
-    active_commands = {a["command"] for a in approvals_repo.list_by_agent(agent_id, status="approved")}
+    active = approvals_repo.list_by_agent(agent_id, status="approved")
+    active_commands = {a["command"] for a in active}
+    active_rules = [a.get("k8s_rule") for a in active if a.get("k8s_rule")]
     now = _iso()
     reviewer = user.get("username") or user.get("user_id", "")
     created = []
     skipped = []
 
-    for command in commands:
-        if command in active_commands:
+    for item in items:
+        command, rule = item["command"], item["k8s_rule"]
+        already = (rule in active_rules) if is_k8s else (command in active_commands)
+        if already:
             skipped.append({"command": command, "reason": "already_approved"})
             continue
         approval = {
@@ -265,6 +330,7 @@ def handle_tenant_create_approval(body: dict, raw_token: str) -> dict:
             "tenant_id": user["tenant_id"],
             "agent_id": agent_id,
             "command": command,
+            "k8s_rule": rule,
             "requested_by": user.get("user_id", ""),
             "requester_name": reviewer,
             "job_id": None,
