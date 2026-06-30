@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { AuditLogsPage } from '../pages/AuditLogsPage';
 import type { AuditLog } from '../types';
@@ -131,33 +131,38 @@ describe('AuditLogsPage - action dropdown', () => {
     expect(values).toContain('api_token.revoked');
   });
 
-  it('selecting an action immediately triggers a reload', async () => {
+  it('selecting an action does not reload until Search is clicked', async () => {
     renderPlatform();
     await waitFor(() => expect(api.listPlatformAuditLogs).toHaveBeenCalledTimes(1));
 
     fireEvent.change(await screen.findByRole('combobox'), { target: { value: 'user.login' } });
+    expect(api.listPlatformAuditLogs).toHaveBeenCalledTimes(1); // staged, not applied
 
+    fireEvent.click(screen.getByRole('button', { name: 'Search' }));
     await waitFor(() => expect(api.listPlatformAuditLogs).toHaveBeenCalledTimes(2));
   });
 
-  it('reload passes the selected action as a query param', async () => {
+  it('Search passes the selected action as a query param', async () => {
     renderPlatform();
     fireEvent.change(await screen.findByRole('combobox'), { target: { value: 'tenant.created' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Search' }));
 
     await waitFor(() =>
-      expect(api.listPlatformAuditLogs).toHaveBeenCalledWith(
+      expect(api.listPlatformAuditLogs).toHaveBeenLastCalledWith(
         'http://api', 'tok', expect.objectContaining({ action: 'tenant.created' }),
       ),
     );
   });
 
-  it('selecting "All actions" omits action from reload params', async () => {
+  it('selecting "All actions" then Search omits action from params', async () => {
     renderPlatform();
     const sel = await screen.findByRole('combobox');
     fireEvent.change(sel, { target: { value: 'user.login' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Search' }));
     await waitFor(() => expect(api.listPlatformAuditLogs).toHaveBeenCalledTimes(2));
 
     fireEvent.change(sel, { target: { value: '' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Search' }));
     await waitFor(() => expect(api.listPlatformAuditLogs).toHaveBeenCalledTimes(3));
 
     const lastParams = vi.mocked(api.listPlatformAuditLogs).mock.calls[2][2];
@@ -166,84 +171,53 @@ describe('AuditLogsPage - action dropdown', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Text filters - debounced (400 ms)
+// Text filters - explicit Search (no auto-apply)
 // ---------------------------------------------------------------------------
 
-describe('AuditLogsPage - text filters (debounced)', () => {
-  beforeEach(() => { vi.useFakeTimers(); });
-  afterEach(() => { vi.useRealTimers(); });
-
-  async function initialLoad() {
+describe('AuditLogsPage - text filters (explicit Search)', () => {
+  it('typing does not query until Search is clicked', async () => {
     renderPlatform();
-    await vi.runAllTimersAsync(); // flush useEffect + promise
-  }
+    await waitFor(() => expect(api.listPlatformAuditLogs).toHaveBeenCalledTimes(1));
 
-  it('actor input sends actor param after 400 ms', async () => {
-    await initialLoad();
-    const input = screen.getByPlaceholderText('Actor…');
+    fireEvent.change(screen.getByPlaceholderText('Actor…'), { target: { value: 'alice' } });
+    expect(api.listPlatformAuditLogs).toHaveBeenCalledTimes(1); // still just the initial load
 
-    fireEvent.change(input, { target: { value: 'alice' } });
-    expect(api.listPlatformAuditLogs).toHaveBeenCalledTimes(1); // no immediate call
-
-    await vi.advanceTimersByTimeAsync(400);
-    expect(api.listPlatformAuditLogs).toHaveBeenCalledTimes(2);
-    expect(api.listPlatformAuditLogs).toHaveBeenLastCalledWith(
+    fireEvent.click(screen.getByRole('button', { name: 'Search' }));
+    await waitFor(() => expect(api.listPlatformAuditLogs).toHaveBeenLastCalledWith(
       'http://api', 'tok', expect.objectContaining({ actor: 'alice' }),
-    );
+    ));
   });
 
-  it('resource input sends resource param after 400 ms', async () => {
-    await initialLoad();
-    fireEvent.change(screen.getByPlaceholderText('Resource…'), { target: { value: 'user_abc' } });
-    await vi.advanceTimersByTimeAsync(400);
-    expect(api.listPlatformAuditLogs).toHaveBeenLastCalledWith(
+  it('Enter in a text box triggers the search', async () => {
+    renderPlatform();
+    await waitFor(() => expect(api.listPlatformAuditLogs).toHaveBeenCalledTimes(1));
+    const input = screen.getByPlaceholderText('Resource…');
+    fireEvent.change(input, { target: { value: 'user_abc' } });
+    fireEvent.keyDown(input, { key: 'Enter' });
+    await waitFor(() => expect(api.listPlatformAuditLogs).toHaveBeenLastCalledWith(
       'http://api', 'tok', expect.objectContaining({ resource: 'user_abc' }),
-    );
+    ));
   });
 
-  it('IP input sends ip param after 400 ms', async () => {
-    await initialLoad();
+  it('IP filter is sent on Search', async () => {
+    renderPlatform();
+    await waitFor(() => expect(api.listPlatformAuditLogs).toHaveBeenCalledTimes(1));
     fireEvent.change(screen.getByPlaceholderText('IP…'), { target: { value: '10.0.0.1' } });
-    await vi.advanceTimersByTimeAsync(400);
-    expect(api.listPlatformAuditLogs).toHaveBeenLastCalledWith(
+    fireEvent.click(screen.getByRole('button', { name: 'Search' }));
+    await waitFor(() => expect(api.listPlatformAuditLogs).toHaveBeenLastCalledWith(
       'http://api', 'tok', expect.objectContaining({ ip: '10.0.0.1' }),
-    );
+    ));
   });
 
-  it('does not call API before 400 ms has elapsed', async () => {
-    await initialLoad();
-    fireEvent.change(screen.getByPlaceholderText('Actor…'), { target: { value: 'a' } });
-    await vi.advanceTimersByTimeAsync(200); // under debounce
-    expect(api.listPlatformAuditLogs).toHaveBeenCalledTimes(1); // only initial
-  });
-
-  it('rapid keystrokes collapse into one request with final value', async () => {
-    await initialLoad();
-    const input = screen.getByPlaceholderText('Actor…');
-
-    fireEvent.change(input, { target: { value: 'a' } });
-    await vi.advanceTimersByTimeAsync(100);
-    fireEvent.change(input, { target: { value: 'al' } });
-    await vi.advanceTimersByTimeAsync(100);
-    fireEvent.change(input, { target: { value: 'ali' } });
-    await vi.advanceTimersByTimeAsync(400); // debounce fires for last change
-
-    expect(api.listPlatformAuditLogs).toHaveBeenCalledTimes(2); // initial + one debounced
-    expect(api.listPlatformAuditLogs).toHaveBeenLastCalledWith(
-      'http://api', 'tok', expect.objectContaining({ actor: 'ali' }),
-    );
-  });
-
-  it('multiple filters accumulate in the same request', async () => {
-    await initialLoad();
+  it('multiple filters are sent together on one Search', async () => {
+    renderPlatform();
+    await waitFor(() => expect(api.listPlatformAuditLogs).toHaveBeenCalledTimes(1));
     fireEvent.change(screen.getByPlaceholderText('Actor…'),    { target: { value: 'alice' } });
-    await vi.advanceTimersByTimeAsync(400);
     fireEvent.change(screen.getByPlaceholderText('Resource…'), { target: { value: 'user_abc' } });
-    await vi.advanceTimersByTimeAsync(400);
-
-    expect(api.listPlatformAuditLogs).toHaveBeenLastCalledWith(
+    fireEvent.click(screen.getByRole('button', { name: 'Search' }));
+    await waitFor(() => expect(api.listPlatformAuditLogs).toHaveBeenLastCalledWith(
       'http://api', 'tok', expect.objectContaining({ actor: 'alice', resource: 'user_abc' }),
-    );
+    ));
   });
 });
 
@@ -275,13 +249,13 @@ describe('AuditLogsPage - clear filters', () => {
 
   it('"Clear filters" triggers a reload without filter params', async () => {
     renderPlatform();
+    await waitFor(() => expect(api.listPlatformAuditLogs).toHaveBeenCalledTimes(1));
     fireEvent.change(await screen.findByRole('combobox'), { target: { value: 'user.login' } });
-    await waitFor(() => expect(api.listPlatformAuditLogs).toHaveBeenCalledTimes(2));
 
     fireEvent.click(screen.getByText('Clear filters'));
 
-    await waitFor(() => expect(api.listPlatformAuditLogs).toHaveBeenCalledTimes(3));
-    const lastParams = vi.mocked(api.listPlatformAuditLogs).mock.calls[2][2];
+    await waitFor(() => expect(api.listPlatformAuditLogs).toHaveBeenCalledTimes(2));
+    const lastParams = vi.mocked(api.listPlatformAuditLogs).mock.calls[1][2];
     expect(lastParams).not.toHaveProperty('action');
     expect(lastParams).not.toHaveProperty('actor');
   });

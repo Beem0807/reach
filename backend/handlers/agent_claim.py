@@ -1,8 +1,5 @@
-import hmac
 import json
 import logging
-import secrets
-
 import secrets
 
 from shared.auth import AGENT_TOKEN_PREFIX, _hmac_token
@@ -14,24 +11,39 @@ logger.setLevel(logging.INFO)
 
 
 def handle_agent_claim(body: dict) -> dict:
-    agent_id = body.get("agent_id", "").strip()
     install_token = body.get("install_token", "").strip()
     machine_fp = body.get("machine_fingerprint", "").strip()
     hostname = body.get("hostname", "").strip()
     agent_version = body.get("agent_version", "").strip()
+    agent_type = (body.get("type") or "").strip().lower()
 
-    if not all([agent_id, install_token, machine_fp]):
-        return _err("agent_id, install_token, machine_fingerprint required")
+    if not all([install_token, machine_fp]):
+        return _err("install_token, machine_fingerprint required")
 
-    agent = agents_repo.get(agent_id)
+    # The agent self-reports its environment: "k8s" in a cluster, else "host".
+    # The agent record itself is the cluster's identity - we store no cluster id.
+    if agent_type not in ("k8s", "host"):
+        agent_type = "host"
+
+    # Credential-only: the install token identifies the agent. We look it up by
+    # the token hash, so the agent never sends an agent_id. The unique-hash lookup
+    # is itself the token check; we still enforce one-time-use and expiry.
+    agent = agents_repo.get_by_install_token_hash(_hmac_token(install_token))
     if not agent:
-        return _err("agent not found", 404)
+        return _err("invalid install token", 403)
+    agent_id = agent["agent_id"]
     if agent.get("status") != "CREATED":
         return _err("agent already claimed or disabled", 403)
     if _now() > int(agent.get("install_token_expires_at") or 0):
         return _err("install token expired", 403)
-    if not hmac.compare_digest(_hmac_token(install_token), agent.get("install_token_hash") or ""):
-        return _err("invalid install token", 403)
+
+    # Bind the install token to the type the agent was created for: a k8s agent's
+    # token cannot be redeemed by the host installer, or vice-versa. The created
+    # type is authoritative - it drove the install command shown and the agent's
+    # RBAC (k8s) / capability grants (host), so a mismatch is a misuse.
+    created_type = (agent.get("type") or "host").strip().lower()
+    if agent_type != created_type:
+        return _err(f"install token is for a '{created_type}' agent, not '{agent_type}'", 403)
 
     raw_agent_token = AGENT_TOKEN_PREFIX + secrets.token_urlsafe(32)
     now_iso = _iso()
@@ -44,6 +56,7 @@ def handle_agent_claim(body: dict) -> dict:
         "claimed_at": now_iso,
         "active_until": _now() + 120,
         "token_issued_at": now_iso,
+        "type": created_type,
     })
 
     agent_history_repo.create({

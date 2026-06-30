@@ -85,26 +85,38 @@ def handle_rename_api_token(token_id: str, body: dict, token_payload: dict, ip: 
 
 
 def handle_revoke_api_token(token_id: str, token_payload: dict, ip: str = "") -> dict:
+    """Two-step deletion. An ACTIVE token is first **revoked** (soft: kept as a
+    REVOKED record for audit, can no longer authenticate). Deleting again - i.e.
+    DELETE on an already-REVOKED token - **hard-deletes** the row. This makes
+    revocation a required step before removal, and revocation is terminal (there
+    is no un-revoke; issue a new token instead)."""
     tenant_id = token_payload["tenant_id"]
     tokens = api_tokens_repo.list_by_user(token_payload["sub"])
     match = next((t for t in tokens if t["token_id"] == token_id), None)
     if not match or match["tenant_id"] != tenant_id:
         return _err("token not found", 404)
 
-    now = _iso()
-    api_tokens_repo.revoke(token_id, now)
+    def _audit(action: str):
+        audit.write(
+            action,
+            tenant_id=tenant_id,
+            actor_id=token_payload["sub"],
+            actor_name=token_payload.get("username"),
+            actor_role=token_payload.get("role"),
+            resource_type="api_token",
+            resource_id=token_id,
+            ip_address=ip,
+        )
 
-    audit.write(
-        "api_token.revoked",
-        tenant_id=tenant_id,
-        actor_id=token_payload["sub"],
-        actor_name=token_payload.get("username"),
-        actor_role=token_payload.get("role"),
-        resource_type="api_token",
-        resource_id=token_id,
-        ip_address=ip,
-    )
-    return _ok({"token_id": token_id, "status": "REVOKED"})
+    if match.get("status") == "ACTIVE":
+        api_tokens_repo.revoke(token_id, _iso())
+        _audit("api_token.revoked")
+        return _ok({"token_id": token_id, "status": "REVOKED"})
+
+    # Already revoked -> permanently remove the record.
+    api_tokens_repo.delete(token_id)
+    _audit("api_token.deleted")
+    return _ok({"token_id": token_id, "status": "DELETED"})
 
 
 def handle_revoke_all_user_tokens(user_id: str, token_payload: dict, ip: str = "") -> dict:

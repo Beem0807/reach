@@ -89,15 +89,50 @@ export interface User {
   commands?: { cli_login?: string };
 }
 
+export interface K8sResourceRule {
+  verbs: string[];
+  api_groups?: string[];
+  resources?: string[];
+  resource_names?: string[];
+}
+
+export interface K8sNonResourceRule {
+  verbs: string[];
+  non_resource_urls?: string[];
+}
+
+// Rules effective only in one namespace, beyond the cluster-wide baseline.
+export interface K8sNamespacePerms {
+  namespace: string;
+  resource_rules: K8sResourceRule[];
+}
+
+// The agent's effective RBAC, deduped: cluster-wide rules reported once, plus the
+// extra rules bound in specific namespaces. Self-reported via SelfSubjectRulesReview.
+export interface K8sPermissions {
+  cluster_wide: K8sResourceRule[];
+  non_resource_rules?: K8sNonResourceRule[];
+  namespaces?: K8sNamespacePerms[];
+  incomplete: boolean;  // a namespace review couldn't be fully evaluated
+  truncated?: boolean;  // snapshot exceeded the size cap; some entries dropped
+  hash: string;
+}
+
 export interface Agent {
   agent_id: string;
   tenant_id: string;
   status: 'CREATED' | 'ACTIVE' | 'INACTIVE' | 'REVOKED' | 'DELETED';
   hostname?: string;
   agent_version?: string;
+  type?: 'k8s' | 'host';
+  k8s_permissions?: K8sPermissions;
+  k8s_permissions_acked?: K8sPermissions | null;
+  k8s_permissions_drift?: boolean;
+  k8s_permissions_reported?: boolean;
   mode: 'wild' | 'readonly' | 'approved';
   access_level: 'open' | 'elevated' | 'managed' | 'restricted';
   claimed_at?: string;
+  created_at?: string;
   token_issued_at?: string;
   last_heartbeat_at?: string;
   tags?: string[];
@@ -111,12 +146,21 @@ export interface Agent {
   commands?: { agent?: string; cli_use?: string };
 }
 
+export interface K8sRule {
+  verb: string;
+  resource: string;
+  namespace: string;
+  name: string;
+}
+
 export interface Approval {
   approval_id: string;
   agent_id: string;
   agent_hostname?: string;
+  agent_type?: 'k8s' | 'host';
   tenant_id: string;
   command: string;
+  k8s_rule?: K8sRule | null;
   status: 'pending' | 'approved' | 'denied' | 'expired';
   requested_by?: string;
   requester_name?: string;

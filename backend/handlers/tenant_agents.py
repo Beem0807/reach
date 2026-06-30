@@ -5,18 +5,25 @@ import secrets
 from typing import Optional
 
 import shared.audit as audit
+from shared.access import can_access_agent, is_agent_restricted
 from shared.auth import INSTALL_TOKEN_PREFIX, _hmac_token, _verify_tenant_token
 from shared.policy import compute_access_level
 from shared.response import _err, _iso, _iso_offset, _now, _ok
 from shared.store import agent_history_repo, agents_repo, approvals_repo, users_repo
 from shared.tags import validate_tags
+from shared.versions import available_versions, valid_version
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 _S3_BASE = os.environ.get("RELEASES_S3_BASE", "https://reach-releases.s3.amazonaws.com")
-_AGENT_VERSION = os.environ.get("AGENT_VERSION", "latest")
-_S3_VERSIONED = f"{_S3_BASE}/agent/{_AGENT_VERSION}"
+# The default (unpinned) host install always tracks the newest release under
+# agent/latest/; a specific version is chosen per-agent at create time.
+_S3_LATEST = f"{_S3_BASE}/agent/latest"
+# The Helm chart repo serves index.yaml + reach-agent-<version>.tgz. Chart version
+# == appVersion == agent image, released together; the image follows the chart's
+# appVersion (no --set image.tag). An unpinned install always takes the newest chart.
+_CHART_REPO_URL = os.environ.get("RELEASES_CHART_REPO", f"{_S3_BASE}/charts/reach-agent")
 INSTALL_TOKEN_TTL = 86400
 VALID_MODES = ("wild", "readonly", "approved")
 _ROLE_RANK = {"admin": 3, "operator": 2, "developer": 1}
@@ -27,8 +34,13 @@ def _require_role(user: dict, min_role: str) -> bool:
 
 
 def _get_agent(agent_id: str, user: dict) -> Optional[dict]:
+    # Enforce tenant boundary and per-user agent scope together. An agent-scoped
+    # operator can only manage the agents they're assigned to; out of scope reads as
+    # "not found" (same as a read via GET /agents). Admins are always tenant-wide.
     agent = agents_repo.get(agent_id)
     if not agent or agent.get("tenant_id") != user["tenant_id"]:
+        return None
+    if not can_access_agent(user, agent):
         return None
     return agent
 
@@ -37,12 +49,34 @@ def _build_install_commands(
     api_url: str,
     agent_id: str,
     raw_install_token: str,
+    agent_type: str = "host",
     grant_service_mgmt: bool = True,
     grant_docker: bool = False,
+    version: Optional[str] = None,
 ) -> dict:
+    # A caller-picked version pins the install; anything unset/invalid/"latest"
+    # falls back to the platform default. valid_version enforces a strict format
+    # since this value is interpolated straight into a shell command.
+    picked = valid_version(version)
+    # Kubernetes agents install via Helm; access is controlled by RBAC, so the
+    # host-only docker / service-management grants do not apply.
+    if agent_type == "k8s":
+        version_flag = f" --version {picked}" if picked else ""
+        helm = (
+            f"helm repo add reach {_CHART_REPO_URL} --force-update && "
+            "helm install reach-agent reach/reach-agent "
+            "--namespace reach --create-namespace"
+            f"{version_flag} "
+            f'--set reach.apiUrl="{api_url}" '
+            f'--set reach.installToken="{raw_install_token}"'
+        )
+        return {"helm": helm, "cli_use": f"reach agents use {agent_id}"}
+
+    # Released binaries live under agent/v<version>/ (the `v` prefix); an unpinned
+    # install uses agent/latest/.
+    base = f"{_S3_BASE}/agent/v{picked}" if picked else _S3_LATEST
     flags = (
         f'--api-url "{api_url}" '
-        f'--agent-id "{agent_id}" '
         f'--install-token "{raw_install_token}" '
         f"--yes --force"
     )
@@ -51,7 +85,7 @@ def _build_install_commands(
     if grant_docker:
         flags += " --grant-docker"
     return {
-        "agent": f"curl -fsSL {_S3_VERSIONED}/install.sh | sudo bash -s -- {flags}",
+        "agent": f"curl -fsSL {base}/install.sh | sudo bash -s -- {flags}",
         "cli_use": f"reach agents use {agent_id}",
     }
 
@@ -66,8 +100,26 @@ def handle_create_tenant_agent(body: dict, raw_token: str, api_url: str) -> dict
     mode = body.get("mode", "wild").strip()
     if mode not in VALID_MODES:
         return _err("mode must be wild, readonly, or approved")
-    grant_service_mgmt = bool(body.get("grant_service_mgmt", False))
-    grant_docker = bool(body.get("grant_docker", False))
+
+    agent_type = (body.get("type") or "host").strip().lower()
+    if agent_type not in ("host", "k8s"):
+        return _err("type must be host or k8s")
+
+    # Optional pinned version; empty/"latest" installs the platform default.
+    version = (body.get("version") or "").strip() or None
+    if version and version.lower() != "latest" and valid_version(version) is None:
+        return _err("invalid version")
+
+    grant_user_ids = body.get("grant_user_ids") or []
+    if not isinstance(grant_user_ids, list) or not all(isinstance(i, str) for i in grant_user_ids):
+        return _err("grant_user_ids must be a list of user ID strings")
+    # Docker / service-management grants are host-only; k8s access is RBAC-driven.
+    if agent_type == "k8s":
+        grant_service_mgmt = False
+        grant_docker = False
+    else:
+        grant_service_mgmt = bool(body.get("grant_service_mgmt", False))
+        grant_docker = bool(body.get("grant_docker", False))
 
     agent_id = "agent_" + secrets.token_urlsafe(12)
     raw_install_token = INSTALL_TOKEN_PREFIX + secrets.token_urlsafe(32)
@@ -77,7 +129,7 @@ def handle_create_tenant_agent(body: dict, raw_token: str, api_url: str) -> dict
         "agent_id": agent_id,
         "tenant_id": user["tenant_id"],
         "status": "CREATED",
-        "type": "manual",
+        "type": agent_type,
         "fleet_id": None,
         "mode": mode,
         "install_token_hash": _hmac_token(raw_install_token),
@@ -87,6 +139,27 @@ def handle_create_tenant_agent(body: dict, raw_token: str, api_url: str) -> dict
         "created_at": _iso(),
     })
 
+    # A restricted creator (a scoped operator) must be able to manage the agent they
+    # just created, so grant themselves access to it. Admins are tenant-wide already.
+    if is_agent_restricted(user):
+        current = list(user.get("allowed_agent_ids") or [])
+        if agent_id not in current:
+            users_repo.set_allowed_agents(user["user_id"], current + [agent_id])
+
+    # Optionally grant the new agent to specific restricted users. Unrestricted users
+    # (allowed_agent_ids is None) already see every agent, so they're skipped.
+    granted_user_ids: list = []
+    for uid in dict.fromkeys(grant_user_ids):  # de-dupe, preserve order
+        target = users_repo.get(uid)
+        if not target or target.get("tenant_id") != user["tenant_id"]:
+            continue
+        current = target.get("allowed_agent_ids")
+        if current is None:  # unrestricted - nothing to grant
+            continue
+        if agent_id not in current:
+            users_repo.set_allowed_agents(uid, list(current) + [agent_id])
+        granted_user_ids.append(uid)
+
     audit.write(
         "agent.created",
         tenant_id=user["tenant_id"],
@@ -95,16 +168,19 @@ def handle_create_tenant_agent(body: dict, raw_token: str, api_url: str) -> dict
         actor_role=user.get("role", ""),
         resource_type="agent",
         resource_id=agent_id,
-        metadata={"mode": mode, "grant_service_mgmt": grant_service_mgmt, "grant_docker": grant_docker},
+        metadata={"mode": mode, "type": agent_type, "version": version or "latest",
+                  "grant_service_mgmt": grant_service_mgmt,
+                  "grant_docker": grant_docker, "granted_user_ids": granted_user_ids},
     )
-    logger.info("Created agent=%s tenant=%s by user=%s", agent_id, user["tenant_id"], user.get("user_id"))
+    logger.info("Created agent=%s type=%s tenant=%s by user=%s", agent_id, agent_type, user["tenant_id"], user.get("user_id"))
     return _ok({
         "agent_id": agent_id,
         "tenant_id": user["tenant_id"],
+        "type": agent_type,
         "install_token": raw_install_token,
         "install_token_expires_at": _iso_offset(INSTALL_TOKEN_TTL),
         "mode": mode,
-        "commands": _build_install_commands(api_url, agent_id, raw_install_token, grant_service_mgmt, grant_docker),
+        "commands": _build_install_commands(api_url, agent_id, raw_install_token, agent_type, grant_service_mgmt, grant_docker, version),
     }, 201)
 
 
@@ -122,6 +198,9 @@ def handle_reissue_tenant_install_token(agent_id: str, body: dict, raw_token: st
     force = bool(body.get("force", False))
     grant_service_mgmt = bool(body.get("grant_service_mgmt", False))
     grant_docker = bool(body.get("grant_docker", False))
+    version = (body.get("version") or "").strip() or None
+    if version and version.lower() != "latest" and valid_version(version) is None:
+        return _err("invalid version")
 
     status = agent.get("status")
     if status == "DELETED":
@@ -166,7 +245,10 @@ def handle_reissue_tenant_install_token(agent_id: str, body: dict, raw_token: st
         "agent_id": agent_id,
         "install_token": raw_install_token,
         "install_token_expires_at": _iso_offset(INSTALL_TOKEN_TTL),
-        "commands": _build_install_commands(api_url, agent_id, raw_install_token, grant_service_mgmt, grant_docker),
+        "commands": _build_install_commands(
+            api_url, agent_id, raw_install_token,
+            agent.get("type", "host"), grant_service_mgmt, grant_docker, version,
+        ),
     })
 
 
@@ -377,11 +459,21 @@ def handle_acknowledge_capability(agent_id: str, body: dict, raw_token: str) -> 
     if not agent:
         return _err("agent not found", 404)
     capability = body.get("capability", "").strip()
-    if capability not in ("docker", "service_mgmt"):
-        return _err("capability must be docker or service_mgmt")
+    if capability not in ("docker", "service_mgmt", "k8s_permissions"):
+        return _err("capability must be docker, service_mgmt, or k8s_permissions")
     if capability == "docker":
         agents_repo.update_grants(agent_id, grant_docker=True)
         label = "Docker"
+    elif capability == "k8s_permissions":
+        # Acknowledge the agent's currently-reported RBAC: pin the acked hash to the
+        # current one (drift clears until the permissions change again) and snapshot
+        # the current permissions as the acknowledged baseline so the console can
+        # later diff current vs acknowledged and show *what* drifted.
+        cur = agent.get("k8s_permissions_hash")
+        if not cur:
+            return _err("no reported permissions to acknowledge")
+        agents_repo.acknowledge_k8s_permissions(agent_id, cur, agent.get("k8s_permissions"))
+        label = "Kubernetes permissions"
     else:
         agents_repo.update_grants(agent_id, grant_service_mgmt=True)
         label = "service management"
@@ -408,6 +500,18 @@ def handle_get_agent_history(agent_id: str, raw_token: str) -> dict:
         return _err("agent not found", 404)
     history = agent_history_repo.list_by_agent(agent_id, limit=50)
     return _ok({"history": history})
+
+
+def handle_list_agent_versions(agent_type: str, raw_token: str) -> dict:
+    """Installable versions for the create dropdown, newest-first. The UI shows
+    a "Latest" default on top of these; empty is fine (dropdown = Latest only)."""
+    user = _verify_tenant_token(raw_token)
+    if not user:
+        return _err("unauthorized", 401)
+    if not _require_role(user, "operator"):
+        return _err("forbidden", 403)
+    t = "k8s" if (agent_type or "").strip().lower() == "k8s" else "host"
+    return _ok({"type": t, "default": "latest", "versions": available_versions(t)})
 
 
 # ---------------------------------------------------------------------------
@@ -524,3 +628,12 @@ def agent_history_handler(event, context):
         return _err("missing Authorization header", 401)
     agent_id = (event.get("pathParameters") or {}).get("agent_id", "")
     return handle_get_agent_history(agent_id, token)
+
+
+def list_agent_versions_handler(event, context):
+    logger.info("GET /tenant/agent-versions")
+    token = _token(event)
+    if not token:
+        return _err("missing Authorization header", 401)
+    agent_type = (event.get("queryStringParameters") or {}).get("type", "host")
+    return handle_list_agent_versions(agent_type, token)

@@ -25,7 +25,7 @@ _AGENT_BASE = {
     "install_token_expires_at": None,
     "rotation_requested": False,
     "fleet_id": None,
-    "type": "manual",
+    "type": "host",
     "tags": [],
 }
 

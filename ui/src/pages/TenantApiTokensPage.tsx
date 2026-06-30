@@ -1,9 +1,10 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import type { ApiToken, TenantConfig } from '../types';
-import { listApiTokens, createApiToken, revokeApiToken, renameApiToken } from '../api';
+import { listApiTokens, createApiToken, revokeApiToken, deleteApiToken, renameApiToken } from '../api';
 import { Modal } from '../components/Modal';
 import { Spinner } from '../components/Spinner';
 import { DataTable } from '../components/DataTable';
+import { RefreshButton } from '../components/RefreshButton';
 import { relTime } from '../utils';
 
 export function TenantApiTokensPage({ config }: { config: TenantConfig }) {
@@ -12,7 +13,7 @@ export function TenantApiTokensPage({ config }: { config: TenantConfig }) {
   const [loading, setLoading] = useState(false);
   const [showCreate, setShowCreate] = useState(false);
   const [newToken, setNewToken] = useState<ApiToken | null>(null);
-  const [revokeTarget, setRevokeTarget] = useState<ApiToken | null>(null);
+  const [actionTarget, setActionTarget] = useState<ApiToken | null>(null);  // token to revoke or delete
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
   const [renameLoading, setRenameLoading] = useState(false);
@@ -25,9 +26,18 @@ export function TenantApiTokensPage({ config }: { config: TenantConfig }) {
 
   useEffect(() => { load(); }, [load]);
 
+  // Step 1: revoke an ACTIVE token (soft) - it stays listed as REVOKED for audit.
   const doRevoke = async (t: ApiToken) => {
     await revokeApiToken(apiUrl, tenantToken, t.token_id);
-    setRevokeTarget(null);
+    setActionTarget(null);
+    setTokens(prev => prev.map(tok =>
+      tok.token_id === t.token_id ? { ...tok, status: 'REVOKED', revoked_at: new Date().toISOString() } : tok));
+  };
+
+  // Step 2: hard-delete an already-REVOKED token - removes the record.
+  const doDelete = async (t: ApiToken) => {
+    await deleteApiToken(apiUrl, tenantToken, t.token_id);
+    setActionTarget(null);
     setTokens(prev => prev.filter(tok => tok.token_id !== t.token_id));
   };
 
@@ -52,9 +62,7 @@ export function TenantApiTokensPage({ config }: { config: TenantConfig }) {
     }
   };
 
-  // Only show active tokens - deleted ones are removed from the list
-  const displayTokens = tokens.filter(t => t.status !== 'REVOKED');
-  const activeCount = displayTokens.length;
+  const activeCount = tokens.filter(t => t.status === 'ACTIVE').length;
 
   return (
     <div className="min-h-full bg-slate-50">
@@ -79,6 +87,7 @@ export function TenantApiTokensPage({ config }: { config: TenantConfig }) {
                 {activeCount} active
               </span>
             )}
+            <RefreshButton onClick={load} loading={loading} />
             <button
               onClick={() => setShowCreate(true)}
               className="inline-flex items-center gap-1.5 bg-white text-sky-700 hover:bg-sky-50 text-sm font-semibold px-4 py-2 rounded-lg transition-colors shadow-sm"
@@ -90,7 +99,7 @@ export function TenantApiTokensPage({ config }: { config: TenantConfig }) {
       </div>
 
       <div className="px-8 py-6">
-      {loading && displayTokens.length === 0 ? (
+      {loading && tokens.length === 0 ? (
         <div className="flex justify-center py-20"><Spinner /></div>
       ) : (
         <div className="bg-white rounded-xl border border-gray-200 shadow-sm overflow-hidden">
@@ -98,14 +107,19 @@ export function TenantApiTokensPage({ config }: { config: TenantConfig }) {
             tableId="api-tokens"
             columns={[
               { label: 'Description', sortValue: t => t.name ?? '', required: true },
+              { label: 'Status',    sortValue: t => t.status ?? '' },
               { label: 'Created',   sortValue: t => t.created_at ?? '' },
               { label: 'Last used', sortValue: t => t.last_used_at ?? '' },
+              { label: 'Revoked',   sortValue: t => t.revoked_at ?? '' },
+              { label: 'Token ID',  sortValue: t => t.token_id, defaultHidden: true },
               { label: '' },
             ]}
-            rows={displayTokens}
+            rows={tokens}
             fallback="No API tokens - create one to use the CLI or MCP"
-            renderRow={t => (
-              <tr key={t.token_id} className="hover:bg-gray-50/70 group">
+            renderRow={t => {
+              const revoked = t.status === 'REVOKED';
+              return (
+              <tr key={t.token_id} className={`hover:bg-gray-50/70 group ${revoked ? 'text-gray-400' : ''}`}>
                 <td className="px-4 py-3 font-medium text-gray-900">
                   {renamingId === t.token_id ? (
                     <div className="flex items-center gap-2">
@@ -131,31 +145,56 @@ export function TenantApiTokensPage({ config }: { config: TenantConfig }) {
                     </div>
                   ) : (
                     <div className="flex items-center gap-2">
-                      <span>{t.name || '-'}</span>
-                      <button
-                        onClick={() => startRename(t)}
-                        className="opacity-0 group-hover:opacity-100 transition-opacity text-gray-400 hover:text-indigo-600"
-                        title="Rename"
-                      >
-                        <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
-                          <path strokeLinecap="round" strokeLinejoin="round" d="M16.862 4.487l1.687-1.688a1.875 1.875 0 112.652 2.652L10.582 16.07a4.5 4.5 0 01-1.897 1.13L6 18l.8-2.685a4.5 4.5 0 011.13-1.897l8.932-8.931zm0 0L19.5 7.125" />
-                        </svg>
-                      </button>
+                      <span className={revoked ? 'text-gray-500 line-through' : ''}>{t.name || '-'}</span>
+                      {/* Rename only ACTIVE tokens - a revoked token is on its way out. */}
+                      {!revoked && (
+                        <button
+                          onClick={() => startRename(t)}
+                          className="opacity-0 group-hover:opacity-100 transition-opacity text-gray-400 hover:text-indigo-600"
+                          title="Rename"
+                        >
+                          <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" d="M16.862 4.487l1.687-1.688a1.875 1.875 0 112.652 2.652L10.582 16.07a4.5 4.5 0 01-1.897 1.13L6 18l.8-2.685a4.5 4.5 0 011.13-1.897l8.932-8.931zm0 0L19.5 7.125" />
+                          </svg>
+                        </button>
+                      )}
                     </div>
+                  )}
+                </td>
+                <td className="px-4 py-3.5">
+                  {revoked ? (
+                    <span className="inline-flex items-center gap-1 text-xs font-medium text-gray-500 bg-gray-100 border border-gray-200 px-2 py-0.5 rounded-full">
+                      <span className="w-1.5 h-1.5 rounded-full bg-gray-400" /> Revoked
+                    </span>
+                  ) : (
+                    <span className="inline-flex items-center gap-1 text-xs font-medium text-emerald-700 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded-full">
+                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" /> Active
+                    </span>
                   )}
                 </td>
                 <td className="px-4 py-3.5 text-xs text-gray-500">{relTime(t.created_at)}</td>
                 <td className="px-4 py-3.5 text-xs text-gray-500">{t.last_used_at ? relTime(t.last_used_at) : '-'}</td>
+                <td className="px-4 py-3.5 text-xs text-gray-500">{t.revoked_at ? relTime(t.revoked_at) : '-'}</td>
+                <td className="px-4 py-3.5 font-mono text-xs text-gray-400">{t.token_id}</td>
                 <td className="px-4 py-3.5 text-right">
-                  <button
-                    onClick={() => setRevokeTarget(t)}
-                    className="text-xs font-semibold text-red-600 hover:text-white hover:bg-red-600 bg-red-50 border border-red-200 px-2.5 py-1 rounded-md transition-colors"
-                  >
-                    Delete
-                  </button>
+                  {revoked ? (
+                    <button
+                      onClick={() => setActionTarget(t)}
+                      className="text-xs font-semibold text-red-600 hover:text-white hover:bg-red-600 bg-red-50 border border-red-200 px-2.5 py-1 rounded-md transition-colors"
+                    >
+                      Delete
+                    </button>
+                  ) : (
+                    <button
+                      onClick={() => setActionTarget(t)}
+                      className="text-xs font-semibold text-amber-700 hover:text-white hover:bg-amber-600 bg-amber-50 border border-amber-200 px-2.5 py-1 rounded-md transition-colors"
+                    >
+                      Revoke
+                    </button>
+                  )}
                 </td>
               </tr>
-            )}
+            );}}
           />
         </div>
       )}
@@ -173,11 +212,11 @@ export function TenantApiTokensPage({ config }: { config: TenantConfig }) {
         <TokenRevealModal token={newToken} onClose={() => setNewToken(null)} />
       )}
 
-      {revokeTarget && (
-        <RevokeTokenModal
-          token={revokeTarget}
-          onClose={() => setRevokeTarget(null)}
-          onConfirm={() => doRevoke(revokeTarget)}
+      {actionTarget && (
+        <TokenActionModal
+          token={actionTarget}
+          onClose={() => setActionTarget(null)}
+          onConfirm={() => actionTarget.status === 'REVOKED' ? doDelete(actionTarget) : doRevoke(actionTarget)}
         />
       )}
       </div>
@@ -185,11 +224,15 @@ export function TenantApiTokensPage({ config }: { config: TenantConfig }) {
   );
 }
 
-function RevokeTokenModal({ token, onClose, onConfirm }: { token: ApiToken; onClose: () => void; onConfirm: () => Promise<void> }) {
+// One modal for both steps. Revoking an active token is a simple confirm (it is
+// reversible in the sense that the record remains); permanently deleting a revoked
+// token requires typing the name to confirm.
+function TokenActionModal({ token, onClose, onConfirm }: { token: ApiToken; onClose: () => void; onConfirm: () => Promise<void> }) {
+  const isDelete = token.status === 'REVOKED';
   const confirmKey = token.name || token.token_id;
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
-  const match = input === confirmKey;
+  const match = !isDelete || input === confirmKey;
 
   const submit = async () => {
     if (!match) return;
@@ -198,25 +241,36 @@ function RevokeTokenModal({ token, onClose, onConfirm }: { token: ApiToken; onCl
   };
 
   return (
-    <Modal title="Delete API token" onClose={onClose}>
+    <Modal title={isDelete ? 'Delete API token' : 'Revoke API token'} onClose={onClose}>
       <div className="space-y-4">
         <div className="bg-red-50 border border-red-200 rounded-lg p-4">
-          <p className="text-sm text-red-800 font-medium">This token will be permanently deleted and can no longer be used.</p>
-          <p className="text-xs text-red-700 mt-1">Any CLI or MCP sessions using this token will lose access immediately.</p>
+          {isDelete ? (
+            <>
+              <p className="text-sm text-red-800 font-medium">This revoked token will be permanently deleted from your records.</p>
+              <p className="text-xs text-red-700 mt-1">This cannot be undone. The audit-log entry for its revocation is kept.</p>
+            </>
+          ) : (
+            <>
+              <p className="text-sm text-red-800 font-medium">This token will be revoked and can no longer authenticate.</p>
+              <p className="text-xs text-red-700 mt-1">Any CLI or MCP sessions using it lose access immediately. It stays listed as <span className="font-semibold">Revoked</span> (for audit) until you delete it. Revocation is permanent - issue a new token to restore access.</p>
+            </>
+          )}
         </div>
-        <div>
-          <label className="block text-sm font-medium text-gray-700 mb-1">
-            Type <span className="font-mono text-gray-900 bg-gray-100 px-1.5 py-0.5 rounded">{confirmKey}</span> to confirm
-          </label>
-          <input
-            value={input}
-            onChange={e => setInput(e.target.value)}
-            onKeyDown={e => e.key === 'Enter' && match && submit()}
-            autoFocus
-            placeholder={confirmKey}
-            className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-red-500 focus:border-transparent"
-          />
-        </div>
+        {isDelete && (
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              Type <span className="font-mono text-gray-900 bg-gray-100 px-1.5 py-0.5 rounded">{confirmKey}</span> to confirm
+            </label>
+            <input
+              value={input}
+              onChange={e => setInput(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && match && submit()}
+              autoFocus
+              placeholder={confirmKey}
+              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-red-500 focus:border-transparent"
+            />
+          </div>
+        )}
         <div className="flex justify-end gap-3 pt-1">
           <button type="button" onClick={onClose} className="text-sm text-gray-600 hover:text-gray-800 px-3 py-2">Cancel</button>
           <button
@@ -224,7 +278,7 @@ function RevokeTokenModal({ token, onClose, onConfirm }: { token: ApiToken; onCl
             disabled={!match || loading}
             className="flex items-center gap-2 bg-red-600 hover:bg-red-700 text-white text-sm font-semibold px-4 py-2 rounded-lg disabled:opacity-40 transition-colors"
           >
-            {loading && <Spinner className="h-4 w-4" />} Delete permanently
+            {loading && <Spinner className="h-4 w-4" />} {isDelete ? 'Delete permanently' : 'Revoke token'}
           </button>
         </div>
       </div>

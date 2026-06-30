@@ -12,7 +12,6 @@ logger.setLevel(logging.INFO)
 
 
 def handle_agent_job_result(job_id: str, body: dict, raw_token: str) -> dict:
-    agent_id = body.get("agent_id", "").strip()
     machine_fp = body.get("machine_fingerprint", "").strip()
     status = body.get("status", "").strip()
     exit_code = body.get("exit_code")
@@ -24,12 +23,18 @@ def handle_agent_job_result(job_id: str, body: dict, raw_token: str) -> dict:
 
     if status not in ("SUCCEEDED", "FAILED", "REJECTED"):
         return _err("status must be SUCCEEDED, FAILED, or REJECTED")
-    if not agent_id or not machine_fp:
-        return _err("agent_id and machine_fingerprint required")
+    if not machine_fp:
+        return _err("machine_fingerprint required")
 
-    agent = _verify_agent_token(raw_token, agent_id)
+    # Credential-only: the agent token identifies the agent; no agent_id is sent.
+    agent = _verify_agent_token(raw_token)
     if not agent:
         return _err("unauthorized", 401)
+    agent_id = agent["agent_id"]
+    # A revoked/deleted agent is cut off - it can't report results either (consistent
+    # with /agent/sync and /agent/rotate-token).
+    if agent.get("status") not in ("ACTIVE", "INACTIVE"):
+        return _err("agent not active", 403)
     if agent.get("machine_fingerprint") != machine_fp:
         return _err("fingerprint mismatch", 403)
 

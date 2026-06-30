@@ -155,6 +155,18 @@ class TestRevokeApiToken:
         assert json.loads(r["body"])["status"] == "REVOKED"
         atr.revoke.assert_called_once_with("tkid_abc", atr.revoke.call_args[0][1])
 
+    def test_delete_after_revoke_hard_deletes(self):
+        # Two-step: DELETE on an already-REVOKED token removes the record.
+        token = {**STORED_TOKEN, "user_id": "user_alice", "status": "REVOKED"}
+        with patch("handlers.tenant_tokens.api_tokens_repo") as atr, \
+             patch("handlers.tenant_tokens.audit"):
+            atr.list_by_user.return_value = [token]
+            r = handle_revoke_api_token("tkid_abc", ADMIN_TOKEN)
+        assert r["statusCode"] == 200
+        assert json.loads(r["body"])["status"] == "DELETED"
+        atr.delete.assert_called_once_with("tkid_abc")
+        atr.revoke.assert_not_called()
+
     def test_token_not_found_returns_404(self):
         with patch("handlers.tenant_tokens.api_tokens_repo") as atr:
             atr.list_by_user.return_value = []

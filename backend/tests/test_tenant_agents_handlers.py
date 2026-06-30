@@ -6,6 +6,7 @@ from handlers.tenant_agents import (
     handle_acknowledge_capability,
     handle_create_tenant_agent,
     handle_get_agent_history,
+    handle_list_agent_versions,
     handle_reissue_tenant_install_token,
     handle_revoke_tenant_agent,
     handle_delete_tenant_agent,
@@ -79,6 +80,125 @@ class TestHandleCreateTenantAgent:
     def test_mode_stored_in_response(self):
         r, _ = self._call(body={"mode": "readonly"})
         assert json.loads(r["body"])["mode"] == "readonly"
+
+    def test_restricted_operator_autogranted_new_agent(self):
+        # A scoped operator who creates an agent gets access to it (can't create blind).
+        op = {"user_id": "user_op", "tenant_id": TENANT_ID, "role": "operator",
+              "username": "op", "allowed_agent_ids": ["agent_existing"]}
+        with _auth(op), patch("handlers.tenant_agents.agents_repo") as ar, \
+             patch("handlers.tenant_agents.users_repo") as ur:
+            ar.create.return_value = None
+            r = handle_create_tenant_agent({"mode": "wild"}, TOKEN, API_URL)
+        assert r["statusCode"] == 201
+        new_id = json.loads(r["body"])["agent_id"]
+        ur.set_allowed_agents.assert_called_once()
+        target_user, new_ids = ur.set_allowed_agents.call_args[0]
+        assert target_user == "user_op"
+        assert new_id in new_ids and "agent_existing" in new_ids
+
+    def test_unrestricted_admin_no_autogrant(self):
+        with _auth(_ADMIN), patch("handlers.tenant_agents.agents_repo") as ar, \
+             patch("handlers.tenant_agents.users_repo") as ur:
+            ar.create.return_value = None
+            r = handle_create_tenant_agent({"mode": "wild"}, TOKEN, API_URL)
+        assert r["statusCode"] == 201
+        ur.set_allowed_agents.assert_not_called()
+
+    def test_grant_new_agent_to_restricted_user(self):
+        restricted = {"user_id": "user_r", "tenant_id": TENANT_ID, "allowed_agent_ids": ["agent_old"]}
+        with _auth(_ADMIN), patch("handlers.tenant_agents.agents_repo") as ar, \
+             patch("handlers.tenant_agents.users_repo") as ur:
+            ar.create.return_value = None
+            ur.get.return_value = restricted
+            r = handle_create_tenant_agent({"mode": "wild", "grant_user_ids": ["user_r"]}, TOKEN, API_URL)
+        new_id = json.loads(r["body"])["agent_id"]
+        ur.set_allowed_agents.assert_called_once()
+        uid_arg, ids_arg = ur.set_allowed_agents.call_args[0]
+        assert uid_arg == "user_r"
+        assert new_id in ids_arg and "agent_old" in ids_arg
+
+    def test_grant_skips_unrestricted_user(self):
+        unrestricted = {"user_id": "user_u", "tenant_id": TENANT_ID, "allowed_agent_ids": None}
+        with _auth(_ADMIN), patch("handlers.tenant_agents.agents_repo") as ar, \
+             patch("handlers.tenant_agents.users_repo") as ur:
+            ar.create.return_value = None
+            ur.get.return_value = unrestricted
+            r = handle_create_tenant_agent({"mode": "wild", "grant_user_ids": ["user_u"]}, TOKEN, API_URL)
+        assert r["statusCode"] == 201
+        ur.set_allowed_agents.assert_not_called()  # unrestricted already has access
+
+    def test_grant_skips_cross_tenant_user(self):
+        other = {"user_id": "user_x", "tenant_id": "tenant_other", "allowed_agent_ids": ["a"]}
+        with _auth(_ADMIN), patch("handlers.tenant_agents.agents_repo") as ar, \
+             patch("handlers.tenant_agents.users_repo") as ur:
+            ar.create.return_value = None
+            ur.get.return_value = other
+            r = handle_create_tenant_agent({"mode": "wild", "grant_user_ids": ["user_x"]}, TOKEN, API_URL)
+        assert r["statusCode"] == 201
+        ur.set_allowed_agents.assert_not_called()
+
+    def test_grant_user_ids_bad_shape_returns_400(self):
+        with _auth(_ADMIN), patch("handlers.tenant_agents.agents_repo"):
+            r = handle_create_tenant_agent({"mode": "wild", "grant_user_ids": "nope"}, TOKEN, API_URL)
+        assert r["statusCode"] == 400
+
+    def test_default_type_is_host_with_curl_command(self):
+        r, ar = self._call(body={"mode": "wild"})
+        body = json.loads(r["body"])
+        assert body["type"] == "host"
+        assert "agent" in body["commands"]  # curl installer
+        assert "helm" not in body["commands"]
+        assert ar.create.call_args[0][0]["type"] == "host"
+
+    def test_k8s_type_returns_helm_command(self):
+        r, ar = self._call(body={"mode": "wild", "type": "k8s"})
+        body = json.loads(r["body"])
+        assert body["type"] == "k8s"
+        assert "helm" in body["commands"]
+        assert "agent" not in body["commands"]
+        helm = body["commands"]["helm"]
+        # Installs from the published Helm repo (not a local path). The image is
+        # not pinned separately - it resolves from the chart's appVersion, so the
+        # command carries no --set image.tag.
+        assert "helm repo add reach" in helm
+        assert "helm install reach-agent reach/reach-agent" in helm
+        assert "deploy/helm/reach-agent" not in helm
+        assert "--set image.tag=" not in helm
+        assert "reach.installToken" in helm
+        assert ar.create.call_args[0][0]["type"] == "k8s"
+
+    def test_default_version_is_latest_no_pin(self):
+        # No version -> host command uses the default (latest) path, not agent/v...
+        r, _ = self._call(body={"mode": "wild"})
+        cmd = json.loads(r["body"])["commands"]["agent"]
+        assert "/agent/v" not in cmd
+
+    def test_picked_host_version_pins_versioned_path(self):
+        r, _ = self._call(body={"mode": "wild", "version": "0.9.4"})
+        cmd = json.loads(r["body"])["commands"]["agent"]
+        assert "/agent/v0.9.4/install.sh" in cmd
+
+    def test_picked_k8s_version_pins_helm_chart(self):
+        r, _ = self._call(body={"mode": "wild", "type": "k8s", "version": "0.2.0"})
+        helm = json.loads(r["body"])["commands"]["helm"]
+        assert "--version 0.2.0" in helm
+
+    def test_invalid_version_returns_400(self):
+        # A shell-unsafe version must be rejected before it reaches a command.
+        r, _ = self._call(body={"mode": "wild", "version": "0.9.4; rm -rf /"})
+        assert r["statusCode"] == 400
+
+    def test_k8s_ignores_host_grants(self):
+        # Docker / service-mgmt are host-only; a k8s agent must not carry them.
+        r, ar = self._call(body={"mode": "wild", "type": "k8s",
+                                 "grant_docker": True, "grant_service_mgmt": True})
+        created = ar.create.call_args[0][0]
+        assert created["grant_docker"] is False
+        assert created["grant_service_mgmt"] is False
+
+    def test_invalid_type_returns_400(self):
+        r, _ = self._call(body={"mode": "wild", "type": "vm"})
+        assert r["statusCode"] == 400
 
     def test_approved_mode_accepted(self):
         r, _ = self._call(body={"mode": "approved"})
@@ -192,6 +312,18 @@ class TestHandleRevokeTenantAgent:
             ar.get.return_value = None
             r = handle_revoke_tenant_agent(AGENT_ID, TOKEN)
         assert r["statusCode"] == 404
+
+    def test_scoped_operator_out_of_scope_returns_404(self):
+        # A scoped operator can't manage an agent outside their access (hidden = 404).
+        scoped_op = {**_ADMIN, "role": "operator", "allowed_agent_ids": ["other_agent"]}
+        r, ar = self._call(user=scoped_op)
+        assert r["statusCode"] == 404
+        ar.set_status.assert_not_called()
+
+    def test_scoped_operator_in_scope_allowed(self):
+        scoped_op = {**_ADMIN, "role": "operator", "allowed_agent_ids": [AGENT_ID]}
+        r, _ = self._call(user=scoped_op)
+        assert r["statusCode"] == 200
 
     def test_already_revoked_returns_409(self):
         r, _ = self._call(agent=_AGENT_REVOKED)
@@ -803,6 +935,13 @@ class TestHandleGetAgentHistory:
             r = handle_get_agent_history(AGENT_ID, TOKEN)
         assert r["statusCode"] == 404
 
+    def test_scoped_operator_out_of_scope_returns_404(self):
+        scoped_op = {**_ADMIN, "role": "operator", "allowed_agent_ids": ["other_agent"]}
+        with _auth(scoped_op), patch("handlers.tenant_agents.agents_repo") as ar:
+            ar.get.return_value = _AGENT_ACTIVE
+            r = handle_get_agent_history(AGENT_ID, TOKEN)
+        assert r["statusCode"] == 404
+
     def test_success_returns_history(self):
         records = [
             {"from_status": "ACTIVE", "to_status": "INACTIVE", "triggered_by": "heartbeat"},
@@ -857,3 +996,40 @@ class TestAgentHistoryHandler:
         with patch("handlers.tenant_agents.handle_get_agent_history", return_value=_OK) as h:
             agent_history_handler(_evt(path={"agent_id": "agent_xyz"}), None)
         assert h.call_args[0][0] == "agent_xyz"
+
+
+# ---------------------------------------------------------------------------
+# handle_list_agent_versions
+# ---------------------------------------------------------------------------
+
+class TestHandleListAgentVersions:
+    def test_unauthorized(self):
+        with patch("handlers.tenant_agents._verify_tenant_token", return_value=None):
+            r = handle_list_agent_versions("host", TOKEN)
+        assert r["statusCode"] == 401
+
+    def test_developer_forbidden(self):
+        with _auth(_DEV):
+            r = handle_list_agent_versions("host", TOKEN)
+        assert r["statusCode"] == 403
+
+    def test_returns_versions_for_host(self):
+        with _auth(_ADMIN), patch("handlers.tenant_agents.available_versions", return_value=["0.9.4", "0.9.1"]) as av:
+            r = handle_list_agent_versions("host", TOKEN)
+        body = json.loads(r["body"])
+        assert r["statusCode"] == 200
+        assert body["type"] == "host"
+        assert body["default"] == "latest"
+        assert body["versions"] == ["0.9.4", "0.9.1"]
+        av.assert_called_once_with("host")
+
+    def test_type_normalized_to_k8s(self):
+        with _auth(_ADMIN), patch("handlers.tenant_agents.available_versions", return_value=[]) as av:
+            r = handle_list_agent_versions("k8s", TOKEN)
+        assert json.loads(r["body"])["type"] == "k8s"
+        av.assert_called_once_with("k8s")
+
+    def test_unknown_type_defaults_to_host(self):
+        with _auth(_ADMIN), patch("handlers.tenant_agents.available_versions", return_value=[]) as av:
+            handle_list_agent_versions("bogus", TOKEN)
+        av.assert_called_once_with("host")

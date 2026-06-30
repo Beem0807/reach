@@ -1,4 +1,4 @@
-import type { Agent, AgentHistory, ApiToken, Approval, AuditLog, Job, Tenant, TenantUser } from './types';
+import type { Agent, AgentHistory, ApiToken, Approval, AuditLog, Job, K8sRule, Tenant, TenantUser } from './types';
 
 export async function adminLogin(apiUrl: string, password: string): Promise<string> {
   const url = apiUrl.replace(/\/$/, '');
@@ -136,6 +136,9 @@ export const disableTenantUser = (u: string, t: string, userId: string) =>
 export const enableTenantUser = (u: string, t: string, userId: string) =>
   req<{ status: string }>(u, t, 'POST', `/tenant/users/${userId}/enable`);
 
+export const deleteTenantUser = (u: string, t: string, userId: string) =>
+  req<{ user_id: string; deleted: boolean }>(u, t, 'DELETE', `/tenant/users/${userId}`);
+
 export const revokeAllUserTokens = (u: string, t: string, userId: string) =>
   req<{ revoked: number }>(u, t, 'POST', `/tenant/users/${userId}/revoke-tokens`);
 
@@ -152,7 +155,12 @@ export const listApiTokens = (u: string, t: string) =>
 export const createApiToken = (u: string, t: string, name: string) =>
   req<ApiToken>(u, t, 'POST', '/tenant/api-tokens', { name });
 
+// Two-step deletion on one endpoint: DELETE an ACTIVE token revokes it (soft);
+// DELETE an already-REVOKED token hard-deletes the record.
 export const revokeApiToken = (u: string, t: string, tokenId: string) =>
+  req<{ status: string }>(u, t, 'DELETE', `/tenant/api-tokens/${tokenId}`);
+
+export const deleteApiToken = (u: string, t: string, tokenId: string) =>
   req<{ status: string }>(u, t, 'DELETE', `/tenant/api-tokens/${tokenId}`);
 
 export const renameApiToken = (u: string, t: string, tokenId: string, name: string) =>
@@ -167,18 +175,32 @@ export const listTenantAgents = (u: string, t: string) =>
   req<{ agents: Agent[] }>(u, t, 'GET', '/agents');
 
 // Tenant admin - agent management (admin/operator via JWT)
+// Installable versions for the create dropdown, newest-first ('latest' is the
+// implicit default the UI shows on top). type=host lists agent binaries; k8s
+// lists Helm chart versions.
+export const listAgentVersions = (u: string, t: string, type: 'host' | 'k8s') =>
+  req<{ type: string; default: string; versions: string[] }>(
+    u, t, 'GET', `/tenant/agent-versions?type=${type}`,
+  );
+
 export const createTenantAgent = (
   u: string, t: string,
   mode?: string,
   grantServiceMgmt?: boolean,
   grantDocker?: boolean,
+  type?: 'host' | 'k8s',
+  grantUserIds?: string[],
+  version?: string,
 ) =>
   req<Agent & { install_token: string; install_token_expires_at: string; commands: Record<string, string> }>(
     u, t, 'POST', '/tenant/agents',
     {
       ...(mode ? { mode } : {}),
+      ...(type ? { type } : {}),
       ...(grantServiceMgmt !== undefined ? { grant_service_mgmt: grantServiceMgmt } : {}),
       ...(grantDocker !== undefined ? { grant_docker: grantDocker } : {}),
+      ...(grantUserIds && grantUserIds.length ? { grant_user_ids: grantUserIds } : {}),
+      ...(version && version !== 'latest' ? { version } : {}),
     },
   );
 
@@ -215,7 +237,7 @@ export const setTenantAgentMode = (u: string, t: string, agentId: string, mode: 
 export const setTenantAgentTags = (u: string, t: string, agentId: string, tags: string[]) =>
   req<{ agent_id: string; tags: string[] }>(u, t, 'PUT', `/tenant/agents/${agentId}/tags`, { tags });
 
-export const acknowledgeCapability = (u: string, t: string, agentId: string, capability: 'docker' | 'service_mgmt') =>
+export const acknowledgeCapability = (u: string, t: string, agentId: string, capability: 'docker' | 'service_mgmt' | 'k8s_permissions') =>
   req<{ agent_id: string; capability: string; acknowledged: boolean }>(
     u, t, 'POST', `/tenant/agents/${agentId}/acknowledge-capability`, { capability }
   );
@@ -226,11 +248,11 @@ export const listTenantJobs = (u: string, t: string, params: Record<string, stri
 
 // Tenant console - approvals (pending, for current user - all roles)
 export const listTenantApprovals = (u: string, t: string, params: Record<string, string> = {}) =>
-  req<{ approvals: Approval[] }>(u, t, 'GET', `/approvals/pending?${new URLSearchParams(params)}`);
+  req<{ approvals: Approval[]; total?: number; limit?: number; offset?: number }>(u, t, 'GET', `/approvals/pending?${new URLSearchParams(params)}`);
 
 // Tenant admin - approval management (operator+)
 export const listAllTenantApprovals = (u: string, t: string, params: Record<string, string> = {}) =>
-  req<{ approvals: Approval[] }>(u, t, 'GET', `/tenant/approvals?${new URLSearchParams(params)}`);
+  req<{ approvals: Approval[]; total?: number; limit?: number; offset?: number }>(u, t, 'GET', `/tenant/approvals?${new URLSearchParams(params)}`);
 
 export const approveTenantApproval = (u: string, t: string, approvalId: string, duration?: string) =>
   req<Approval>(u, t, 'PUT', `/tenant/approvals/${approvalId}/approve`, duration ? { duration } : {});
@@ -245,6 +267,14 @@ export const tenantPreApprove = (u: string, t: string, agentId: string, command:
   req<Approval>(u, t, 'POST', '/tenant/approvals', {
     agent_id: agentId,
     command,
+    ...(duration ? { duration } : {}),
+  });
+
+// k8s agents: create/pre-approve a structured rule instead of a command string.
+export const tenantPreApproveRule = (u: string, t: string, agentId: string, rule: K8sRule, duration?: string) =>
+  req<Approval>(u, t, 'POST', '/tenant/approvals', {
+    agent_id: agentId,
+    k8s_rule: rule,
     ...(duration ? { duration } : {}),
   });
 

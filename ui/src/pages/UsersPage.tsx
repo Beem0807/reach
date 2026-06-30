@@ -9,6 +9,7 @@ import {
 import { Modal } from '../components/Modal';
 import { Spinner } from '../components/Spinner';
 import { DataTable } from '../components/DataTable';
+import { RefreshButton } from '../components/RefreshButton';
 import { relTime } from '../utils';
 
 const ROLES: TenantRole[] = ['admin', 'operator', 'developer'];
@@ -114,6 +115,7 @@ export function UsersPage({ config }: { config: Config }) {
               <option key={t.tenant_id} value={t.tenant_id}>{t.name} ({t.tenant_id})</option>
             ))}
           </select>
+          <RefreshButton onClick={loadUsers} loading={loading} variant="onLight" />
           <button
             onClick={() => setModal('create')}
             disabled={!tenantId || selectedTenant?.status === 'DISABLED'}
@@ -173,9 +175,11 @@ export function UsersPage({ config }: { config: Config }) {
             renderRow={u => (
               <tr key={u.user_id} className={`hover:bg-gray-50/70 transition-colors ${u.status === 'REVOKED' ? 'opacity-60' : ''}`}>
                 <td className="px-4 py-3.5 font-medium text-gray-800">
-                  {u.name}
+                  {u.name || u.username}
                   {u.must_reset_password && (
-                    <span className="ml-2 text-[10px] bg-amber-100 text-amber-700 px-1.5 py-0.5 rounded font-semibold">TEMP PW</span>
+                    u.last_login_at
+                      ? <span className="ml-2 text-[10px] bg-amber-100 text-amber-700 px-1.5 py-0.5 rounded font-semibold" title="Temporary password issued - pending change">TEMP PW</span>
+                      : <span className="ml-2 text-[10px] bg-sky-100 text-sky-700 px-1.5 py-0.5 rounded font-semibold" title="Created but has never logged in">INVITED</span>
                   )}
                 </td>
                 <td className="px-4 py-3.5 font-mono text-xs text-gray-500">

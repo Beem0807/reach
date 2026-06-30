@@ -17,9 +17,13 @@ TABLES = [
         "AttributeDefinitions": [
             {"AttributeName": "agent_id", "AttributeType": "S"},
             {"AttributeName": "tenant_id", "AttributeType": "S"},
+            {"AttributeName": "install_token_hash", "AttributeType": "S"},
+            {"AttributeName": "agent_token_hash", "AttributeType": "S"},
         ],
         "GlobalSecondaryIndexes": [
             {"IndexName": "tenant-index", "KeySchema": [{"AttributeName": "tenant_id", "KeyType": "HASH"}]},
+            {"IndexName": "install-token-hash-index", "KeySchema": [{"AttributeName": "install_token_hash", "KeyType": "HASH"}]},
+            {"IndexName": "agent-token-hash-index", "KeySchema": [{"AttributeName": "agent_token_hash", "KeyType": "HASH"}]},
         ],
     },
     {

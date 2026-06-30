@@ -19,6 +19,7 @@ Use Approved mode for production and explicitly allowlist the write operations
 the agent is permitted to perform.
 """
 import re
+import shlex
 
 # Splits on shell operators: ; && || and single pipe |
 # Each segment is checked independently so chained writes are caught.
@@ -133,6 +134,300 @@ def _is_readonly_blocked(command: str) -> bool:
             if re.search(pattern, segment, re.IGNORECASE):
                 return True
     return False
+
+
+# Kubernetes job classification is authoritative HERE (backend), enforced at job
+# submission - the k8s agent does not classify verbs; it only enforces the no-shell
+# allowlist (see agent/k8s_exec.go). Default-deny: any kubectl verb that is not a
+# known read (incl. exec/cp/port-forward and unrecognized verbs) is a write.
+_K8S_READ_VERBS = {
+    "get", "describe", "logs", "top", "explain", "api-resources", "api-versions",
+    "version", "cluster-info", "events", "diff", "wait",
+    # Cluster-inert utilities: they render/print locally or touch only the local
+    # kubeconfig (the agent authenticates via its in-cluster ServiceAccount, not
+    # kubeconfig, and runs read-only-rootfs), so they never change cluster state.
+    "kustomize", "options", "completion", "plugin", "config",
+}
+_K8S_WRITE_VERBS = {
+    "create", "apply", "delete", "edit", "patch", "replace", "scale", "autoscale",
+    "expose", "run", "label", "annotate", "taint", "cordon", "uncordon",
+    "drain", "exec", "attach", "cp", "port-forward", "proxy", "debug",
+}
+# "Double verbs": kubectl subcommands whose real operation is (base + sub). The
+# operation is keyed as the compound "<base> <sub>" (e.g. "rollout restart",
+# "set image", "certificate approve") - that string is what a rule's `verb`
+# stores, so reads/writes are distinguished and each write is separately
+# approvable (e.g. allow `certificate approve` but not `certificate deny`). An
+# unrecognized sub of a known base is treated as a write (fail-closed). Keep
+# _K8S_COMPOUND_WRITES in sync with the UI verb dropdown.
+_K8S_COMPOUND_BASES = {"rollout", "auth", "apply", "set", "certificate"}
+_K8S_COMPOUND_READS = {
+    "rollout status", "rollout history",
+    "auth can-i", "auth whoami",
+    "apply view-last-applied",
+}
+_K8S_COMPOUND_WRITES = {
+    "rollout restart", "rollout undo", "rollout pause", "rollout resume",
+    "auth reconcile",
+    "apply set-last-applied", "apply edit-last-applied",
+    "set image", "set env", "set resources", "set selector",
+    "set serviceaccount", "set subject",
+    "certificate approve", "certificate deny",
+}
+
+
+def _is_read_verb(verb: str) -> bool:
+    """Read operations never need approval and run even in readonly mode."""
+    return verb in _K8S_READ_VERBS or verb in _K8S_COMPOUND_READS
+
+
+def _kubectl_verb(tokens: list) -> str:
+    """The kubectl operation: a single verb, or the compound "<base> <sub>" for
+    double verbs (rollout, auth, apply, set, certificate). First recognized verb,
+    skipping global flags/values. A double-verb base with no sub falls back to the
+    bare base (classified a write)."""
+    toks = tokens[1:]
+    for i, t in enumerate(toks):
+        if t == "--":
+            break
+        v = t.lower()
+        if v in _K8S_COMPOUND_BASES:
+            nxt = toks[i + 1] if i + 1 < len(toks) else ""
+            return f"{v} {nxt.lower()}" if nxt and not nxt.startswith("-") else v
+        if v in _K8S_READ_VERBS or v in _K8S_WRITE_VERBS:
+            return v
+    return ""  # unrecognized -> caller treats as write
+
+
+def _tokenize(segment: str) -> list:
+    try:
+        return shlex.split(segment)
+    except ValueError:
+        return segment.split()
+
+
+def _kubectl_stages(command: str) -> list:
+    """Token lists for each kubectl stage in a (possibly piped/chained) command.
+    Non-kubectl stages are read-only filters and are skipped."""
+    stages = []
+    for segment in _shell_segments(command):
+        tokens = _tokenize(segment)
+        if tokens and tokens[0].rsplit("/", 1)[-1] == "kubectl":
+            stages.append(tokens)
+    return stages
+
+
+def _stage_is_dry_run(tokens: list) -> bool:
+    """A `--dry-run=client|server` (or the deprecated bare `--dry-run`) makes an
+    otherwise-mutating stage non-mutating, so it's a read. `--dry-run=none` really
+    applies, so it is NOT a dry run."""
+    for t in tokens[1:]:
+        low = t.lower()
+        if low == "--dry-run":
+            return True
+        if low.startswith("--dry-run="):
+            return low.split("=", 1)[1] in ("client", "server")
+    return False
+
+
+def _stage_is_write(tokens: list) -> bool:
+    """Whether one kubectl stage mutates: a non-read verb that isn't a dry run."""
+    if _stage_is_dry_run(tokens):
+        return False
+    return not _is_read_verb(_kubectl_verb(tokens))
+
+
+def is_k8s_write(command: str) -> bool:
+    """Whether a k8s job mutates/execs: any kubectl stage that is a write."""
+    return any(_stage_is_write(tokens) for tokens in _kubectl_stages(command))
+
+
+# ---------------------------------------------------------------------------
+# Structured k8s approvals
+#
+# Host approvals are text (prefix) matches. For k8s agents a text prefix is a
+# poor fit - `kubectl create pod nginx -n team-a` and `... redis ...` are the
+# same intent. Instead we parse a kubectl write into a structured rule
+# {verb, resource, namespace, name} and match against approved rules, where any
+# field may be "*" (wildcard). Parsing is best-effort: an unusual command that
+# parses to an empty resource simply fails to match and stays blocked (safe),
+# and the derived rule is shown to the operator to review before approval.
+# ---------------------------------------------------------------------------
+
+# Global flags that consume the following token as their value, so it is not a
+# positional (resource/name). --namespace is handled separately.
+_K8S_VALUE_FLAGS = {
+    "--context", "--cluster", "--user", "--kubeconfig", "--as", "--as-group",
+    "-s", "--server", "--token", "--request-timeout", "-o", "--output",
+    "--field-selector", "-l", "--selector", "--field-manager", "-f", "--filename",
+}
+
+# Short/singular resource forms → canonical plural. Unknown resources pass
+# through lowercased; parsing is symmetric (submitted command and derived rule
+# normalize identically), so matching stays consistent either way.
+_K8S_RESOURCE_ALIASES = {
+    "po": "pods", "pod": "pods",
+    "deploy": "deployments", "deployment": "deployments",
+    "svc": "services", "service": "services",
+    "ns": "namespaces", "namespace": "namespaces",
+    "cm": "configmaps", "configmap": "configmaps",
+    "secret": "secrets",
+    "rs": "replicasets", "replicaset": "replicasets",
+    "sts": "statefulsets", "statefulset": "statefulsets",
+    "ds": "daemonsets", "daemonset": "daemonsets",
+    "job": "jobs", "cronjob": "cronjobs", "cj": "cronjobs",
+    "ing": "ingresses", "ingress": "ingresses",
+    "no": "nodes", "node": "nodes",
+    "pvc": "persistentvolumeclaims", "pv": "persistentvolumes",
+    "sa": "serviceaccounts", "serviceaccount": "serviceaccounts",
+    "ep": "endpoints", "endpoint": "endpoints",
+}
+
+def _normalize_resource(res: str) -> str:
+    if not res:
+        return ""
+    r = res.lower().split(".", 1)[0]  # drop API group, e.g. deployments.apps
+    return _K8S_RESOURCE_ALIASES.get(r, r)
+
+
+def parse_kubectl(tokens: list) -> dict:
+    """Parse one kubectl token list into {verb, resource, namespace, name}.
+
+    Returns None if there is no recognizable verb. Best-effort: forms it cannot
+    resolve yield an empty resource/name, which fails to match (blocked-safe)
+    and surfaces to the operator for review.
+    """
+    verb = _kubectl_verb(tokens)
+    if not verb:
+        return None
+    base = verb.split(" ", 1)[0]  # compound verbs (e.g. "rollout restart") skip the base token
+
+    namespace = "default"
+    positionals = []
+    seen_verb = False
+    i = 1
+    while i < len(tokens):
+        t = tokens[i]
+        low = t.lower()
+        if t == "--":
+            break  # everything after -- is a container command (exec/run), not a resource
+        if low in ("-a", "--all-namespaces"):
+            namespace = "*"
+            i += 1
+            continue
+        if low in ("-n", "--namespace"):
+            if i + 1 < len(tokens):
+                namespace = tokens[i + 1]
+            i += 2
+            continue
+        if low.startswith("--namespace=") or low.startswith("-n="):
+            namespace = t.split("=", 1)[1]
+            i += 1
+            continue
+        if t.startswith("-"):
+            base = low.split("=", 1)[0]
+            if "=" not in t and base in _K8S_VALUE_FLAGS:
+                i += 2  # skip flag and its value
+            else:
+                i += 1  # boolean flag or --flag=value
+            continue
+        # positional token
+        if not seen_verb and low == base:
+            seen_verb = True
+            i += 1
+            continue
+        positionals.append(t)
+        i += 1
+
+    # Compound verbs (rollout/auth/apply/set/certificate) carry the sub-subcommand
+    # in `verb`, so drop that leading positional to expose the real resource.
+    if " " in verb and positionals:
+        positionals = positionals[1:]
+
+    resource, name = "", ""
+    if verb == "run":
+        resource, name = "pods", (positionals[0] if positionals else "")
+    elif positionals:
+        first = positionals[0]
+        if "/" in first:
+            r, _, n = first.partition("/")
+            resource, name = _normalize_resource(r), n
+        else:
+            resource = _normalize_resource(first)
+            name = positionals[1] if len(positionals) > 1 else ""
+
+    return {"verb": verb, "resource": resource, "namespace": namespace, "name": name}
+
+
+def _rule_field_matches(rule_val: str, cmd_val: str) -> bool:
+    return rule_val == "*" or rule_val == cmd_val
+
+
+def k8s_rule_matches(parsed: dict, rule: dict) -> bool:
+    """A parsed kubectl write is permitted by a rule when every field is equal
+    or wildcarded (`*`) in the rule."""
+    if not parsed or not rule:
+        return False
+    return (
+        _rule_field_matches(rule.get("verb", "*"), parsed.get("verb", ""))
+        and _rule_field_matches(rule.get("resource", "*"), parsed.get("resource", ""))
+        and _rule_field_matches(rule.get("namespace", "*"), parsed.get("namespace", ""))
+        and _rule_field_matches(rule.get("name", "*"), parsed.get("name", ""))
+    )
+
+
+def derive_k8s_rule(command: str) -> dict:
+    """The structured rule for a command's first write stage (for the pending
+    approval an operator reviews). None if there is no parseable write."""
+    for tokens in _kubectl_stages(command):
+        if _stage_is_write(tokens):
+            return parse_kubectl(tokens)
+    return None
+
+
+def is_k8s_command_approved(command: str, rules: list) -> bool:
+    """Whether every write stage of a k8s command is permitted by some approved
+    rule. Read stages are always allowed."""
+    for tokens in _kubectl_stages(command):
+        if not _stage_is_write(tokens):
+            continue
+        parsed = parse_kubectl(tokens)
+        if not parsed or not any(k8s_rule_matches(parsed, r) for r in rules if isinstance(r, dict)):
+            return False
+    return True
+
+
+def normalize_k8s_rule(raw: dict) -> dict:
+    """Validate and normalize a structured rule for storage. The verb is
+    mandatory (an explicit `*` is allowed, but an absent rule must not silently
+    become allow-all); resource/namespace/name default to the `*` wildcard and
+    resource is canonicalized. Returns None if the input has no verb, or the
+    verb is neither `*` nor a known write verb (rules only gate writes)."""
+    if not isinstance(raw, dict):
+        return None
+    raw_verb = raw.get("verb")
+    if not raw_verb:  # verb must be explicit - may be "*", but not defaulted
+        return None
+    verb = " ".join(str(raw_verb).strip().lower().split())  # collapse inner spaces for compound verbs
+    if verb != "*" and verb not in _K8S_WRITE_VERBS and verb not in _K8S_COMPOUND_WRITES:
+        return None
+    resource = str(raw.get("resource") or "*").strip()
+    resource = "*" if resource == "*" else (_normalize_resource(resource) or "*")
+    namespace = str(raw.get("namespace") or "*").strip() or "*"
+    name = str(raw.get("name") or "*").strip() or "*"
+    return {"verb": verb, "resource": resource, "namespace": namespace, "name": name}
+
+
+def rule_to_command(rule: dict) -> str:
+    """Human-readable one-line form of a rule - shown in lists and used as the
+    dedup key alongside the structured rule."""
+    verb = rule.get("verb", "*")
+    resource = rule.get("resource", "*")
+    name = rule.get("name", "*")
+    namespace = rule.get("namespace", "*")
+    target = resource if name in ("*", "") else f"{resource}/{name}"
+    ns = "(all namespaces)" if namespace == "*" else f"-n {namespace}"
+    return f"kubectl {verb} {target} {ns}"
 
 
 def compute_access_level(

@@ -39,3 +39,18 @@ def can_access_agent(user: dict, agent: dict) -> bool:
         and agent.get("fleet_id") in set(allowed_fleets)
     )
     return in_agent_list or in_fleet
+
+
+def is_agent_restricted(user: dict) -> bool:
+    """True if the user is scoped to a subset of agents (not tenant-wide).
+
+    Admins/operators/developers are all subject to the same rule: if either
+    allowed_agent_ids or allowed_fleet_ids is set, they only see/act on that
+    subset. Both absent → unrestricted (whole tenant).
+    """
+    return user.get("allowed_agent_ids") is not None or user.get("allowed_fleet_ids") is not None
+
+
+def accessible_agent_ids(user: dict, agents: list) -> list:
+    """The subset of agent IDs (from `agents`) this user may see/use."""
+    return [a["agent_id"] for a in agents if can_access_agent(user, a)]

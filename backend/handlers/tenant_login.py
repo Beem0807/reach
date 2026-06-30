@@ -4,7 +4,7 @@ import logging
 from shared.password import hash_password, verify_password
 from shared.response import _err, _iso, _ok
 from shared.store import tenants_repo, users_repo
-from shared.auth import _verify_tenant_payload
+from shared.auth import _verify_tenant_payload, _verify_tenant_token
 from shared.tenant_auth import create_tenant_token
 import shared.audit as audit
 
@@ -126,7 +126,9 @@ def handle_change_password(body: dict, token_payload: dict, ip: str = "") -> dic
 
 
 def handle_tenant_me(token_payload: dict) -> dict:
-    user = users_repo.get(token_payload["sub"])
+    # Accepts a JWT payload ("sub") or a resolved user dict ("user_id"), so it works
+    # for both console sessions and API tokens.
+    user = users_repo.get(token_payload.get("user_id") or token_payload.get("sub"))
     if not user:
         return _err("user not found", 404)
     tenant = tenants_repo.get(token_payload["tenant_id"])
@@ -187,7 +189,8 @@ def tenant_me_handler(event, context):
     token = _bearer(event)
     if not token:
         return _err("missing Authorization header", 401)
-    payload = _verify_tenant_payload(token)
-    if not payload:
+    # API-key-aware so both console sessions and CLI/MCP API tokens can introspect.
+    user = _verify_tenant_token(token)
+    if not user:
         return _err("unauthorized", 401)
-    return handle_tenant_me(payload)
+    return handle_tenant_me(user)

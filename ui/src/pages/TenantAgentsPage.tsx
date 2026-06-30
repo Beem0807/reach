@@ -1,8 +1,10 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { createPortal } from 'react-dom';
-import type { TenantConfig, Agent, AgentHistory } from '../types';
+import type { TenantConfig, Agent, AgentHistory, TenantUser } from '../types';
 import {
   listTenantAgents,
+  listTenantUsers,
+  listAgentVersions,
   createTenantAgent,
   reissueTenantInstallToken,
   requestAgentRotation,
@@ -15,7 +17,9 @@ import {
   listAgentHistory,
 } from '../api';
 import { Modal } from '../components/Modal';
+import { RefreshButton } from '../components/RefreshButton';
 import { Badge } from '../components/Badge';
+import { K8sPermissionsView } from '../components/K8sPermissionsView';
 import { Spinner } from '../components/Spinner';
 import { CopyButton, TokenBox } from '../components/CopyButton';
 import { DataTable } from '../components/DataTable';
@@ -93,10 +97,63 @@ function CapabilityCell({ granted, detected, onAcknowledge }: { granted?: boolea
   );
 }
 
+// RbacCell is the Kubernetes counterpart of CapabilityCell. Docker/service-mgmt
+// model a grant; cluster RBAC instead has a self-reported permission set that
+// must be acknowledged. The cell is icon-only: drift (a change since the last
+// ack, including the first report) shows a warning, acknowledged shows a check,
+// and nothing-reported shows a dash. Hover explains the state; clicking opens
+// the agent's RBAC detail (where the rules are reviewed and acknowledged).
+function RbacCell({ reported, drift, onOpen }: { reported?: boolean; drift?: boolean; onOpen?: () => void }) {
+  const tooltip = drift
+    ? 'Cluster RBAC changed - needs acknowledgement. Click to review the rules and acknowledge.'
+    : reported
+    ? 'Cluster RBAC reported and acknowledged. Click to view the rules.'
+    : 'No cluster RBAC reported yet';
+
+  const icon = drift ? (
+    <svg className="w-4 h-4 text-amber-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126z" />
+    </svg>
+  ) : reported ? (
+    <svg className="w-4 h-4 text-emerald-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M9 12.75L11.25 15 15 9.75M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+    </svg>
+  ) : (
+    <span className="text-gray-300 text-sm">-</span>
+  );
+
+  // No reported permissions yet: plain dash, nothing to open.
+  if (!reported && !drift) {
+    return (
+      <div className="relative group/cap inline-flex">
+        {icon}
+        <div className="pointer-events-none absolute bottom-full left-0 mb-1.5 z-20 w-56 bg-gray-900 text-white text-[11px] leading-snug rounded-lg px-2.5 py-2 opacity-0 group-hover/cap:opacity-100 transition-opacity shadow-xl whitespace-normal">
+          {tooltip}
+          <div className="absolute top-full left-4 -mt-px border-4 border-transparent border-t-gray-900" />
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <button
+      onClick={e => { e.stopPropagation(); onOpen?.(); }}
+      className="relative group/cap inline-flex rounded hover:bg-gray-100 p-0.5 -m-0.5"
+      aria-label={drift ? 'Cluster RBAC needs review' : 'View cluster RBAC'}
+    >
+      {icon}
+      <div className="pointer-events-none absolute bottom-full left-0 mb-1.5 z-20 w-56 bg-gray-900 text-white text-[11px] leading-snug rounded-lg px-2.5 py-2 opacity-0 group-hover/cap:opacity-100 transition-opacity shadow-xl whitespace-normal text-left">
+        {tooltip}
+        <div className="absolute top-full left-4 -mt-px border-4 border-transparent border-t-gray-900" />
+      </div>
+    </button>
+  );
+}
+
 function fmtDate(iso?: string) {
   if (!iso) return '-';
   return new Date(iso).toLocaleString(undefined, {
-    month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+    month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit',
   });
 }
 
@@ -124,6 +181,7 @@ export function TenantAgentsPage({ config }: { config: TenantConfig }) {
   const [tagFilters, setTagFilters] = useState<Set<string>>(new Set());
   const [modeFilter, setModeFilter] = useState('');
   const [accessFilter, setAccessFilter] = useState('');
+  const [typeFilter, setTypeFilter] = useState('');
   const [tagPickerOpen, setTagPickerOpen] = useState(false);
   const tagPickerRef = useRef<HTMLDivElement>(null);
 
@@ -140,9 +198,10 @@ export function TenantAgentsPage({ config }: { config: TenantConfig }) {
 
   const closeAndReload = () => { setModal(null); load(); };
 
-  const handleAcknowledge = async (agent: Agent, capability: 'docker' | 'service_mgmt') => {
+  const handleAcknowledge = async (agent: Agent, capability: 'docker' | 'service_mgmt' | 'k8s_permissions') => {
     try {
       await acknowledgeCapability(apiUrl, tenantToken, agent.agent_id, capability);
+      setModal(null);  // close the (now-stale) detail modal so the reloaded list shows cleared drift
       load();
     } catch (e) {
       setError((e as Error).message);
@@ -159,12 +218,13 @@ export function TenantAgentsPage({ config }: { config: TenantConfig }) {
     if (tagFilters.size > 0 && !(a.tags ?? []).some(t => tagFilters.has(t))) return false;
     if (modeFilter && a.mode !== modeFilter) return false;
     if (accessFilter && a.access_level !== accessFilter) return false;
+    if (typeFilter && (a.type ?? 'host') !== typeFilter) return false;
     return true;
   });
 
-  const activeFilterCount = tagFilters.size + (modeFilter ? 1 : 0) + (accessFilter ? 1 : 0);
+  const activeFilterCount = tagFilters.size + (modeFilter ? 1 : 0) + (accessFilter ? 1 : 0) + (typeFilter ? 1 : 0);
 
-  const clearFilters = () => { setTagFilters(new Set()); setModeFilter(''); setAccessFilter(''); };
+  const clearFilters = () => { setTagFilters(new Set()); setModeFilter(''); setAccessFilter(''); setTypeFilter(''); };
 
   const activeCount   = agents.filter(a => a.status === 'ACTIVE').length;
   const inactiveCount = agents.filter(a => a.status === 'INACTIVE').length;
@@ -226,6 +286,7 @@ export function TenantAgentsPage({ config }: { config: TenantConfig }) {
                 )}
               </>
             )}
+            <RefreshButton onClick={load} loading={loading} />
             {isOperator && (
               <button
                 onClick={() => setModal({ type: 'create' })}
@@ -305,6 +366,19 @@ export function TenantAgentsPage({ config }: { config: TenantConfig }) {
               </div>
             )}
 
+            {/* Type filter */}
+            <select
+              value={typeFilter}
+              onChange={e => setTypeFilter(e.target.value)}
+              className={`text-sm px-3 py-1.5 rounded-lg border transition-all focus:outline-none focus:ring-2 focus:ring-slate-400 ${
+                typeFilter ? 'bg-slate-800 text-white border-slate-800' : 'bg-white text-gray-700 border-gray-300 hover:border-gray-400'
+              }`}
+            >
+              <option value="">All types</option>
+              <option value="host">Host</option>
+              <option value="k8s">Kubernetes</option>
+            </select>
+
             {/* Mode filter */}
             <select
               value={modeFilter}
@@ -352,14 +426,18 @@ export function TenantAgentsPage({ config }: { config: TenantConfig }) {
               tableId="agents"
               columns={[
                 { label: 'Hostname',     sortValue: a => a.hostname ?? a.agent_id, required: true },
+                { label: 'Type',         sortValue: a => a.type ?? '' },
                 { label: 'Status',       sortValue: a => a.status },
                 { label: 'Mode',         sortValue: a => a.mode },
                 { label: 'Access',       sortValue: a => a.access_level },
                 { label: 'Docker',       sortValue: a => String(a.docker_detected ?? a.grant_docker ?? false) },
                 { label: 'Service mgmt', sortValue: a => String(a.service_mgmt_detected ?? a.grant_service_mgmt ?? false) },
+                { label: 'Cluster RBAC', sortValue: a => a.type === 'k8s' ? (a.k8s_permissions_drift ? '2' : a.k8s_permissions_reported ? '1' : '0') : '' },
                 { label: 'Tags',         sortValue: a => (a.tags ?? []).join(',') },
                 { label: 'Version',      sortValue: a => a.agent_version ?? '' },
                 { label: 'Last seen',    sortValue: a => a.last_heartbeat_at ?? '' },
+                { label: 'Agent ID',     sortValue: a => a.agent_id, defaultHidden: true },
+                { label: 'Created',      sortValue: a => a.created_at ?? '', defaultHidden: true },
                 ...(isOperator ? [{ label: '' }] : []),
               ]}
               rows={filteredAgents}
@@ -387,22 +465,44 @@ export function TenantAgentsPage({ config }: { config: TenantConfig }) {
                       </span>
                     </div>
                   </td>
+                  <td className="px-4 py-3">
+                    {a.type ? <Badge value={a.type} /> : <span className="text-gray-400">-</span>}
+                  </td>
                   <td className="px-4 py-3"><Badge value={a.status} /></td>
                   <td className="px-4 py-3"><Badge value={a.mode} /></td>
                   <td className="px-4 py-3"><Badge value={a.access_level} /></td>
                   <td className="px-4 py-3">
-                    <CapabilityCell
-                      granted={a.grant_docker}
-                      detected={a.docker_detected}
-                      onAcknowledge={isOperator ? () => handleAcknowledge(a, 'docker') : undefined}
-                    />
+                    {a.type === 'k8s' ? (
+                      <span className="text-gray-300 text-xs">n/a</span>
+                    ) : (
+                      <CapabilityCell
+                        granted={a.grant_docker}
+                        detected={a.docker_detected}
+                        onAcknowledge={isOperator ? () => handleAcknowledge(a, 'docker') : undefined}
+                      />
+                    )}
                   </td>
                   <td className="px-4 py-3">
-                    <CapabilityCell
-                      granted={a.grant_service_mgmt}
-                      detected={a.service_mgmt_detected}
-                      onAcknowledge={isOperator ? () => handleAcknowledge(a, 'service_mgmt') : undefined}
-                    />
+                    {a.type === 'k8s' ? (
+                      <span className="text-gray-300 text-xs">n/a</span>
+                    ) : (
+                      <CapabilityCell
+                        granted={a.grant_service_mgmt}
+                        detected={a.service_mgmt_detected}
+                        onAcknowledge={isOperator ? () => handleAcknowledge(a, 'service_mgmt') : undefined}
+                      />
+                    )}
+                  </td>
+                  <td className="px-4 py-3">
+                    {a.type === 'k8s' ? (
+                      <RbacCell
+                        reported={a.k8s_permissions_reported}
+                        drift={a.k8s_permissions_drift}
+                        onOpen={() => setModal({ type: 'detail', agent: a })}
+                      />
+                    ) : (
+                      <span className="text-gray-300 text-xs">n/a</span>
+                    )}
                   </td>
                   <td className="px-4 py-3">
                     <div className="flex flex-wrap gap-1">
@@ -421,6 +521,8 @@ export function TenantAgentsPage({ config }: { config: TenantConfig }) {
                   <td className={`px-4 py-3 text-xs whitespace-nowrap ${stale ? 'text-amber-600 font-medium' : 'text-gray-400'}`}>
                     {stale && <span className="mr-1">⚠</span>}{relTime(a.last_heartbeat_at)}
                   </td>
+                  <td className="px-4 py-3 text-gray-400 font-mono text-xs">{a.agent_id}</td>
+                  <td className="px-4 py-3 text-xs text-gray-400 whitespace-nowrap">{a.created_at ? relTime(a.created_at) : '-'}</td>
                   {isOperator && (
                     <td className="px-4 py-3">
                       <AgentMenu agent={a} isOperator={isOperator} onAction={setModal} />
@@ -442,6 +544,7 @@ export function TenantAgentsPage({ config }: { config: TenantConfig }) {
             isOperator={isOperator}
             onClose={() => setModal(null)}
             onAction={setModal}
+            onAcknowledge={isOperator ? cap => handleAcknowledge(modal.agent, cap) : undefined}
           />
         )}
 
@@ -554,7 +657,7 @@ export function TenantAgentsPage({ config }: { config: TenantConfig }) {
 // ---------------------------------------------------------------------------
 
 function AgentDetailModal({
-  apiUrl, token, agent, isOperator, onClose, onAction,
+  apiUrl, token, agent, isOperator, onClose, onAction, onAcknowledge,
 }: {
   apiUrl: string;
   token: string;
@@ -562,6 +665,7 @@ function AgentDetailModal({
   isOperator: boolean;
   onClose: () => void;
   onAction: (s: ModalState) => void;
+  onAcknowledge?: (capability: 'docker' | 'service_mgmt' | 'k8s_permissions') => void;
 }) {
   const [tab, setTab] = useState<'info' | 'history'>('info');
   const [history, setHistory] = useState<AgentHistory[]>([]);
@@ -630,14 +734,24 @@ function AgentDetailModal({
           <div className="space-y-4">
             <div className="grid grid-cols-2 gap-2.5">
               <DetailField label="Status"><Badge value={agent.status} /></DetailField>
+              <DetailField label="Type">
+                {agent.type ? <Badge value={agent.type} /> : <span className="text-xs text-gray-400">-</span>}
+              </DetailField>
               <DetailField label="Mode">
                 <Badge value={agent.mode} />
               </DetailField>
               <DetailField label="Access level">
                 <Badge value={agent.access_level} />
+                {agent.type === 'k8s' && (
+                  <p className="text-[10px] text-gray-400 mt-0.5 leading-tight">
+                    Reflects policy mode; cluster RBAC is shown below.
+                  </p>
+                )}
               </DetailField>
               <DetailField label="Running as root">
-                {agent.running_as_root == null ? (
+                {agent.type === 'k8s' ? (
+                  <span className="text-xs text-gray-400" title="Not applicable - the pod runs non-root; cluster access is governed by RBAC">n/a</span>
+                ) : agent.running_as_root == null ? (
                   <span className="text-xs text-gray-400">-</span>
                 ) : (
                   <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${agent.running_as_root === 'true' ? 'bg-red-50 text-red-700 border border-red-200' : 'bg-emerald-50 text-emerald-700 border border-emerald-200'}`}>
@@ -658,6 +772,15 @@ function AgentDetailModal({
                 <span className="text-xs text-gray-700">{fmtDate(agent.token_issued_at)}</span>
               </DetailField>
             </div>
+
+            {agent.type === 'k8s' && agent.k8s_permissions && (
+              <K8sPermissionsView
+                permissions={agent.k8s_permissions}
+                acked={agent.k8s_permissions_acked}
+                drift={agent.k8s_permissions_drift}
+                onAcknowledge={onAcknowledge ? () => onAcknowledge('k8s_permissions') : undefined}
+              />
+            )}
 
             {(agent.tags ?? []).length > 0 && (
               <div className="bg-gray-50 rounded-lg px-3 py-2.5">
@@ -885,12 +1008,38 @@ function CreateAgentModal({
   onClose: () => void;
   onCreated: (result: unknown) => void;
 }) {
+  const [agentType, setAgentType] = useState<'host' | 'k8s'>('host');
   const [mode, setMode] = useState<Mode>('wild');
   const [grantSvc, setGrantSvc] = useState(false);
   const [grantDocker, setGrantDocker] = useState(false);
+  // Installable versions for the picked type; '' means the default "Latest".
+  const [version, setVersion] = useState('');
+  const [versions, setVersions] = useState<string[]>([]);
+  useEffect(() => {
+    setVersion('');  // reset to Latest when the type changes
+    listAgentVersions(apiUrl, token, agentType)
+      .then(r => setVersions(r.versions ?? []))
+      .catch(() => setVersions([]));
+  }, [apiUrl, token, agentType]);
   const [tagPairs, setTagPairs] = useState<KVPair[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+
+  // Restricted (agent-scoped) users who won't see the new agent unless granted.
+  // Unrestricted users already have access, so they're excluded. Listing users is
+  // admin-only; for non-admins the fetch fails and the section stays hidden.
+  const [restrictedUsers, setRestrictedUsers] = useState<TenantUser[]>([]);
+  const [grantIds, setGrantIds] = useState<Set<string>>(new Set());
+  useEffect(() => {
+    listTenantUsers(apiUrl, token)
+      .then(r => setRestrictedUsers((r.users ?? []).filter(u => u.allowed_agent_ids != null && u.status !== 'REVOKED')))
+      .catch(() => {/* non-admin or fetch failed: section stays hidden */});
+  }, [apiUrl, token]);
+  const toggleGrant = (id: string) => setGrantIds(prev => {
+    const next = new Set(prev);
+    next.has(id) ? next.delete(id) : next.add(id);
+    return next;
+  });
 
   const addTag = () => setTagPairs(p => [...p, { key: '', value: '' }]);
   const removeTag = (idx: number) => setTagPairs(p => p.filter((_, i) => i !== idx));
@@ -900,7 +1049,17 @@ function CreateAgentModal({
   const submit = async () => {
     setLoading(true); setError('');
     try {
-      const result = await createTenantAgent(apiUrl, token, mode, grantSvc, grantDocker);
+      const isK8s = agentType === 'k8s';
+      // Docker / service-mgmt grants are host-only; the backend ignores them for
+      // k8s, but we omit them here too so intent is clear.
+      const result = await createTenantAgent(
+        apiUrl, token, mode,
+        isK8s ? undefined : grantSvc,
+        isK8s ? undefined : grantDocker,
+        agentType,
+        [...grantIds],
+        version || undefined,
+      );
       const tags = serializePairs(tagPairs);
       if (tags.length > 0) {
         await setTenantAgentTags(apiUrl, token, (result as { agent_id: string }).agent_id, tags);
@@ -915,6 +1074,49 @@ function CreateAgentModal({
   return (
     <Modal wide title="New agent" onClose={onClose}>
       <div className="space-y-5">
+        {/* Agent type */}
+        <div>
+          <p className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-2.5">Agent type</p>
+          <div className="grid grid-cols-2 gap-2.5">
+            {([
+              { t: 'host' as const, label: 'Host', desc: 'A machine / VM. Installs via curl + systemd or launchd.' },
+              { t: 'k8s' as const, label: 'Kubernetes', desc: 'A cluster. Installs via Helm; access is controlled by RBAC.' },
+            ]).map(({ t, label, desc }) => (
+              <button
+                key={t}
+                type="button"
+                onClick={() => setAgentType(t)}
+                className={`flex flex-col items-start gap-1 p-4 rounded-xl border-2 transition-all text-left ${
+                  agentType === t ? 'border-indigo-400 bg-indigo-50' : 'border-gray-200 hover:border-gray-300 hover:bg-gray-50'
+                }`}
+              >
+                <p className={`text-sm font-bold leading-tight ${agentType === t ? 'text-gray-900' : 'text-gray-700'}`}>{label}</p>
+                <p className="text-[11px] text-gray-500 leading-tight">{desc}</p>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Version */}
+        <div>
+          <p className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-2.5">Version</p>
+          <select
+            value={version}
+            onChange={e => setVersion(e.target.value)}
+            className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+          >
+            <option value="">Latest{versions.length ? ` (${versions[0]})` : ''}</option>
+            {versions.map(v => (
+              <option key={v} value={v}>{v}</option>
+            ))}
+          </select>
+          <p className="text-[11px] text-gray-500 mt-1.5">
+            {agentType === 'k8s'
+              ? 'Pins the Helm chart version in the install command. Latest installs the newest published chart.'
+              : 'Pins the agent binary version in the install command. Latest tracks the newest release.'}
+          </p>
+        </div>
+
         {/* Mode selection */}
         <div>
           <p className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-2.5">Execution mode</p>
@@ -957,7 +1159,19 @@ function CreateAgentModal({
           </div>
         </div>
 
-        {/* Permissions */}
+        {/* Permissions (host only - k8s access is controlled by RBAC) */}
+        {agentType === 'k8s' ? (
+          <div className="flex items-start gap-2.5 bg-sky-50 border border-sky-200 rounded-xl px-3.5 py-3 text-xs text-sky-800">
+            <svg className="w-4 h-4 shrink-0 mt-0.5 text-sky-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M9 12.75L11.25 15 15 9.75M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+            </svg>
+            <span>
+              Access is controlled by <strong>Kubernetes RBAC</strong>, configured in the Helm
+              chart (<code>clusterAccess</code>). Docker and service-management grants don't apply.
+              You'll see the agent's effective permissions here once it connects.
+            </span>
+          </div>
+        ) : (
         <div>
           <p className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-2.5">Permissions</p>
           <div className="space-y-2">
@@ -987,17 +1201,20 @@ function CreateAgentModal({
             </label>
           </div>
         </div>
+        )}
 
-        {/* Sudo notice */}
-        <div className="flex items-start gap-2.5 bg-amber-50 border border-amber-200 rounded-xl px-3.5 py-3 text-xs text-amber-800">
-          <svg className="w-4 h-4 shrink-0 mt-0.5 text-amber-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-            <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126z" />
-          </svg>
-          <span>
-            The install command requires <strong>sudo</strong> - the agent installs to system directories.
-            {(grantDocker || grantSvc) && ' Docker and service management grants also configure group membership and sudoers rules.'}
-          </span>
-        </div>
+        {/* Sudo notice (host install only) */}
+        {agentType === 'host' && (
+          <div className="flex items-start gap-2.5 bg-amber-50 border border-amber-200 rounded-xl px-3.5 py-3 text-xs text-amber-800">
+            <svg className="w-4 h-4 shrink-0 mt-0.5 text-amber-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126z" />
+            </svg>
+            <span>
+              The install command requires <strong>sudo</strong> - the agent installs to system directories.
+              {(grantDocker || grantSvc) && ' Docker and service management grants also configure group membership and sudoers rules.'}
+            </span>
+          </div>
+        )}
 
         {/* Tags */}
         <div>
@@ -1026,6 +1243,42 @@ function CreateAgentModal({
             </button>
           </div>
         </div>
+
+        {/* Grant access to restricted users. Unrestricted users already see every
+            agent, so only agent-scoped users are listed here. */}
+        {restrictedUsers.length > 0 && (
+          <div>
+            <p className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-1">
+              Grant access <span className="font-normal normal-case text-gray-400">(optional)</span>
+            </p>
+            <p className="text-[11px] text-gray-500 mb-2.5">
+              These users are restricted to specific agents and won't see this one unless you grant it.
+              Unrestricted users already have access.
+            </p>
+            <div className="border border-gray-200 rounded-xl overflow-hidden divide-y divide-gray-100 max-h-56 overflow-y-auto">
+              {restrictedUsers.map(u => {
+                const sel = grantIds.has(u.user_id);
+                return (
+                  <label key={u.user_id}
+                    className={`flex items-center gap-3 px-3 py-2.5 cursor-pointer transition-colors ${sel ? 'bg-indigo-50 hover:bg-indigo-100/70' : 'hover:bg-gray-50'}`}>
+                    <input type="checkbox" checked={sel} onChange={() => toggleGrant(u.user_id)} className="w-4 h-4" />
+                    <div className="min-w-0">
+                      <p className="text-sm font-medium text-gray-800 leading-tight truncate">
+                        {u.name || u.username} <span className="text-gray-400 font-mono text-xs">@{u.username}</span>
+                      </p>
+                      <p className="text-[11px] text-gray-500 leading-tight">
+                        {u.role} · currently {u.allowed_agent_ids?.length ?? 0} agent{(u.allowed_agent_ids?.length ?? 0) !== 1 ? 's' : ''}
+                      </p>
+                    </div>
+                  </label>
+                );
+              })}
+            </div>
+            {grantIds.size > 0 && (
+              <p className="text-[11px] text-indigo-600 mt-1.5">{grantIds.size} user{grantIds.size !== 1 ? 's' : ''} will be granted access to this agent.</p>
+            )}
+          </div>
+        )}
 
         {error && <p className="text-sm text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2">{error}</p>}
         <div className="flex justify-end gap-3 pt-1 border-t border-gray-100">
@@ -1065,15 +1318,27 @@ function InstallModal({
         {agent.install_token && (
           <TokenBox label="Install token" value={agent.install_token} />
         )}
-        {agent.commands?.agent && (
-          <div>
-            <p className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-1.5">Install command</p>
-            <div className="relative bg-gray-900 rounded-lg p-3 pr-10">
-              <code className="text-xs text-green-400 break-all whitespace-pre-wrap">{agent.commands.agent}</code>
-              <CopyButton text={agent.commands.agent} className="absolute top-2 right-2" />
+        {(() => {
+          const cmd = agent.commands?.helm ?? agent.commands?.agent;
+          if (!cmd) return null;
+          const isHelm = !!agent.commands?.helm;
+          return (
+            <div>
+              <p className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-1.5">
+                {isHelm ? 'Helm install command' : 'Install command'}
+              </p>
+              {isHelm && (
+                <p className="text-[11px] text-gray-500 mb-1.5">
+                  Runs in your cluster. Tune cluster access with <code>--set clusterAccess.*</code> (defaults to read-only).
+                </p>
+              )}
+              <div className="relative bg-gray-900 rounded-lg p-3 pr-10">
+                <code className="text-xs text-green-400 break-all whitespace-pre-wrap">{cmd}</code>
+                <CopyButton text={cmd} className="absolute top-2 right-2" />
+              </div>
             </div>
-          </div>
-        )}
+          );
+        })()}
         <div className="flex justify-end pt-1">
           <button
             onClick={onClose}

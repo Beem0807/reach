@@ -23,6 +23,7 @@ def handle_list_agents(raw_token: str, tag: Optional[str] = None) -> dict:
             "status": a.get("status"),
             "hostname": a.get("hostname"),
             "agent_version": a.get("agent_version"),
+            "created_at": a.get("created_at"),
             "claimed_at": a.get("claimed_at"),
             "last_heartbeat_at": a.get("last_heartbeat_at"),
             "token_issued_at": a.get("token_issued_at"),
@@ -33,6 +34,10 @@ def handle_list_agents(raw_token: str, tag: Optional[str] = None) -> dict:
             "mode": a.get("mode", "wild"),
             "access_level": a.get("access_level") or "open",
             "running_as_root": a.get("running_as_root"),
+            "k8s_permissions_reported": bool(a.get("k8s_permissions_hash")),
+            "k8s_permissions_drift": a.get("k8s_permissions_drift", False),
+            "k8s_permissions": a.get("k8s_permissions"),  # RBAC snapshot for the detail view (k8s only)
+            "k8s_permissions_acked": a.get("k8s_permissions_acked"),  # acknowledged baseline, for the drift diff
             "tags": a.get("tags") or [],
             "grant_service_mgmt": a.get("grant_service_mgmt", False),
             "grant_docker": a.get("grant_docker", False),

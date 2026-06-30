@@ -58,13 +58,15 @@ For full architectural detail see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 **Agent token binding** - agent tokens are bound to a machine fingerprint at claim time. A token stolen from one machine cannot be replayed from another.
 
-**Install token** - one-time use, 24-hour expiry, cleared from disk after a successful claim.
+**Install token** - one-time use, 24-hour expiry, cleared from disk after a successful claim. It is also **bound to the agent's type**: a token minted for a `k8s` agent cannot be redeemed by the host installer, or a `host` token by the k8s image (the claim is rejected `403`). This keeps a token from being used to enroll an agent whose runtime doesn't match the RBAC / capability configuration it was created with.
 
 **Tenant isolation** - user tokens can only access agents and jobs within their own tenant. The storage layer enforces this; there is no client-side filtering.
 
-**Policy enforcement** - the global blocklist and mode-specific write blocking are enforced server-side before the job reaches the agent. The agent enforces a second time locally (Landlock on Linux, `is_write` flag on macOS). Two independent enforcement points must both be bypassed.
+**Policy enforcement** - the global blocklist and mode-specific write blocking are enforced server-side before the job reaches the agent. On a host the agent enforces a second time locally (Landlock on Linux, `is_write` flag on macOS). Two independent enforcement points must both be bypassed.
 
-**No inbound connections** - agents make outbound HTTPS requests only. No ports are opened on the remote machine.
+**Kubernetes execution** - a pod holds a cluster credential, so the model is stricter. Three layers compose: **RBAC** (the API server's unbypassable floor; what the agent can do is the `clusterAccess` you bind, defaulting to read-only), the **policy mode** (enforced by the backend per `kubectl` verb at submission), and the **agent's no-shell + allowlist** - jobs run as `kubectl` plus a few read-only filters with **no shell**, and arguments resolving to a local file are rejected so a job can never read the mounted ServiceAccount token. The agent self-reports its effective cluster-wide RBAC for acknowledge/drift. See [agent/README.md](agent/README.md).
+
+**No inbound connections** - agents make outbound HTTPS requests only. No ports are opened on the remote machine (or pod). The one exception is the [optional metrics endpoint](#optional-metrics-endpoint), which is **off by default**.
 
 **Config file permissions** - agent config files are written with `0600` permissions (owner read/write only).
 
@@ -73,6 +75,23 @@ For full architectural detail see [ARCHITECTURE.md](ARCHITECTURE.md).
 **Secret redaction** - command output is scrubbed for recognizable secrets before it is stored or shown to an AI agent. See [Secret redaction in command output](#secret-redaction-in-command-output).
 
 **Brute-force mitigation** - all login endpoints (`POST /admin/login`, `POST /tenant/login`) are rate limited to 10 requests/minute per IP, and every other endpoint is rate limited as well (see [API.md](API.md#rate-limits)). There is no per-account lockout counter; protection relies on rate limiting combined with strong, randomly generated credentials. Counters are in-memory (per-process) by default - if you run more than one backend replica, point them at a shared store via `RATE_LIMIT_STORAGE_URI` so the limit holds across replicas (see [Running multiple replicas](SELF_HOSTING.md#running-multiple-replicas)).
+
+---
+
+## Optional metrics endpoint
+
+The agent can expose Prometheus metrics at `/metrics` when `REACH_METRICS_ADDR` is set. **This is off by default and is a deliberate deviation from the outbound-only model** - it is the only case in which the agent opens an inbound listening port. It is not tied to Kubernetes: the same binary serves it for host agents too (see the host note below).
+
+What it does and does not expose:
+
+- **Read-only counters, no secrets.** The endpoint serves operational metrics only (job counts, durations, sync success/failure, leadership, token-rotation count). It never exposes command output, tokens, RBAC contents, or configuration. It requires no authentication because it carries nothing sensitive - so it must be reached only by your monitoring stack.
+- **Leader-aware.** All replicas are scraped; each reports `reach_agent_is_leader` so standby replicas are distinguishable from the active leader.
+
+**Kubernetes (`metrics.enabled=true`) - locked down by default.** Enabling it renders a `NetworkPolicy` (Ingress-only) that admits the metrics port **only from the Prometheus namespace** (`metrics.networkPolicy.prometheusNamespace`, default `monitoring`). The policy governs ingress only, so the agent's outbound HTTPS - its real control channel - is unaffected. Keep this policy on; disabling it (`metrics.networkPolicy.enabled=false`) exposes the port to the whole cluster.
+
+**Host agents - no automatic containment.** `install.sh` never sets `REACH_METRICS_ADDR`, so a host install exposes nothing unless you set it yourself. If you do, note that a host has **no NetworkPolicy** to scope the port and **no authentication** on the endpoint - an open `:9090` is reachable by anything that can route to the machine. Bind it to **loopback** (`REACH_METRICS_ADDR=127.0.0.1:9090`) and scrape via a collector already running on that host, or leave it unset. Never bind a host metrics port to a public or shared interface.
+
+If your posture is "no inbound ports, ever," leave it unset (the default on both host and k8s) and instead rely on the metrics the agent already reports to the backend through its outbound sync. See [agent/README.md → Metrics](agent/README.md#metrics-opt-in).
 
 ---
 
@@ -99,12 +118,12 @@ This is **defense-in-depth, not a guarantee.** It catches structurally recogniza
 |---|---|---|
 | `ADMIN_PASSWORD` | Your environment / secrets manager | Raw (you set it) |
 | `TOKEN_PEPPER` | Your environment / secrets manager | Raw (you set it) |
-| Install token | Agent config file (`/etc/reach-agent/config.json`) until claim; then cleared | Raw until claim, then gone |
-| Agent token | Agent config file (`/etc/reach-agent/config.json`) | Raw - **protect this file** |
+| Install token | **Host:** agent config file until claim, then cleared. **k8s:** the bootstrap Secret (or `--set`) | Raw until claim, then gone |
+| Agent token | **Host:** agent config file (`/etc/reach-agent/config.json`). **k8s:** a Kubernetes Secret the agent manages - **never written to the pod filesystem** | Raw - **protect it** |
 | API token (`tok_`) | Returned once at creation; not stored by the backend | Raw - user must store it |
 | All token hashes | Database (DynamoDB or PostgreSQL) | `HMAC-SHA256(TOKEN_PEPPER, token)` only |
 
-The agent config file is written with `0600` permissions and owned by the `reach-agent` system user. Only root and `reach-agent` can read it. Protect it like an SSH private key.
+On a **host**, the agent config file is written with `0600` permissions and owned by the `reach-agent` system user - protect it like an SSH private key. In **Kubernetes**, the agent token lives only in a Secret the agent shares across replicas (the pod's root filesystem is read-only, so nothing is cached on a node's disk); anyone with `get secret` in the agent's namespace can read it, so scope namespace access accordingly. (The agent identifies itself to the backend by token hash - there is no `agent_id` on the agent to steal; see [ARCHITECTURE.md → Token model](ARCHITECTURE.md#token-model).)
 
 ---
 
@@ -126,7 +145,12 @@ Tenant admins can also trigger an out-of-band rotation from the tenant console u
 
 **Revoke an agent**: from the tenant console, go to **Agents → [agent] → Revoke**. Cuts sync access immediately and removes the agent from all user access lists. The agent goes dormant on its next poll. Reissue an install token to bring it back.
 
-**Revoke a user**: from the tenant console, go to **Users → [user] → Revoke all tokens**. All their API tokens stop working immediately. Other users are unaffected.
+**Revoke a user's access** - two levels, depending on whether you distrust the *account* or just a *credential*:
+
+- **Disable the account** (**Users → [user] → Disable**) - cuts **all** access immediately: existing console sessions **and** API tokens stop authenticating, not just future logins. Re-enable to restore, or **Delete** a disabled user to remove them permanently (which also purges their API tokens). Use when the person should lose access.
+- **Revoke all tokens** (**Users → [user] → Revoke all tokens**) - kills only the user's API tokens while they keep console access and can mint fresh ones. Use when a *token* is compromised (leaked in CI, a commit, a laptop) but the person is fine - it rotates their programmatic credentials without locking them out.
+
+Other users are unaffected in both cases.
 
 **Restrict a user to specific agents**: from the tenant console, go to **Users → [user] → Agent Access**. Set an explicit list of agents the user can see - all others return 404. Pass an empty list to lock them out of all agents without deleting the account.
 

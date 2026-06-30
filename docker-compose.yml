@@ -1,3 +1,17 @@
+# Local dev stack for Reach: Postgres + backend (runs migrations) + nginx, with an
+# optional one-shot `seed` service that loads dummy data. Served on
+# http://localhost:8080 (web UI at /ui).
+#
+#   Bring it ALL up (build + start + seed dummy data):
+#     docker compose --profile seed up -d --build
+#
+#   Take it ALL down (containers, network, AND the Postgres volume - wipes data):
+#     docker compose --profile seed down -v
+#
+# Seeds 3 tenants - "alpha", "beta", and "gamma" - each with the
+# same logins (username == password): localadmin / localoperator / localdeveloper.
+# Platform-admin login uses ADMIN_PASSWORD (default "localadmin").
+# Re-run `docker compose run --rm seed` any time to reset the seed data.
 services:
   db:
     image: postgres:16-alpine
@@ -19,8 +33,10 @@ services:
     build: .
     environment:
       TOKEN_PEPPER: ${TOKEN_PEPPER:-localtest}
+      SESSION_SIGNING_KEY: ${SESSION_SIGNING_KEY:-localsigning}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-localadmin}
       DATABASE_URL: postgresql://reach:reach@db:5432/reach
+      STORAGE_BACKEND: postgres
       APPROVAL_RETENTION_DAYS: ${APPROVAL_RETENTION_DAYS:-7}
       JOB_RETENTION_DAYS: ${JOB_RETENTION_DAYS:-7}
       AUDIT_RETENTION_DAYS: ${AUDIT_RETENTION_DAYS:-90}

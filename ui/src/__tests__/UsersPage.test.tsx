@@ -123,11 +123,18 @@ describe('user list', () => {
     expect(screen.getByText('disabled')).toBeInTheDocument();
   });
 
-  it('shows TEMP PW badge for users who must reset password', async () => {
-    mockApis({ users: [{ ...USER_A, must_reset_password: true }] });
+  it('shows TEMP PW badge for a user who has logged in but must reset', async () => {
+    mockApis({ users: [{ ...USER_A, must_reset_password: true, last_login_at: '2024-02-01T00:00:00Z' }] });
     render(<UsersPage config={CONFIG} />);
     await screen.findByText('Alice Smith');
     expect(screen.getByText('TEMP PW')).toBeInTheDocument();
+  });
+
+  it('shows INVITED badge for a user who has never logged in', async () => {
+    mockApis({ users: [{ ...USER_A, must_reset_password: true }] });  // no last_login_at
+    render(<UsersPage config={CONFIG} />);
+    await screen.findByText('Alice Smith');
+    expect(screen.getByText('INVITED')).toBeInTheDocument();
   });
 
   it('shows "No users in this tenant yet" when list is empty', async () => {

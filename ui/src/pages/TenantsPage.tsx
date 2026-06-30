@@ -3,6 +3,7 @@ import type { Config, Tenant } from '../types';
 import { listTenants, createTenant, disableTenant, enableTenant, listUsers, listAgentsAdmin } from '../api';
 import { Modal } from '../components/Modal';
 import { Spinner } from '../components/Spinner';
+import { RefreshButton } from '../components/RefreshButton';
 import { tenantPalette, tenantInitials } from '../utils';
 
 function fmtDate(iso?: string) {
@@ -86,6 +87,7 @@ export function TenantsPage({ config }: { config: Config }) {
               {tenants.length} {tenants.length === 1 ? 'tenant' : 'tenants'}
             </span>
           )}
+          <RefreshButton onClick={loadTenants} loading={loading} variant="onLight" />
           <button
             onClick={() => setCreating(true)}
             className="inline-flex items-center gap-1.5 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-semibold px-4 py-2 rounded-lg transition-colors shadow-sm"

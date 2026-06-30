@@ -3,9 +3,10 @@ import re
 import secrets
 import logging
 
+from shared.access import accessible_agent_ids, is_agent_restricted
 from shared.password import hash_password, generate_temp_password
 from shared.response import _err, _iso, _ok
-from shared.store import users_repo
+from shared.store import agents_repo, api_tokens_repo, users_repo
 from shared.auth import _verify_tenant_payload
 import shared.audit as audit
 
@@ -13,10 +14,29 @@ logger = logging.getLogger()
 
 VALID_ROLES = ("admin", "operator", "developer")
 _USERNAME_RE = re.compile(r'^[a-z0-9]+$')
+_ADMIN_SCOPE_ERR = "admins have tenant-wide access and cannot be restricted to specific agents"
 
 
 def _require_admin(tp: dict) -> bool:
     return tp.get("role") == "admin"
+
+
+def _grant_exceeds_actor_scope(token_payload: dict, requested, tenant_id: str) -> bool:
+    """True if `requested` (allowed_agent_ids being granted) exceeds the acting
+    admin's own agent access. Admins can only delegate access they hold:
+
+    - unrestricted actor (allowed_agent_ids is None) may grant anything, incl. null
+    - restricted actor may not grant tenant-wide (null), nor any agent outside their set
+
+    The actor's scope is read fresh from their user record, not the token.
+    """
+    actor = users_repo.get(token_payload.get("sub") or token_payload.get("user_id", "")) or {}
+    if not is_agent_restricted(actor):
+        return False
+    if requested is None:
+        return True  # granting "all agents" while restricted is an escalation
+    actor_agents = set(accessible_agent_ids(actor, agents_repo.list_by_tenant(tenant_id)))
+    return any(a not in actor_agents for a in requested)
 
 
 def handle_list_tenant_users(token_payload: dict) -> dict:
@@ -52,6 +72,15 @@ def handle_create_tenant_user(body: dict, token_payload: dict, ip: str = "") -> 
         if not isinstance(allowed_agent_ids_raw, list) or not all(isinstance(i, str) for i in allowed_agent_ids_raw):
             return _err("allowed_agent_ids must be null or a list of agent ID strings")
     allowed_agent_ids = allowed_agent_ids_raw
+
+    # Admins are the tenant trust root: always tenant-wide, never agent-scoped. This
+    # guarantees at least one role can reach every agent (no agent can be orphaned).
+    if role == "admin" and allowed_agent_ids is not None:
+        return _err(_ADMIN_SCOPE_ERR)
+
+    # An admin can only grant agent access they hold themselves.
+    if _grant_exceeds_actor_scope(token_payload, allowed_agent_ids, tenant_id):
+        return _err("you can only grant access to agents you have access to", 403)
 
     # Check uniqueness
     existing = users_repo.get_by_username(tenant_id, username)
@@ -148,6 +177,42 @@ def handle_enable_tenant_user(user_id: str, token_payload: dict, ip: str = "") -
     return _ok({"user_id": user_id, "status": "ACTIVE"})
 
 
+def handle_delete_tenant_user(user_id: str, token_payload: dict, ip: str = "") -> dict:
+    """Hard-delete a user. Two-step like API tokens: the user must be disabled
+    (REVOKED) first, so an active account can't be removed by accident. Also purges
+    the user's API tokens so no orphaned credentials remain."""
+    if not _require_admin(token_payload):
+        return _err("forbidden", 403)
+    tenant_id = token_payload["tenant_id"]
+    user = users_repo.get(user_id)
+    if not user or user["tenant_id"] != tenant_id:
+        return _err("user not found", 404)
+    if user["user_id"] == token_payload["sub"]:
+        return _err("cannot delete yourself", 409)
+    if user.get("status") != "REVOKED":
+        return _err("disable the user before deleting", 409)
+
+    # Purge the user's API tokens, then the user record itself.
+    tokens = api_tokens_repo.list_by_user(user_id) or []
+    for tok in tokens:
+        api_tokens_repo.delete(tok["token_id"])
+    users_repo.delete(user_id)
+
+    audit.write(
+        "user.deleted",
+        tenant_id=tenant_id,
+        actor_id=token_payload["sub"],
+        actor_name=token_payload.get("username"),
+        actor_role=token_payload.get("role"),
+        resource_type="user",
+        resource_id=user_id,
+        metadata={"username": user.get("username"), "role": user.get("role"),
+                  "tokens_deleted": len(tokens)},
+        ip_address=ip,
+    )
+    return _ok({"user_id": user_id, "deleted": True})
+
+
 def handle_set_user_role(user_id: str, body: dict, token_payload: dict, ip: str = "") -> dict:
     if not _require_admin(token_payload):
         return _err("forbidden", 403)
@@ -161,6 +226,10 @@ def handle_set_user_role(user_id: str, body: dict, token_payload: dict, ip: str 
         return _err("user not found", 404)
 
     users_repo.set_role(user_id, role)
+    # Promotion to admin implies tenant-wide access; drop any prior agent scope so
+    # the admin isn't left artificially restricted.
+    if role == "admin" and user.get("allowed_agent_ids") is not None:
+        users_repo.set_allowed_agents(user_id, None)
     audit.write(
         "user.role_changed",
         tenant_id=tenant_id,
@@ -234,6 +303,19 @@ def handle_set_user_agents(user_id: str, body: dict, token_payload: dict) -> dic
         return _err("user not found", 404)
     prev = user.get("allowed_agent_ids")  # None = all agents
     agent_ids = body.get("allowed_agent_ids")  # None = allow all agents
+    if agent_ids is not None:
+        if not isinstance(agent_ids, list) or not all(isinstance(i, str) for i in agent_ids):
+            return _err("allowed_agent_ids must be null or a list of agent ID strings")
+
+    # Admins are always tenant-wide - you can't scope one to specific agents.
+    if user.get("role") == "admin" and agent_ids is not None:
+        return _err(_ADMIN_SCOPE_ERR)
+
+    # An admin can only grant agent access they hold themselves (this also stops a
+    # restricted admin from widening their own scope).
+    if _grant_exceeds_actor_scope(token_payload, agent_ids, tenant_id):
+        return _err("you can only grant access to agents you have access to", 403)
+
     users_repo.set_allowed_agents(user_id, agent_ids)
     added = sorted(set(agent_ids or []) - set(prev or [])) if prev is not None and agent_ids is not None else None
     removed = sorted(set(prev or []) - set(agent_ids or [])) if prev is not None and agent_ids is not None else None
@@ -318,6 +400,15 @@ def enable_user_handler(event, context):
         return err
     user_id = (event.get("pathParameters") or {}).get("user_id", "")
     return handle_enable_tenant_user(user_id, payload, ip=_ip(event))
+
+
+def delete_user_handler(event, context):
+    logger.info("DELETE /tenant/users/{user_id}")
+    payload, err = _auth(event)
+    if err:
+        return err
+    user_id = (event.get("pathParameters") or {}).get("user_id", "")
+    return handle_delete_tenant_user(user_id, payload, ip=_ip(event))
 
 
 def set_role_handler(event, context):

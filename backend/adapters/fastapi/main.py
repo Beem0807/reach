@@ -23,7 +23,7 @@ from handlers.admin_tenants import (
 from handlers.tenant_login import handle_tenant_login, handle_change_password, handle_tenant_me
 from handlers.tenant_users import (
     handle_list_tenant_users, handle_create_tenant_user,
-    handle_disable_tenant_user, handle_enable_tenant_user,
+    handle_disable_tenant_user, handle_enable_tenant_user, handle_delete_tenant_user,
     handle_set_user_role, handle_reset_user_password,
     handle_get_user_agents, handle_set_user_agents,
 )
@@ -38,6 +38,8 @@ from handlers.tenant_agents import (
     handle_set_tenant_agent_tags,
     handle_set_tenant_agent_mode,
     handle_request_agent_rotation,
+    handle_get_agent_history,
+    handle_list_agent_versions,
 )
 from handlers.tenant_approvals import (
     handle_list_my_pending,
@@ -50,6 +52,7 @@ from handlers.tenant_approvals import (
 from handlers.audit_logs import handle_list_platform_audit_logs, handle_list_tenant_audit_logs
 from handlers.admin_users import handle_list_users
 from shared.tenant_auth import verify_tenant_token
+from shared.auth import _verify_tenant_token
 from handlers.agent_claim import handle_agent_claim
 from handlers.agent_job_result import handle_agent_job_result
 from handlers.agent_rotate_token import handle_agent_rotate_token
@@ -484,10 +487,11 @@ async def tenant_me(request: Request):
     token = _token(request)
     if not token:
         return JSONResponse({"error": "missing Authorization header"}, status_code=401)
-    payload = verify_tenant_token(token)
-    if not payload:
+    # API-key-aware so both console sessions and CLI/MCP API tokens can introspect.
+    user = _verify_tenant_token(token)
+    if not user:
         return JSONResponse({"error": "unauthorized"}, status_code=401)
-    return _resp(handle_tenant_me(payload))
+    return _resp(handle_tenant_me(user))
 
 
 # ---------------------------------------------------------------------------
@@ -547,6 +551,19 @@ async def tenant_enable_user(user_id: str, request: Request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     ip = request.client.host if request.client else ""
     return _resp(handle_enable_tenant_user(user_id, payload, ip))
+
+
+@app.delete("/tenant/users/{user_id}")
+@limiter.limit("20/minute")
+async def tenant_delete_user(user_id: str, request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    payload = verify_tenant_token(token)
+    if not payload:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    ip = request.client.host if request.client else ""
+    return _resp(handle_delete_tenant_user(user_id, payload, ip))
 
 
 @app.post("/tenant/users/{user_id}/revoke-tokens")
@@ -623,6 +640,15 @@ async def tenant_set_user_agents(user_id: str, request: Request):
 # ---------------------------------------------------------------------------
 # Tenant admin - agent management
 # ---------------------------------------------------------------------------
+
+@app.get("/tenant/agent-versions")
+async def tenant_agent_versions(request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    agent_type = request.query_params.get("type", "host")
+    return _resp(handle_list_agent_versions(agent_type, token))
+
 
 @app.post("/tenant/agents", status_code=201)
 @limiter.limit("20/minute")
@@ -730,19 +756,12 @@ async def tenant_set_agent_mode(agent_id: str, request: Request):
 @app.get("/tenant/agents/{agent_id}/history")
 @limiter.limit("60/minute")
 async def tenant_agent_history(agent_id: str, request: Request):
-    from shared.store import agent_history_repo, agents_repo as _ar
-    from shared.tenant_auth import verify_tenant_token as _vt
     token = _token(request)
     if not token:
         return JSONResponse({"error": "missing Authorization header"}, status_code=401)
-    payload = _vt(token)
-    if not payload:
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-    agent = _ar.get(agent_id)
-    if not agent or agent.get("tenant_id") != payload.get("tenant_id"):
-        return JSONResponse({"error": "not found"}, status_code=404)
-    history = agent_history_repo.list_by_agent(agent_id, limit=50)
-    return JSONResponse({"status": "ok", "history": history})
+    # Delegate to the shared handler so tenant-boundary + per-user agent scope are
+    # enforced consistently with the Lambda adapter.
+    return _resp(handle_get_agent_history(agent_id, token))
 
 
 # ---------------------------------------------------------------------------

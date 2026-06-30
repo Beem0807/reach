@@ -20,14 +20,9 @@ class TestAgentRotateToken:
              patch("handlers.agent_rotate_token.agents_repo") as ar:
             return handle_agent_rotate_token(body or _VALID_BODY, "tok"), ar
 
-    def test_missing_agent_id(self):
-        with patch("handlers.agent_rotate_token._verify_agent_token", return_value=_AGENT_ACTIVE):
-            r = handle_agent_rotate_token({"machine_fingerprint": FP}, "tok")
-        assert r["statusCode"] == 400
-
     def test_missing_fingerprint(self):
         with patch("handlers.agent_rotate_token._verify_agent_token", return_value=_AGENT_ACTIVE):
-            r = handle_agent_rotate_token({"agent_id": AGENT_ID}, "tok")
+            r = handle_agent_rotate_token({}, "tok")
         assert r["statusCode"] == 400
 
     def test_unauthorized(self):

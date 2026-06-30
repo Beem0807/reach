@@ -11,15 +11,16 @@ logger.setLevel(logging.INFO)
 
 
 def handle_agent_rotate_token(body: dict, raw_token: str) -> dict:
-    agent_id = body.get("agent_id", "").strip()
     machine_fp = body.get("machine_fingerprint", "").strip()
 
-    if not agent_id or not machine_fp:
-        return _err("agent_id and machine_fingerprint required", 400)
+    if not machine_fp:
+        return _err("machine_fingerprint required", 400)
 
-    agent = _verify_agent_token(raw_token, agent_id)
+    # Credential-only: the (old) agent token identifies the agent; no agent_id.
+    agent = _verify_agent_token(raw_token)
     if not agent:
         return _err("unauthorized", 401)
+    agent_id = agent["agent_id"]
 
     if agent.get("status") not in ("ACTIVE", "INACTIVE"):
         return _err("agent not active", 403)

@@ -17,6 +17,7 @@ backend/ui_dist/
 ui/dist/
 ui/node_modules/
 ui/coverage/
+node_modules
 
 # Local dev DB
 *.db

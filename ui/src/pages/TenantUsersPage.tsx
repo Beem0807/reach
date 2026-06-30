@@ -2,13 +2,14 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import type { TenantConfig, TenantUser, TenantRole, Agent } from '../types';
 import {
-  listTenantUsers, createTenantUser, disableTenantUser, enableTenantUser, revokeAllUserTokens,
+  listTenantUsers, createTenantUser, disableTenantUser, enableTenantUser, deleteTenantUser, revokeAllUserTokens,
   setTenantUserRole, resetTenantUserPassword,
   getUserAgentAccess, setUserAgentAccess, listTenantAgents,
 } from '../api';
 import { Modal } from '../components/Modal';
 import { Spinner } from '../components/Spinner';
 import { DataTable } from '../components/DataTable';
+import { RefreshButton } from '../components/RefreshButton';
 import { relTime } from '../utils';
 
 const ROLES: TenantRole[] = ['admin', 'operator', 'developer'];
@@ -44,6 +45,8 @@ export function TenantUsersPage({ config }: { config: TenantConfig }) {
   const [resetPwTarget, setResetPwTarget] = useState<TenantUser | null>(null);
   const [disableTarget, setDisableTarget] = useState<TenantUser | null>(null);
   const [enableTarget, setEnableTarget] = useState<TenantUser | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<TenantUser | null>(null);
+  const [revokeTokensTarget, setRevokeTokensTarget] = useState<TenantUser | null>(null);
   const [agentAccessTarget, setAgentAccessTarget] = useState<TenantUser | null>(null);
 
   const load = useCallback(() => {
@@ -66,6 +69,18 @@ export function TenantUsersPage({ config }: { config: TenantConfig }) {
   const doEnable = async (u: TenantUser) => {
     await enableTenantUser(apiUrl, tenantToken, u.user_id);
     setEnableTarget(null);
+    load();
+  };
+
+  const doDelete = async (u: TenantUser) => {
+    await deleteTenantUser(apiUrl, tenantToken, u.user_id);
+    setDeleteTarget(null);
+    load();
+  };
+
+  const doRevokeTokens = async (u: TenantUser) => {
+    await revokeAllUserTokens(apiUrl, tenantToken, u.user_id);
+    setRevokeTokensTarget(null);
     load();
   };
 
@@ -116,6 +131,7 @@ export function TenantUsersPage({ config }: { config: TenantConfig }) {
                 )}
               </>
             )}
+            <RefreshButton onClick={load} loading={loading} />
             {isAdmin && (
               <button
                 onClick={() => setModal('create')}
@@ -157,8 +173,8 @@ export function TenantUsersPage({ config }: { config: TenantConfig }) {
                   <div className="flex items-start gap-1.5">
                     <div className="min-w-0">
                       <button
-                        onClick={() => (isAdmin && u.user_id !== config.userId && u.status !== 'REVOKED') ? setAgentAccessTarget(u) : undefined}
-                        className={`font-medium text-sm text-gray-900 text-left leading-tight ${(isAdmin && u.user_id !== config.userId && u.status !== 'REVOKED') ? 'hover:text-violet-700 transition-colors cursor-pointer' : 'cursor-default'}`}
+                        onClick={() => (isAdmin && u.role !== 'admin' && u.user_id !== config.userId && u.status !== 'REVOKED') ? setAgentAccessTarget(u) : undefined}
+                        className={`font-medium text-sm text-gray-900 text-left leading-tight ${(isAdmin && u.role !== 'admin' && u.user_id !== config.userId && u.status !== 'REVOKED') ? 'hover:text-violet-700 transition-colors cursor-pointer' : 'cursor-default'}`}
                       >
                         {u.name || u.username}
                       </button>
@@ -172,7 +188,9 @@ export function TenantUsersPage({ config }: { config: TenantConfig }) {
                       </div>
                     </div>
                     {u.must_reset_password && (
-                      <span className="text-[10px] bg-amber-100 text-amber-700 px-1.5 py-0.5 rounded font-semibold shrink-0 mt-0.5">TEMP PW</span>
+                      u.last_login_at
+                        ? <span className="text-[10px] bg-amber-100 text-amber-700 px-1.5 py-0.5 rounded font-semibold shrink-0 mt-0.5" title="Temporary password issued - pending change">TEMP PW</span>
+                        : <span className="text-[10px] bg-sky-100 text-sky-700 px-1.5 py-0.5 rounded font-semibold shrink-0 mt-0.5" title="Created but has never logged in">INVITED</span>
                     )}
                   </div>
                 </td>
@@ -193,18 +211,28 @@ export function TenantUsersPage({ config }: { config: TenantConfig }) {
                 <td className="px-4 py-3.5">
                   {isAdmin && u.user_id !== config.userId && (
                     u.status === 'REVOKED' ? (
-                      <button
-                        onClick={() => setEnableTarget(u)}
-                        className="text-xs font-semibold text-emerald-700 hover:text-white hover:bg-emerald-600 bg-emerald-50 border border-emerald-200 px-2.5 py-1 rounded-md transition-colors"
-                      >
-                        Enable
-                      </button>
+                      <div className="flex items-center gap-2">
+                        <button
+                          onClick={() => setEnableTarget(u)}
+                          className="text-xs font-semibold text-emerald-700 hover:text-white hover:bg-emerald-600 bg-emerald-50 border border-emerald-200 px-2.5 py-1 rounded-md transition-colors"
+                        >
+                          Enable
+                        </button>
+                        <button
+                          onClick={() => setDeleteTarget(u)}
+                          className="text-xs font-semibold text-red-700 hover:text-white hover:bg-red-600 bg-red-50 border border-red-200 px-2.5 py-1 rounded-md transition-colors"
+                        >
+                          Delete
+                        </button>
+                      </div>
                     ) : (
                       <TenantUserMenu
                         onChangeRole={() => { setTargetUser(u); setModal('role'); }}
                         onResetPw={() => setResetPwTarget(u)}
+                        onRevokeTokens={() => setRevokeTokensTarget(u)}
                         onDisable={() => setDisableTarget(u)}
                         onAgentAccess={() => setAgentAccessTarget(u)}
+                        showAgentAccess={u.role !== 'admin'}
                       />
                     )
                   )}
@@ -230,7 +258,10 @@ export function TenantUsersPage({ config }: { config: TenantConfig }) {
           apiUrl={apiUrl}
           tenantToken={tenantToken}
           onClose={() => { setModal(null); setTargetUser(null); }}
-          onChanged={() => { load(); setModal(null); setTargetUser(null); }}
+          onChanged={(editAgentsFor) => {
+            load(); setModal(null); setTargetUser(null);
+            if (editAgentsFor) setAgentAccessTarget(editAgentsFor);
+          }}
         />
       )}
 
@@ -259,6 +290,22 @@ export function TenantUsersPage({ config }: { config: TenantConfig }) {
           user={enableTarget}
           onClose={() => setEnableTarget(null)}
           onConfirm={() => doEnable(enableTarget)}
+        />
+      )}
+
+      {deleteTarget && (
+        <DeleteUserModal
+          user={deleteTarget}
+          onClose={() => setDeleteTarget(null)}
+          onConfirm={() => doDelete(deleteTarget)}
+        />
+      )}
+
+      {revokeTokensTarget && (
+        <RevokeTokensModal
+          user={revokeTokensTarget}
+          onClose={() => setRevokeTokensTarget(null)}
+          onConfirm={() => doRevokeTokens(revokeTokensTarget)}
         />
       )}
 
@@ -361,7 +408,7 @@ function CreateUserModal({
           <label className="block text-sm font-medium text-gray-700 mb-2">Role</label>
           <div className="grid grid-cols-3 gap-2">
             {ROLES.map(r => (
-              <button key={r} type="button" onClick={() => setRole(r)}
+              <button key={r} type="button" onClick={() => { setRole(r); if (r === 'admin') setRestricted(false); }}
                 className={`text-left px-3 py-2.5 rounded-md border transition-colors ${role === r ? 'bg-indigo-50 border-indigo-400 text-indigo-900' : 'border-gray-200 text-gray-700 hover:bg-gray-50'}`}>
                 <div className="mb-1"><span className={`text-xs font-semibold px-1.5 py-0.5 rounded ${ROLE_STYLE[r]}`}>{ROLE_LABEL[r]}</span></div>
                 <p className="text-[11px] text-gray-500 leading-tight">{ROLE_DESC[r]}</p>
@@ -370,7 +417,15 @@ function CreateUserModal({
           </div>
         </div>
 
-        {/* Agent access */}
+        {/* Agent access - admins are always tenant-wide, so the picker is hidden for them */}
+        {role === 'admin' ? (
+          <div className="flex items-start gap-2 rounded-lg border border-indigo-100 bg-indigo-50 px-3 py-2.5">
+            <svg className="w-4 h-4 text-indigo-500 shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M9 12.75 11.25 15 15 9.75M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z" />
+            </svg>
+            <p className="text-xs text-indigo-800">Admins have <span className="font-semibold">tenant-wide access</span> to all agents and can't be restricted to specific ones.</p>
+          </div>
+        ) : (
         <div>
           <div className="flex items-center gap-2 mb-2.5">
             <span className="text-sm font-medium text-gray-700">Agent access</span>
@@ -444,6 +499,7 @@ function CreateUserModal({
             </div>
           )}
         </div>
+        )}
 
         {error && <p className="text-sm text-red-600">{error}</p>}
         <div className="flex justify-end gap-3 pt-1">
@@ -465,18 +521,22 @@ function ChangeRoleModal({
   apiUrl: string;
   tenantToken: string;
   onClose: () => void;
-  onChanged: () => void;
+  onChanged: (editAgentsFor?: TenantUser) => void;
 }) {
   const [role, setRole] = useState<TenantRole>((user.role as TenantRole) ?? 'developer');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+
+  // Demoting an admin to a scopeable role is the moment agent access becomes
+  // relevant (an admin has none). Offer to set it right after the role change.
+  const demotingAdmin = user.role === 'admin' && role !== 'admin';
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true); setError('');
     try {
       await setTenantUserRole(apiUrl, tenantToken, user.user_id, role);
-      onChanged();
+      onChanged(demotingAdmin ? { ...user, role, allowed_agent_ids: null } : undefined);
     } catch (e) { setError((e as Error).message); setLoading(false); }
   };
 
@@ -486,12 +546,37 @@ function ChangeRoleModal({
         <div className="space-y-2">
           {ROLES.map(r => (
             <button key={r} type="button" onClick={() => setRole(r)}
-              className={`w-full text-left px-3 py-2.5 rounded-md border transition-colors ${role === r ? 'bg-indigo-50 border-indigo-400 text-indigo-900' : 'border-gray-200 text-gray-700 hover:bg-gray-50'}`}>
-              <span className={`text-xs font-semibold px-1.5 py-0.5 rounded ${ROLE_STYLE[r]}`}>{ROLE_LABEL[r]}</span>
-              <span className="text-xs text-gray-500 ml-2">{ROLE_DESC[r]}</span>
+              className={`w-full flex items-center gap-3 text-left px-3 py-2.5 rounded-md border transition-colors ${role === r ? 'bg-indigo-50 border-indigo-400 text-indigo-900' : 'border-gray-200 text-gray-700 hover:bg-gray-50'}`}>
+              <span className="w-24 shrink-0">
+                <span className={`inline-block text-xs font-semibold px-1.5 py-0.5 rounded ${ROLE_STYLE[r]}`}>{ROLE_LABEL[r]}</span>
+              </span>
+              <span className="text-xs text-gray-500">{ROLE_DESC[r]}</span>
             </button>
           ))}
         </div>
+        {role === 'admin' && user.role !== 'admin' && user.allowed_agent_ids != null && (
+          <div className="flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2.5">
+            <svg className="w-4 h-4 text-amber-500 shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m9-.75a9 9 0 1 1-18 0 9 9 0 0 1 18 0Zm-9 3.75h.008v.008H12v-.008Z" />
+            </svg>
+            <p className="text-xs text-amber-800">
+              This user is currently restricted to{' '}
+              <span className="font-semibold">{user.allowed_agent_ids.length} agent{user.allowed_agent_ids.length !== 1 ? 's' : ''}</span>.
+              Promoting to Admin grants <span className="font-semibold">tenant-wide access</span> - the restriction will be removed.
+            </p>
+          </div>
+        )}
+        {demotingAdmin && (
+          <div className="flex items-start gap-2 rounded-lg border border-indigo-100 bg-indigo-50 px-3 py-2.5">
+            <svg className="w-4 h-4 text-indigo-500 shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M9 12.75 11.25 15 15 9.75M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z" />
+            </svg>
+            <p className="text-xs text-indigo-800">
+              Admins have access to all agents. After saving, you can restrict{' '}
+              <span className="font-semibold">@{user.username}</span> to specific agents - the agent access editor opens next.
+            </p>
+          </div>
+        )}
         {error && <p className="text-sm text-red-600">{error}</p>}
         <div className="flex justify-end gap-3 pt-1">
           <button type="button" onClick={onClose} className="text-sm text-gray-600">Cancel</button>
@@ -541,12 +626,14 @@ function CredentialsModal({ creds, onClose }: { creds: { username: string; temp_
 }
 
 function TenantUserMenu({
-  onChangeRole, onResetPw, onDisable, onAgentAccess,
+  onChangeRole, onResetPw, onRevokeTokens, onDisable, onAgentAccess, showAgentAccess = true,
 }: {
   onChangeRole: () => void;
   onResetPw: () => void;
+  onRevokeTokens: () => void;
   onDisable: () => void;
   onAgentAccess: () => void;
+  showAgentAccess?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const [pos, setPos] = useState({ top: 0, right: 0 });
@@ -580,13 +667,19 @@ function TenantUserMenu({
               className="w-full text-left px-4 py-2 text-gray-700 hover:bg-gray-50 transition-colors">
               Change role
             </button>
-            <button onClick={() => { setOpen(false); onAgentAccess(); }}
-              className="w-full text-left px-4 py-2 text-gray-700 hover:bg-gray-50 transition-colors">
-              Agent access
-            </button>
+            {showAgentAccess && (
+              <button onClick={() => { setOpen(false); onAgentAccess(); }}
+                className="w-full text-left px-4 py-2 text-gray-700 hover:bg-gray-50 transition-colors">
+                Agent access
+              </button>
+            )}
             <button onClick={() => { setOpen(false); onResetPw(); }}
               className="w-full text-left px-4 py-2 text-gray-700 hover:bg-gray-50 transition-colors">
               Reset password
+            </button>
+            <button onClick={() => { setOpen(false); onRevokeTokens(); }}
+              className="w-full text-left px-4 py-2 text-gray-700 hover:bg-gray-50 transition-colors">
+              Revoke all tokens
             </button>
             <div className="my-1 border-t border-gray-100" />
             <button onClick={() => { setOpen(false); onDisable(); }}
@@ -733,6 +826,96 @@ function EnableUserModal({ user, onClose, onConfirm }: {
             className="flex items-center gap-2 bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-semibold px-4 py-2 rounded-lg disabled:opacity-40 transition-colors">
             {loading && <Spinner className="h-4 w-4" />}
             Enable user
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+function RevokeTokensModal({ user, onClose, onConfirm }: {
+  user: TenantUser;
+  onClose: () => void;
+  onConfirm: () => Promise<void>;
+}) {
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const submit = async () => {
+    setLoading(true); setError('');
+    try { await onConfirm(); }
+    catch (e) { setError((e as Error).message); setLoading(false); }
+  };
+
+  return (
+    <Modal title="Revoke all tokens" onClose={onClose}>
+      <div className="space-y-4">
+        <div className="bg-amber-50 border border-amber-200 rounded-lg p-4">
+          <p className="text-sm font-semibold text-amber-800 mb-1">Revoke API tokens</p>
+          <p className="text-sm text-amber-700">
+            All of <strong>@{user.username}</strong>'s API tokens stop working immediately - use this
+            when a token may be compromised. The account stays active: they keep console access and
+            can create new tokens. To block the account entirely, disable it instead.
+          </p>
+        </div>
+        {error && <p className="text-sm text-red-600">{error}</p>}
+        <div className="flex justify-end gap-3 pt-1">
+          <button onClick={onClose} className="text-sm text-gray-500 hover:text-gray-700 px-3 py-2">Cancel</button>
+          <button onClick={submit} disabled={loading}
+            className="flex items-center gap-2 bg-amber-600 hover:bg-amber-700 text-white text-sm font-semibold px-4 py-2 rounded-lg disabled:opacity-40 transition-colors">
+            {loading && <Spinner className="h-4 w-4" />}
+            Revoke all tokens
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+function DeleteUserModal({ user, onClose, onConfirm }: {
+  user: TenantUser;
+  onClose: () => void;
+  onConfirm: () => Promise<void>;
+}) {
+  const [confirm, setConfirm] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const submit = async () => {
+    setLoading(true); setError('');
+    try { await onConfirm(); }
+    catch (e) { setError((e as Error).message); setLoading(false); }
+  };
+
+  return (
+    <Modal title="Delete user" onClose={onClose}>
+      <div className="space-y-4">
+        <div className="bg-red-50 border border-red-200 rounded-lg p-4">
+          <p className="text-sm font-semibold text-red-800 mb-1">Permanently delete this user</p>
+          <p className="text-sm text-red-700">
+            <strong>@{user.username}</strong> and their API tokens will be permanently removed.
+            This can't be undone. Past audit log entries are kept for the record.
+          </p>
+        </div>
+        <div>
+          <label className="block text-sm text-gray-600 mb-1.5">
+            Type <span className="font-mono font-semibold text-gray-800">{user.username}</span> to confirm
+          </label>
+          <input
+            value={confirm}
+            onChange={e => setConfirm(e.target.value)}
+            placeholder={user.username}
+            autoFocus
+            className="w-full border border-gray-300 rounded-md px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-red-400 focus:border-transparent"
+          />
+        </div>
+        {error && <p className="text-sm text-red-600">{error}</p>}
+        <div className="flex justify-end gap-3 pt-1">
+          <button onClick={onClose} className="text-sm text-gray-500 hover:text-gray-700 px-3 py-2">Cancel</button>
+          <button onClick={submit} disabled={loading || confirm !== user.username}
+            className="flex items-center gap-2 bg-red-600 hover:bg-red-700 text-white text-sm font-semibold px-4 py-2 rounded-lg disabled:opacity-40 transition-colors">
+            {loading && <Spinner className="h-4 w-4" />}
+            Delete user
           </button>
         </div>
       </div>

@@ -145,6 +145,7 @@ describe('Access level badge', () => {
 describe('Sudo notice in CreateAgentModal', () => {
   async function openCreate() {
     vi.spyOn(api, 'listTenantAgents').mockResolvedValue({ agents: [] });
+    vi.spyOn(api, 'listAgentVersions').mockResolvedValue({ type: 'host', default: 'latest', versions: [] });
     render(<TenantAgentsPage config={CONFIG} />);
     fireEvent.click(await screen.findByRole('button', { name: /New agent/i }));
     await screen.findByRole('heading', { name: /new agent/i });
@@ -187,6 +188,52 @@ describe('Sudo notice in CreateAgentModal', () => {
     await waitFor(() => expect(extraGrantText()).toBeInTheDocument());
     await user.click(permissionCheckbox('Docker access'));
     await waitFor(() => expect(extraGrantText()).not.toBeInTheDocument());
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Version dropdown in CreateAgentModal
+// ---------------------------------------------------------------------------
+
+describe('Version dropdown in CreateAgentModal', () => {
+  async function openCreate(versions: string[]) {
+    vi.spyOn(api, 'listTenantAgents').mockResolvedValue({ agents: [] });
+    const spy = vi.spyOn(api, 'listAgentVersions')
+      .mockResolvedValue({ type: 'host', default: 'latest', versions });
+    render(<TenantAgentsPage config={CONFIG} />);
+    fireEvent.click(await screen.findByRole('button', { name: /New agent/i }));
+    await screen.findByRole('heading', { name: /new agent/i });
+    return spy;
+  }
+  const versionSelect = () =>
+    screen.getByRole('option', { name: /^Latest/ }).closest('select') as HTMLSelectElement;
+
+  it('defaults to Latest and lists discovered versions', async () => {
+    await openCreate(['0.9.4', '0.9.1']);
+    await waitFor(() => expect(screen.getByRole('option', { name: /Latest \(0\.9\.4\)/ })).toBeInTheDocument());
+    expect(screen.getByRole('option', { name: '0.9.4' })).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: '0.9.1' })).toBeInTheDocument();
+    expect(versionSelect().value).toBe('');  // Latest is the default selection
+  });
+
+  it('re-fetches versions when the agent type switches to k8s', async () => {
+    const spy = await openCreate(['0.9.4']);
+    await waitFor(() => expect(spy).toHaveBeenCalledWith(CONFIG.apiUrl, CONFIG.tenantToken, 'host'));
+    fireEvent.click(screen.getByRole('button', { name: /Kubernetes/i }));
+    await waitFor(() => expect(spy).toHaveBeenCalledWith(CONFIG.apiUrl, CONFIG.tenantToken, 'k8s'));
+  });
+
+  it('passes the picked version to createTenantAgent', async () => {
+    const user = userEvent.setup();
+    await openCreate(['0.9.4', '0.9.1']);
+    const create = vi.spyOn(api, 'createTenantAgent')
+      .mockResolvedValue({ agent_id: 'agent_new', commands: {} } as never);
+    await waitFor(() => expect(screen.getByRole('option', { name: '0.9.4' })).toBeInTheDocument());
+    await user.selectOptions(versionSelect(), '0.9.4');
+    await user.click(screen.getByRole('button', { name: /Create agent/i }));
+    await waitFor(() => expect(create).toHaveBeenCalled());
+    // version is the 8th positional arg of createTenantAgent
+    expect(create.mock.calls[0][7]).toBe('0.9.4');
   });
 });
 
@@ -319,5 +366,96 @@ describe('CapabilityCell hover tooltips', () => {
     renderPage([BASE_AGENT]);
     await screen.findByText('myhost.local');
     expect(screen.queryByText(/Capability status legend/i)).not.toBeInTheDocument();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Agent type: filter, n/a host-grants for k8s, drift indicator
+// ---------------------------------------------------------------------------
+
+describe('Agent type column and filter', () => {
+  const HOST_AGENT: Agent = { ...BASE_AGENT, agent_id: 'agent_host', hostname: 'host-1', type: 'host' };
+  const K8S_AGENT: Agent = {
+    ...BASE_AGENT, agent_id: 'agent_k8s', hostname: 'cluster-1', type: 'k8s',
+  };
+
+  it('filters the table to the selected type', async () => {
+    renderPage([HOST_AGENT, K8S_AGENT]);
+    await screen.findByText('host-1');
+    expect(screen.getByText('cluster-1')).toBeInTheDocument();
+
+    await userEvent.selectOptions(screen.getByDisplayValue('All types'), 'k8s');
+    expect(screen.getByText('cluster-1')).toBeInTheDocument();
+    expect(screen.queryByText('host-1')).not.toBeInTheDocument();
+  });
+
+  it('shows n/a for docker and service-mgmt on k8s agents', async () => {
+    renderPage([K8S_AGENT]);
+    await screen.findByText('cluster-1');
+    const table = document.querySelector('table')!;
+    expect(within(table).getAllByText('n/a').length).toBe(2);
+  });
+
+  it('shows a clickable drift indicator on k8s agents with permission drift', async () => {
+    renderPage([{ ...K8S_AGENT, k8s_permissions_drift: true }]);
+    await screen.findByText('cluster-1');
+    const btn = screen.getByRole('button', { name: /cluster rbac needs review/i });
+    expect(btn).toBeInTheDocument();
+    // Hover reason is rendered (tooltip text), and clicking opens the RBAC detail modal.
+    expect(screen.getByText(/needs acknowledgement/i)).toBeInTheDocument();
+    await userEvent.click(btn);
+    // "Claimed at" is a detail-modal-only field label, confirming the modal opened.
+    expect(await screen.findByText('Claimed at')).toBeInTheDocument();
+  });
+
+  // The RBAC snapshot must be present on the list item so the detail modal can show it
+  // (regression: it was previously omitted from GET /agents, so the section never rendered).
+  const K8S_AGENT_PERMS: Agent = {
+    ...K8S_AGENT, k8s_permissions_reported: true,
+    k8s_permissions: {
+      cluster_wide: [
+        { verbs: ['get', 'list', 'watch'], api_groups: ['apps'], resources: ['deployments', 'statefulsets'] },
+      ],
+      namespaces: [
+        { namespace: 'team-a', resource_rules: [{ verbs: ['get', 'update', 'patch'], api_groups: [''], resources: ['pods'] }] },
+      ],
+      incomplete: false,
+      hash: 'abc123',
+    },
+  };
+
+  it('shows the cluster RBAC rules in the detail modal for a k8s agent', async () => {
+    renderPage([K8S_AGENT_PERMS]);
+    await screen.findByText('cluster-1');
+    fireEvent.click(screen.getByText('cluster-1'));  // open the detail modal
+    expect(await screen.findByText('Cluster permissions')).toBeInTheDocument();
+    expect(screen.getByText(/Effective in every namespace/i)).toBeInTheDocument();
+    expect(screen.getByText(/deployments, statefulsets/)).toBeInTheDocument();
+    expect(screen.getByText(/team-a/)).toBeInTheDocument();
+  });
+
+  it('shows the Acknowledge action when a k8s agent has RBAC drift', async () => {
+    renderPage([{ ...K8S_AGENT_PERMS, k8s_permissions_drift: true }]);
+    await screen.findByText('cluster-1');
+    await userEvent.click(screen.getByRole('button', { name: /cluster rbac needs review/i }));
+    expect(await screen.findByText('Cluster permissions')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Acknowledge/i })).toBeInTheDocument();
+  });
+
+  it('shows n/a in the Cluster RBAC column for host agents', async () => {
+    renderPage([HOST_AGENT]);
+    await screen.findByText('host-1');
+    const table = document.querySelector('table')!;
+    // host: docker + service-mgmt show CapabilityCell, Cluster RBAC shows n/a
+    expect(within(table).getByText('n/a')).toBeInTheDocument();
+  });
+
+  it('renders running-as-root as n/a (with the two-axis note) in the k8s detail', async () => {
+    renderPage([K8S_AGENT]);
+    await screen.findByText('cluster-1');
+    fireEvent.click(screen.getByText('cluster-1'));  // open detail modal
+    expect(await screen.findByText('Running as root')).toBeInTheDocument();
+    expect(screen.getByTitle(/non-root/i)).toHaveTextContent('n/a');
+    expect(screen.getByText(/Reflects policy mode/i)).toBeInTheDocument();
   });
 });

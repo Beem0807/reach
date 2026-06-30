@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import type { TenantConfig, Job, Agent } from '../types';
 import { listTenantJobs, listTenantAgents } from '../api';
 import { Badge } from '../components/Badge';
@@ -7,6 +7,7 @@ import { DataTable } from '../components/DataTable';
 import { AgentInfo } from '../components/AgentInfo';
 import { Modal } from '../components/Modal';
 import { CopyButton } from '../components/CopyButton';
+import { RefreshButton } from '../components/RefreshButton';
 
 function fmtDate(iso?: string) {
   if (!iso) return '-';
@@ -34,14 +35,15 @@ export function TenantJobsPage({ config }: { config: TenantConfig }) {
   const [searchedAgentId, setSearchedAgentId] = useState('');
 
   // Load agents for the dropdown
-  useEffect(() => {
+  const loadAgents = useCallback(() => {
     listTenantAgents(apiUrl, tenantToken)
       .then(r => setAgents(r.agents ?? []))
       .catch(() => {});
   }, [apiUrl, tenantToken]);
+  useEffect(() => { loadAgents(); }, [loadAgents]);
 
-  // Load jobs when searchedAgentId changes
-  useEffect(() => {
+  // Load jobs for the current agent filter
+  const loadJobs = useCallback(() => {
     setLoading(true);
     setError('');
     const params: Record<string, string> = {};
@@ -51,6 +53,9 @@ export function TenantJobsPage({ config }: { config: TenantConfig }) {
       .catch(e => setError(e.message))
       .finally(() => setLoading(false));
   }, [apiUrl, tenantToken, searchedAgentId]);
+  useEffect(() => { loadJobs(); }, [loadJobs]);
+
+  const refresh = () => { loadJobs(); loadAgents(); };
 
   const handleSearch = () => setSearchedAgentId(agentFilter);
   const handleClear = () => { setAgentFilter(''); setSearchedAgentId(''); };
@@ -75,27 +80,30 @@ export function TenantJobsPage({ config }: { config: TenantConfig }) {
               <p className="text-sm text-emerald-200">Command execution history for your tenant</p>
             </div>
           </div>
-          {!loading && jobs.length > 0 && (
-            <div className="flex items-center gap-2">
-              {runningCount > 0 && (
-                <span className="inline-flex items-center gap-1.5 bg-blue-500/20 border border-blue-400/30 text-blue-200 text-xs font-semibold px-3 py-1.5 rounded-lg">
-                  <span className="w-1.5 h-1.5 rounded-full bg-blue-400 animate-pulse shrink-0" />
-                  {runningCount} running
-                </span>
-              )}
-              {completedCount > 0 && (
-                <span className="inline-flex items-center gap-1.5 bg-emerald-500/20 border border-emerald-400/30 text-emerald-200 text-xs font-semibold px-3 py-1.5 rounded-lg">
-                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-300 shrink-0" />
-                  {completedCount} completed
-                </span>
-              )}
-              {failedCount > 0 && (
-                <span className="inline-flex items-center gap-1.5 bg-red-500/20 border border-red-400/30 text-red-200 text-xs font-semibold px-3 py-1.5 rounded-lg">
-                  {failedCount} failed
-                </span>
-              )}
-            </div>
-          )}
+          <div className="flex items-center gap-2">
+            {!loading && jobs.length > 0 && (
+              <>
+                {runningCount > 0 && (
+                  <span className="inline-flex items-center gap-1.5 bg-blue-500/20 border border-blue-400/30 text-blue-200 text-xs font-semibold px-3 py-1.5 rounded-lg">
+                    <span className="w-1.5 h-1.5 rounded-full bg-blue-400 animate-pulse shrink-0" />
+                    {runningCount} running
+                  </span>
+                )}
+                {completedCount > 0 && (
+                  <span className="inline-flex items-center gap-1.5 bg-emerald-500/20 border border-emerald-400/30 text-emerald-200 text-xs font-semibold px-3 py-1.5 rounded-lg">
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-300 shrink-0" />
+                    {completedCount} completed
+                  </span>
+                )}
+                {failedCount > 0 && (
+                  <span className="inline-flex items-center gap-1.5 bg-red-500/20 border border-red-400/30 text-red-200 text-xs font-semibold px-3 py-1.5 rounded-lg">
+                    {failedCount} failed
+                  </span>
+                )}
+              </>
+            )}
+            <RefreshButton onClick={refresh} loading={loading} />
+          </div>
         </div>
       </div>
 

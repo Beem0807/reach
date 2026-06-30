@@ -28,6 +28,7 @@ def handle_get_agent(agent_id: str, raw_token: str) -> dict:
         "token_issued_at": agent.get("token_issued_at"),
         "last_heartbeat_at": agent.get("last_heartbeat_at"),
         "active_until": agent.get("active_until"),
+        "type": agent.get("type"),
         "mode": agent.get("mode", "wild"),
         "access_level": agent.get("access_level") or "open",
         "tags": agent.get("tags") or [],
@@ -35,6 +36,9 @@ def handle_get_agent(agent_id: str, raw_token: str) -> dict:
         "grant_docker": agent.get("grant_docker", False),
         "service_mgmt_detected": agent.get("service_mgmt_detected"),
         "docker_detected": agent.get("docker_detected"),
+        "k8s_permissions": agent.get("k8s_permissions"),
+        "k8s_permissions_acked": agent.get("k8s_permissions_acked"),
+        "k8s_permissions_drift": agent.get("k8s_permissions_drift", False),
     })
 
 

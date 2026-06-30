@@ -1,0 +1,34 @@
+Reach agent installed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+This deploys ONE logical Reach agent for the cluster:
+  - {{ .Values.replicaCount }} replica(s); a Lease ("{{ include "reach-agent.leaseName" . }}")
+    elects a single active leader, the rest stand by.
+  - The agent auto-detects Kubernetes and derives a stable cluster identity from
+    the kube-system namespace UID - no cluster-id configuration needed.
+  - It claims once, then shares/persists its token in the Secret
+    "{{ include "reach-agent.tokenSecretName" . }}".
+  - The backend tags this agent type=k8s automatically.
+
+Check it came up:
+
+  kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }}
+  kubectl -n {{ .Release.Namespace }} logs -l app.kubernetes.io/instance={{ .Release.Name }} --tail=50
+
+Who holds leadership:
+
+  kubectl -n {{ .Release.Namespace }} get lease {{ include "reach-agent.leaseName" . }}
+
+Then it should appear in your tenant console under Agents (type: k8s). Select it
+there and run commands against the cluster with `reach exec`, e.g. kubectl get pods -A.
+
+{{- if not .Values.reach.existingSecret }}
+{{- if not .Values.reach.apiUrl }}
+
+WARNING: reach.apiUrl/installToken were not set. Provide them via --set
+or a values file (or use reach.existingSecret).
+{{- end }}
+{{- end }}
+
+Security: the agent's cluster power = this ServiceAccount's RBAC. Start read-only
+(e.g. bind it to the built-in "view" ClusterRole) and run the agent in approved
+or readonly policy mode for production.

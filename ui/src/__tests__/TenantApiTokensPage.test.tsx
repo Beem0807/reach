@@ -59,13 +59,14 @@ describe('TenantApiTokensPage rendering', () => {
     expect(screen.getByText('CI runner')).toBeInTheDocument();
   });
 
-  it('does not show revoked tokens', async () => {
+  it('shows revoked tokens with a Revoked status', async () => {
     vi.spyOn(api, 'listApiTokens').mockResolvedValue({
       tokens: [...TOKENS, { ...TOKENS[0], token_id: 'tkid_3', name: 'Old key', status: 'REVOKED' }],
     });
     render(<TenantApiTokensPage config={CONFIG} />);
     await screen.findByText('My laptop');
-    expect(screen.queryByText('Old key')).not.toBeInTheDocument();
+    expect(screen.getByText('Old key')).toBeInTheDocument();
+    expect(screen.getAllByText(/revoked/i).length).toBeGreaterThan(0);
   });
 
   it('shows active count badge', async () => {

@@ -3,6 +3,7 @@ import type { AuditLog } from '../types';
 import { listPlatformAuditLogs, listTenantAuditLogs } from '../api';
 import { Spinner } from '../components/Spinner';
 import { DataTable } from '../components/DataTable';
+import { RefreshButton } from '../components/RefreshButton';
 
 function fmtDate(iso: string) {
   return new Date(iso).toLocaleString(undefined, {
@@ -18,6 +19,7 @@ const ACTION_COLOR: Record<string, string> = {
   'tenant.enabled': 'bg-emerald-50 text-emerald-700',
   'user.created': 'bg-indigo-50 text-indigo-700',
   'user.disabled': 'bg-red-50 text-red-700',
+  'user.deleted': 'bg-red-50 text-red-700',
   'user.login': 'bg-gray-100 text-gray-600',
   'user.login_failed': 'bg-red-50 text-red-700',
   'user.password_changed': 'bg-amber-50 text-amber-700',
@@ -170,7 +172,6 @@ export function AuditLogsPage({ mode, apiUrl, token }: Props) {
   const [error, setError] = useState('');
   const cursorRef = useRef<string | undefined>(undefined);
   const seqRef = useRef(0);
-  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const [filterAction, setFilterAction] = useState('');
   const [filterActor, setFilterActor] = useState('');
@@ -214,36 +215,20 @@ export function AuditLogsPage({ mode, apiUrl, token }: Props) {
 
   useEffect(() => { load(true); }, [load]);
 
-  function changeAction(v: string) {
-    setFilterAction(v);
-    filterRefs.current.action = v;
+  // Filters are staged in input state and only sent when the user hits Search
+  // (the default view is the recent page). Enter in any text box also searches.
+  function applyFilters() {
+    filterRefs.current = {
+      action: filterAction, actor: filterActor, resource: filterResource,
+      ip: filterIp, since: filterSince, until: filterUntil,
+    };
     load(true);
-  }
-
-  function changeSince(v: string) {
-    setFilterSince(v);
-    filterRefs.current.since = v;
-    load(true);
-  }
-
-  function changeUntil(v: string) {
-    setFilterUntil(v);
-    filterRefs.current.until = v;
-    load(true);
-  }
-
-  function changeText(key: 'actor' | 'resource' | 'ip', setter: (v: string) => void, v: string) {
-    setter(v);
-    filterRefs.current[key] = v;
-    if (debounceRef.current) clearTimeout(debounceRef.current);
-    debounceRef.current = setTimeout(() => load(true), 400);
   }
 
   function clearFilters() {
     setFilterAction(''); setFilterActor(''); setFilterResource(''); setFilterIp('');
     setFilterSince(''); setFilterUntil('');
     filterRefs.current = { action: '', actor: '', resource: '', ip: '', since: '', until: '' };
-    if (debounceRef.current) clearTimeout(debounceRef.current);
     load(true);
   }
 
@@ -251,18 +236,21 @@ export function AuditLogsPage({ mode, apiUrl, token }: Props) {
     <div className="min-h-full bg-slate-50">
       {/* Page header */}
       <div className="bg-gradient-to-r from-orange-700 to-orange-600 px-8 py-5">
-        <div className="flex items-center gap-4">
-          <div className="w-10 h-10 rounded-xl bg-white/10 ring-1 ring-white/20 flex items-center justify-center shrink-0">
-            <svg className="w-5 h-5 text-white" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" d="M9 12h3.75M9 15h3.75M9 18h3.75m3 .75H18a2.25 2.25 0 002.25-2.25V6.108c0-1.135-.845-2.098-1.976-2.192a48.424 48.424 0 00-1.123-.08m-5.801 0c-.065.21-.1.433-.1.664 0 .414.336.75.75.75h4.5a.75.75 0 00.75-.75 2.25 2.25 0 00-.1-.664m-5.8 0A2.251 2.251 0 0113.5 2.25H15c1.012 0 1.867.668 2.15 1.586m-5.8 0c-.376.023-.75.05-1.124.08C9.095 4.01 8.25 4.973 8.25 6.108V19.5a2.25 2.25 0 002.25 2.25h.75" />
-            </svg>
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-4">
+            <div className="w-10 h-10 rounded-xl bg-white/10 ring-1 ring-white/20 flex items-center justify-center shrink-0">
+              <svg className="w-5 h-5 text-white" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M9 12h3.75M9 15h3.75M9 18h3.75m3 .75H18a2.25 2.25 0 002.25-2.25V6.108c0-1.135-.845-2.098-1.976-2.192a48.424 48.424 0 00-1.123-.08m-5.801 0c-.065.21-.1.433-.1.664 0 .414.336.75.75.75h4.5a.75.75 0 00.75-.75 2.25 2.25 0 00-.1-.664m-5.8 0A2.251 2.251 0 0113.5 2.25H15c1.012 0 1.867.668 2.15 1.586m-5.8 0c-.376.023-.75.05-1.124.08C9.095 4.01 8.25 4.973 8.25 6.108V19.5a2.25 2.25 0 002.25 2.25h.75" />
+              </svg>
+            </div>
+            <div>
+              <h1 className="text-xl font-bold text-white">Audit Logs</h1>
+              <p className="text-sm text-orange-200">
+                {mode === 'platform' ? 'All platform-level events' : 'Events within your tenant'}
+              </p>
+            </div>
           </div>
-          <div>
-            <h1 className="text-xl font-bold text-white">Audit Logs</h1>
-            <p className="text-sm text-orange-200">
-              {mode === 'platform' ? 'All platform-level events' : 'Events within your tenant'}
-            </p>
-          </div>
+          <RefreshButton onClick={() => load(true)} loading={loading} />
         </div>
       </div>
 
@@ -275,7 +263,7 @@ export function AuditLogsPage({ mode, apiUrl, token }: Props) {
       <div className="flex flex-wrap items-center gap-2 mb-4">
         <select
           value={filterAction}
-          onChange={e => changeAction(e.target.value)}
+          onChange={e => setFilterAction(e.target.value)}
           className="text-sm border border-gray-300 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-orange-400 bg-white w-52"
         >
           <option value="">All actions</option>
@@ -285,19 +273,22 @@ export function AuditLogsPage({ mode, apiUrl, token }: Props) {
         </select>
         <input
           value={filterActor}
-          onChange={e => changeText('actor', setFilterActor, e.target.value)}
+          onChange={e => setFilterActor(e.target.value)}
+          onKeyDown={e => e.key === 'Enter' && applyFilters()}
           placeholder="Actor…"
           className="text-sm border border-gray-300 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-orange-400 w-36"
         />
         <input
           value={filterResource}
-          onChange={e => changeText('resource', setFilterResource, e.target.value)}
+          onChange={e => setFilterResource(e.target.value)}
+          onKeyDown={e => e.key === 'Enter' && applyFilters()}
           placeholder="Resource…"
           className="text-sm border border-gray-300 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-orange-400 w-44"
         />
         <input
           value={filterIp}
-          onChange={e => changeText('ip', setFilterIp, e.target.value)}
+          onChange={e => setFilterIp(e.target.value)}
+          onKeyDown={e => e.key === 'Enter' && applyFilters()}
           placeholder="IP…"
           className="text-sm border border-gray-300 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-orange-400 w-32"
         />
@@ -305,7 +296,7 @@ export function AuditLogsPage({ mode, apiUrl, token }: Props) {
           <input
             type="date"
             value={filterSince}
-            onChange={e => changeSince(e.target.value)}
+            onChange={e => setFilterSince(e.target.value)}
             title="From date"
             className="text-sm border border-gray-300 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-orange-400"
           />
@@ -313,11 +304,17 @@ export function AuditLogsPage({ mode, apiUrl, token }: Props) {
           <input
             type="date"
             value={filterUntil}
-            onChange={e => changeUntil(e.target.value)}
+            onChange={e => setFilterUntil(e.target.value)}
             title="To date"
             className="text-sm border border-gray-300 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-orange-400"
           />
         </div>
+        <button
+          onClick={applyFilters}
+          className="text-sm font-semibold px-3 py-1.5 rounded-lg bg-orange-600 text-white hover:bg-orange-700 transition-colors shadow-sm"
+        >
+          Search
+        </button>
         {activeFilters > 0 && (
           <button
             onClick={clearFilters}

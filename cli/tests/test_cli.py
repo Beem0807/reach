@@ -94,14 +94,24 @@ def _mock_cfg(profile=_PROFILE, profile_name="default", aliases=None):
 
 
 # ---------------------------------------------------------------------------
-# reach version
+# reach --version
 # ---------------------------------------------------------------------------
 
 class TestVersion:
-    def test_prints_version(self):
-        result = runner.invoke(app, ["version"])
+    def test_version_flag(self):
+        result = runner.invoke(app, ["--version"])
         assert result.exit_code == 0
         assert "reach" in result.output
+
+    def test_version_flag_short(self):
+        result = runner.invoke(app, ["-V"])
+        assert result.exit_code == 0
+        assert "reach" in result.output
+
+    def test_no_version_subcommand(self):
+        # `reach version` is intentionally not a subcommand - only the flag exists.
+        result = runner.invoke(app, ["version"])
+        assert result.exit_code != 0
 
 
 # ---------------------------------------------------------------------------
@@ -268,7 +278,9 @@ class TestAgentsList:
         mock_client = MagicMock()
         mock_client.list_agents.return_value = {"agents": [agent_with_tags]}
         with _mock_cfg(), patch("reach.main.ReachClient", return_value=mock_client):
-            result = runner.invoke(app, ["agents", "list"])
+            # Render at a normal terminal width so the full table (incl. the Tags
+            # column) is not truncated to the 80-col non-tty default.
+            result = runner.invoke(app, ["agents", "list"], env={"COLUMNS": "160"})
         assert "env:prod" in result.output
 
     def test_default_agent_marked(self):
@@ -681,7 +693,7 @@ class TestApprovals:
         # don't bleed in - always start with agent_a as the default.
         fresh = {"api_url": "https://api.example.com", "api_key": "tok_test", "default_agent_id": "agent_a"}
         with _mock_cfg(profile=fresh), patch("reach.main.ReachClient", return_value=mock_client):
-            result = runner.invoke(app, ["approvals"] + args)
+            result = runner.invoke(app, ["approvals", "list"] + args)
         return result, mock_client
 
     def test_default_shows_approved_list(self):
@@ -710,6 +722,25 @@ class TestApprovals:
         result, _ = self._run(["--pending", "--denied"])
         assert result.exit_code == 1
         assert "only one" in result.output
+
+    def test_host_approval_shows_command_column(self):
+        result, _ = self._run([])
+        assert "Command" in result.output
+        # host view has no structured-rule columns
+        assert "Namespace" not in result.output
+
+    def test_k8s_approval_renders_structured_rule_columns(self):
+        k8s = {
+            "k8s_rule": {"verb": "delete", "resource": "pods", "namespace": "team-a", "name": "*"},
+            "requester_name": "Alice", "status": "approved", "created_at": "2026-06-01T10:00:00Z",
+        }
+        result, _ = self._run([], approvals=[k8s])
+        assert result.exit_code == 0
+        for col in ("Verb", "Resource", "Namespace", "Name"):
+            assert col in result.output
+        assert "delete" in result.output and "team-a" in result.output
+        # k8s view does not use the flat Command column
+        assert "Kubernetes agent" in result.output
 
     def test_agent_flag_overrides_default(self):
         result, client = self._run(["--agent", "agent_b"])
@@ -741,7 +772,7 @@ class TestApprovals:
         mock_resp.text = "Unauthorized"
         mock_client.list_agent_approved.side_effect = req.HTTPError(response=mock_resp)
         with _mock_cfg(), patch("reach.main.ReachClient", return_value=mock_client):
-            result = runner.invoke(app, ["approvals"])
+            result = runner.invoke(app, ["approvals", "list"])
         assert result.exit_code == 1
         assert "401" in result.output
 

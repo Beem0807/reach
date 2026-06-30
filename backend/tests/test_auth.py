@@ -78,6 +78,21 @@ def test_verify_tenant_token_disabled_tenant_blocked():
     assert result is None
 
 
+def test_verify_tenant_token_disabled_user_blocked():
+    # A REVOKED user's existing session must stop working immediately.
+    from shared.auth import _verify_tenant_token
+    user = {"user_id": "u1", "tenant_id": "t1", "status": "REVOKED"}
+    tenant = {"tenant_id": "t1", "status": "ACTIVE"}
+    payload = {"sub": "u1", "tenant_id": "t1"}
+    with patch("shared.tenant_auth.verify_tenant_token", return_value=payload), \
+         patch("shared.store.users_repo") as umock, \
+         patch("shared.store.tenants_repo") as tmock:
+        umock.get.return_value = user
+        tmock.get.return_value = tenant
+        result = _verify_tenant_token("jwt_abc")
+    assert result is None
+
+
 def test_verify_tenant_token_invalid_jwt():
     from shared.auth import _verify_tenant_token
     with patch("shared.tenant_auth.verify_tenant_token", return_value=None):
@@ -97,29 +112,32 @@ def test_verify_tenant_token_user_not_found():
 
 
 def test_verify_agent_token_valid():
+    # Credential-only: the agent is resolved by hashing the bearer token and
+    # looking it up - no agent_id is supplied.
     from shared.auth import _verify_agent_token
     raw = "agent_secret"
     agent = {"agent_id": "agent_a", "agent_token_hash": _hmac_token(raw)}
     with patch("shared.store.agents_repo") as mock:
-        mock.get.return_value = agent
-        result = _verify_agent_token(raw, "agent_a")
+        mock.get_by_agent_token_hash.return_value = agent
+        result = _verify_agent_token(raw)
     assert result == agent
+    mock.get_by_agent_token_hash.assert_called_once_with(_hmac_token(raw))
 
 
 def test_verify_agent_token_wrong_hash():
     from shared.auth import _verify_agent_token
-    agent = {"agent_id": "agent_a", "agent_token_hash": _hmac_token("correct")}
     with patch("shared.store.agents_repo") as mock:
-        mock.get.return_value = agent
-        result = _verify_agent_token("wrong", "agent_a")
+        # No agent has this token hash -> lookup returns nothing.
+        mock.get_by_agent_token_hash.return_value = None
+        result = _verify_agent_token("wrong")
     assert result is None
 
 
 def test_verify_agent_token_agent_not_found():
     from shared.auth import _verify_agent_token
     with patch("shared.store.agents_repo") as mock:
-        mock.get.return_value = None
-        result = _verify_agent_token("tok", "agent_a")
+        mock.get_by_agent_token_hash.return_value = None
+        result = _verify_agent_token("tok")
     assert result is None
 
 
@@ -173,6 +191,21 @@ def test_verify_api_key_disabled_tenant_returns_none():
         atr.get_by_hash.return_value = stored
         ur.get.return_value = user
         tr.get.return_value = tenant
+        result = _verify_api_key("tok_secret")
+    assert result is None
+
+
+def test_verify_api_key_disabled_user_returns_none():
+    # A disabled (REVOKED) user's API token must stop authenticating.
+    from shared.auth import _verify_api_key
+    stored = {"token_id": "tkid_1", "user_id": "u1", "tenant_id": "t1", "status": "ACTIVE"}
+    user = {"user_id": "u1", "tenant_id": "t1", "status": "REVOKED"}
+    with patch("shared.store.api_tokens_repo") as atr, \
+         patch("shared.store.users_repo") as ur, \
+         patch("shared.store.tenants_repo") as tr:
+        atr.get_by_hash.return_value = stored
+        ur.get.return_value = user
+        tr.get.return_value = {"tenant_id": "t1", "status": "ACTIVE"}
         result = _verify_api_key("tok_secret")
     assert result is None
 

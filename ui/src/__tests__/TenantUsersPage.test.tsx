@@ -537,16 +537,24 @@ describe('TenantUsersPage table basics', () => {
     expect(await screen.findByText('No users')).toBeInTheDocument();
   });
 
-  it('shows TEMP PW badge for users requiring password reset', async () => {
-    renderPage([{ ...BASE_USER, must_reset_password: true }]);
+  it('shows TEMP PW badge for a user who has logged in but must reset', async () => {
+    renderPage([{ ...BASE_USER, must_reset_password: true, last_login_at: '2024-02-01T00:00:00Z' }]);
     await screen.findByText('Bob Smith');
     expect(screen.getByText('TEMP PW')).toBeInTheDocument();
   });
 
-  it('does not show TEMP PW badge when not required', async () => {
+  it('shows INVITED badge for a created user who has never logged in', async () => {
+    renderPage([{ ...BASE_USER, must_reset_password: true }]);  // no last_login_at
+    await screen.findByText('Bob Smith');
+    expect(screen.getByText('INVITED')).toBeInTheDocument();
+    expect(screen.queryByText('TEMP PW')).not.toBeInTheDocument();
+  });
+
+  it('shows no badge when a password reset is not required', async () => {
     renderPage([{ ...BASE_USER, must_reset_password: false }]);
     await screen.findByText('Bob Smith');
     expect(screen.queryByText('TEMP PW')).not.toBeInTheDocument();
+    expect(screen.queryByText('INVITED')).not.toBeInTheDocument();
   });
 
   it('hides Add user button for non-admins', async () => {

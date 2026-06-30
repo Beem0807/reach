@@ -7,7 +7,7 @@ AGENT_ID = "agent_a"
 JOB_ID = "job_1"
 FP = "fp_abc123"
 
-_AGENT = {"agent_id": AGENT_ID, "machine_fingerprint": FP}
+_AGENT = {"agent_id": AGENT_ID, "machine_fingerprint": FP, "status": "ACTIVE"}
 _JOB_RUNNING = {"job_id": JOB_ID, "agent_id": AGENT_ID, "status": "RUNNING"}
 _JOB_PENDING = {"job_id": JOB_ID, "agent_id": AGENT_ID, "status": "PENDING"}
 
@@ -36,10 +36,6 @@ class TestAgentJobResult:
         r = self._call({**_VALID_BODY, "status": "DONE"})
         assert r["statusCode"] == 400
 
-    def test_missing_agent_id(self):
-        r = self._call({**_VALID_BODY, "agent_id": ""})
-        assert r["statusCode"] == 400
-
     def test_missing_fingerprint(self):
         r = self._call({**_VALID_BODY, "machine_fingerprint": ""})
         assert r["statusCode"] == 400
@@ -51,6 +47,10 @@ class TestAgentJobResult:
 
     def test_fingerprint_mismatch(self):
         r = self._call({**_VALID_BODY, "machine_fingerprint": "wrong"})
+        assert r["statusCode"] == 403
+
+    def test_revoked_agent_cannot_report(self):
+        r = self._call(agent={**_AGENT, "status": "REVOKED"})
         assert r["statusCode"] == 403
 
     def test_job_not_found(self):

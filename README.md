@@ -7,27 +7,53 @@ reach exec -- hostname
 reach exec --agent prod -- docker ps
 ```
 
-> ### ⚠️ What Reach is — and isn't
+## ⚡ 2-minute Quick Start
+
+Zero to your **AI agent running commands on a real machine**, in three steps:
+
+**1. Start Reach.** One command runs the backend, creates your tenant and first agent, installs the CLI, and logs you in:
+
+```bash
+curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh | bash
+```
+
+**2. Install the agent** on the machine you want to control. The script prints a ready-to-paste command - a `curl … | sudo bash` for a host, or `helm install …` for Kubernetes.
+
+**3. Connect your AI tool.** `reach agent-init` writes the context file for Claude Code / Cursor and prints the MCP server config to drop in - now your agent can drive that machine through Reach:
+
+```bash
+reach agent-init
+```
+
+Now ask your AI agent to run something - or check it yourself:
+
+```bash
+reach exec -- hostname
+```
+
+That's it: your AI agent has **controlled, audited** access to the machine - no SSH, no VPN, no open ports. On AWS instead? Swap step 1 for `lambda-setup.sh`. Docker, Kubernetes, and production hardening are in [SELF_HOSTING.md](SELF_HOSTING.md).
+
+---
+
+> ### ⚠️ What Reach is - and isn't
 >
 > Reach gives AI agents **controlled, audited** command execution on machines you own. It is **not a sandbox for arbitrary untrusted commands.**
 >
-> - **`wild` mode can damage machines** — reboots, deletes, package installs all run. Use it only on personal/dev boxes where you're the sole user.
-> - **For production, use `approved` mode** — only commands you've allowlisted execute; everything else is blocked and queued for review.
-> - Reach is **not a security boundary against the machine's own owner/root** — whoever controls the host can read the agent's token.
+> - **`wild` mode can damage machines** - reboots, deletes, package installs all run. Use it only on personal/dev boxes where you're the sole user.
+> - **For production, use `approved` mode** - only commands you've allowlisted execute; everything else is blocked and queued for review.
+> - Reach is **not a security boundary against the machine's own owner/root** - whoever controls the host can read the agent's token.
 >
-> See **[SECURITY.md](SECURITY.md)** for the full threat model: exactly what Reach does and does not protect against.
+> See **[SECURITY.md](SECURITY.md)** for the full threat model, and **[POLICIES.md](POLICIES.md)** for how the modes work.
 
 ---
 
 ## What can I use this for?
 
-- **Let Claude Code inspect a remote dev box** - ask Claude to check what's running, tail logs, or diff configs without leaving your editor
+- **Let Claude Code inspect a remote dev box** - check what's running, tail logs, or diff configs without leaving your editor
 - **Debug Docker containers without SSH** - `reach exec -- docker ps`, `docker logs`, `docker inspect` from anywhere
-- **Check Kubernetes pods from an in-cluster agent** - install the agent inside the cluster, run `kubectl` commands through it from your laptop
-- **Run approved operational commands on production machines** - lock agents to `approved` mode so only allowlisted commands can execute; everything else is blocked and queued for admin review
+- **Check Kubernetes pods from an in-cluster agent** - install the agent inside the cluster, run `kubectl` through it from your laptop
+- **Run approved operational commands on production** - lock agents to `approved` mode so only allowlisted commands run; everything else is blocked and queued for review
 - **Give AI tools controlled machine access without exposing SSH** - no open ports, no VPN, no key distribution; the agent makes outbound HTTPS calls to your backend
-
----
 
 ## Why Reach?
 
@@ -35,46 +61,35 @@ AI agents can reason about your code, but they cannot safely operate your remote
 
 Reach gives any AI agent - Claude Code, Cursor, custom LLM workflows, or your own automation - a controlled command bridge to your machines without requiring SSH, VPNs, public IPs, or inbound firewall rules.
 
----
-
 ## How it works
 
-1. You deploy the Reach backend (Lambda or Docker).
-2. You open the admin console at `/ui`, create a tenant, add users, and register agents - the console gives you ready-to-paste CLI and agent install commands.
-3. You install the CLI on your local machine.
-4. You install the agent on each remote machine.
-5. The agent makes outbound HTTPS requests to your backend - no inbound ports needed.
-6. Commands are queued via the CLI, the agent picks them up and runs them, results come back.
+The agent never accepts inbound connections - it makes outbound HTTPS requests to your backend, polls for jobs, runs them, and posts results back.
 
-On the local and Lambda options, the interactive setup script does steps 1–3 for you (and even prints the agent install command for step 4) - see [Getting started](#getting-started).
+1. Deploy the backend (Local, Lambda, or Docker).
+2. Register agents in the console (or let the setup script do it) - you get ready-to-paste install commands.
+3. Install the CLI locally and the agent on each machine.
+4. Queue commands via the CLI or MCP; the agent picks them up and runs them; results come back.
 
----
+The local and Lambda setup scripts do 1-3 for you. See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design.
 
-## Admin console
+## Screenshots
 
-The backend ships with a built-in web UI served at `/ui`. It has two separate consoles - choose at the login screen:
-
-**Platform admin console** - log in with `ADMIN_PASSWORD`:
-- **Tenants** - create tenants, enable/disable them, see agent and user counts
-- **Users** - view and manage users across all tenants; reset passwords, change roles, disable accounts
-- **Audit logs** - platform-wide event log covering every action across all tenants
-
-**Tenant console** - log in with a username and password (created by the platform admin):
-- **Dashboard** - agent health bar, pending approvals, recent activity
-- **Agents** - register agents, set policy mode, manage tags, view detected capabilities (Docker, service management), request token rotation, full lifecycle management
-- **Users** - create users with roles (admin / operator / developer), set per-user agent access restrictions, reset passwords (admin role only)
-- **Jobs** - browse job history with full stdout/stderr output
-- **Approvals** - operators review and approve/deny write requests; developers see their own pending requests and can request approval
-- **API Tokens** - create and manage named API tokens for the CLI and MCP server
-- **Audit logs** - tenant-scoped event log (admin role)
-
-The CLI and MCP server authenticate with API tokens, not the admin password. Create tokens in the tenant console under **API Tokens**.
+<table>
+  <tr>
+    <td width="50%"><a href="docs/images/agents.png"><img src="docs/images/agents.png" alt="Agents list"></a><br><b>Agents</b> - every host and Kubernetes agent in your tenant, with status, policy mode, and cluster-RBAC drift at a glance.</td>
+    <td width="50%"><a href="docs/images/rbac-drift.png"><img src="docs/images/rbac-drift.png" alt="Cluster RBAC drift"></a><br><b>Cluster RBAC drift</b> - an agent's effective permissions diffed against the acknowledged baseline, down to the exact verbs.</td>
+  </tr>
+  <tr>
+    <td width="50%"><a href="docs/images/jobs.png"><img src="docs/images/jobs.png" alt="Jobs history"></a><br><b>Jobs</b> - command history across the fleet; writes in <code>approved</code> mode are gated (note the rejected <code>kubectl delete</code>).</td>
+    <td width="50%"><a href="docs/images/new-agent.png"><img src="docs/images/new-agent.png" alt="New agent"></a><br><b>New agent</b> - enroll a host or Kubernetes agent: pick a version, execution mode, and access.</td>
+  </tr>
+</table>
 
 ---
 
 ## Getting started
 
-Reach is self-hosted - you deploy your own backend. The fastest path is the **interactive setup script**: one command walks you through a few prompts and bootstraps everything end to end - it deploys the backend, provisions your workspace, admin user, API key, and first agent, then installs the CLI and logs you in. When it finishes, you can run `reach exec -- hostname` straight away. No console clicks, no manual token copying.
+Reach is self-hosted - you deploy your own backend. The fastest path is the **interactive setup script**: one command bootstraps everything end to end - it deploys the backend, provisions your tenant, tenant admin user, API token, and first agent, then installs the CLI and logs you in.
 
 **Local machine** (no cloud account needed):
 ```bash
@@ -86,9 +101,9 @@ curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh | bash
 curl -fsSL https://reach-releases.s3.amazonaws.com/lambda-setup.sh | bash
 ```
 
-Both scripts are interactive and safe to re-run - every prompt has a sensible default, and they double as management tools afterward (`--update`, `--down`, and more; see [SELF_HOSTING.md](SELF_HOSTING.md)).
+Both scripts are interactive, safe to re-run, and double as management tools (`--update`, `--down`, …).
 
-**Docker + PostgreSQL** (any cloud) - this path is a plain container, so you finish setup yourself in the admin console at `http://<your-api-url>/ui`:
+**Docker + PostgreSQL** (any cloud) - a plain container; finish setup in the console at `http://<your-api-url>/ui`:
 ```bash
 docker run -d -p 8000:8000 \
   -e TOKEN_PEPPER="<your-pepper>" \
@@ -98,341 +113,124 @@ docker run -d -p 8000:8000 \
   nabeemdev/reach:0.1.0
 ```
 
-See [SELF_HOSTING.md](SELF_HOSTING.md) for the full setup guide for all three options.
-
----
+Full setup guide for all three: [SELF_HOSTING.md](SELF_HOSTING.md).
 
 ## Install the CLI
 
-**With uv (recommended):**
+The setup script installs it for you. To install it yourself:
 
 ```bash
 uv tool install https://reach-releases.s3.amazonaws.com/cli/v0.1.0/reach-0.1.0-py3-none-any.whl
+reach login --api-url "<your-api-url>" --api-key "<your-api-token>"   # token from the tenant console → API Tokens
 ```
 
-**With pip:**
-
-```bash
-pip install https://reach-releases.s3.amazonaws.com/cli/v0.1.0/reach-0.1.0-py3-none-any.whl
-```
-
-Log in with an API token from the tenant console (**API Tokens → New token**):
-
-```bash
-reach login --api-url "<your-api-url>" --api-key "<your-api-token>"
-```
+Full command reference, profiles, aliases, and MCP setup: **[cli/README.md](cli/README.md)**.
 
 ---
 
 ## Add a machine
 
-In the tenant console, go to **Agents → New agent**, choose a policy mode, and click Create. Copy the install command shown and run it on the target machine.
+In the tenant console, go to **Agents → New agent**, choose the agent **type** (Host or Kubernetes) and a policy mode, and click Create. The console shows the install command for that type.
 
-The script auto-detects your OS and architecture - one command works on Linux and macOS (Intel and Apple Silicon).
+### Host
 
-- **Linux** - installs as a systemd service, starts on boot, survives reboots.
-- **macOS** - runs in the current terminal by default. Add `--background` to install as a LaunchDaemon under a dedicated system user (starts on boot, no terminal needed).
-
-**`--yes`** skips all optional prompts and applies their defaults. Without it, the script prompts interactively for each choice.
+Run the generated `curl … install.sh …` command on the machine. It auto-detects OS/architecture (Linux → systemd service; macOS → foreground or, with `--background`, a LaunchDaemon). The generated command already includes `--yes --force` and your API URL + install token. Optional grants:
 
 | Flag | What it does | Default with `--yes` |
 |---|---|---|
-| `--yes` | Non-interactive mode - skip all prompts | - |
-| `--grant-service-mgmt` | Grant `systemctl`/`launchctl` restart/start/stop via sudoers | ✅ on |
-| `--no-grant-service-mgmt` | Skip the sudoers grant | - |
-| `--grant-docker` | Add `reach-agent` to the `docker` group | ❌ off |
-| `--no-grant-docker` | Skip the docker group grant | - |
-| `--background` | macOS only - install as a LaunchDaemon (starts on boot) | - |
-| `--force` | Overwrite an existing agent config without prompting (used for reinstall) | - |
+| `--grant-service-mgmt` / `--no-grant-service-mgmt` | `systemctl`/`launchctl` start/stop/restart via sudoers | ✅ on |
+| `--grant-docker` / `--no-grant-docker` | Add `reach-agent` to the `docker` group | ❌ off |
+| `--background` | macOS only - install as a LaunchDaemon | - |
 
-Flags can be combined with `--yes` to override specific defaults, e.g. `--yes --grant-docker` or `--yes --no-grant-service-mgmt`. The install command generated by the console already includes `--yes --force`; the `--api-url`, `--agent-id`, and `--install-token` values are filled in for you.
+Uninstall: `curl -fsSL …/agent/latest/install.sh | sudo bash -s -- --uninstall`.
 
-Set it as your default:
+### Kubernetes
+
+Run the generated `helm install …` command (it fills in `reach.apiUrl` and a one-time `reach.installToken`; it also adds `--version` when you pick a specific version at create time, otherwise it installs the latest chart):
 
 ```bash
-reach agents use agent_xxx
+helm repo add reach https://reach-releases.s3.amazonaws.com/charts/reach-agent --force-update
+helm install reach-agent reach/reach-agent \
+  --namespace reach --create-namespace \
+  --set reach.apiUrl=https://reach.example.com \
+  --set reach.installToken=install_xxx
 ```
 
-**To decommission an agent:** open the tenant console, go to **Agents**, select the agent, and use the decommission action. To uninstall the binary from the machine first:
+Deploys the agent as a **Deployment** - **one logical agent per cluster** (replicas share a cluster-derived identity; a `Lease` elects one leader), so scaling replicas doesn't create more agents. What it can do is bounded by **Kubernetes RBAC** (the chart's `clusterAccess`, default read-only `view`), which the agent self-reports for you to **acknowledge** in the console (later changes surface as **drift**). Uninstall: `helm uninstall reach-agent -n reach`.
 
-```bash
-curl -fsSL https://reach-releases.s3.amazonaws.com/agent/latest/install.sh | sudo bash -s -- --uninstall
-```
+Full chart values, RBAC, and execution model: [deploy/helm/reach-agent](deploy/helm/reach-agent) and [agent/README.md](agent/README.md).
+
+### After install
+
+Set an agent as your CLI default: `reach agents use <id|alias>`. Decommission any agent from the tenant console → **Agents**.
 
 ---
 
-## Usage
+## Admin console
 
-```bash
-reach agents list                           # list all your machines
-reach agents list --tag env:prod            # filter by tag
-reach status                                # show default agent status
-reach exec -- <command>                     # run on default machine
-reach exec --agent <id|alias> -- <command>  # run on specific machine
-reach exec --no-wait -- <command>           # fire-and-forget; check with `reach job <id>`
-```
+The backend ships a web UI at `/ui` with two consoles (choose at login):
 
-### Aliases
+- **Platform admin** (log in with `ADMIN_PASSWORD`) - cross-tenant administration: tenants, users across tenants, and platform-wide audit logs. It does **not** operate tenant agents or approvals.
+- **Tenant console** (username + password) - per-tenant operations: dashboard, agents, users (roles + per-user agent access), jobs, approvals, API tokens, and a tenant-scoped audit log.
 
-Give your machines friendly names:
+The CLI and MCP server authenticate with **API tokens** (created under **API Tokens**), not the admin password.
 
-```bash
-reach alias set prod agent_xxx
-reach alias set staging agent_yyy
-
-reach exec --agent prod -- docker ps
-reach exec --agent staging -- uptime
-reach alias list
-```
-
-### Multiple tenants (profiles)
-
-If you access more than one reach deployment (e.g. a home server and a work server), use profiles to hold multiple credentials:
-
-```bash
-reach login --profile home --api-url "<home-url>" --api-key "<home-token>"
-reach login --profile work --api-url "<work-url>" --api-key "<work-token>"
-
-reach profile list       # see all profiles, active one is marked
-reach profile use home   # switch to home deployment
-reach profile use work   # switch to work deployment
-```
-
-Each profile has its own API URL, token, default agent, and aliases. All commands (`exec`, `agents list`, `history`, etc.) operate against the active profile.
-
----
-
-## Admin operations
-
-Everything in this section is available through the admin console at `/ui`. The platform admin console covers cross-tenant operations (agents, users, audit logs). The tenant console covers per-tenant operations (agents, users, jobs, approvals, API tokens).
-
-| Operation | Where in the console |
+| Operation | Where |
 |---|---|
-| View all agents for a tenant | Tenant console → Agents |
-| View job history | Tenant console → Jobs |
-| Restrict a user to specific agents | Tenant console → Users → [user] → Agent Access |
+| View agents / job history | Tenant console → Agents / Jobs |
 | Change an agent's policy mode | Tenant console → Agents → [agent] → Policy |
 | Manage approvals | Tenant console → Approvals |
-| Platform-wide audit log | Platform admin → Audit Logs |
-| Tenant-scoped audit log | Tenant console → Audit Logs |
+| Restrict a user to specific agents | Tenant console → Users → [user] → Agent Access |
+| Audit log (tenant / platform) | Tenant console → Audit Logs / Platform admin → Audit Logs |
 
-See [API.md](API.md) for the full endpoint reference if you need to automate any of these operations.
+Automating any of this? See [API.md](API.md).
 
 ---
 
-## AI agent integration
-
-Run `reach agent-init` inside any project to generate context for your AI agent. It fetches your machines, prompts for a role for each, and writes a file that tells the agent to use `reach exec` automatically.
+## Using the CLI
 
 ```bash
-reach agent-init
+reach agents list                           # your machines, with mode + access level
+reach exec -- <command>                     # run on the default machine
+reach exec --agent <id|alias> -- <command>  # run on a specific machine
+reach exec --no-wait -- <command>           # fire-and-forget; check with `reach job <id>`
+reach history                               # recent jobs
 ```
 
-```
-Select your agent:
-  1  claude        - writes CLAUDE.md
-  2  cursor        - writes .cursor/rules/reach.mdc
-  3  system-prompt - prints to stdout, paste anywhere
-```
+Aliases, multi-deployment profiles, approvals, and the full command reference are in **[cli/README.md](cli/README.md)**.
 
-Or pass `--for` directly to skip the prompt:
-
-```bash
-reach agent-init --for claude        # CLAUDE.md for Claude Code
-reach agent-init --for cursor        # .cursor/rules/reach.mdc for Cursor
-reach agent-init --for system-prompt # paste into any agent or API call
-```
+**AI agents & MCP.** `reach agent-init` writes context for Claude Code / Cursor and prints the MCP config so your AI tool can call Reach as tools. The MCP server (`reach mcp`) is launched by your MCP client - add `{"mcpServers":{"reach":{"command":"reach","args":["mcp"]}}}` to its settings. See [cli/README.md](cli/README.md#mcp-server).
 
 ---
 
-## MCP server
+## Policy modes
 
-Reach ships a native [MCP](https://modelcontextprotocol.io) server. Any MCP-compatible client (Claude Code, Claude Desktop, Cursor, or your own tooling) can call reach tools directly - no CLI syntax, no output parsing.
+Each agent runs in one of three modes (set in the tenant console or via the API):
 
-The client launches `reach mcp` as a subprocess and manages its lifecycle automatically. You don't run anything manually.
+- **`wild`** - runs almost anything; only a catastrophic/abuse set (`rm -rf /`, `mkfs`, privileged escapes, reverse shells) is always blocked. For personal/dev boxes.
+- **`readonly`** - only reads run; any write/delete/restart/install is blocked.
+- **`approved`** - reads run; writes run only if pre-approved for that agent (blocked and queued otherwise).
 
-**Configure your MCP client** - the config block is the same for all clients:
-
-```json
-{
-  "mcpServers": {
-    "reach": {
-      "command": "reach",
-      "args": ["mcp"]
-    }
-  }
-}
-```
-
-Common locations:
-- **Claude Code** - `.claude/settings.json` (project) or `~/.claude.json` (global)
-- **Claude Desktop** - `~/Library/Application Support/Claude/claude_desktop_config.json`
-- **Cursor** - `.cursor/mcp.json`
-
-The MCP server reads from `~/.reach/config.json` - make sure you've run `reach login` first.
-
-**Available MCP tools:**
-
-| Tool | Description |
-|---|---|
-| `get_context` | **Call first.** Returns your identity, default agent (with mode and access_level), and aliases - full session orientation in one call |
-| `whoami` | Show current authenticated user and tenant |
-| `list_agents` | List all registered machines with mode and access level |
-| `get_agent(agent_id)` | Get status of a specific machine |
-| `exec_command(command, agent_id?, timeout?)` | Run a command and wait for the result |
-| `get_job(job_id)` | Fetch result of a previously submitted job |
-| `list_history(agent_id?, limit?)` | Browse recent job history |
-| `list_approved_commands(agent_id?)` | List pre-approved write commands for an agent (approved mode) |
-| `list_pending_approvals(agent_id?)` | List your blocked commands awaiting admin approval |
-
----
-
-## Policies
-
-Each agent runs in one of three modes, set in the tenant console (or via the API). The mode determines how commands are evaluated before execution.
-
-### Wild mode
-
-Wild mode is intentionally permissive. It is designed for personal machines, dev environments, break-glass debugging, and power users who want full command flexibility.
-
-Reach still rejects a small set of commands in wild mode - those that are catastrophic or abuse-like regardless of context: raw disk wipes (`mkfs`, `dd if=`, `wipefs`), recursive deletion of the root filesystem (`rm -rf /`), privileged container and host escapes (`docker run --privileged`, `nsenter --target 1`, `chroot /`), credential exfiltration (`env | curl`), fork bombs, and reverse shells (`/dev/tcp/`, `nc -e`, `socat exec:`). Everything else runs, including reboots, shutdowns, IaC destroys, cloud resource deletions, and package installs.
-
-For production machines, use **Approved** mode and explicitly allowlist the write operations Reach is allowed to perform.
-
-### Readonly mode
-
-Readonly mode blocks any command that writes, deletes, installs, or mutates system state. This includes: file writes and deletes, process kills, service restarts, reboots and shutdowns, package managers, container mutations (`docker run/stop/rm`), firewall changes, user management, IaC destroys (`terraform destroy`, `pulumi destroy`), and cloud destructive operations (`aws ec2 terminate-instances`, `gcloud instances delete`).
-
-Read-only commands (`ls`, `cat`, `git log`, `docker ps`, `kubectl get`, `aws describe-*`, `journalctl`) always pass.
-
-Shell-chained commands are checked segment by segment - `ls && rm file.txt` is blocked even though the `ls` segment is safe.
-
-On Linux, readonly mode enforcement is backed by Landlock (a kernel sandbox) on the agent. Commands run in a sandboxed subprocess that cannot write outside `/tmp`, providing defence-in-depth beyond the pattern-based check.
-
-On macOS, Landlock is not available. Readonly mode relies entirely on the server-side blocked-command list - the server rejects blocked writes before they are queued, so the agent never receives them.
-
-### Approved mode
-
-Reads are always allowed - you do not need to add read commands to any list. Write and destructive operations (anything blocked in readonly mode) are only permitted if the exact command has been pre-approved for this agent.
-
-**How it works:**
-
-1. When a command is submitted, the server classifies it as a write or read (`is_write: true/false`) using the same pattern list as readonly mode, and queues it to the agent.
-2. The agent checks whether the command matches the approved list.
-   - **Approved match** - runs the command normally (write explicitly permitted).
-   - **Not approved, Linux** - runs under Landlock. If Landlock blocks the write, the agent returns a structured error and the backend creates a pending approval record.
-   - **Not approved, macOS** - no Landlock available. The agent uses the server-supplied `is_write` flag: if the command is a write and not approved, it is refused immediately and a pending approval record is created. Read commands always run.
-3. An operator or admin reviews pending approvals and approves or denies them in the tenant console under **Approvals**.
-4. Once approved, the command prefix is included in the approved list on the next sync and runs without restriction.
-
-The match is prefix-based with word boundary: approving `docker logs` permits `docker logs myapp --tail 100` but not `docker rm myapp`.
-
-**Viewing approvals from the CLI:**
-
-```bash
-reach approvals                      # effective approved commands (default agent)
-reach approvals --agent prod         # effective approved commands for a specific agent
-reach approvals --pending            # your pending requests (default agent)
-reach approvals --denied             # your denied requests (default agent)
-reach approvals --expired            # your expired approvals (default agent)
-reach approvals --agent prod --pending  # any of the above for a specific agent
-```
-
-`--pending`, `--denied`, and `--expired` show only your own records. Expired entries are visually marked so you can see why a command stopped working.
-
-### Access level
-
-Each agent has an `access_level` label that combines its policy mode with whether the agent process is running as root. This is shown in `reach agents list` and `reach status`.
-
-| access_level | Mode | Running as root |
-|---|---|---|
-| `open` | wild | yes |
-| `elevated` | wild (non-root) or approved (root) | - |
-| `managed` | approved (non-root) or readonly (root) | - |
-| `restricted` | readonly | no |
-
-These are factual descriptors, not risk scores. An `open` agent in a personal dev environment is intentional.
-
----
+Host and Kubernetes agents share these modes but enforce them differently - agent-side Landlock vs backend-side `kubectl`-verb gating - and k8s approvals are structured `verb/resource/namespace/name` rules. Full detail (enforcement model, structured rules, `access_level`): **[POLICIES.md](POLICIES.md)**.
 
 ## Safety
 
-Reach is designed for controlled command execution:
+Built for controlled execution: no inbound ports, no SSH, outbound-HTTPS-only agents, a default 60s command timeout, and a full audit trail.
 
-- No inbound ports are opened
-- No SSH server is required
-- Agents only make outbound HTTPS requests
-- Commands have a default timeout of 60 seconds
-- Job history is recorded for 7 days
-- Policy modes are configured server-side in the tenant console
+- **Always blocked (any mode):** catastrophic filesystem destruction, fork bombs, privileged container/host escapes, credential exfiltration, and reverse shells - rejected server-side before the agent sees them.
+- **Blocked in `readonly` / unapproved in `approved`:** writes, deletes, service restarts, package installs, container mutations, IaC/cloud destroys, privilege escalation.
+- **Kubernetes agents** are bounded differently - no shell, a `kubectl` + read-filters allowlist, no local-file reads, backend verb-gating, and cluster RBAC as the unbypassable floor.
 
-**Always blocked - regardless of mode:**
-
-Catastrophic filesystem destruction (`rm -rf /`, `mkfs`, `dd if=`, `wipefs`), fork bombs, privileged container and host escapes (`docker run --privileged`, `nsenter --target 1`), credential exfiltration (`env | curl`), and reverse shells are rejected by the server before the agent ever sees them.
-
-**Blocked in readonly mode and unapproved writes in approved mode:**
-
-File writes and deletes, process kills, service restarts, reboots and shutdowns, package installs, container mutations (`docker run/stop/rm`), IaC destroys, cloud destructive operations, firewall changes, user management, and privilege escalation (`sudo`).
-
-See [SELF_HOSTING.md](SELF_HOSTING.md) for the full blocked command reference.
-
----
+Blocked-command reference: [SELF_HOSTING.md](SELF_HOSTING.md). Threat model: [SECURITY.md](SECURITY.md). Policy detail: [POLICIES.md](POLICIES.md).
 
 ## Production usage
 
-For production machines, use the **Approved** policy mode - set it in the tenant console when creating the agent, or change it afterward under **Agents → [agent] → Policy**.
+Use **`approved`** mode on production machines (set it when creating the agent, or under **Agents → [agent] → Policy**). `wild` is for personal machines, dev, and break-glass - not shared production.
 
-Wild mode is for personal machines, dev environments, and break-glass access. Do not use it on shared production machines.
+## Observability
 
----
-
-## Commands
-
-| Command | Description |
-|---|---|
-| **Auth & setup** | |
-| `reach login --api-url <url> --api-key <token>` | Store credentials (saves to `default` profile) |
-| `reach login --api-url <url> --api-key <token> --profile <name>` | Store credentials under a named profile |
-| `reach profile list` | List all profiles |
-| `reach profile use <name>` | Switch active profile |
-| `reach profile rename <old> <new>` | Rename a profile |
-| `reach profile delete <name>` | Delete a profile (cannot delete the active profile) |
-| `reach config show` | Show active profile, API URL, default agent, and aliases |
-| `reach whoami` | Show current user identity (user_id, tenant_id, name) |
-| `reach version` | Show CLI version |
-| `reach man` | Show full command reference in the terminal |
-| **Agents** | |
-| `reach agents list` | List all machines with mode and access level |
-| `reach agents list --tag <key:value>` | Filter machines by tag |
-| `reach agents use <id\|alias>` | Set default machine |
-| `reach status` | Show default machine status and access level |
-| `reach alias set <name> <id>` | Create alias |
-| `reach alias list` | List aliases |
-| `reach alias remove <name>` | Remove alias |
-| **Execution** | |
-| `reach exec -- <cmd>` | Run command on default machine |
-| `reach exec --agent <id\|alias> -- <cmd>` | Run command on specific machine |
-| `reach exec --timeout <s> -- <cmd>` | Override wait timeout (default 60s) |
-| `reach exec --no-wait -- <cmd>` | Submit job and exit immediately; use `reach job <id>` to check later |
-| `reach job <job_id>` | Re-view stdout/stderr of a past job |
-| `reach history` | Show your recent jobs |
-| `reach history --agent <id\|alias>` | Filter your history by machine |
-| `reach history --limit <n>` | Show up to N jobs (max 100, default 20) |
-| `reach history --cursor <cursor>` | Fetch the next page (cursor from previous response) |
-| **Approvals** | |
-| `reach approvals` | Show effective approved commands for the default agent |
-| `reach approvals --agent <id\|alias>` | Show effective approved commands for a specific agent |
-| `reach approvals --pending` | Your pending requests for the default agent |
-| `reach approvals --denied` | Your denied requests for the default agent |
-| `reach approvals --expired` | Your expired approvals for the default agent |
-| `reach approvals --agent <id\|alias> --pending` | Any of the above for a specific agent |
-| **AI integration** | |
-| `reach agent-init` | Interactively generate context for your AI agent |
-| `reach agent-init --for claude` | Write CLAUDE.md for Claude Code |
-| `reach agent-init --for cursor` | Write .cursor/rules/reach.mdc for Cursor |
-| `reach agent-init --for system-prompt` | Print system prompt snippet to stdout |
-| `reach agent-init --for mcp` | Print MCP server config to stdout |
-| `reach mcp` | Start the MCP server (stdio transport for any MCP-compatible client) |
+- **Audit log** (built-in) - every action recorded: logins, agent lifecycle (create/revoke/rotate/unreachable/recover), policy changes, approvals. Tenant-scoped or platform-wide, in the console or via the API (`GET /tenant/audit-logs`).
+- **Prometheus metrics** (opt-in, Kubernetes agents) - `--set metrics.enabled=true` exposes `/metrics` (job/sync/blocked counters, leadership) with a `ServiceMonitor` and a `NetworkPolicy` locking the port to your Prometheus namespace. Off by default. See [agent/README.md → Metrics](agent/README.md#metrics-opt-in).
 
 ---
 
@@ -440,10 +238,14 @@ Wild mode is for personal machines, dev environments, and break-glass access. Do
 
 | Doc | What's in it |
 |---|---|
-| [SELF_HOSTING.md](SELF_HOSTING.md) | Deploy and operate your own backend (Local, AWS Lambda, Docker), first-time setup, agent lifecycle, sudo/docker grants, policy and approval management |
-| [API.md](API.md) | Complete HTTP endpoint reference - platform admin, tenant admin, user/CLI, and agent endpoints, plus rate limits, pagination, and audit-log actions |
-| [ARCHITECTURE.md](ARCHITECTURE.md) | How the pieces fit together - command flow, token model, storage split, policy enforcement, approvals, multi-tenancy |
-| [SECURITY.md](SECURITY.md) | Threat model, token storage and rotation, revoking access, audit history, and production hardening |
+| [cli/README.md](cli/README.md) | The `reach` CLI and `reach-mcp` server - install, commands, profiles, aliases, MCP setup |
+| [POLICIES.md](POLICIES.md) | Policy modes (wild/readonly/approved), approvals, host vs Kubernetes enforcement, structured k8s rules, `access_level` |
+| [agent/README.md](agent/README.md) | How the agent works - host vs Kubernetes, credential-only identity, the poll loop, execution models, leader election, RBAC self-review, metrics |
+| [deploy/helm/reach-agent](deploy/helm/reach-agent) | Kubernetes agent Helm chart - install, RBAC (`clusterAccess`), execution allowlist, and all values |
+| [SELF_HOSTING.md](SELF_HOSTING.md) | Deploy and operate your own backend (Local, AWS Lambda, Docker), setup, agent lifecycle, grants, blocked-command reference |
+| [API.md](API.md) | Complete HTTP endpoint reference, rate limits, pagination, audit-log actions |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | How the pieces fit - command flow, token model, storage split, policy enforcement, approvals, multi-tenancy |
+| [SECURITY.md](SECURITY.md) | Threat model, token storage and rotation, revoking access, audit history, production hardening |
 
 ---
 

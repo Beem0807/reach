@@ -5,6 +5,7 @@ Or directly: DATABASE_URL=... TOKEN_PEPPER=localtest python seed.py
 """
 import hashlib
 import hmac
+import json
 import os
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -47,13 +48,88 @@ def _raw_api_token() -> str:
 
 
 TENANTS = [
-    {"tenant_id": _tenant_id("acme"),   "name": "Acme Corp",     "created_at": _iso(30)},
-    {"tenant_id": _tenant_id("globex"), "name": "Globex Systems", "created_at": _iso(14)},
-    {"tenant_id": _tenant_id("initech"),"name": "Initech",        "created_at": _iso(3)},
+    {"tenant_id": _tenant_id("alpha"), "name": "alpha", "status": "ACTIVE",   "created_at": _iso(30)},
+    {"tenant_id": _tenant_id("beta"),  "name": "beta",  "status": "ACTIVE",   "created_at": _iso(14)},
+    {"tenant_id": _tenant_id("gamma"), "name": "gamma", "status": "ACTIVE",   "created_at": _iso(3)},
+    # DISABLED tenant - login is blocked; visible/manageable only in the platform admin console.
+    {"tenant_id": _tenant_id("delta"), "name": "delta", "status": "DISABLED", "created_at": _iso(7)},
 ]
+
+def _k8s_effective_rbac() -> dict:
+    """A realistic SelfSubjectRulesReview snapshot the k8s agent would report:
+    read-only cluster-wide plus write in one namespace. `hash` drives drift."""
+    perms: dict = {
+        "cluster_wide": [
+            {"verbs": ["get", "list", "watch"], "api_groups": [""],
+             "resources": ["pods", "services", "configmaps", "namespaces", "nodes"]},
+            {"verbs": ["get", "list", "watch"], "api_groups": ["apps"],
+             "resources": ["deployments", "statefulsets", "daemonsets"]},
+        ],
+        "namespaces": [
+            {"namespace": "team-a", "resource_rules": [
+                {"verbs": ["get", "list", "watch", "update", "patch"],
+                 "api_groups": ["apps"], "resources": ["deployments"]},
+            ]},
+            {"namespace": "team-b", "resource_rules": [
+                {"verbs": ["get", "list", "watch"],
+                 "api_groups": [""], "resources": ["pods", "configmaps"]},
+            ]},
+            {"namespace": "monitoring", "resource_rules": [
+                {"verbs": ["get", "list", "watch"],
+                 "api_groups": [""], "resources": ["pods", "services"]},
+            ]},
+        ],
+    }
+    perms["hash"] = "sha256:" + hashlib.sha256(
+        json.dumps(perms, sort_keys=True).encode()).hexdigest()[:32]
+    return perms
+
+
+def _k8s_effective_rbac_drifted() -> dict:
+    """The same agent AFTER its RBAC changed since it was acknowledged, so the console
+    shows a concrete drift diff vs the acknowledged baseline (`_k8s_effective_rbac`),
+    covering both cluster-wide and per-namespace changes:
+
+    - cluster-wide: apps workloads gained create/delete (verb change); new secrets read (added)
+    - namespaces:   team-a gained delete (verb change); team-b removed; team-c added;
+                    monitoring gained the `endpoints` resource (resource change -> old
+                    rule removed + new rule added, since resources are part of a rule's
+                    identity).
+    """
+    perms: dict = {
+        "cluster_wide": [
+            {"verbs": ["get", "list", "watch"], "api_groups": [""],
+             "resources": ["pods", "services", "configmaps", "namespaces", "nodes"]},
+            {"verbs": ["get", "list", "watch", "create", "delete"], "api_groups": ["apps"],
+             "resources": ["deployments", "statefulsets", "daemonsets"]},
+            {"verbs": ["get", "list"], "api_groups": [""], "resources": ["secrets"]},
+        ],
+        "namespaces": [
+            {"namespace": "team-a", "resource_rules": [
+                {"verbs": ["get", "list", "watch", "update", "patch", "delete"],
+                 "api_groups": ["apps"], "resources": ["deployments"]},
+            ]},
+            # team-b removed
+            {"namespace": "monitoring", "resource_rules": [
+                # resource-level change: gained `endpoints` (same verbs)
+                {"verbs": ["get", "list", "watch"],
+                 "api_groups": [""], "resources": ["pods", "services", "endpoints"]},
+            ]},
+            {"namespace": "team-c", "resource_rules": [
+                {"verbs": ["get", "list", "create"],
+                 "api_groups": [""], "resources": ["secrets"]},
+            ]},
+        ],
+    }
+    perms["hash"] = "sha256:" + hashlib.sha256(
+        json.dumps(perms, sort_keys=True).encode()).hexdigest()[:32]
+    return perms
+
 
 def make_agents(tenant_id: str) -> list[dict]:
     install_token = _raw_install_token()
+    k8s_perms = _k8s_effective_rbac()
+    k8s_perms_drifted = _k8s_effective_rbac_drifted()
     return [
         # 1. ACTIVE - approved mode, user (not root), all fields populated, fleet tagged
         {
@@ -73,10 +149,14 @@ def make_agents(tenant_id: str) -> list[dict]:
             "active_until":            _ts(-90 / 86400),# 90s from now
             "token_issued_at":         _iso(20),
             "rotation_requested":      False,
-            "type":                    "manual",
+            "type":                    "host",
             "fleet_id":                f"fleet_{tenant_id}_prod",
             "tags":                    ["env:prod", "role:web", "region:us-east-1"],
             "created_at":              _iso(21),
+            "grant_service_mgmt":      True,     # granted + detected: fully capable
+            "grant_docker":            True,
+            "service_mgmt_detected":   True,
+            "docker_detected":         True,
         },
         # 2. ACTIVE - wild mode, running as root, rotation requested, no fleet
         {
@@ -96,10 +176,14 @@ def make_agents(tenant_id: str) -> list[dict]:
             "active_until":            _ts(-90 / 86400),
             "token_issued_at":         _iso(5),
             "rotation_requested":      True,             # token rotation pending
-            "type":                    "manual",
+            "type":                    "host",
             "fleet_id":                None,
             "tags":                    ["env:dev", "role:worker"],
             "created_at":              _iso(6),
+            "grant_service_mgmt":      False,    # detected but NOT granted (capability present, sudoers not added)
+            "grant_docker":            False,
+            "service_mgmt_detected":   True,
+            "docker_detected":         True,
         },
         # 3. INACTIVE - readonly mode, missed heartbeat, fleet member
         {
@@ -119,10 +203,14 @@ def make_agents(tenant_id: str) -> list[dict]:
             "active_until":            _ts(2),           # in the past
             "token_issued_at":         _iso(10),
             "rotation_requested":      False,
-            "type":                    "manual",
+            "type":                    "host",
             "fleet_id":                f"fleet_{tenant_id}_staging",
             "tags":                    ["env:staging", "role:db", "tier:primary"],
             "created_at":              _iso(11),
+            "grant_service_mgmt":      True,     # service mgmt granted+detected; no docker on this host
+            "grant_docker":            False,
+            "service_mgmt_detected":   True,
+            "docker_detected":         False,
         },
         # 4. CREATED - awaiting install (no hostname/fingerprint/agent token yet)
         {
@@ -142,10 +230,14 @@ def make_agents(tenant_id: str) -> list[dict]:
             "active_until":            None,
             "token_issued_at":         None,
             "rotation_requested":      False,
-            "type":                    "manual",
+            "type":                    "host",
             "fleet_id":                f"fleet_{tenant_id}_prod",
             "tags":                    ["env:prod", "role:api"],
             "created_at":              _iso(0.1),
+            "grant_service_mgmt":      True,     # grants chosen at creation; nothing detected yet (never synced)
+            "grant_docker":            False,
+            "service_mgmt_detected":   None,
+            "docker_detected":         None,
         },
         # 5. REVOKED - decommissioned, all historical timestamps populated
         {
@@ -165,10 +257,105 @@ def make_agents(tenant_id: str) -> list[dict]:
             "active_until":            _ts(15),         # lapsed
             "token_issued_at":         _iso(60),
             "rotation_requested":      False,
-            "type":                    "manual",
+            "type":                    "host",
             "fleet_id":                None,
             "tags":                    ["env:prod", "decommissioned", "role:bastion"],
             "created_at":              _iso(61),
+            "grant_service_mgmt":      True,     # historical grants; docker never detected on the bastion
+            "grant_docker":            True,
+            "service_mgmt_detected":   True,
+            "docker_detected":         False,
+        },
+        # 6. ACTIVE - Kubernetes agent, approved mode, RBAC reported + acknowledged
+        {
+            "agent_id":                _agent_id(),
+            "tenant_id":               tenant_id,
+            "status":                  "ACTIVE",
+            "hostname":                "reach-agent-6d5f79c8b-x7k2p",   # pod name
+            "agent_version":           "0.1.0",
+            "machine_fingerprint":     "k8s:" + secrets.token_hex(16),  # cluster-derived identity
+            "mode":                    "approved",
+            "running_as_root":         "false",         # k8s pods run non-root (root is n/a)
+            "agent_token_hash":        _hmac(_raw_agent_token()),
+            "install_token_hash":      None,
+            "install_token_expires_at": None,
+            "claimed_at":              _iso(8),
+            "last_heartbeat_at":       _iso(0),
+            "active_until":            _ts(-90 / 86400),
+            "token_issued_at":         _iso(8),
+            "rotation_requested":      False,
+            "type":                    "k8s",
+            "fleet_id":                None,
+            "tags":                    ["env:prod", "cluster:us-east-1"],
+            "created_at":              _iso(9),
+            "grant_service_mgmt":      False,            # host-only grants, n/a on k8s
+            "grant_docker":            False,
+            "service_mgmt_detected":   None,
+            "docker_detected":         None,
+            "k8s_permissions":         k8s_perms,
+            "k8s_permissions_hash":    k8s_perms["hash"],
+            "k8s_permissions_acked_hash": k8s_perms["hash"],  # acknowledged → no drift
+        },
+        # 7. DELETED - soft-deleted host; hidden from user endpoints, admin-only
+        {
+            "agent_id":                _agent_id(),
+            "tenant_id":               tenant_id,
+            "status":                  "DELETED",
+            "hostname":                "retired-host-09.internal",
+            "agent_version":           "0.1.0",
+            "machine_fingerprint":     secrets.token_hex(16),
+            "mode":                    "readonly",
+            "running_as_root":         "false",
+            "agent_token_hash":        None,             # cleared
+            "install_token_hash":      None,
+            "install_token_expires_at": None,
+            "claimed_at":              _iso(40),
+            "last_heartbeat_at":       _iso(25),
+            "active_until":            _ts(25),
+            "token_issued_at":         _iso(40),
+            "rotation_requested":      False,
+            "type":                    "host",
+            "fleet_id":                None,
+            "tags":                    ["env:dev", "decommissioned"],
+            "created_at":              _iso(41),
+            "grant_service_mgmt":      False,
+            "grant_docker":            False,
+            "service_mgmt_detected":   True,
+            "docker_detected":         False,
+        },
+        # 8. ACTIVE - second k8s agent (another cluster) with RBAC DRIFT: the
+        #    reported permissions no longer match what the operator acknowledged.
+        {
+            "agent_id":                _agent_id(),
+            "tenant_id":               tenant_id,
+            "status":                  "ACTIVE",
+            "hostname":                "reach-agent-84c7bd5f9-mn3qz",
+            "agent_version":           "0.1.0",
+            "machine_fingerprint":     "k8s:" + secrets.token_hex(16),
+            "mode":                    "approved",
+            "running_as_root":         "false",
+            "agent_token_hash":        _hmac(_raw_agent_token()),
+            "install_token_hash":      None,
+            "install_token_expires_at": None,
+            "claimed_at":              _iso(12),
+            "last_heartbeat_at":       _iso(0),
+            "active_until":            _ts(-90 / 86400),
+            "token_issued_at":         _iso(12),
+            "rotation_requested":      False,
+            "type":                    "k8s",
+            "fleet_id":                None,
+            "tags":                    ["env:staging", "cluster:eu-west-1"],
+            "created_at":              _iso(13),
+            "grant_service_mgmt":      False,
+            "grant_docker":            False,
+            "service_mgmt_detected":   None,
+            "docker_detected":         None,
+            # Current RBAC differs from what was acknowledged → DRIFT, and the
+            # acknowledged snapshot is retained so the console shows the diff.
+            "k8s_permissions":            k8s_perms_drifted,
+            "k8s_permissions_hash":       k8s_perms_drifted["hash"],
+            "k8s_permissions_acked_hash": k8s_perms["hash"],
+            "k8s_permissions_acked":      k8s_perms,
         },
     ]
 
@@ -180,9 +367,11 @@ def make_jobs(
     user_ids: list[str],
     pending_job_id: str,
     running_job_id: str,
+    k8s_agent_id: str = None,
 ) -> list[dict]:
     ag1 = agent_ids[0] if agent_ids else "agent_unknown"
     ag2 = agent_ids[1] if len(agent_ids) > 1 else ag1
+    k8s_ag = k8s_agent_id or ag1
     uid1 = user_ids[0] if user_ids else "user_unknown"
     uid2 = user_ids[1] if len(user_ids) > 1 else uid1
 
@@ -325,6 +514,105 @@ def make_jobs(
             "completed_at": None,
             "expires_at":   _ts(0.25),          # expired 6h ago
         },
+        # 8. FAILED - command not found (exit 127), stderr only
+        {
+            "job_id":       "job_" + secrets.token_hex(8),
+            "tenant_id":    tenant_id,
+            "agent_id":     ag2,
+            "command":      "helm status myrelease",
+            "status":       "FAILED",
+            "mode":         "wild",
+            "is_write":     False,
+            "exit_code":    127,
+            "stdout":       "",
+            "stderr":       "bash: helm: command not found\n",
+            "duration_ms":  25,
+            "created_by":   uid2,
+            "created_at":   _iso(1.5),
+            "started_at":   _iso(1.5),
+            "completed_at": _iso(1.5),
+            "expires_at":   None,
+        },
+        # 9. SUCCEEDED - exit 0 but with warnings on stderr (stdout + stderr both set)
+        {
+            "job_id":       "job_" + secrets.token_hex(8),
+            "tenant_id":    tenant_id,
+            "agent_id":     ag1,
+            "command":      "pip install requests",
+            "status":       "SUCCEEDED",
+            "mode":         "wild",
+            "is_write":     True,
+            "exit_code":    0,
+            "stdout":       "Requirement already satisfied: requests in /usr/lib/python3/dist-packages (2.31.0)\n",
+            "stderr":       "WARNING: Running pip as the 'root' user can lead to broken permissions.\n",
+            "duration_ms":  1340,
+            "created_by":   uid1,
+            "created_at":   _iso(0.7),
+            "started_at":   _iso(0.7),
+            "completed_at": _iso(0.7),
+            "expires_at":   None,
+        },
+        # 10. k8s SUCCEEDED - read (kubectl get)
+        {
+            "job_id":       "job_" + secrets.token_hex(8),
+            "tenant_id":    tenant_id,
+            "agent_id":     k8s_ag,
+            "command":      "kubectl get pods -A",
+            "status":       "SUCCEEDED",
+            "mode":         "approved",
+            "is_write":     False,
+            "exit_code":    0,
+            "stdout":       (
+                "NAMESPACE     NAME                    READY   STATUS    RESTARTS   AGE\n"
+                "team-a        web-6d5f79c8b-x7k2p     1/1     Running   0          3d\n"
+                "kube-system   coredns-5d78c9-abcde    1/1     Running   0          40d\n"
+            ),
+            "stderr":       "",
+            "duration_ms":  190,
+            "created_by":   uid1,
+            "created_at":   _iso(0.3),
+            "started_at":   _iso(0.3),
+            "completed_at": _iso(0.3),
+            "expires_at":   None,
+        },
+        # 11. k8s SUCCEEDED - approved write (kubectl scale, matches the approved rule)
+        {
+            "job_id":       "job_" + secrets.token_hex(8),
+            "tenant_id":    tenant_id,
+            "agent_id":     k8s_ag,
+            "command":      "kubectl scale deployment web --replicas=3 -n team-a",
+            "status":       "SUCCEEDED",
+            "mode":         "approved",
+            "is_write":     True,
+            "exit_code":    0,
+            "stdout":       "deployment.apps/web scaled\n",
+            "stderr":       "",
+            "duration_ms":  260,
+            "created_by":   uid1,
+            "created_at":   _iso(0.2),
+            "started_at":   _iso(0.2),
+            "completed_at": _iso(0.2),
+            "expires_at":   None,
+        },
+        # 12. k8s REJECTED - unapproved write; a pending approval was raised (delete pods)
+        {
+            "job_id":       "job_" + secrets.token_hex(8),
+            "tenant_id":    tenant_id,
+            "agent_id":     k8s_ag,
+            "command":      "kubectl delete pod web-6d5f79c8b-x7k2p -n team-a",
+            "status":       "REJECTED",
+            "mode":         "approved",
+            "is_write":     True,
+            "exit_code":    None,
+            "stdout":       None,
+            "stderr":       "Blocked: approval required - a request has been sent to your admin.\n",
+            "duration_ms":  None,
+            "created_by":   uid2,
+            "created_at":   _iso(0.04),
+            "started_at":   None,
+            "completed_at": None,
+            "expires_at":   None,
+        },
     ]
 
 
@@ -334,6 +622,7 @@ def make_approvals(
     user_ids: list[str],
     pending_job_id: str,
     running_job_id: str,
+    k8s_agent_id: str = None,
 ) -> list[dict]:
     ag1 = agent_ids[0] if agent_ids else "agent_unknown"
     ag2 = agent_ids[1] if len(agent_ids) > 1 else ag1
@@ -431,6 +720,38 @@ def make_approvals(
             "reviewed_at":   _iso(1.9),
             "reviewed_by":   "admin",
         },
+        # 7. k8s APPROVED - structured rule (command is null; k8s_rule carries it)
+        {
+            "approval_id":   "appr_" + secrets.token_hex(8),
+            "tenant_id":     tenant_id,
+            "agent_id":      k8s_agent_id or agent_ids[0],
+            "command":       "kubectl scale deployments -n team-a",  # rule_to_command(k8s_rule)
+            "k8s_rule":      {"verb": "scale", "resource": "deployments", "namespace": "team-a", "name": "*"},
+            "requested_by":  uid1,
+            "requester_name": "Alice",
+            "job_id":        None,
+            "status":        "approved",
+            "expires_at":    None,
+            "created_at":    _iso(2),
+            "reviewed_at":   _iso(1.9),
+            "reviewed_by":   "admin",
+        },
+        # 8. k8s PENDING - structured rule awaiting review
+        {
+            "approval_id":   "appr_" + secrets.token_hex(8),
+            "tenant_id":     tenant_id,
+            "agent_id":      k8s_agent_id or agent_ids[0],
+            "command":       "kubectl delete pods -n team-a",  # rule_to_command(k8s_rule)
+            "k8s_rule":      {"verb": "delete", "resource": "pods", "namespace": "team-a", "name": "*"},
+            "requested_by":  uid2,
+            "requester_name": "Bob",
+            "job_id":        None,
+            "status":        "pending",
+            "expires_at":    None,
+            "created_at":    _iso(0.03),
+            "reviewed_at":   None,
+            "reviewed_by":   None,
+        },
     ]
 
 
@@ -440,54 +761,49 @@ def _hash_password(password: str) -> str:
     return f"pbkdf2${salt}${h.hex()}"
 
 
-def make_tenant_admin_users(tenant_id: str, tenant_slug: str) -> list[dict]:
-    """Admin + operator + developer users with password-based login for testing."""
-    return [
-        {
-            "user_id":             "user_adm_" + tenant_slug,
+def make_tenant_admin_users(tenant_id: str, tenant_slug: str, restrict_agent_id: str = None,
+                            dev_agent_ids: list[str] = None) -> list[dict]:
+    """Users per tenant. The login trio (localadmin/localoperator/localdeveloper)
+    has password == username; three more cover edge states: agent-restricted,
+    disabled, and must-reset-password. The user_adm_/user_ops_/user_dev_ ids stay
+    stable so API tokens and audit logs still reference them.
+
+    Developers are scoped to specific agents (allowed_agent_ids): localdeveloper
+    sees only `dev_agent_ids`, and localrestricted only `restrict_agent_id`.
+    Admins and operators keep tenant-wide access (allowed_agent_ids=None)."""
+    def _u(uid_prefix: str, username: str, role: str, login_days: float = 1.0, **extra) -> dict:
+        u = {
+            "user_id":             uid_prefix + tenant_slug,
             "tenant_id":           tenant_id,
-            "name":                f"Admin ({tenant_slug})",
-            "username":            "admin",
-            "password_hash":       _hash_password("admin123"),
-            "role":                "admin",
+            # Clean display name (no tenant suffix). The platform console appends the
+            # tenant itself; the tenant console is already scoped to one tenant.
+            "name":                username,
+            "username":            username,
+            "password_hash":       _hash_password(username),   # password == username
+            "role":                role,
             "must_reset_password": False,
             "disabled_at":         None,
-            "last_login_at":       _iso(0.1),
+            "last_login_at":       _iso(login_days),
             "allowed_agent_ids":   None,
             "allowed_fleet_ids":   None,
             "status":              "ACTIVE",
             "created_at":          _iso(20),
-        },
-        {
-            "user_id":             "user_ops_" + tenant_slug,
-            "tenant_id":           tenant_id,
-            "name":                f"Operator ({tenant_slug})",
-            "username":            "operator",
-            "password_hash":       _hash_password("operator123"),
-            "role":                "operator",
-            "must_reset_password": False,
-            "disabled_at":         None,
-            "last_login_at":       _iso(1),
-            "allowed_agent_ids":   None,
-            "allowed_fleet_ids":   None,
-            "status":              "ACTIVE",
-            "created_at":          _iso(15),
-        },
-        {
-            "user_id":             "user_dev_" + tenant_slug,
-            "tenant_id":           tenant_id,
-            "name":                f"Developer ({tenant_slug})",
-            "username":            "developer",
-            "password_hash":       _hash_password("changeme"),
-            "role":                "developer",
-            "must_reset_password": True,
-            "disabled_at":         None,
-            "last_login_at":       None,
-            "allowed_agent_ids":   None,
-            "allowed_fleet_ids":   None,
-            "status":              "ACTIVE",
-            "created_at":          _iso(10),
-        },
+        }
+        u.update(extra)
+        return u
+    return [
+        _u("user_adm_", "localadmin",      "admin",     0.1, name="Alice Admin"),
+        _u("user_ops_", "localoperator",   "operator",  1,   name="Oscar Operator"),
+        # scoped to a curated subset of agents (per-user agent access)
+        _u("user_dev_", "localdeveloper",  "developer", 2, name="Dana Developer",
+           allowed_agent_ids=list(dev_agent_ids) if dev_agent_ids else None),
+        # restricted to a single agent (per-user agent access)
+        _u("user_res_", "localrestricted", "developer", 3, name="Riley Restricted",
+           allowed_agent_ids=[restrict_agent_id] if restrict_agent_id else None),
+        # disabled account - login is blocked (status REVOKED + disabled_at)
+        _u("user_dis_", "localdisabled",   "operator",  5, name="Dylan Disabled", status="REVOKED", disabled_at=_iso(1)),
+        # forced first-login password reset; never logged in
+        _u("user_new_", "localnewbie",     "developer", 1, name="Noah Newbie", must_reset_password=True, last_login_at=None),
     ]
 
 
@@ -632,11 +948,9 @@ def seed():
         db.execute(delete(_Tenant).where(_Tenant.tenant_id.in_(known_ids)))
         db.commit()
 
-        admin_creds: list[tuple[str, str, str, str]] = []  # (tenant_name, username, password, role)
-
         for tenant in TENANTS:
             tenant_slug = tenant["tenant_id"].replace("tenant_", "")
-            db.add(_Tenant(**{**tenant, "status": "ACTIVE"}))
+            db.add(_Tenant(**tenant))   # carries its own status (alpha/beta/gamma ACTIVE, delta DISABLED)
             db.flush()
 
             agents = make_agents(tenant["tenant_id"])
@@ -646,24 +960,33 @@ def seed():
 
             all_agent_ids = [a["agent_id"] for a in agents]
             active_agent_ids = [a["agent_id"] for a in agents if a["status"] == "ACTIVE"]
+            active_host_ids = [a["agent_id"] for a in agents
+                               if a["status"] == "ACTIVE" and a.get("type") != "k8s"]
+            k8s_agent_id = next((a["agent_id"] for a in agents if a.get("type") == "k8s"), None)
 
-            pw_map = {"admin": "admin123", "operator": "operator123", "developer": "changeme"}
-            pw_users = make_tenant_admin_users(tenant["tenant_id"], tenant_slug)
+            # Developers only get access to certain agents, not the whole fleet:
+            # localdeveloper sees one host agent plus the cluster (k8s) agent.
+            dev_agent_ids = ([active_host_ids[0]] if active_host_ids else []) + \
+                            ([k8s_agent_id] if k8s_agent_id else [])
+
+            pw_users = make_tenant_admin_users(
+                tenant["tenant_id"], tenant_slug,
+                active_agent_ids[0] if active_agent_ids else None,
+                dev_agent_ids=dev_agent_ids)
             user_ids = []
             for u in pw_users:
                 db.add(_User(**u))
                 user_ids.append(u["user_id"])
-                admin_creds.append((tenant["name"], u["username"], pw_map.get(u["role"], "changeme"), u["role"]))
 
             db.flush()
 
             pending_job_id = "job_" + secrets.token_hex(8)
             running_job_id = "job_" + secrets.token_hex(8)
 
-            for j in make_jobs(tenant["tenant_id"], active_agent_ids, user_ids, pending_job_id, running_job_id):
+            for j in make_jobs(tenant["tenant_id"], active_agent_ids, user_ids, pending_job_id, running_job_id, k8s_agent_id):
                 db.add(_Job(**j))
 
-            for appr in make_approvals(tenant["tenant_id"], active_agent_ids, user_ids, pending_job_id, running_job_id):
+            for appr in make_approvals(tenant["tenant_id"], active_agent_ids, user_ids, pending_job_id, running_job_id, k8s_agent_id):
                 db.add(_Approval(**appr))
 
             for tok in make_api_tokens(tenant["tenant_id"], tenant_slug):
@@ -677,13 +1000,18 @@ def seed():
 
         db.commit()
 
+    active = [t["name"] for t in TENANTS if t.get("status") != "DISABLED"]
+    disabled = [t["name"] for t in TENANTS if t.get("status") == "DISABLED"]
     print("✓ Seeded database:")
-    print(f"  {len(TENANTS)} tenants · 5 agents · 3 users · 7 jobs · 6 approvals · 3 api tokens · 10 audit logs · agent history")
+    print(f"  {len(TENANTS)} tenants ({'/'.join(active)} active, {'/'.join(disabled)} disabled) · "
+          f"8 agents/tenant (host + k8s, incl. DELETED and RBAC-drift) · 6 users/tenant · "
+          f"12 jobs · 8 approvals · 3 api tokens · 10 audit logs · agent history")
     print()
-    print("  Logins (username / password  [role]):")
-    for tenant_name, username, password, role in admin_creds:
-        note = " [must reset]" if password == "changeme" else ""
-        print(f"    [{tenant_name}] {username:<12} / {password:<14}  ({role}){note}")
+    print(f"  Tenant-console logins on {' / '.join(active)} (username == password):")
+    print("    localadmin (admin, all agents)  ·  localoperator (operator, all agents)")
+    print("    localdeveloper (developer, scoped to 1 host + the k8s agent)")
+    print("  Also per tenant: localrestricted (developer, single agent) · localnewbie (must-reset) · localdisabled (login blocked).")
+    print(f"  Platform-admin login uses ADMIN_PASSWORD. Tenant '{'/'.join(disabled)}' is DISABLED (login blocked).")
 
 
 if __name__ == "__main__":

@@ -40,7 +40,33 @@ const (
 	idlePollSeconds   = 15
 	maxOutputBytes    = 50_000
 	tokenRotationDays = 30
+	// Default cadence for re-reviewing cluster-wide RBAC. RBAC changes rarely, so
+	// this is infrequent - it bounds the API cost of reviewing every namespace
+	// while still surfacing a sneaked-in grant within minutes (as drift).
+	// Override with REACH_K8S_REVIEW_INTERVAL_SECONDS.
+	defaultPermReviewInterval = 5 * time.Minute
 )
+
+// minPermReviewInterval floors the configured cadence: the review is cluster-wide
+// (cost scales with namespace count), so we never re-review more often than this
+// even if misconfigured. RBAC is config drift, so 30s detection latency is ample.
+const minPermReviewInterval = 30 * time.Second
+
+// permReviewInterval is how often the agent re-reviews its cluster-wide RBAC,
+// from REACH_K8S_REVIEW_INTERVAL_SECONDS (floored at minPermReviewInterval),
+// defaulting to defaultPermReviewInterval.
+func permReviewInterval() time.Duration {
+	if v := os.Getenv("REACH_K8S_REVIEW_INTERVAL_SECONDS"); v != "" {
+		var secs int
+		if _, err := fmt.Sscanf(v, "%d", &secs); err == nil && secs > 0 {
+			if d := time.Duration(secs) * time.Second; d >= minPermReviewInterval {
+				return d
+			}
+			return minPermReviewInterval
+		}
+	}
+	return defaultPermReviewInterval
+}
 
 // configPath and installIDPath are overridable via REACH_CONFIG_PATH for local dev.
 var (
@@ -60,12 +86,16 @@ func init() {
 // ---------------------------------------------------------------------------
 
 type Config struct {
+	// Credential-only: the agent has no agent_id. The install token identifies it
+	// at claim, the agent token on every call after; the backend keys on those.
 	APIURL             string `json:"api_url"`
-	AgentID            string `json:"agent_id"`
 	AgentToken         string `json:"agent_token,omitempty"`
 	InstallToken       string `json:"install_token,omitempty"`
 	MachineFingerprint string `json:"machine_fingerprint,omitempty"`
 	TokenIssuedAt      string `json:"token_issued_at,omitempty"`
+	// Type is "k8s" in a Kubernetes cluster, otherwise "host". The cluster id is
+	// used only to derive the fingerprint; it is not sent or stored separately.
+	Type string `json:"type,omitempty"`
 }
 
 func loadConfig() (*Config, error) {
@@ -77,13 +107,27 @@ func loadConfig() (*Config, error) {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
-	if cfg.APIURL == "" || cfg.AgentID == "" {
-		return nil, fmt.Errorf("config missing api_url or agent_id")
+	if cfg.APIURL == "" {
+		return nil, fmt.Errorf("config missing api_url")
 	}
 	return &cfg, nil
 }
 
 func saveConfig(cfg *Config) error {
+	// In Kubernetes the managed Secret is the sole store: the token (the only
+	// stateful field) lives there, shared across replicas and restarts, and
+	// everything else is re-derived from env/cluster each start. We deliberately
+	// do not write to local disk - the rootfs is read-only and the token must
+	// not be cached on the node.
+	if k8sTokenStore != nil {
+		if cfg.AgentToken == "" {
+			return nil
+		}
+		if err := k8sTokenStore.save(cfg.AgentToken, cfg.TokenIssuedAt); err != nil {
+			return fmt.Errorf("write token secret %s: %w", k8sTokenStore.name, err)
+		}
+		return nil
+	}
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return err
@@ -92,6 +136,27 @@ func saveConfig(cfg *Config) error {
 		return fmt.Errorf("write config: %w", err)
 	}
 	return nil
+}
+
+// touchHealthFile updates the liveness freshness file's mtime. A no-op when path
+// is empty (host installs) or on write error (best-effort; the probe will catch a
+// genuinely wedged loop regardless).
+func touchHealthFile(path string) {
+	if path == "" {
+		return
+	}
+	_ = os.WriteFile(path, []byte(time.Now().UTC().Format(time.RFC3339)), 0600)
+}
+
+// healthFilePath returns the liveness health-file path, but only in Kubernetes
+// mode. The file backs the pod liveness probe (the chart sets REACH_HEALTH_FILE);
+// it has no meaning on host installs, so it is ignored there even if the env var
+// is somehow set. An empty result makes touchHealthFile a no-op.
+func healthFilePath() string {
+	if !inKubernetes() {
+		return ""
+	}
+	return os.Getenv("REACH_HEALTH_FILE")
 }
 
 // ---------------------------------------------------------------------------
@@ -160,11 +225,11 @@ func apiPost(apiURL, path, token string, payload, result any) (int, error) {
 // ---------------------------------------------------------------------------
 
 type ClaimRequest struct {
-	AgentID            string `json:"agent_id"`
 	InstallToken       string `json:"install_token"`
 	MachineFingerprint string `json:"machine_fingerprint"`
 	Hostname           string `json:"hostname"`
 	AgentVersion       string `json:"agent_version"`
+	Type               string `json:"type,omitempty"`
 }
 
 type ClaimResponse struct {
@@ -176,11 +241,11 @@ type ClaimResponse struct {
 func claim(cfg *Config, fp string) error {
 	hostname, _ := os.Hostname()
 	payload := ClaimRequest{
-		AgentID:            cfg.AgentID,
 		InstallToken:       cfg.InstallToken,
 		MachineFingerprint: fp,
 		Hostname:           hostname,
 		AgentVersion:       agentVersion,
+		Type:               cfg.Type,
 	}
 	var result ClaimResponse
 	status, err := apiPost(cfg.APIURL, "/agent/claim", "", payload, &result)
@@ -240,13 +305,25 @@ func probeServiceMgmt() bool {
 // ---------------------------------------------------------------------------
 
 type SyncRequest struct {
-	AgentID             string `json:"agent_id"`
 	MachineFingerprint  string `json:"machine_fingerprint"`
 	AgentVersion        string `json:"agent_version"`
 	RunningAsRoot       bool   `json:"running_as_root"`
 	DockerDetected      bool   `json:"docker_detected"`
 	ServiceMgmtDetected bool   `json:"service_mgmt_detected"`
+	Type                string `json:"type,omitempty"`
+	// In k8s mode the agent reports its effective RBAC, but only on the first
+	// sync and whenever it changes - omitted otherwise to keep the heartbeat
+	// small. See k8sPermsProvider / lastSentPermHash.
+	K8sPermissions *K8sPermissions `json:"k8s_permissions,omitempty"`
 }
+
+// k8sPermsProvider returns the agent's current effective permissions (set in
+// k8s mode); nil otherwise. lastSentPermHash is the hash last accepted by the
+// backend, so the full rule set is sent only when it actually changes.
+var (
+	k8sPermsProvider func() (*K8sPermissions, error)
+	lastSentPermHash string
+)
 
 type Job struct {
 	JobID            string   `json:"job_id"`
@@ -265,12 +342,22 @@ type SyncResponse struct {
 
 func sync(cfg *Config) (*SyncResponse, error) {
 	payload := SyncRequest{
-		AgentID:             cfg.AgentID,
 		MachineFingerprint:  cfg.MachineFingerprint,
 		AgentVersion:        agentVersion,
 		RunningAsRoot:       os.Getuid() == 0,
 		DockerDetected:      probeDocker(),
 		ServiceMgmtDetected: probeServiceMgmt(),
+		Type:                cfg.Type,
+	}
+	// In k8s mode, attach the effective RBAC only when it changed since the last
+	// accepted sync (first send, or after an RBAC change). Self-review failures
+	// are non-fatal - we just skip reporting this round.
+	if k8sPermsProvider != nil {
+		if perms, perr := k8sPermsProvider(); perr != nil {
+			log.Printf("WARNING: effective-permissions review failed: %v", perr)
+		} else if perms != nil && perms.Hash != lastSentPermHash {
+			payload.K8sPermissions = perms
+		}
 	}
 	var result SyncResponse
 	status, err := apiPost(cfg.APIURL, "/agent/sync", cfg.AgentToken, payload, &result)
@@ -291,6 +378,11 @@ func sync(cfg *Config) (*SyncResponse, error) {
 	if status != 200 {
 		return nil, fmt.Errorf("sync failed (%d): %s", status, result.Error)
 	}
+	// The backend accepted this sync; remember the permissions hash we sent so we
+	// don't resend the full rule set until it changes again.
+	if payload.K8sPermissions != nil {
+		lastSentPermHash = payload.K8sPermissions.Hash
+	}
 	return &result, nil
 }
 
@@ -299,7 +391,6 @@ func sync(cfg *Config) (*SyncResponse, error) {
 // ---------------------------------------------------------------------------
 
 type RotateTokenRequest struct {
-	AgentID            string `json:"agent_id"`
 	MachineFingerprint string `json:"machine_fingerprint"`
 }
 
@@ -310,7 +401,6 @@ type RotateTokenResponse struct {
 
 func rotateToken(cfg *Config) error {
 	payload := RotateTokenRequest{
-		AgentID:            cfg.AgentID,
 		MachineFingerprint: cfg.MachineFingerprint,
 	}
 	var result RotateTokenResponse
@@ -326,6 +416,7 @@ func rotateToken(cfg *Config) error {
 	}
 	cfg.AgentToken = result.AgentToken
 	cfg.TokenIssuedAt = time.Now().UTC().Format(time.RFC3339)
+	recordTokenRotation()
 	if err := saveConfig(cfg); err != nil {
 		// Token rotated on server but config write failed. New token is in memory
 		// for this session but will be lost on restart - agent will need manual reclaim.
@@ -480,7 +571,6 @@ func executeCommand(command, mode string, isWrite bool, approvedCommands []strin
 // ---------------------------------------------------------------------------
 
 type ResultRequest struct {
-	AgentID            string `json:"agent_id"`
 	MachineFingerprint string `json:"machine_fingerprint"`
 	Status             string `json:"status"`
 	ExitCode           int    `json:"exit_code"`
@@ -497,7 +587,6 @@ func postResult(cfg *Config, jobID string, res CommandResult) error {
 		status = "FAILED"
 	}
 	payload := ResultRequest{
-		AgentID:            cfg.AgentID,
 		MachineFingerprint: cfg.MachineFingerprint,
 		Status:             status,
 		ExitCode:           res.ExitCode,
@@ -532,18 +621,104 @@ func sleep(ctx context.Context, d time.Duration) bool {
 }
 
 func run(ctx context.Context) error {
-	cfg, err := loadConfig()
-	if err != nil {
-		return err
-	}
+	var cfg *Config
+	var fp string
 
-	fp, err := machineFingerprint()
-	if err != nil {
-		return fmt.Errorf("fingerprint: %w", err)
+	if inKubernetes() {
+		// Kubernetes mode: identity is derived from the cluster (kube-system UID)
+		// so every replica computes the same fingerprint; bootstrap comes from env.
+		kc, err := newK8sClient()
+		if err != nil {
+			return fmt.Errorf("kubernetes client: %w", err)
+		}
+		clusterID, err := kc.clusterID()
+		if err != nil {
+			return err
+		}
+		cfg, err = k8sConfig()
+		if err != nil {
+			return err
+		}
+		cfg.Type = "k8s"
+		fp = clusterFingerprint(clusterID)
+		log.Printf("Kubernetes mode: cluster %s", clusterID)
+
+		// Report effective RBAC via self-review (no extra grant needed for the
+		// review itself). The agent discovers every namespace itself and reviews
+		// each, so it reports its full cluster-wide access automatically - including
+		// grants bound in namespaces nobody told it about. If listing namespaces is
+		// not permitted, it falls back to its own namespace (which still captures
+		// cluster-wide bindings). Throttled so a busy poll loop doesn't re-review
+		// constantly; the backend only stores/flags drift when the rule set changes.
+		ownNS := podNamespace()
+		reviewEvery := permReviewInterval()
+		log.Printf("Kubernetes mode: reviewing cluster-wide RBAC every %s", reviewEvery)
+		var permCache *K8sPermissions
+		var permCacheAt time.Time
+		k8sPermsProvider = func() (*K8sPermissions, error) {
+			if permCache != nil && time.Since(permCacheAt) < reviewEvery {
+				return permCache, nil
+			}
+			namespaces, err := kc.listNamespaceNames()
+			if err != nil || len(namespaces) == 0 {
+				log.Printf("WARNING: listing namespaces failed (%v); reviewing own namespace only", err)
+				namespaces = []string{ownNS}
+			}
+			perms, perr := kc.selfSubjectRulesMulti(namespaces)
+			if perr != nil {
+				return nil, perr
+			}
+			permCache, permCacheAt = perms, time.Now()
+			return perms, nil
+		}
+
+		// Gate job execution: kubectl + safe filters, no shell (see k8s_exec.go).
+		k8sAllowedBinaries = k8sBinaryAllowlist()
+		log.Printf("Kubernetes mode: jobs limited to [%s], no shell", strings.Join(k8sAllowedBinaries, " "))
+
+		// The shared Secret is the authoritative token store across replicas and
+		// restarts. Read it first so a fresh replica reuses the claimed token
+		// instead of re-claiming (which the backend rejects once ACTIVE).
+		if name := strings.TrimSpace(os.Getenv("REACH_K8S_TOKEN_SECRET")); name != "" {
+			k8sTokenStore = &secretTokenStore{client: kc, namespace: podNamespace(), name: name}
+			if tok, issued, lerr := k8sTokenStore.load(); lerr != nil {
+				log.Printf("WARNING: reading token secret %s: %v", name, lerr)
+			} else if tok != "" {
+				cfg.AgentToken = tok
+				cfg.TokenIssuedAt = issued
+				log.Printf("Reusing shared agent token from secret %s", name)
+			}
+		}
+
+		// Leader election: with multiple replicas only the lease holder claims,
+		// heartbeats, and runs jobs; the rest stand by and fail over.
+		if lease := strings.TrimSpace(os.Getenv("REACH_K8S_LEASE")); lease != "" {
+			pod := strings.TrimSpace(os.Getenv("REACH_POD_NAME"))
+			if pod == "" {
+				pod = fp // fall back to the cluster fingerprint if POD_NAME is unset
+			}
+			leaderElector = &leaseElector{client: kc, namespace: podNamespace(), name: lease, identity: pod}
+			go leaderElector.Run(ctx)
+			log.Printf("Leader election enabled (lease %s, identity %s)", lease, pod)
+		}
+	} else {
+		var err error
+		cfg, err = loadConfig()
+		if err != nil {
+			return err
+		}
+		fp, err = machineFingerprint()
+		if err != nil {
+			return fmt.Errorf("fingerprint: %w", err)
+		}
+		cfg.Type = "host"
 	}
 	cfg.MachineFingerprint = fp
 
-	if cfg.AgentToken == "" {
+	// Non-leader-elected agents (every non-k8s agent) claim up front. Under
+	// leader election the claim is deferred into the loop and gated on the lease,
+	// so only the leader claims and followers reuse the shared token.
+	if cfg.AgentToken == "" && leaderElector == nil {
 		if cfg.InstallToken == "" {
 			return fmt.Errorf("no agent_token and no install_token in config")
 		}
@@ -553,11 +728,46 @@ func run(ctx context.Context) error {
 		}
 	}
 
-	log.Printf("Agent %s starting poll loop", cfg.AgentID)
+	log.Printf("Agent starting poll loop (type=%s)", cfg.Type)
 	pollSeconds := idlePollSeconds
 	syncFailed := false
+	// Liveness: touch a freshness file each loop iteration (leader and follower
+	// alike). A liveness probe restarts the pod if the loop wedges. Kubernetes
+	// only - a no-op on host installs (see healthFilePath).
+	healthFile := healthFilePath()
+
+	// Optional Prometheus /metrics endpoint (k8s only, opt-in via the chart which
+	// sets REACH_METRICS_ADDR). No-op when unset - host installs stay port-free.
+	startMetricsServer(ctx, os.Getenv("REACH_METRICS_ADDR"), cfg.Type)
 
 	for {
+		touchHealthFile(healthFile)
+		// Leadership gate: a non-leader stands by, only picking up the shared
+		// token the leader claimed so it can take over instantly on failover.
+		if leaderElector != nil && !leaderElector.IsLeader() {
+			if cfg.AgentToken == "" && k8sTokenStore != nil {
+				if tok, issued, lerr := k8sTokenStore.load(); lerr == nil && tok != "" {
+					cfg.AgentToken = tok
+					cfg.TokenIssuedAt = issued
+				}
+			}
+			if !sleep(ctx, time.Duration(idlePollSeconds)*time.Second) {
+				return nil
+			}
+			continue
+		}
+
+		// We are the leader (or not elected at all). Ensure we hold a token.
+		if cfg.AgentToken == "" {
+			if cfg.InstallToken == "" {
+				return fmt.Errorf("no agent_token and no install_token in config")
+			}
+			log.Println("Leader has no agent_token, claiming...")
+			if err := claim(cfg, fp); err != nil {
+				return err
+			}
+		}
+
 		if cfg.TokenIssuedAt != "" {
 			if issuedAt, err := time.Parse(time.RFC3339, cfg.TokenIssuedAt); err == nil {
 				if time.Since(issuedAt) >= time.Duration(tokenRotationDays)*24*time.Hour {
@@ -591,12 +801,14 @@ func run(ctx context.Context) error {
 				return fmt.Errorf("re-claim required: %w", err)
 			}
 			syncFailed = true
+			recordSyncError()
 			log.Printf("Sync error: %v - retrying in %ds", err, pollSeconds)
 			if !sleep(ctx, time.Duration(pollSeconds)*time.Second) {
 				return nil
 			}
 			continue
 		}
+		recordSyncOK()
 
 		if syncFailed {
 			log.Printf("Sync recovered - heartbeat sent successfully")
@@ -626,8 +838,16 @@ func run(ctx context.Context) error {
 
 			log.Printf("Received job %s: %q", job.JobID, job.Command)
 
-			res := executeCommand(job.Command, job.Mode, job.IsWrite, job.ApprovedCommands)
+			var res CommandResult
+			if k8sAllowedBinaries != nil {
+				// Kubernetes: shell-free execution (kubectl + allow-listed filters).
+				// Policy mode is enforced by the backend at submission, not here.
+				res = executeK8sCommand(job.Command, k8sAllowedBinaries)
+			} else {
+				res = executeCommand(job.Command, job.Mode, job.IsWrite, job.ApprovedCommands)
+			}
 			log.Printf("Job %s done: exit=%d duration=%dms", job.JobID, res.ExitCode, res.DurationMS)
+			recordJob(res)
 
 			if err := postResult(cfg, job.JobID, res); err != nil {
 				log.Printf("Error posting result for %s: %v", job.JobID, err)
@@ -670,8 +890,21 @@ func main() {
 		// (e.g. systemctl restart reach-agent) once it's corrected.
 		log.Printf("Permanent failure, not retrying: %v", err)
 		log.Printf("Fix the agent config and restart the service manually")
+		// On Kubernetes, keep the liveness health file fresh while idle so the
+		// kubelet leaves the pod Running instead of restarting it into an
+		// identical doomed claim - a CrashLoop would bury the reason logged
+		// above. staleSeconds defaults to 120, so a 30s touch has ample margin.
+		// healthFilePath is empty off-cluster, so on host this just idles.
+		healthFile := healthFilePath()
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
 		for {
-			time.Sleep(1 * time.Hour)
+			touchHealthFile(healthFile)
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
 		}
 	}
 	log.Fatalf("Fatal: %v", err)

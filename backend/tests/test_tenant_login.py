@@ -237,6 +237,16 @@ class TestTenantMe:
             r = handle_tenant_me(self._payload)
         assert r["statusCode"] == 404
 
+    def test_accepts_api_key_user_dict_shape(self):
+        # _verify_tenant_token returns a user dict ("user_id"), not a JWT payload.
+        with patch("handlers.tenant_login.users_repo") as ur, \
+             patch("handlers.tenant_login.tenants_repo") as tr:
+            ur.get.return_value = USER
+            tr.get.return_value = TENANT
+            r = handle_tenant_me({"user_id": "user_123", "tenant_id": "tenant_acme"})
+        assert r["statusCode"] == 200
+        assert json.loads(r["body"])["username"] == "alice"
+
 
 # ---------------------------------------------------------------------------
 # Lambda handler wrappers
@@ -321,8 +331,8 @@ class TestTenantMeHandler:
         assert r["statusCode"] == 401
 
     def test_delegates_to_handler(self):
-        payload = {"sub": "user_123", "tenant_id": "tenant_acme", "role": "admin"}
-        with patch("handlers.tenant_login._verify_tenant_payload", return_value=payload), \
+        user = {"user_id": "user_123", "tenant_id": "tenant_acme", "role": "admin"}
+        with patch("handlers.tenant_login._verify_tenant_token", return_value=user), \
              patch("handlers.tenant_login.handle_tenant_me", return_value=_OK) as h:
             tenant_me_handler(_evt(), None)
-        h.assert_called_once_with(payload)
+        h.assert_called_once_with(user)

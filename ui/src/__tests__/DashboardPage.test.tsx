@@ -73,12 +73,15 @@ beforeEach(() => { vi.restoreAllMocks(); });
 // ---------------------------------------------------------------------------
 
 describe('loading state', () => {
-  it('shows spinner before data loads', () => {
+  it('shows spinner before data loads', async () => {
     vi.spyOn(api, 'listTenantAgents').mockResolvedValue({ agents: [] });
     vi.spyOn(api, 'listAllTenantApprovals').mockResolvedValue({ approvals: [] });
     vi.spyOn(api, 'listTenantAuditLogs').mockResolvedValue({ logs: [] });
     render(<DashboardPage config={CONFIG} />);
     expect(document.querySelector('[class*="animate"]')).toBeInTheDocument();
+    // Flush the pending fetch so its state updates settle inside act(); otherwise
+    // they fire after the test ends and React warns about updates outside act().
+    await screen.findByText('Active agents');
   });
 });
 
@@ -112,20 +115,22 @@ describe('stat cards', () => {
     expect(statLabel.nextElementSibling?.textContent).toBe('0');
   });
 
-  it('shows inactive agent count', async () => {
+  it('counts an offline agent under Needs attention', async () => {
     mockApis({ agents: [INACTIVE_AGENT] });
     render(<DashboardPage config={CONFIG} />);
-    const heading = await screen.findByText('Inactive agents');
+    const heading = await screen.findByText('Needs attention');
     const card = heading.closest('div')!.parentElement!;
     expect(card).toHaveTextContent('1');
+    expect(card).toHaveTextContent(/offline/i);
   });
 
-  it('shows 0 inactive agents when all are active', async () => {
+  it('shows "All agents healthy" when nothing needs attention', async () => {
     mockApis({ agents: [BASE_AGENT] });
     render(<DashboardPage config={CONFIG} />);
-    const heading = await screen.findByText('Inactive agents');
+    const heading = await screen.findByText('Needs attention');
     const card = heading.closest('div')!.parentElement!;
     expect(card).toHaveTextContent('0');
+    expect(card).toHaveTextContent(/All agents healthy/i);
   });
 
   it('shows recent events count', async () => {

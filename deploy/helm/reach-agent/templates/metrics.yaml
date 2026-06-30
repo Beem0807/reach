@@ -1,0 +1,81 @@
+{{- if .Values.metrics.enabled }}
+# Prometheus metrics for the agent. OPT-IN: the agent is otherwise strictly
+# outbound-only, so enabling this opens its single inbound port. It is scoped
+# read-only (counters, no secrets) and, by default, locked to the Prometheus
+# namespace with the NetworkPolicy below. Headless Service so scrapes reach
+# every replica; each exports reach_agent_is_leader to tell leader from standby.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "reach-agent.fullname" . }}-metrics
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "reach-agent.labels" . | nindent 4 }}
+    app.kubernetes.io/component: metrics
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    {{- include "reach-agent.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: metrics
+      port: {{ .Values.metrics.port }}
+      targetPort: metrics
+      protocol: TCP
+{{- if .Values.metrics.serviceMonitor.enabled }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "reach-agent.fullname" . }}
+  namespace: {{ .Values.metrics.serviceMonitor.namespace | default .Release.Namespace }}
+  labels:
+    {{- include "reach-agent.labels" . | nindent 4 }}
+    {{- with .Values.metrics.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+  selector:
+    matchLabels:
+      {{- include "reach-agent.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: metrics
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: {{ .Values.metrics.serviceMonitor.interval }}
+      scrapeTimeout: {{ .Values.metrics.serviceMonitor.scrapeTimeout }}
+{{- end }}
+{{- if .Values.metrics.networkPolicy.enabled }}
+---
+# Restrict ingress to the metrics port to Prometheus only. policyTypes is
+# Ingress-only, so the agent's outbound HTTPS (its real channel) is untouched.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "reach-agent.fullname" . }}-metrics
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "reach-agent.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "reach-agent.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        {{- with .Values.metrics.networkPolicy.from }}
+        {{- toYaml . | nindent 8 }}
+        {{- else }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.metrics.networkPolicy.prometheusNamespace }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.metrics.port }}
+{{- end }}
+{{- end }}
