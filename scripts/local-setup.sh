@@ -12,35 +12,46 @@
 # Usage:
 #
 #   Fresh setup:
+#     curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh | bash
 #     ./scripts/local-setup.sh
 #
-#   Run from remote release (no local clone needed):
-#     curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh | bash
-#
 #   Check if everything is running:
+#     curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh | bash -s -- --status
 #     ./scripts/local-setup.sh --status
 #
+#   Register another agent against the running stack:
+#     curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh | bash -s -- --create-agent
+#     ./scripts/local-setup.sh --create-agent
+#
 #   Update backend image only (keeps all data):
+#     curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh | bash -s -- --update
 #     ./scripts/local-setup.sh --update
 #
 #   Stop backend, keep database:
+#     curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh | bash -s -- --down
 #     ./scripts/local-setup.sh --down
 #
 #   Stop backend and delete database:
+#     curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh | bash -s -- --reset
 #     ./scripts/local-setup.sh --reset
 #
 #   Remove everything, optionally uninstall CLI:
+#     curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh | bash -s -- --purge
 #     ./scripts/local-setup.sh --purge
 #
 #   Rotate the platform admin password:
+#     curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh | bash -s -- --rotate-password
 #     ./scripts/local-setup.sh --rotate-password
 #
 #   Rotate the session signing key (forces console re-login):
+#     curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh | bash -s -- --rotate-session-key
 #     ./scripts/local-setup.sh --rotate-session-key
 #
 # Notes:
 #
 #   --status             checks containers, backend health, API key auth, and agent state.
+#   --create-agent       registers another agent (host or k8s) via a tenant login; optionally
+#                        starts a tunnel so the install command uses a public URL.
 #   --down               stops containers but keeps the Postgres data volume.
 #   --reset              removes containers and the Postgres data volume (data loss).
 #   --purge              deletes ~/.reach/local and asks before uninstalling the Reach CLI.
@@ -69,6 +80,15 @@ COMPOSE_FILE="$WORK_DIR/docker-compose.yml"
 ENV_FILE="$WORK_DIR/env"
 API_PORT="${API_PORT:-8000}"
 CLI_WHEEL_URL="https://reach-releases.s3.amazonaws.com/cli/latest/reach-0.1.0-py3-none-any.whl"
+# Resolve public tunnel hostnames over DoH. macOS curl's system resolver can fail
+# on freshly-created *.trycloudflare.com names that a browser (which uses DoH)
+# reaches fine; `curl --doh-url` sidesteps that. Not used for localhost. Only
+# applied when this curl supports it (>= 7.62), so older curl still works.
+DOH_URL="${DOH_URL:-https://cloudflare-dns.com/dns-query}"
+DOH_ARGS=""
+if curl --help all 2>/dev/null | grep -q -- '--doh-url'; then
+  DOH_ARGS="--doh-url $DOH_URL"
+fi
 
 ok()   { printf "  [OK]      %s\n" "$1"; }
 info() { printf "  [INFO]    %s\n" "$1"; }
@@ -96,11 +116,19 @@ request_json() {
   local tmp
   tmp="$(mktemp)"
 
+  # Force HTTP/1.1 (curl over HTTP/2 to a cloudflared quick tunnel often stalls),
+  # and resolve public hostnames over DoH (the OS resolver can fail on fresh
+  # *.trycloudflare.com names). Both are no-ops / skipped for localhost.
+  local doh=""
+  case "$url" in
+    *localhost*|*127.0.0.1*) : ;;
+    https://*) doh="$DOH_ARGS" ;;
+  esac
   local code
   if [[ -n "$body" ]]; then
-    code=$(curl -sS -o "$tmp" -w "%{http_code}" -X "$method" "$url" "$@" -d "$body")
+    code=$(curl -sS --http1.1 $doh -o "$tmp" -w "%{http_code}" -X "$method" "$url" "$@" -d "$body")
   else
-    code=$(curl -sS -o "$tmp" -w "%{http_code}" -X "$method" "$url" "$@")
+    code=$(curl -sS --http1.1 $doh -o "$tmp" -w "%{http_code}" -X "$method" "$url" "$@")
   fi
 
   if [[ "$code" -lt 200 || "$code" -ge 300 ]]; then
@@ -266,8 +294,11 @@ load_env_file() {
   : "${AUDIT_RETENTION_DAYS:?AUDIT_RETENTION_DAYS missing from env file}"
   : "${AGENT_HISTORY_RETENTION_DAYS:?AGENT_HISTORY_RETENTION_DAYS missing from env file}"
 
-  # Default for older env files so downstream refs are safe.
+  # Defaults for older env files so downstream refs are safe.
   RELEASES_CHART_REPO="${RELEASES_CHART_REPO:-}"
+  LOCAL_API_URL="${LOCAL_API_URL:-http://localhost:${API_PORT}}"
+  PUBLIC_API_URL="${PUBLIC_API_URL:-}"
+  API_URL="${API_URL:-$LOCAL_API_URL}"
 
   # SESSION_SIGNING_KEY was added after the initial release; generate and persist
   # one for older env files so session tokens aren't signed with a weak default.
@@ -355,6 +386,8 @@ EOF
 save_env_file() {
   cat > "$ENV_FILE" <<EOF
 API_URL=${API_URL:-http://localhost:${API_PORT}}
+LOCAL_API_URL=${LOCAL_API_URL:-http://localhost:${API_PORT}}
+PUBLIC_API_URL=${PUBLIC_API_URL:-}
 IMAGE=${IMAGE}
 TOKEN_PEPPER=${TOKEN_PEPPER}
 SESSION_SIGNING_KEY=${SESSION_SIGNING_KEY}
@@ -414,8 +447,329 @@ wait_for_backend() {
   done
 }
 
+wait_for_public_api_login() {
+  local url="$1"
+  local login_body=""
+  local login_code=""
+  local health_code=""
+  local login_tmp=""
+  local health_tmp=""
+
+  # Do not accept grep/binary-warning text as a URL.
+  if [[ ! "$url" =~ ^https://[^[:space:]]+$ ]]; then
+    warn "Invalid tunnel URL discovered: $url"
+    return 1
+  fi
+
+  printf "  Waiting for the tunnel to become reachable (Cloudflare can take a minute or two)"
+
+  login_tmp="$(mktemp)"
+  health_tmp="$(mktemp)"
+
+  # Cloudflare quick tunnels can take a couple of minutes to become globally
+  # resolvable + routable. Wait patiently (~4 min of fast-failing probes) before
+  # handing back to the caller's retry prompt.
+  local max_attempts=120
+  for i in $(seq 1 "$max_attempts"); do
+    # First verify the tunnel can route to the backend at all. Force HTTP/1.1
+    # (curl+HTTP/2 to a quick tunnel often stalls) and resolve over DoH (the OS
+    # resolver can fail on the fresh hostname a browser reaches fine).
+    health_code=$(curl -k -L -sS --http1.1 $DOH_ARGS --max-time 5 -o "$health_tmp" -w "%{http_code}" "${url}/health" 2>/dev/null || true)
+
+    # Then verify the public URL can issue a real tenant login token.
+    login_code=$(curl -k -L -sS --http1.1 $DOH_ARGS --max-time 8 -o "$login_tmp" -w "%{http_code}" \
+      -X POST "${url}/tenant/login" \
+      -H "Content-Type: application/json" \
+      -d "$(mkjson tenant_name "$SETUP_TENANT" username "$SETUP_USERNAME" password "$SETUP_PASSWORD")" \
+      2>/dev/null || true)
+
+    login_body="$(cat "$login_tmp" 2>/dev/null || true)"
+
+    if [[ "$login_code" == "200" ]] && echo "$login_body" | jq -e '.token and (.token | length > 0)' >/dev/null 2>&1; then
+      rm -f "$login_tmp" "$health_tmp"
+      printf "\n"
+      ok "Public API is reachable: $url"
+      return 0
+    fi
+
+    # Give a progress hint every ~20 seconds without spamming the terminal, so a
+    # slow tunnel looks like it's still working rather than hung.
+    if (( i % 10 == 0 )); then
+      printf "(%ss elapsed, health:%s login:%s)" "$((i * 2))" "${health_code:-000}" "${login_code:-000}"
+    else
+      printf "."
+    fi
+
+    sleep 2
+  done
+
+  printf "\n"
+  warn "Public API did not become ready in time: $url"
+  warn "Last /health HTTP status: ${health_code:-unknown}"
+  warn "Last /tenant/login HTTP status: ${login_code:-unknown}"
+
+  if [[ -s "$health_tmp" ]]; then
+    echo ""
+    echo "  Last /health response:"
+    sed 's/^/    /' "$health_tmp" | head -20 || true
+  fi
+
+  if [[ -s "$login_tmp" ]]; then
+    echo ""
+    echo "  Last /tenant/login response:"
+    sed 's/^/    /' "$login_tmp" | head -20 || true
+  fi
+
+  echo ""
+  echo "  Last cloudflared/ngrok log lines:"
+  tail -20 /tmp/reach-tunnel.log 2>/dev/null | sed 's/^/    /' || true
+
+  rm -f "$login_tmp" "$health_tmp"
+  return 1
+}
+
+extract_trycloudflare_url() {
+  local log_file="$1"
+
+  # cloudflared logs can contain control characters; grep may otherwise print
+  # "Binary file ... matches" instead of the actual URL. LC_ALL=C + grep -a
+  # forces text-mode scanning.
+  LC_ALL=C grep -aEo 'https://[^[:space:]]+\.trycloudflare\.com' "$log_file" 2>/dev/null     | head -1     | tr -d '\r'
+}
+
+rewrite_agent_commands_for_public_url() {
+  # Agent commands are generated by the backend using the request host. Since
+  # setup bootstraps through localhost for reliability, rewrite only the printed
+  # install commands to use the public tunnel URL when one was discovered.
+  [[ -n "${AGENT_API_URL:-}" ]] || return 0
+  [[ -n "${BOOTSTRAP_API_URL:-}" ]] || return 0
+  [[ "$AGENT_API_URL" == "$BOOTSTRAP_API_URL" ]] && return 0
+
+  if [[ -n "${INSTALL_AGENT:-}" ]]; then
+    INSTALL_AGENT="${INSTALL_AGENT//$BOOTSTRAP_API_URL/$AGENT_API_URL}"
+  fi
+
+  if [[ -n "${CLI_USE_CMD:-}" ]]; then
+    CLI_USE_CMD="${CLI_USE_CMD//$BOOTSTRAP_API_URL/$AGENT_API_URL}"
+  fi
+}
+
+start_public_tunnel() {
+  PUBLIC_URL=""
+  rm -f /tmp/reach-tunnel.log
+
+  echo ""
+  ok "Starting tunnel..."
+
+  if [[ "$TUNNEL_CMD" == "cloudflared" ]]; then
+    # Force HTTP/2 because QUIC quick tunnels can register and still flap briefly
+    # with control-stream/datagram errors on some networks.
+    cloudflared tunnel --protocol http2 --url "http://localhost:${API_PORT}" > /tmp/reach-tunnel.log 2>&1 &
+    TUNNEL_PID=$!
+    for i in $(seq 1 25); do
+      PUBLIC_URL=$(extract_trycloudflare_url /tmp/reach-tunnel.log || true)
+      [[ -n "$PUBLIC_URL" ]] && break
+      sleep 2
+    done
+  elif [[ "$TUNNEL_CMD" == "ngrok" ]]; then
+    if [[ -n "$NGROK_DOMAIN" ]]; then
+      ngrok http "$API_PORT" --domain="$NGROK_DOMAIN" --log=stdout > /tmp/reach-tunnel.log 2>&1 &
+      TUNNEL_PID=$!
+      PUBLIC_URL="https://$NGROK_DOMAIN"
+    else
+      ngrok http "$API_PORT" --log=stdout > /tmp/reach-tunnel.log 2>&1 &
+      TUNNEL_PID=$!
+      for i in $(seq 1 20); do
+        PUBLIC_URL=$(curl -sf http://localhost:4040/api/tunnels 2>/dev/null \
+          | jq -r 'first(.tunnels[] | select(.proto == "https") | .public_url) // empty' 2>/dev/null || true)
+        [[ -n "$PUBLIC_URL" ]] && break
+        sleep 2
+      done
+    fi
+  fi
+
+  if [[ -n "$PUBLIC_URL" && "$PUBLIC_URL" =~ ^https://[^[:space:]]+$ ]]; then
+    PUBLIC_API_URL="$PUBLIC_URL"
+    ok "Public tunnel URL: $PUBLIC_API_URL"
+    return 0
+  fi
+
+  warn "Could not get a valid tunnel URL."
+  tail -10 /tmp/reach-tunnel.log 2>/dev/null || true
+  return 1
+}
+
+# `--create-agent`: register another agent against an already-running local stack
+# (e.g. when the first one was skipped because the tunnel was slow). Self-contained
+# so it can run as a subcommand, reusing the shared login/tunnel/create helpers.
+create_agent_subcommand() {
+  load_env_file
+
+  if ! curl -sf "${LOCAL_API_URL}/health" &>/dev/null; then
+    fail "Local backend is not responding at ${LOCAL_API_URL}. Start it first (re-run setup, or 'docker compose up -d')."
+  fi
+
+  # Confirm which workspace + admin to act as (defaults come from setup, but let
+  # them override in case the values changed or a different admin should be used).
+  local tenant_name admin_user pw
+  echo ""
+  read -rp "  Workspace (tenant) name [${TENANT_NAME:-}]: " tenant_name < /dev/tty
+  tenant_name="${tenant_name:-${TENANT_NAME:-}}"
+  [[ -n "$tenant_name" ]] || fail "Workspace name is required."
+  read -rp "  Admin username [${USERNAME:-}]: " admin_user < /dev/tty
+  admin_user="${admin_user:-${USERNAME:-}}"
+  [[ -n "$admin_user" ]] || fail "Admin username is required."
+
+  # Password is never stored; read one to obtain a session token (the persisted
+  # API key can't create agents - that needs a tenant login). Verify the login
+  # up front so bad credentials fail before configuring the agent; wrong password
+  # just re-prompts, and we only give up after several tries.
+  local user_token="" attempts=0
+  while true; do
+    read -rsp "  Password for ${admin_user}@${tenant_name}: " pw < /dev/tty
+    echo ""
+    user_token=$(request_json POST "${LOCAL_API_URL}/tenant/login" \
+      "$(mkjson tenant_name "$tenant_name" username "$admin_user" password "$pw")" \
+      -H "Content-Type: application/json" 2>/dev/null | json_get '.token' 2>/dev/null || true)
+    [[ -n "$user_token" && "$user_token" != "null" ]] && break
+    attempts=$((attempts + 1))
+    if (( attempts >= 3 )); then
+      fail "Login failed after ${attempts} attempts. Double-check the workspace name and admin username too, then re-run."
+    fi
+    warn "Login failed - wrong password? Try again (${attempts}/3)."
+  done
+
+  echo ""
+  ok "Signed in. Creating a new agent in workspace '${tenant_name}' as '${admin_user}'."
+
+  # Type / mode / grants (defaults come from the last agent you created).
+  local a_type a_mode g_docker="false" g_svc="false"
+  echo ""
+  echo "    host - a machine (Linux/macOS), installed via install.sh"
+  echo "    k8s  - a Kubernetes cluster, installed via Helm"
+  echo ""
+  while true; do
+    read -rp "  Agent type [host/k8s] (default: ${AGENT_TYPE:-host}): " a_type < /dev/tty
+    a_type="${a_type:-${AGENT_TYPE:-host}}"
+    case "$a_type" in host|k8s) break ;; *) echo "    Enter host or k8s." ;; esac
+  done
+  while true; do
+    read -rp "  Agent mode [wild/readonly/approved] (default: ${AGENT_MODE:-wild}): " a_mode < /dev/tty
+    a_mode="${a_mode:-${AGENT_MODE:-wild}}"
+    case "$a_mode" in wild|readonly|approved) break ;; *) echo "    Enter wild, readonly, or approved." ;; esac
+  done
+  if [[ "$a_type" == "host" ]]; then
+    g_docker=$(prompt_yes_no "Grant Docker access?" "N")
+    g_svc=$(prompt_yes_no "Grant systemctl access?" "N")
+  fi
+
+  # wait_for_public_api_login logs in using these SETUP_* globals; in a subcommand
+  # they are unset, so point them at the credentials we just used.
+  SETUP_TENANT="$tenant_name"
+  SETUP_USERNAME="$admin_user"
+  SETUP_PASSWORD="$pw"
+
+  # Pick the URL the agent will use to reach this backend. They may have replaced
+  # their tunnel since setup, so let them confirm the saved one, paste a different
+  # URL, start a fresh tunnel, or stay local. A chosen public URL is verified and
+  # re-logged-in through so the generated install command embeds a URL that works.
+  local target_url="$LOCAL_API_URL" target_token="$user_token"
+  local has_cf=false has_ng=false
+  command -v cloudflared &>/dev/null && has_cf=true
+  command -v ngrok &>/dev/null && has_ng=true
+
+  echo ""
+  echo "  How will the agent reach this backend?"
+  echo "    - paste a public URL (a tunnel/domain you already run)"
+  { [[ "$has_cf" == true || "$has_ng" == true ]]; } && echo "    - type 'tunnel' to start a new one now"
+  echo "    - blank or 'local' for this machine / local network"
+  [[ -n "${PUBLIC_API_URL:-}" ]] && echo "    (saved from setup: ${PUBLIC_API_URL})"
+  echo ""
+  local answer
+  read -rp "  URL${PUBLIC_API_URL:+ [${PUBLIC_API_URL}]}: " answer < /dev/tty
+  answer="${answer:-${PUBLIC_API_URL:-local}}"
+
+  case "$answer" in
+    local|localhost|none)
+      : # keep the local URL
+      ;;
+    tunnel)
+      if [[ "$has_cf" != true && "$has_ng" != true ]]; then
+        warn "No tunnel tool (cloudflared/ngrok) found - using the local URL."
+      else
+        local default_tool; default_tool=$([[ "$has_cf" == true ]] && echo cloudflared || echo ngrok)
+        TUNNEL_CMD=""; NGROK_DOMAIN=""
+        echo ""
+        [[ "$has_cf" == true ]] && echo "    cloudflared - no account needed"
+        [[ "$has_ng" == true ]] && echo "    ngrok       - requires account"
+        echo ""
+        local choice
+        while true; do
+          read -rp "  Tunnel [cloudflared/ngrok] (default: ${default_tool}): " choice < /dev/tty
+          choice="${choice:-$default_tool}"
+          case "$choice" in
+            cloudflared) [[ "$has_cf" == true ]] && { TUNNEL_CMD=cloudflared; break; } || echo "    cloudflared not installed." ;;
+            ngrok)       [[ "$has_ng" == true ]] && { TUNNEL_CMD=ngrok; break; }       || echo "    ngrok not installed." ;;
+            *) echo "    Enter cloudflared or ngrok." ;;
+          esac
+        done
+        if start_public_tunnel && wait_for_public_api_login "$PUBLIC_API_URL"; then
+          local t
+          t=$(request_json POST "${PUBLIC_API_URL}/tenant/login" \
+            "$(mkjson tenant_name "$tenant_name" username "$admin_user" password "$pw")" \
+            -H "Content-Type: application/json" 2>/dev/null | json_get '.token' 2>/dev/null || true)
+          [[ -n "$t" && "$t" != "null" ]] && { target_url="$PUBLIC_API_URL"; target_token="$t"; }
+        else
+          warn "Tunnel not reachable - using the local URL instead."
+        fi
+      fi
+      ;;
+    https://*)
+      local clean="${answer%/}"
+      echo ""
+      echo "  Verifying ${clean} ..."
+      if wait_for_public_api_login "$clean"; then
+        local t
+        t=$(request_json POST "${clean}/tenant/login" \
+          "$(mkjson tenant_name "$tenant_name" username "$admin_user" password "$pw")" \
+          -H "Content-Type: application/json" 2>/dev/null | json_get '.token' 2>/dev/null || true)
+        if [[ -n "$t" && "$t" != "null" ]]; then
+          target_url="$clean"; target_token="$t"
+        else
+          warn "Could not log in through ${clean} - using the local URL instead."
+        fi
+      else
+        warn "${clean} is not reachable - using the local URL instead."
+      fi
+      ;;
+    *)
+      warn "Unrecognized value '${answer}' (public URLs must start with https://) - using the local URL."
+      ;;
+  esac
+
+  local resp agent_id install_cmd cli_use
+  resp=$(request_json POST "${target_url}/tenant/agents" \
+    "$(mkjson type "$a_type" mode "$a_mode" grant_service_mgmt "$g_svc" grant_docker "$g_docker")" \
+    -H "Authorization: Bearer $target_token" \
+    -H "Content-Type: application/json")
+  agent_id=$(echo "$resp" | json_get '.agent_id')
+  install_cmd=$(echo "$resp" | json_get '.commands.helm // .commands.agent // empty')
+  cli_use=$(echo "$resp" | json_get '.commands.cli_use // empty')
+  [[ -n "$agent_id" && "$agent_id" != "null" ]] || fail "Agent creation failed. Response: $resp"
+
+  echo ""
+  ok "Agent created: ${agent_id} (type=${a_type}, mode=${a_mode}) via ${target_url}"
+  echo ""
+  echo "  Run this on the target machine to install the agent:"
+  echo ""
+  echo "    ${install_cmd}"
+  echo ""
+  [[ -n "$cli_use" ]] && echo "  Select it in the CLI:  ${cli_use}"
+  echo ""
+}
+
 # ---------------------------------------------------------------------------
-# Subcommands (--status, --update, --rotate-password, --down, --reset, --purge)
+# Subcommands (--status, --update, --rotate-password, --down, --reset, --purge, --create-agent)
 # ---------------------------------------------------------------------------
 case "${1:-}" in
   --down)
@@ -555,7 +909,7 @@ case "${1:-}" in
 
     # Public URL if set
     if [[ -n "${API_URL:-}" && "$API_URL" != "$LOCAL_URL" ]]; then
-      if curl -sf "$API_URL/health" &>/dev/null; then
+      if curl -k -L -sf --http1.1 "$API_URL/health" &>/dev/null; then
         ok "public URL: $API_URL"
       else
         warn "public URL: $API_URL (not reachable - tunnel may have stopped)"
@@ -698,11 +1052,6 @@ case "${1:-}" in
     echo ""
     ok "Updating backend image to: $IMAGE"
 
-    echo ""
-    echo "  Agent versions are chosen per-agent in the console at create time."
-    read -rp "  Chart repo URL           [${RELEASES_CHART_REPO:-derived}]: " _cr < /dev/tty
-    [[ -n "$_cr" ]] && RELEASES_CHART_REPO="$_cr"
-
     write_nginx_config
     write_compose_file
 
@@ -727,11 +1076,16 @@ case "${1:-}" in
     echo "    Database volume"
     echo "    Tenant/users/API keys/agents"
     echo "    Retention settings"
-    echo "    Agent/chart version pins"
     echo ""
     echo "  Logs:"
     echo "    $COMPOSE -f $COMPOSE_FILE logs -f"
     echo ""
+    exit 0
+    ;;
+
+  --create-agent)
+    [[ -f "$COMPOSE_FILE" ]] || fail "no local stack found at $COMPOSE_FILE. Run setup first."
+    create_agent_subcommand
     exit 0
     ;;
 esac
@@ -920,14 +1274,10 @@ else
   AGENT_HISTORY_RETENTION_DAYS=30
 fi
 
-# Chart repo URL (advanced, for self-hosting the Helm repo). Agent/chart versions
-# are chosen per-agent in the console at create time - there is no global pin.
-echo ""
+# Chart repo defaults to <RELEASES_S3_BASE>/charts/reach-agent. Self-hosting the
+# Helm repo is rare, so it's an env override (RELEASES_CHART_REPO=…) rather than a
+# prompt. Agent/chart versions are chosen per-agent in the console.
 RELEASES_CHART_REPO="${RELEASES_CHART_REPO:-}"
-CUSTOM_CHART_REPO=$(prompt_yes_no "Self-hosting the Helm chart repo? (default: derive from releases base)" "N")
-if [[ "$CUSTOM_CHART_REPO" == "true" ]]; then
-  read -rp "  Chart repo URL           (blank = derive from releases base): " RELEASES_CHART_REPO < /dev/tty
-fi
 
 # CLI
 echo ""
@@ -972,55 +1322,29 @@ $COMPOSE -f "$COMPOSE_FILE" up -d
 
 wait_for_backend
 
-API_URL="http://localhost:${API_PORT}"
+LOCAL_API_URL="http://localhost:${API_PORT}"
+BOOTSTRAP_API_URL="$LOCAL_API_URL"
+PUBLIC_API_URL=""
+API_URL="$LOCAL_API_URL"
+TUNNEL_REACHABLE=false
+AGENT_CREATE_API_URL="$LOCAL_API_URL"
+AGENT_CREATE_TOKEN=""
+AGENT_SKIPPED_REASON=""
 
-if [[ "$USE_TUNNEL" == true ]]; then
-  PUBLIC_URL=""
-  if [[ "$TUNNEL_CMD" == "cloudflared" ]]; then
-    cloudflared tunnel --url "http://localhost:${API_PORT}" > /tmp/reach-tunnel.log 2>&1 &
-    for i in $(seq 1 25); do
-      PUBLIC_URL=$(grep -o 'https://[^ ]*\.trycloudflare\.com' /tmp/reach-tunnel.log 2>/dev/null | head -1 || true)
-      [[ -n "$PUBLIC_URL" ]] && break
-      sleep 2
-    done
-  elif [[ "$TUNNEL_CMD" == "ngrok" ]]; then
-    if [[ -n "$NGROK_DOMAIN" ]]; then
-      ngrok http "$API_PORT" --domain="$NGROK_DOMAIN" --log=stdout > /tmp/reach-tunnel.log 2>&1 &
-      PUBLIC_URL="https://$NGROK_DOMAIN"
-      sleep 3
-    else
-      ngrok http "$API_PORT" --log=stdout > /tmp/reach-tunnel.log 2>&1 &
-      for i in $(seq 1 20); do
-        PUBLIC_URL=$(curl -sf http://localhost:4040/api/tunnels 2>/dev/null \
-          | jq -r 'first(.tunnels[] | select(.proto == "https") | .public_url) // empty' 2>/dev/null || true)
-        [[ -n "$PUBLIC_URL" ]] && break
-        sleep 2
-      done
-    fi
-  fi
-  if [[ -n "$PUBLIC_URL" ]]; then
-    API_URL="$PUBLIC_URL"
-    ok "Tunnel: $API_URL"
-  else
-    warn "Could not get tunnel URL - falling back to local URL."
-    tail -10 /tmp/reach-tunnel.log 2>/dev/null || true
-  fi
-fi
+ok "Bootstrapping workspace through local backend..."
 
-ok "Bootstrapping workspace..."
-
-ADMIN_TOKEN=$(request_json POST "$API_URL/admin/login" \
+ADMIN_TOKEN=$(request_json POST "$BOOTSTRAP_API_URL/admin/login" \
   "$(mkjson password "$ADMIN_PASSWORD")" \
   -H "Content-Type: application/json" \
   | json_get '.token')
 
-TENANT_RESP=$(request_json POST "$API_URL/admin/tenants" \
+TENANT_RESP=$(request_json POST "$BOOTSTRAP_API_URL/admin/tenants" \
   "$(mkjson name "$SETUP_TENANT")" \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "Content-Type: application/json")
 TENANT_ID=$(echo "$TENANT_RESP" | json_get '.tenant_id')
 
-USER_RESP=$(request_json POST "$API_URL/admin/tenants/${TENANT_ID}/admin-users" \
+USER_RESP=$(request_json POST "$BOOTSTRAP_API_URL/admin/tenants/${TENANT_ID}/admin-users" \
   "$(mkjson username "$SETUP_USERNAME" role admin)" \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "Content-Type: application/json")
@@ -1028,42 +1352,37 @@ USER_RESP=$(request_json POST "$API_URL/admin/tenants/${TENANT_ID}/admin-users" 
 TEMP_PASS=$(echo "$USER_RESP" | json_get '.temp_password // .temporary_password // .password // .user.temp_password // .user.temporary_password // empty')
 [[ -n "$TEMP_PASS" ]] || fail "Admin user created but no temp password returned. Response: $USER_RESP"
 
-TEMP_TOKEN=$(request_json POST "$API_URL/tenant/login" \
+TEMP_TOKEN=$(request_json POST "$BOOTSTRAP_API_URL/tenant/login" \
   "$(mkjson tenant_name "$SETUP_TENANT" username "$SETUP_USERNAME" password "$TEMP_PASS")" \
   -H "Content-Type: application/json" | json_get '.token')
 
-request_json POST "$API_URL/tenant/me/password" \
+request_json POST "$BOOTSTRAP_API_URL/tenant/me/password" \
   "$(mkjson current_password "$TEMP_PASS" new_password "$SETUP_PASSWORD")" \
   -H "Authorization: Bearer $TEMP_TOKEN" \
   -H "Content-Type: application/json" > /dev/null
 
-USER_TOKEN=$(request_json POST "$API_URL/tenant/login" \
+USER_TOKEN=$(request_json POST "$BOOTSTRAP_API_URL/tenant/login" \
   "$(mkjson tenant_name "$SETUP_TENANT" username "$SETUP_USERNAME" password "$SETUP_PASSWORD")" \
   -H "Content-Type: application/json" | json_get '.token')
 
-API_KEY=$(request_json POST "$API_URL/tenant/api-tokens" \
+API_KEY=$(request_json POST "$BOOTSTRAP_API_URL/tenant/api-tokens" \
   "$(mkjson name "default-cli")" \
   -H "Authorization: Bearer $USER_TOKEN" \
   -H "Content-Type: application/json" | json_get '.token')
 
+ok "Workspace bootstrapped"
+
+# Install/login CLI immediately after local workspace bootstrap. Tunnel and
+# agent creation are handled after this so tunnel flakiness never blocks the
+# core local setup experience.
 AGENT_ID=""
 INSTALL_AGENT=""
 CLI_USE_CMD=""
-
-if [[ "$CREATE_AGENT" == "true" ]]; then
-  # The bootstrap agent always installs the latest version; pin a specific
-  # version per-agent in the console at create time if you need to.
-  AGENT_RESP=$(request_json POST "$API_URL/tenant/agents" \
-    "$(mkjson type "$AGENT_TYPE" mode "$AGENT_MODE" grant_service_mgmt "$GRANT_SERVICE_MGMT" grant_docker "$GRANT_DOCKER")" \
-    -H "Authorization: Bearer $USER_TOKEN" \
-    -H "Content-Type: application/json")
-  AGENT_ID=$(echo "$AGENT_RESP" | json_get '.agent_id')
-  # host agents return commands.agent (install.sh); k8s agents return commands.helm.
-  INSTALL_AGENT=$(echo "$AGENT_RESP" | json_get '.commands.helm // .commands.agent // empty')
-  CLI_USE_CMD=$(echo "$AGENT_RESP" | json_get '.commands.cli_use // empty')
-fi
-
-ok "Workspace bootstrapped"
+TUNNEL_REACHABLE=false
+AGENT_CREATE_API_URL="$LOCAL_API_URL"
+AGENT_CREATE_TOKEN="$USER_TOKEN"
+AGENT_SKIPPED_REASON=""
+TUNNEL_PID=""
 
 CLI_READY=false
 CLI_LOGGED_IN=false
@@ -1095,12 +1414,97 @@ elif [[ "$INSTALL_CLI" == "true" ]]; then
 fi
 
 if [[ "$CLI_READY" == "true" ]]; then
-  reach login --api-url "$API_URL" --api-key "$API_KEY"
-  if [[ -n "$AGENT_ID" ]]; then
-    [[ -n "$CLI_USE_CMD" ]] && $CLI_USE_CMD || reach agents use "$AGENT_ID"
+  if reach login --api-url "$LOCAL_API_URL" --api-key "$API_KEY"; then
+    CLI_LOGGED_IN=true
+    ok "CLI login ready"
+  else
+    warn "CLI login did not update the default profile. It may already exist; keeping existing CLI profile."
   fi
-  CLI_LOGGED_IN=true
+
   ok "CLI ready"
+fi
+
+create_agent_with_current_target() {
+  [[ -n "$AGENT_CREATE_TOKEN" ]] || AGENT_CREATE_TOKEN="$USER_TOKEN"
+
+  # The bootstrap agent always installs the latest version; pin a specific
+  # version per-agent in the console at create time if you need to.
+  AGENT_RESP=$(request_json POST "$AGENT_CREATE_API_URL/tenant/agents" \
+    "$(mkjson type "$AGENT_TYPE" mode "$AGENT_MODE" grant_service_mgmt "$GRANT_SERVICE_MGMT" grant_docker "$GRANT_DOCKER")" \
+    -H "Authorization: Bearer $AGENT_CREATE_TOKEN" \
+    -H "Content-Type: application/json")
+  AGENT_ID=$(echo "$AGENT_RESP" | json_get '.agent_id')
+  # host agents return commands.agent (install.sh); k8s agents return commands.helm.
+  INSTALL_AGENT=$(echo "$AGENT_RESP" | json_get '.commands.helm // .commands.agent // empty')
+  CLI_USE_CMD=$(echo "$AGENT_RESP" | json_get '.commands.cli_use // empty')
+  ok "Agent created using: $AGENT_CREATE_API_URL"
+}
+
+maybe_select_cli_agent() {
+  [[ "$CLI_READY" == "true" ]] || return 0
+  [[ -n "$AGENT_ID" ]] || return 0
+
+  if [[ -n "$CLI_USE_CMD" ]]; then
+    $CLI_USE_CMD || warn "Could not set default CLI agent with returned command."
+  else
+    reach agents use "$AGENT_ID" || warn "Could not set default CLI agent."
+  fi
+}
+
+# Agent creation happens after CLI/local setup. If a tunnel is required, the
+# user gets an interactive retry loop instead of a hard failure.
+if [[ "$CREATE_AGENT" == "true" ]]; then
+  if [[ "$USE_TUNNEL" == true ]]; then
+    while [[ -z "$AGENT_ID" ]]; do
+      # On retry, stop the previous quick-tunnel process before starting a new
+      # one so we do not leave multiple cloudflared/ngrok processes running.
+      if [[ -n "${TUNNEL_PID:-}" ]] && kill -0 "$TUNNEL_PID" 2>/dev/null; then
+        kill "$TUNNEL_PID" 2>/dev/null || true
+        sleep 1
+      fi
+
+      if start_public_tunnel && wait_for_public_api_login "$PUBLIC_API_URL"; then
+        TUNNEL_REACHABLE=true
+        API_URL="$PUBLIC_API_URL"
+        ok "Tunnel: $PUBLIC_API_URL"
+
+        # Re-login through the public URL before agent creation so the backend
+        # generates install commands with the public host, not localhost.
+        AGENT_CREATE_TOKEN=$(request_json POST "$PUBLIC_API_URL/tenant/login" \
+          "$(mkjson tenant_name "$SETUP_TENANT" username "$SETUP_USERNAME" password "$SETUP_PASSWORD")" \
+          -H "Content-Type: application/json" | json_get '.token')
+        AGENT_CREATE_API_URL="$PUBLIC_API_URL"
+        create_agent_with_current_target
+        maybe_select_cli_agent
+        break
+      fi
+
+      warn "Public tunnel is not reachable enough to create the agent safely."
+      warn "Local backend, workspace, API key, and CLI setup are complete."
+
+      retry_agent=$(prompt_yes_no "Retry tunnel check and agent creation now?" "Y")
+      if [[ "$retry_agent" != "true" ]]; then
+        warn "Agent creation skipped."
+        AGENT_SKIPPED_REASON="Public tunnel was not reachable. User skipped retry."
+        API_URL="$LOCAL_API_URL"
+        break
+      fi
+    done
+  else
+    AGENT_CREATE_API_URL="$LOCAL_API_URL"
+    AGENT_CREATE_TOKEN="$USER_TOKEN"
+    create_agent_with_current_target
+    maybe_select_cli_agent
+    API_URL="$LOCAL_API_URL"
+  fi
+fi
+
+# Prefer the public URL in saved metadata only when it is actually usable and
+# the agent was created through it. Otherwise keep the local URL as default.
+if [[ -n "$PUBLIC_API_URL" && "$TUNNEL_REACHABLE" == "true" ]]; then
+  API_URL="$PUBLIC_API_URL"
+else
+  API_URL="$LOCAL_API_URL"
 fi
 
 save_env_file
@@ -1111,7 +1515,13 @@ echo "│                    Reach is ready                            │"
 echo "└──────────────────────────────────────────────────────────────┘"
 echo ""
 echo "  API / Dashboard:"
-echo "    $API_URL"
+echo "    Local:  $LOCAL_API_URL"
+if [[ -n "${PUBLIC_API_URL:-}" ]]; then
+  echo "    Public: $PUBLIC_API_URL"
+  if [[ "$TUNNEL_REACHABLE" != "true" ]]; then
+    echo "    Note:   Public tunnel was discovered but public API login was not stable during setup."
+  fi
+fi
 echo ""
 echo "  Tenant:"
 echo "    $SETUP_TENANT"
@@ -1120,11 +1530,15 @@ echo "  Admin user:"
 echo "    $SETUP_USERNAME"
 echo ""
 echo "  Agent:"
-if [[ "$CREATE_AGENT" == "true" ]]; then
+if [[ -n "$AGENT_ID" ]]; then
   echo "    Created"
   echo "    Mode:                $AGENT_MODE"
   echo "    Docker access:       $GRANT_DOCKER"
   echo "    Service management:  $GRANT_SERVICE_MGMT"
+  echo "    Created via:         $AGENT_CREATE_API_URL"
+elif [[ "$CREATE_AGENT" == "true" ]]; then
+  echo "    Skipped"
+  [[ -n "${AGENT_SKIPPED_REASON:-}" ]] && echo "    Reason:              $AGENT_SKIPPED_REASON"
 else
   echo "    Skipped"
 fi
@@ -1133,7 +1547,7 @@ echo "  Secrets saved to:"
 echo "    $ENV_FILE"
 echo ""
 
-if [[ "$CREATE_AGENT" == "true" ]]; then
+if [[ -n "$AGENT_ID" ]]; then
   if [[ "$AGENT_TYPE" == "k8s" ]]; then
     echo "  ── Install agent on your Kubernetes cluster ────────────────"
   else
@@ -1160,14 +1574,14 @@ echo "  ── Test ────────────────────
 echo ""
 
 if [[ "$CLI_LOGGED_IN" == "true" ]]; then
-  if [[ "$CREATE_AGENT" == "true" ]]; then
+  if [[ -n "$AGENT_ID" ]]; then
     echo "    reach exec -- hostname"
   else
     echo "    reach agents list"
   fi
 else
   echo "    pip install $CLI_WHEEL_URL"
-  echo "    reach login --api-url '$API_URL' --api-key '<API_KEY_FROM_$ENV_FILE>'"
+  echo "    reach login --api-url '$LOCAL_API_URL' --api-key '<API_KEY_FROM_$ENV_FILE>'"
 
   if [[ -n "$CLI_USE_CMD" ]]; then
     echo "    $CLI_USE_CMD"
@@ -1179,15 +1593,41 @@ else
 fi
 
 echo ""
+
+# Show management commands the way the user actually invoked us: the local script
+# path when run from a checkout, otherwise the curl form (a `curl … | bash`
+# install has no ./scripts/local-setup.sh on disk to re-run).
+_setup_url="${RELEASES_S3_BASE:-https://reach-releases.s3.amazonaws.com}/local-setup.sh"
+if [[ -f "$0" && "$0" == *local-setup.sh ]]; then
+  SETUP_CMD="$0"
+else
+  SETUP_CMD="curl -fsSL $_setup_url | bash -s --"
+fi
+
+if [[ "$CREATE_AGENT" == "true" && -z "$AGENT_ID" && "$USE_TUNNEL" == true ]]; then
+  echo "  ── Create agent later ──────────────────────────────────────"
+  echo ""
+  echo "    The local workspace is ready, but no agent was created because the tunnel was not healthy."
+  echo "    Once your tunnel is reachable, register one with:"
+  echo ""
+  echo "      $SETUP_CMD --create-agent"
+  echo ""
+  echo "    It confirms your workspace/admin, (re)starts or reuses a public URL, then prints the install command."
+  echo ""
+fi
+
 echo "  ── Manage local backend ────────────────────────────────────"
 echo ""
-echo "    Status:   ./scripts/local-setup.sh --status            # check if everything is running"
-echo "    Update:   ./scripts/local-setup.sh --update            # updates backend image only"
-echo "    Password: ./scripts/local-setup.sh --rotate-password   # rotate platform admin password"
-echo "    Sessions: ./scripts/local-setup.sh --rotate-session-key # rotate session key (forces re-login)"
-echo "    Stop:     ./scripts/local-setup.sh --down              # keeps DB/data"
-echo "    Reset:    ./scripts/local-setup.sh --reset             # deletes local DB/data"
-echo "    Purge:    ./scripts/local-setup.sh --purge             # deletes local setup, asks before CLI uninstall"
+echo "    Re-run with a flag:  $SETUP_CMD <flag>"
+echo ""
+echo "      --status               check if everything is running"
+echo "      --create-agent         register another agent (host or k8s)"
+echo "      --update               update the backend image only"
+echo "      --rotate-password      rotate platform admin password"
+echo "      --rotate-session-key   rotate session key (forces re-login)"
+echo "      --down                 stop containers, keep DB/data"
+echo "      --reset                delete local DB/data"
+echo "      --purge                delete local setup (asks before CLI uninstall)"
 echo ""
 echo "    Logs:    $COMPOSE -f $COMPOSE_FILE logs -f"
 echo "    Restart: $COMPOSE -f $COMPOSE_FILE restart"

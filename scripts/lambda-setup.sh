@@ -401,14 +401,8 @@ if [[ "${1:-}" == "--update" ]]; then
     esac
   }
 
-  echo ""
-  echo "  Agent versions are chosen per-agent in the console at create time."
-  read -rp "  Chart repo URL           (blank = derive from releases base) [keep existing]: " _cr < /dev/tty
-  if [[ -n "$_cr" ]]; then
-    RELEASES_CHART_REPO_PARAM="ParameterKey=ReleasesChartRepo,ParameterValue=$_cr"; ok "Chart repo → $_cr"
-  else
-    RELEASES_CHART_REPO_PARAM="$(_keep ReleasesChartRepo '')"; info "Chart repo unchanged"
-  fi
+  # Chart repo is an env-only override; keep whatever the stack already has.
+  RELEASES_CHART_REPO_PARAM="$(_keep ReleasesChartRepo '')"
 
   echo ""
   echo "==> Updating stack '$STACK_NAME' to $RELEASE_TAG..."
@@ -593,14 +587,10 @@ else
   AGENT_HISTORY_RETENTION_DAYS=30
 fi
 
-# Chart repo URL (advanced, for self-hosting the Helm repo). Agent/chart versions
-# are chosen per-agent in the console at create time - there is no global pin.
-echo ""
+# Chart repo defaults to <ReleasesS3Base>/charts/reach-agent. Self-hosting the
+# Helm repo is rare, so it's an env override (RELEASES_CHART_REPO=…) rather than a
+# prompt. Agent/chart versions are chosen per-agent in the console.
 RELEASES_CHART_REPO="${RELEASES_CHART_REPO:-}"
-CUSTOM_CHART_REPO=$(prompt_yes_no "Self-hosting the Helm chart repo? (default: derive from releases base)" "N")
-if [[ "$CUSTOM_CHART_REPO" == "true" ]]; then
-  read -rp "  Chart repo URL           (blank = derive from releases base): " RELEASES_CHART_REPO < /dev/tty
-fi
 
 # CLI
 echo ""

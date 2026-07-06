@@ -7,6 +7,7 @@
 #   ./scripts/release_backend.sh --push --no-cache       # same, without Docker layer cache
 #   ./scripts/release_backend.sh --image myorg/reach     # override Docker image name
 #   ./scripts/release_backend.sh --bucket my-bucket      # override S3 bucket
+#   ./scripts/release_backend.sh --scripts               # publish ONLY the setup scripts (no build)
 
 set -euo pipefail
 
@@ -14,18 +15,42 @@ IMAGE="nabeemdev/reach"
 BUCKET="reach-releases"
 PUSH=false
 NO_CACHE=""
+SCRIPTS_ONLY=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --image)     IMAGE="$2";        shift 2 ;;
-    --bucket)    BUCKET="$2";       shift 2 ;;
-    --push)      PUSH=true;         shift   ;;
-    --no-cache)  NO_CACHE="--no-cache"; shift ;;
-    *) echo "Usage: $0 [--image <repo/name>] [--bucket <s3-bucket>] [--push] [--no-cache]"; exit 1 ;;
+    --image)          IMAGE="$2";        shift 2 ;;
+    --bucket)         BUCKET="$2";       shift 2 ;;
+    --push)           PUSH=true;         shift   ;;
+    --no-cache)       NO_CACHE="--no-cache"; shift ;;
+    --scripts|--script) SCRIPTS_ONLY=true; shift ;;
+    *) echo "Usage: $0 [--image <repo/name>] [--bucket <s3-bucket>] [--push] [--no-cache] [--scripts]"; exit 1 ;;
   esac
 done
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+
+# ---------------------------------------------------------------------------
+# --scripts: publish only the setup scripts. Skips tests, Docker, Lambda, and the
+# UI build - handy for iterating on local-setup.sh / lambda-setup.sh alone.
+# ---------------------------------------------------------------------------
+if [[ "$SCRIPTS_ONLY" == true ]]; then
+  command -v aws &>/dev/null || { echo "Error: 'aws' is required but not installed."; exit 1; }
+
+  echo "==> Syntax-checking setup scripts..."
+  bash -n "$ROOT_DIR/scripts/local-setup.sh"
+  bash -n "$ROOT_DIR/scripts/lambda-setup.sh"
+
+  echo "==> Uploading setup scripts to s3://$BUCKET ..."
+  aws s3 cp "$ROOT_DIR/scripts/local-setup.sh"  "s3://$BUCKET/local-setup.sh"
+  aws s3 cp "$ROOT_DIR/scripts/lambda-setup.sh" "s3://$BUCKET/lambda-setup.sh"
+
+  echo ""
+  echo "  Published (scripts only):"
+  echo "    s3://$BUCKET/local-setup.sh"
+  echo "    s3://$BUCKET/lambda-setup.sh"
+  exit 0
+fi
 
 # ---------------------------------------------------------------------------
 # Version
