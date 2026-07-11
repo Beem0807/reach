@@ -93,6 +93,20 @@ reason plainly visible in `kubectl logs` - rather than restarting on a loop that
 buries it. Transient errors (network blips, 5xx) still retry with backoff as
 normal; only permanent 4xx conditions idle.
 
+### Fleet scale-in
+
+When the **machine** shuts down (an Auto Scaling Group instance terminating), a
+**host** agent calls `POST /agent/deregister` so the member is removed from its
+fleet immediately, instead of lingering until the server-side reaper's window
+elapses. It's best-effort (shutdown isn't blocked on it) and the backend no-ops
+for any agent that isn't a host fleet member, so it's always safe to attempt.
+
+A plain `systemctl restart reach-agent` does **not** deregister: both a restart
+and a shutdown deliver `SIGTERM`, so the agent distinguishes them via systemd's
+manager state (`systemctl is-system-running` == `stopping` only during a real
+reboot/poweroff/termination). Only a confirmed OS shutdown triggers deregister;
+the reaper remains the backstop if that signal is ever missed.
+
 ---
 
 ## Execution model

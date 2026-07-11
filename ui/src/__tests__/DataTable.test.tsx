@@ -50,12 +50,12 @@ beforeEach(() => {
 // ---------------------------------------------------------------------------
 
 describe('DataTable rendering', () => {
-  it('renders all column header labels', () => {
+  it('renders visible column header labels (hidden columns not rendered)', () => {
     renderTable();
-    // All th text is in the DOM (CSS hides Extra via style tag but JSDOM doesn't apply CSS)
+    // Hidden columns are dropped from the DOM (not CSS-hidden), so Extra (defaultHidden) is absent.
     expect(document.querySelector('thead')!.textContent).toContain('Name');
     expect(document.querySelector('thead')!.textContent).toContain('Status');
-    expect(document.querySelector('thead')!.textContent).toContain('Extra');
+    expect(document.querySelector('thead')!.textContent).not.toContain('Extra');
   });
 
   it('renders row data in tbody', () => {
@@ -88,34 +88,20 @@ describe('DataTable rendering', () => {
 // Hidden columns - style tag injection
 // ---------------------------------------------------------------------------
 
-describe('DataTable hidden column style injection', () => {
-  it('injects a style tag when a column is defaultHidden', () => {
-    renderTable(); // Extra (index 2) is defaultHidden → nth-child(3)
-    const styleEls = Array.from(document.querySelectorAll('style'));
-    const injected = styleEls.some(s => s.textContent?.includes('nth-child(3)'));
-    expect(injected).toBe(true);
+describe('DataTable hidden columns removed from DOM', () => {
+  it('drops a defaultHidden column from the header', () => {
+    renderTable(); // Extra is defaultHidden
+    expect(document.querySelector('thead')!.textContent).not.toContain('Extra');
   });
 
-  it('style tag targets both thead th and tbody td', () => {
+  it('drops the defaultHidden column cells from the body', () => {
     renderTable();
-    const styleEls = Array.from(document.querySelectorAll('style'));
-    const text = styleEls.find(s => s.textContent?.includes('nth-child(3)'))?.textContent ?? '';
-    expect(text).toContain('thead th');
-    expect(text).toContain('tbody td');
-  });
-
-  it('no style tag when all columns visible', () => {
-    render(
-      <DataTable<string>
-        tableId="nodft"
-        columns={[{ label: 'X', sortValue: r => r, required: true }]}
-        rows={['a']}
-        renderRow={r => <tr key={r}><td>{r}</td></tr>}
-      />,
-    );
-    const styleEls = Array.from(document.querySelectorAll('style'));
-    const hasHide = styleEls.some(s => s.textContent?.includes('nth-child'));
-    expect(hasHide).toBe(false);
+    // Extra values (zzz/aaa/mmm) must not appear in any body cell.
+    expect(screen.queryByText('zzz')).not.toBeInTheDocument();
+    expect(screen.queryByText('aaa')).not.toBeInTheDocument();
+    // Each visible row has exactly the 2 visible columns (Name, Status).
+    const firstRow = (document.querySelector('tbody') as HTMLTableSectionElement).rows[0];
+    expect(firstRow.cells.length).toBe(2);
   });
 
   it('shows column count badge (visible/total) when any column hidden', () => {
@@ -172,23 +158,19 @@ describe('DataTable column picker', () => {
     expect(checkboxes()[2]).not.toBeChecked(); // Extra - defaultHidden
   });
 
-  it('unchecking Status injects nth-child(2) style', () => {
+  it('unchecking Status removes it from the header', () => {
     renderTable();
     openPicker();
-    fireEvent.click(checkboxes()[1]); // hide Status (col index 1 → nth-child 2)
-    const styleEls = Array.from(document.querySelectorAll('style'));
-    const injected = styleEls.some(s => s.textContent?.includes('nth-child(2)'));
-    expect(injected).toBe(true);
+    fireEvent.click(checkboxes()[1]); // hide Status
+    expect(document.querySelector('thead')!.textContent).not.toContain('Status');
   });
 
-  it('unchecking then rechecking Status removes nth-child(2) style', () => {
+  it('unchecking then rechecking Status restores it in the header', () => {
     renderTable();
     openPicker();
     fireEvent.click(checkboxes()[1]); // hide
     fireEvent.click(checkboxes()[1]); // show again
-    const styleEls = Array.from(document.querySelectorAll('style'));
-    const stillHidden = styleEls.some(s => s.textContent?.includes('nth-child(2)'));
-    expect(stillHidden).toBe(false);
+    expect(document.querySelector('thead')!.textContent).toContain('Status');
   });
 
   it('"Show all" button appears when columns are hidden', () => {
@@ -219,6 +201,41 @@ describe('DataTable column picker', () => {
     expect(checkboxes().length).toBeGreaterThan(0);
     openPicker(); // toggle off
     expect(screen.queryAllByRole('checkbox').length).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Column reordering (drag headers)
+// ---------------------------------------------------------------------------
+
+describe('DataTable column reordering', () => {
+  beforeEach(() => { try { localStorage.removeItem('dt_order_test-dt'); } catch {} });
+
+  function headerLabels() {
+    return Array.from(document.querySelectorAll('thead th'))
+      .map(th => th.querySelector('span')!.textContent!.replace(/[⇅▲▼]/g, ''));
+  }
+
+  function reorder(fromIdx: number, toIdx: number) {
+    const ths = document.querySelectorAll('thead th');
+    fireEvent.dragStart(ths[fromIdx]);
+    fireEvent.dragOver(ths[toIdx]);
+    fireEvent.drop(ths[toIdx]);
+  }
+
+  it('reorders columns when a header is dropped before another', () => {
+    renderTable(); // visible order: Name, Status
+    expect(headerLabels()).toEqual(['Name', 'Status']);
+    reorder(1, 0); // drop Status before Name
+    expect(headerLabels()).toEqual(['Status', 'Name']);
+  });
+
+  it('reorders the matching body cells too', () => {
+    renderTable();
+    reorder(1, 0); // Status now first
+    const firstRow = (document.querySelector('tbody') as HTMLTableSectionElement).rows[0];
+    expect(firstRow.cells[0].textContent).toBe('active'); // charlie's status
+    expect(firstRow.cells[1].textContent).toBe('charlie');
   });
 });
 

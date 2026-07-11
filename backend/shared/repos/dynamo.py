@@ -49,6 +49,8 @@ _TABLE_JOBS = _ddb.Table("reach-jobs")
 _TABLE_APPROVALS = _ddb.Table("reach-approvals")
 _TABLE_API_TOKENS = _ddb.Table("reach-api-tokens")
 _TABLE_AUDIT_LOGS = _ddb.Table("reach-audit-logs")
+_TABLE_FLEETS = _ddb.Table("reach-fleets")
+_TABLE_RUNS = _ddb.Table("reach-runs")
 
 
 def _enrich_agent(d: Optional[dict]) -> Optional[dict]:
@@ -181,6 +183,46 @@ class AgentRepo:
         ).get("Items", [])
         return [_enrich_agent(item) for item in items]
 
+    def list_by_fleet(self, fleet_id: str) -> list:
+        """A single fleet's members via the fleet-index GSI (not a tenant-wide read) -
+        the hot path for large fleets. Raw items; standalone-agent enrichment is only
+        needed by list_by_tenant."""
+        results: list = []
+        kwargs = {"IndexName": "fleet-index",
+                  "KeyConditionExpression": DKey("fleet_id").eq(fleet_id)}
+        while True:
+            resp = _TABLE_AGENTS.query(**kwargs)
+            results.extend(resp.get("Items", []))
+            if "LastEvaluatedKey" not in resp:
+                break
+            kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+        return results
+
+    def fleet_member_groups(self, tenant_id: str) -> list:
+        """Grouped member facts for per-fleet stats. DynamoDB has no GROUP BY, so we read
+        a **projection** (5 small attrs, no enrichment/full rows) of the tenant's fleet
+        members and aggregate in Python - the same read shape as member_counts."""
+        counts: dict = {}
+        kwargs = {"IndexName": "tenant-index",
+                  "KeyConditionExpression": DKey("tenant_id").eq(tenant_id),
+                  "FilterExpression": Attr("fleet_id").exists(),
+                  "ProjectionExpression": "fleet_id, #st, grant_service_mgmt, grant_docker, grants_exception",
+                  "ExpressionAttributeNames": {"#st": "status"}}
+        while True:
+            resp = _TABLE_AGENTS.query(**kwargs)
+            for it in resp.get("Items", []):
+                if not it.get("fleet_id"):
+                    continue
+                key = (it["fleet_id"], it.get("status"), bool(it.get("grant_service_mgmt")),
+                       bool(it.get("grant_docker")), it.get("grants_exception"))
+                counts[key] = counts.get(key, 0) + 1
+            if "LastEvaluatedKey" not in resp:
+                break
+            kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+        return [{"fleet_id": k[0], "status": k[1], "grant_service_mgmt": k[2],
+                 "grant_docker": k[3], "grants_exception": k[4], "count": v}
+                for k, v in counts.items()]
+
     def mark_inactive(self, agent_id: str) -> bool:
         try:
             _TABLE_AGENTS.update_item(
@@ -198,6 +240,90 @@ class AgentRepo:
 
     def create(self, agent: dict) -> None:
         _TABLE_AGENTS.put_item(Item=agent)
+
+    def get_by_fleet_and_fingerprint(self, fleet_id: str, machine_fingerprint: str) -> Optional[dict]:
+        if not fleet_id or not machine_fingerprint:
+            return None
+        items = _TABLE_AGENTS.query(
+            IndexName="fleet-index",
+            KeyConditionExpression=DKey("fleet_id").eq(fleet_id)
+            & DKey("machine_fingerprint").eq(machine_fingerprint),
+            Limit=1,
+        ).get("Items", [])
+        return _enrich_agent(items[0]) if items else None
+
+    def _fleet_member_ids(self, fleet_id: str) -> list:
+        ids: list = []
+        kwargs = {"IndexName": "fleet-index",
+                  "KeyConditionExpression": DKey("fleet_id").eq(fleet_id),
+                  "ProjectionExpression": "agent_id"}
+        while True:
+            resp = _TABLE_AGENTS.query(**kwargs)
+            ids.extend(i["agent_id"] for i in resp.get("Items", []))
+            if "LastEvaluatedKey" not in resp:
+                break
+            kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+        return ids
+
+    def detach_fleet(self, fleet_id: str) -> int:
+        ids = self._fleet_member_ids(fleet_id)
+        for aid in ids:
+            _TABLE_AGENTS.update_item(
+                Key={"agent_id": aid},
+                UpdateExpression="REMOVE fleet_id",
+            )
+        return len(ids)
+
+    def delete_by_fleet(self, fleet_id: str) -> int:
+        ids = self._fleet_member_ids(fleet_id)
+        for aid in ids:
+            _TABLE_AGENTS.delete_item(Key={"agent_id": aid})
+        return len(ids)
+
+    def set_mode_by_fleet(self, fleet_id: str, mode: str) -> int:
+        ids = self._fleet_member_ids(fleet_id)
+        for aid in ids:
+            _TABLE_AGENTS.update_item(
+                Key={"agent_id": aid},
+                UpdateExpression="SET #m = :v",
+                ExpressionAttributeNames={"#m": "mode"},
+                ExpressionAttributeValues={":v": mode},
+            )
+        return len(ids)
+
+    def set_tags_by_fleet(self, fleet_id: str, tags: list) -> int:
+        ids = self._fleet_member_ids(fleet_id)
+        for aid in ids:
+            _TABLE_AGENTS.update_item(
+                Key={"agent_id": aid},
+                UpdateExpression="SET tags = :v",
+                ExpressionAttributeValues={":v": tags},
+            )
+        return len(ids)
+
+    def detach_from_fleet(self, agent_id: str) -> None:
+        _TABLE_AGENTS.update_item(Key={"agent_id": agent_id}, UpdateExpression="REMOVE fleet_id")
+
+    def reenroll(self, agent_id: str, fields: dict) -> None:
+        _TABLE_AGENTS.update_item(
+            Key={"agent_id": agent_id},
+            UpdateExpression=(
+                "SET #st = :a, agent_token_hash = :t, machine_fingerprint = :m, "
+                "hostname = :h, agent_version = :v, claimed_at = :c, "
+                "active_until = :u, last_heartbeat_at = :c, token_issued_at = :ti"
+            ),
+            ExpressionAttributeNames={"#st": "status"},
+            ExpressionAttributeValues={
+                ":a": "ACTIVE",
+                ":t": fields["agent_token_hash"],
+                ":m": fields["machine_fingerprint"],
+                ":h": fields["hostname"],
+                ":v": fields["agent_version"],
+                ":c": fields["claimed_at"],
+                ":u": fields["active_until"],
+                ":ti": fields["token_issued_at"],
+            },
+        )
 
     def update_policy(self, agent_id: str, mode: str) -> None:
         _TABLE_AGENTS.update_item(
@@ -276,6 +402,17 @@ class AgentRepo:
             ExpressionAttributeValues=vals,
         )
 
+    def set_grants_exception(self, agent_id: str, signature) -> None:
+        """Record (or clear, with None) an accepted fleet-grant-mismatch exception."""
+        if signature is None:
+            _TABLE_AGENTS.update_item(Key={"agent_id": agent_id},
+                                      UpdateExpression="REMOVE grants_exception")
+        else:
+            _TABLE_AGENTS.update_item(
+                Key={"agent_id": agent_id},
+                UpdateExpression="SET grants_exception = :s",
+                ExpressionAttributeValues={":s": signature})
+
     def scan_stale_active(self, cutoff_iso: str) -> list:
         results = []
         kwargs: dict = {
@@ -292,6 +429,27 @@ class AgentRepo:
                 break
             kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
         return [_enrich_agent(item) for item in results]
+
+    def scan_reapable_fleet_members(self, cutoff_iso: str) -> list:
+        """Fleet members whose last heartbeat is older than cutoff - candidates for
+        reaping. Caller applies each member's fleet-specific reap window precisely."""
+        results = []
+        kwargs: dict = {
+            "FilterExpression": (
+                Attr("fleet_id").exists()
+                & (Attr("status").eq("ACTIVE") | Attr("status").eq("INACTIVE"))
+                & Attr("last_heartbeat_at").exists()
+                & Attr("last_heartbeat_at").lt(cutoff_iso)
+            ),
+        }
+        while True:
+            resp = _TABLE_AGENTS.scan(**kwargs)
+            results.extend(resp.get("Items", []))
+            if "LastEvaluatedKey" not in resp:
+                break
+            kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+        # fleet_id may be present-but-null for detached agents; keep only real members.
+        return [_enrich_agent(item) for item in results if item.get("fleet_id")]
 
 
 class JobRepo:
@@ -343,6 +501,61 @@ class JobRepo:
             ExpressionAttributeValues={":s": "EXPIRED"},
         )
 
+    def _run_jobs_by_status(self, run_id: str, status: str) -> list:
+        items: list = []
+        kwargs: dict = {
+            "IndexName": "run-index",
+            "KeyConditionExpression": DKey("run_id").eq(run_id),
+            "FilterExpression": Attr("status").eq(status),
+        }
+        while True:
+            resp = _TABLE_JOBS.query(**kwargs)
+            items.extend(resp.get("Items", []))
+            lek = resp.get("LastEvaluatedKey")
+            if not lek:
+                break
+            kwargs["ExclusiveStartKey"] = lek
+        return items
+
+    def release_wave(self, run_id: str, wave: int) -> list:
+        """Flip a staged run's wave from HELD to PENDING. Each flip is guarded by
+        status==HELD (idempotent under a concurrent release). Returns the released rows."""
+        released: list = []
+        for item in self._run_jobs_by_status(run_id, "HELD"):
+            if (item.get("wave") or 0) != wave:
+                continue
+            try:
+                _TABLE_JOBS.update_item(
+                    Key={"job_id": item["job_id"]},
+                    UpdateExpression="SET #st = :p",
+                    ConditionExpression="#st = :h",
+                    ExpressionAttributeNames={"#st": "status"},
+                    ExpressionAttributeValues={":p": "PENDING", ":h": "HELD"},
+                )
+                released.append(item)
+            except ClientError as err:
+                if err.response["Error"]["Code"] != "ConditionalCheckFailedException":
+                    raise
+        return released
+
+    def cancel_staged(self, run_id: str) -> int:
+        """Cancel every not-yet-released (HELD) job of a run - the remaining waves."""
+        count = 0
+        for item in self._run_jobs_by_status(run_id, "HELD"):
+            try:
+                _TABLE_JOBS.update_item(
+                    Key={"job_id": item["job_id"]},
+                    UpdateExpression="SET #st = :c",
+                    ConditionExpression="#st = :h",
+                    ExpressionAttributeNames={"#st": "status"},
+                    ExpressionAttributeValues={":c": "CANCELED", ":h": "HELD"},
+                )
+                count += 1
+            except ClientError as err:
+                if err.response["Error"]["Code"] != "ConditionalCheckFailedException":
+                    raise
+        return count
+
     def expire_stale(self, pending_cutoff_iso: str) -> int:
         items = _TABLE_JOBS.scan(
             FilterExpression=Attr("status").eq("PENDING") & Attr("created_at").lt(pending_cutoff_iso)
@@ -363,14 +576,15 @@ class JobRepo:
                     raise
         return count
 
-    def delete_stale(self, before_iso: str) -> int:
-        terminal = ["SUCCEEDED", "FAILED", "REJECTED", "EXPIRED"]
+    def delete_stale(self, before_iso: str, tenant_id: Optional[str] = None) -> int:
         fe = Attr("created_at").lt(before_iso) & (
             Attr("status").eq("SUCCEEDED") |
             Attr("status").eq("FAILED") |
             Attr("status").eq("REJECTED") |
             Attr("status").eq("EXPIRED")
         )
+        if tenant_id is not None:
+            fe = fe & Attr("tenant_id").eq(tenant_id)
         items = _TABLE_JOBS.scan(
             FilterExpression=fe,
             ProjectionExpression="job_id",
@@ -444,6 +658,24 @@ class JobRepo:
             kwargs["FilterExpression"] = expr
         return _TABLE_JOBS.query(**kwargs).get("Items", [])
 
+    def list_by_run(self, tenant_id: str, run_id: str) -> list:
+        """Every job in one fan-out (a "run"), via the run-index GSI. Powers run
+        status and idempotency-key dedupe."""
+        items: list = []
+        kwargs: dict = {
+            "IndexName": "run-index",
+            "KeyConditionExpression": DKey("run_id").eq(run_id),
+            "FilterExpression": Attr("tenant_id").eq(tenant_id),
+        }
+        while True:
+            resp = _TABLE_JOBS.query(**kwargs)
+            items.extend(resp.get("Items", []))
+            lek = resp.get("LastEvaluatedKey")
+            if not lek:
+                break
+            kwargs["ExclusiveStartKey"] = lek
+        return items
+
 
 class TenantRepo:
     def get(self, tenant_id: str) -> Optional[dict]:
@@ -481,6 +713,142 @@ class TenantRepo:
             ExpressionAttributeValues={":s": status},
         )
 
+    def set_settings(self, tenant_id: str, settings: dict) -> None:
+        _TABLE_TENANTS.update_item(
+            Key={"tenant_id": tenant_id},
+            UpdateExpression="SET settings = :s",
+            ExpressionAttributeValues={":s": settings},
+        )
+
+
+class FleetRepo:
+    def get(self, fleet_id: str) -> Optional[dict]:
+        return _TABLE_FLEETS.get_item(Key={"fleet_id": fleet_id}).get("Item")
+
+    def get_by_name(self, tenant_id: str, name: str) -> Optional[dict]:
+        items = _TABLE_FLEETS.query(
+            IndexName="tenant-index",
+            KeyConditionExpression=DKey("tenant_id").eq(tenant_id),
+            FilterExpression=Attr("name").eq(name),
+            Limit=1,
+        ).get("Items", [])
+        return items[0] if items else None
+
+    def get_by_join_token_hash(self, token_hash: str, now: int) -> Optional[dict]:
+        if not token_hash:
+            return None
+        items = _TABLE_FLEETS.query(
+            IndexName="join-token-hash-index",
+            KeyConditionExpression=DKey("join_token_hash").eq(token_hash),
+        ).get("Items", [])
+        if items:
+            return items[0]
+        # Previous token still valid during the rotation grace window.
+        items = _TABLE_FLEETS.query(
+            IndexName="prev-join-token-hash-index",
+            KeyConditionExpression=DKey("prev_join_token_hash").eq(token_hash),
+        ).get("Items", [])
+        for f in items:
+            exp = f.get("prev_join_token_expires_at")
+            if exp is not None and int(exp) > now:
+                return f
+        return None
+
+    def create(self, fleet: dict) -> None:
+        from shared.exceptions import NameTakenError
+        name = fleet.get("name", "")
+        if name and self.get_by_name(fleet.get("tenant_id", ""), name):
+            raise NameTakenError(name)
+        _TABLE_FLEETS.put_item(Item=fleet)
+
+    def list_by_tenant(self, tenant_id: str) -> list:
+        results: list = []
+        kwargs = {"IndexName": "tenant-index",
+                  "KeyConditionExpression": DKey("tenant_id").eq(tenant_id)}
+        while True:
+            resp = _TABLE_FLEETS.query(**kwargs)
+            results.extend(resp.get("Items", []))
+            if "LastEvaluatedKey" not in resp:
+                break
+            kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+        return results
+
+    def scan_all(self) -> list:
+        """Every fleet across all tenants - used by the heartbeat reaper."""
+        results: list = []
+        kwargs: dict = {}
+        while True:
+            resp = _TABLE_FLEETS.scan(**kwargs)
+            results.extend(resp.get("Items", []))
+            if "LastEvaluatedKey" not in resp:
+                break
+            kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+        return results
+
+    def member_counts(self, tenant_id: str) -> dict:
+        counts: dict = {}
+        kwargs = {"IndexName": "tenant-index",
+                  "KeyConditionExpression": DKey("tenant_id").eq(tenant_id),
+                  "ProjectionExpression": "fleet_id"}
+        while True:
+            resp = _TABLE_AGENTS.query(**kwargs)
+            for item in resp.get("Items", []):
+                fid = item.get("fleet_id")
+                if fid:
+                    counts[fid] = counts.get(fid, 0) + 1
+            if "LastEvaluatedKey" not in resp:
+                break
+            kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+        return counts
+
+    def rotate_token(self, fleet_id: str, new_hash: str,
+                     prev_hash: Optional[str], prev_expires_at: Optional[int]) -> None:
+        expr = "SET join_token_hash = :n, #st = :a"
+        vals = {":n": new_hash, ":a": "ACTIVE"}
+        if prev_hash is not None:
+            expr += ", prev_join_token_hash = :ph, prev_join_token_expires_at = :pe"
+            vals[":ph"] = prev_hash
+            vals[":pe"] = prev_expires_at
+        _TABLE_FLEETS.update_item(
+            Key={"fleet_id": fleet_id},
+            UpdateExpression=expr,
+            ExpressionAttributeNames={"#st": "status"},
+            ExpressionAttributeValues=vals,
+        )
+
+    def set_status(self, fleet_id: str, status: str) -> None:
+        _TABLE_FLEETS.update_item(
+            Key={"fleet_id": fleet_id},
+            UpdateExpression="SET #st = :s",
+            ExpressionAttributeNames={"#st": "status"},
+            ExpressionAttributeValues={":s": status},
+        )
+
+    def update_settings(self, fleet_id: str, fields: dict) -> None:
+        if not fields:
+            return
+        from shared.exceptions import NameTakenError
+        if "name" in fields:
+            fleet = self.get(fleet_id)
+            existing = self.get_by_name(fleet.get("tenant_id", ""), fields["name"]) if fleet else None
+            if existing and existing.get("fleet_id") != fleet_id:
+                raise NameTakenError(fields["name"])
+        sets, names, vals = [], {}, {}
+        for i, (k, v) in enumerate(fields.items()):
+            nk, ph = f"#k{i}", f":v{i}"
+            sets.append(f"{nk} = {ph}")
+            names[nk] = k
+            vals[ph] = v
+        _TABLE_FLEETS.update_item(
+            Key={"fleet_id": fleet_id},
+            UpdateExpression="SET " + ", ".join(sets),
+            ExpressionAttributeNames=names,
+            ExpressionAttributeValues=vals,
+        )
+
+    def delete(self, fleet_id: str) -> None:
+        _TABLE_FLEETS.delete_item(Key={"fleet_id": fleet_id})
+
 
 class UserRepo:
     def get(self, user_id: str) -> Optional[dict]:
@@ -501,8 +869,23 @@ class UserRepo:
     def set_allowed_agents(self, user_id: str, agent_ids: list) -> None:
         _TABLE_USERS.update_item(
             Key={"user_id": user_id},
-            UpdateExpression="SET allowed_agent_ids = :ids",
+            UpdateExpression="SET readwrite_agent_ids = :ids",
             ExpressionAttributeValues={":ids": agent_ids},
+        )
+
+    def set_agent_access(self, user_id: str, readwrite_agent_ids, readonly_agent_ids,
+                         readwrite_fleet_ids=None, readonly_fleet_ids=None) -> None:
+        """Set the full access scope: read-write / read-only, agents and fleets."""
+        _TABLE_USERS.update_item(
+            Key={"user_id": user_id},
+            UpdateExpression=(
+                "SET readwrite_agent_ids = :a, readonly_agent_ids = :r,"
+                " readwrite_fleet_ids = :fa, readonly_fleet_ids = :fr"
+            ),
+            ExpressionAttributeValues={
+                ":a": readwrite_agent_ids, ":r": readonly_agent_ids,
+                ":fa": readwrite_fleet_ids, ":fr": readonly_fleet_ids,
+            },
         )
 
     def get_by_username(self, tenant_id: str, username: str) -> Optional[dict]:
@@ -573,13 +956,20 @@ class UserRepo:
             KeyConditionExpression=DKey("tenant_id").eq(tenant_id),
         ).get("Items", [])
         for user in users:
-            current = user.get("allowed_agent_ids") or []
-            if agent_id in current:
-                new_list = [a for a in current if a != agent_id]
+            sets, values = [], {}
+            allowed = user.get("readwrite_agent_ids") or []
+            if agent_id in allowed:
+                sets.append("readwrite_agent_ids = :a")
+                values[":a"] = [a for a in allowed if a != agent_id]
+            readonly = user.get("readonly_agent_ids") or []
+            if agent_id in readonly:
+                sets.append("readonly_agent_ids = :r")
+                values[":r"] = [a for a in readonly if a != agent_id]
+            if sets:
                 _TABLE_USERS.update_item(
                     Key={"user_id": user["user_id"]},
-                    UpdateExpression="SET allowed_agent_ids = :ids",
-                    ExpressionAttributeValues={":ids": new_list},
+                    UpdateExpression="SET " + ", ".join(sets),
+                    ExpressionAttributeValues=values,
                 )
 
 
@@ -658,9 +1048,9 @@ class ApprovalRepo:
         return results
 
     def search_by_tenant(self, tenant_id: str, *, status: Optional[str] = None, agent_id: Optional[str] = None,
-                         agent_ids: Optional[list] = None,
-                         requested_by: Optional[str] = None, kind: Optional[str] = None, q: Optional[str] = None,
-                         limit: int = 20, offset: int = 0) -> tuple:
+                         agent_ids: Optional[list] = None, fleet_id: Optional[str] = None, fleet_ids: Optional[list] = None,
+                         scope: Optional[str] = None, requested_by: Optional[str] = None, kind: Optional[str] = None,
+                         q: Optional[str] = None, limit: int = 20, offset: int = 0) -> tuple:
         """Server-side search + pagination for DynamoDB.
 
         DynamoDB has no LIKE and no OFFSET. Status/agent/requester and the text
@@ -677,16 +1067,23 @@ class ApprovalRepo:
             "ScanIndexForward": False,
         }
         filters = []
+        # Scope: an approval is in view if it matches any given agent/fleet filter.
+        scope_conds = []
         if agent_id is not None:
-            filters.append(Attr("agent_id").eq(agent_id))
-        if agent_ids is not None:
-            # Scope to an explicit allow-list of agents (e.g. an agent-restricted
-            # operator). An empty list matches nothing, so they see nothing.
-            if not agent_ids:
-                return [], 0
-            expr = Attr("agent_id").eq(agent_ids[0])
-            for aid in agent_ids[1:]:
-                expr = expr | Attr("agent_id").eq(aid)
+            scope_conds.append(Attr("agent_id").eq(agent_id))
+        if fleet_id is not None:
+            scope_conds.append(Attr("fleet_id").eq(fleet_id))
+        for aid in (agent_ids or []):
+            scope_conds.append(Attr("agent_id").eq(aid))
+        for fid in (fleet_ids or []):
+            scope_conds.append(Attr("fleet_id").eq(fid))
+        scoped = any(x is not None for x in (agent_id, fleet_id, agent_ids, fleet_ids))
+        if scoped and not scope_conds:
+            return [], 0   # restricted to an empty allow-list → sees nothing
+        if scope_conds:
+            expr = scope_conds[0]
+            for s in scope_conds[1:]:
+                expr = expr | s
             filters.append(expr)
         if status is not None:
             filters.append(Attr("status").eq(status))
@@ -715,6 +1112,11 @@ class ApprovalRepo:
             results = [r for r in results if r.get("k8s_rule")]
         elif kind == "host":
             results = [r for r in results if not r.get("k8s_rule")]
+        # scope: 'agent' = standalone (no fleet), 'fleet' = fleet-scoped.
+        if scope == "agent":
+            results = [r for r in results if not r.get("fleet_id")]
+        elif scope == "fleet":
+            results = [r for r in results if r.get("fleet_id")]
         total = len(results)
         page = results[offset: offset + limit] if limit else results[offset:]
         return page, total
@@ -771,17 +1173,75 @@ class ApprovalRepo:
         return kept
 
     def exists_pending(self, agent_id: str, command: str) -> bool:
-        kwargs: dict = {
-            "IndexName": "agent-approvals-index",
-            "KeyConditionExpression": DKey("agent_id").eq(agent_id),
-            "FilterExpression": Attr("status").eq("pending") & Attr("command").eq(command),
-            "Limit": 1,
-        }
-        resp = _TABLE_APPROVALS.query(**kwargs)
+        resp = _TABLE_APPROVALS.query(
+            IndexName="agent-approvals-index",
+            KeyConditionExpression=DKey("agent_id").eq(agent_id),
+            FilterExpression=Attr("status").eq("pending") & Attr("command").eq(command),
+            Limit=1,
+        )
         return len(resp.get("Items", [])) > 0
+
+    def exists_pending_fleet(self, fleet_id: str, command: str) -> bool:
+        resp = _TABLE_APPROVALS.query(
+            IndexName="fleet-approvals-index",
+            KeyConditionExpression=DKey("fleet_id").eq(fleet_id),
+            FilterExpression=Attr("status").eq("pending") & Attr("command").eq(command),
+            Limit=1,
+        )
+        return len(resp.get("Items", [])) > 0
+
+    def list_by_fleet(self, fleet_id: str, status: Optional[str] = None, requested_by: Optional[str] = None, limit: Optional[int] = None, cursor: Optional[str] = None) -> list:
+        kce = DKey("fleet_id").eq(fleet_id)
+        if cursor:
+            kce = kce & DKey("created_at").lt(cursor)
+        kwargs: dict = {
+            "IndexName": "fleet-approvals-index",
+            "KeyConditionExpression": kce,
+            "ScanIndexForward": False,
+        }
+        if status is not None:
+            kwargs["FilterExpression"] = Attr("status").eq(status)
+        results = []
+        while True:
+            resp = _TABLE_APPROVALS.query(**kwargs)
+            results.extend(resp.get("Items", []))
+            if "LastEvaluatedKey" not in resp:
+                break
+            kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+        if status == "approved":
+            results = self._lazy_expire(results)
+        if requested_by is not None:
+            results = [r for r in results if r.get("requested_by") == requested_by]
+        if limit is not None:
+            results = results[:limit]
+        return results
 
     def delete(self, approval_id: str) -> None:
         _TABLE_APPROVALS.delete_item(Key={"approval_id": approval_id})
+
+    def _delete_by_index(self, index: str, key: str, value: str) -> int:
+        ids = []
+        kwargs: dict = {"IndexName": index, "KeyConditionExpression": DKey(key).eq(value),
+                        "ProjectionExpression": "approval_id"}
+        while True:
+            resp = _TABLE_APPROVALS.query(**kwargs)
+            ids.extend(i["approval_id"] for i in resp.get("Items", []))
+            if "LastEvaluatedKey" not in resp:
+                break
+            kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+        if ids:
+            with _TABLE_APPROVALS.batch_writer() as batch:
+                for aid in ids:
+                    batch.delete_item(Key={"approval_id": aid})
+        return len(ids)
+
+    def delete_by_agent(self, agent_id: str) -> int:
+        """Purge every approval scoped to an agent (agent removal cleanup)."""
+        return self._delete_by_index("agent-approvals-index", "agent_id", agent_id)
+
+    def delete_by_fleet(self, fleet_id: str) -> int:
+        """Purge every approval scoped to a fleet (fleet revoke-remove / delete cleanup)."""
+        return self._delete_by_index("fleet-approvals-index", "fleet_id", fleet_id)
 
     def mark_expired(self, now_iso: str) -> int:
         resp = _TABLE_APPROVALS.scan(
@@ -803,14 +1263,14 @@ class ApprovalRepo:
                     raise
         return len(items)
 
-    def delete_stale(self, before_iso: str) -> int:
-        resp = _TABLE_APPROVALS.scan(
-            FilterExpression=(
-                (Attr("status").eq("denied") & Attr("reviewed_at").lt(before_iso)) |
-                (Attr("status").eq("expired") & Attr("expires_at").lt(before_iso))
-            ),
-            ProjectionExpression="approval_id",
+    def delete_stale(self, before_iso: str, tenant_id: Optional[str] = None) -> int:
+        fe = (
+            (Attr("status").eq("denied") & Attr("reviewed_at").lt(before_iso)) |
+            (Attr("status").eq("expired") & Attr("expires_at").lt(before_iso))
         )
+        if tenant_id is not None:
+            fe = fe & Attr("tenant_id").eq(tenant_id)
+        resp = _TABLE_APPROVALS.scan(FilterExpression=fe, ProjectionExpression="approval_id")
         items = resp.get("Items", [])
         with _TABLE_APPROVALS.batch_writer() as batch:
             for item in items:
@@ -910,6 +1370,73 @@ class ApiTokenRepo:
 _TABLE_AGENT_HISTORY = _ddb.Table("reach-agent-history")
 
 
+class RunRepo:
+    def create(self, run: dict) -> None:
+        _TABLE_RUNS.put_item(Item=run)
+
+    def get(self, run_id: str) -> Optional[dict]:
+        return _TABLE_RUNS.get_item(Key={"run_id": run_id}).get("Item")
+
+    def set_counts(self, run_id: str, state: str, counts: dict, current_wave: Optional[int] = None) -> None:
+        expr = "SET #s = :s, #c = :c"
+        names = {"#s": "state", "#c": "counts"}
+        values = {":s": state, ":c": counts}
+        if current_wave is not None:
+            expr += ", current_wave = :cw"
+            values[":cw"] = current_wave
+        _TABLE_RUNS.update_item(
+            Key={"run_id": run_id},
+            UpdateExpression=expr,
+            ExpressionAttributeNames=names,
+            ExpressionAttributeValues=values,
+        )
+
+    def set_state(self, run_id: str, state: str) -> None:
+        """Set only the run's control state (pause/cancel), leaving cached counts alone."""
+        _TABLE_RUNS.update_item(
+            Key={"run_id": run_id},
+            UpdateExpression="SET #s = :s",
+            ExpressionAttributeNames={"#s": "state"},
+            ExpressionAttributeValues={":s": state},
+        )
+
+    def list_by_tenant(self, tenant_id: str, limit: int = 50, cursor: Optional[str] = None) -> list:
+        # created_at is the GSI RANGE key, so a cursor pages older-than newest-first.
+        kce = DKey("tenant_id").eq(tenant_id)
+        if cursor:
+            kce = kce & DKey("created_at").lt(cursor)
+        return _TABLE_RUNS.query(
+            IndexName="tenant-runs-index",
+            KeyConditionExpression=kce,
+            ScanIndexForward=False,
+            Limit=limit,
+        ).get("Items", [])
+
+    def list_by_fleet(self, fleet_id: str, limit: int = 50, cursor: Optional[str] = None) -> list:
+        kce = DKey("fleet_id").eq(fleet_id)
+        if cursor:
+            kce = kce & DKey("created_at").lt(cursor)
+        return _TABLE_RUNS.query(
+            IndexName="fleet-runs-index",
+            KeyConditionExpression=kce,
+            ScanIndexForward=False,
+            Limit=limit,
+        ).get("Items", [])
+
+    def delete_stale(self, before_iso: str, tenant_id: Optional[str] = None) -> int:
+        fe = Attr("created_at").lt(before_iso)
+        if tenant_id is not None:
+            fe = fe & Attr("tenant_id").eq(tenant_id)
+        items = _TABLE_RUNS.scan(
+            FilterExpression=fe,
+            ProjectionExpression="run_id",
+        ).get("Items", [])
+        with _TABLE_RUNS.batch_writer() as batch:
+            for item in items:
+                batch.delete_item(Key={"run_id": item["run_id"]})
+        return len(items)
+
+
 class AgentHistoryRepo:
     def create(self, entry: dict) -> None:
         _TABLE_AGENT_HISTORY.put_item(Item=entry)
@@ -922,7 +1449,8 @@ class AgentHistoryRepo:
             Limit=limit,
         ).get("Items", [])
 
-    def delete_stale(self, before_iso: str) -> int:
+    def delete_stale(self, before_iso: str, tenant_id: Optional[str] = None) -> int:
+        # History rows carry a TTL; DynamoDB reaps them, so retention is a no-op here.
         return 0
 
 
@@ -938,7 +1466,8 @@ class AuditRepo:
     def list_platform(self, limit: int = 100, cursor: Optional[str] = None,
                       action: Optional[str] = None, actor: Optional[str] = None,
                       resource: Optional[str] = None, ip: Optional[str] = None,
-                      since: Optional[str] = None, until: Optional[str] = None) -> list:
+                      since: Optional[str] = None, until: Optional[str] = None,
+                      tenant: Optional[str] = None) -> list:
         fe = Attr("created_at").lt(cursor) if cursor else Attr("log_id").exists()
         if since:
             fe = fe & Attr("created_at").gte(since)
@@ -946,6 +1475,8 @@ class AuditRepo:
             fe = fe & Attr("created_at").lte(until)
         if action:
             fe = fe & Attr("action").eq(action)
+        if tenant:
+            fe = fe & Attr("tenant_id").contains(tenant)
         if actor:
             fe = fe & Attr("actor_name_lc").contains(actor.lower())
         if resource:
@@ -992,7 +1523,9 @@ class AuditRepo:
         return [_remap_audit(i) for i in items]
 
 
-    def delete_stale(self, before_iso: str) -> int:
+    def delete_stale(self, before_iso: str, tenant_id: Optional[str] = None,
+                     platform_only: bool = False) -> int:
+        # Audit rows carry a TTL; DynamoDB reaps them, so retention is a no-op here.
         return 0
 
 

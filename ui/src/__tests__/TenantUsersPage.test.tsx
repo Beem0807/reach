@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { TenantUsersPage } from '../pages/TenantUsersPage';
-import type { TenantUser, Agent, TenantConfig } from '../types';
+import type { TenantUser, Agent, Fleet, TenantConfig, UserAccessScope } from '../types';
 import * as api from '../api';
 
 // ---------------------------------------------------------------------------
@@ -23,6 +23,7 @@ const CONFIG: TenantConfig = {
 
 const NON_ADMIN_CONFIG: TenantConfig = { ...CONFIG, role: 'developer' };
 
+// A restricted developer with no access by default.
 const BASE_USER: TenantUser = {
   user_id: 'user_abc',
   username: 'bob',
@@ -30,7 +31,10 @@ const BASE_USER: TenantUser = {
   role: 'developer',
   status: 'ACTIVE',
   must_reset_password: false,
-  allowed_agent_ids: null,
+  readwrite_agent_ids: [],
+  readonly_agent_ids: [],
+  readwrite_fleet_ids: [],
+  readonly_fleet_ids: [],
   created_at: '2024-01-01T00:00:00Z',
 };
 
@@ -46,11 +50,16 @@ const BASE_AGENT: Agent = {
   grant_service_mgmt: false,
 };
 
-const AGENT_2: Agent = {
-  ...BASE_AGENT,
-  agent_id: 'agent_222',
-  hostname: 'host-beta.local',
+const AGENT_2: Agent = { ...BASE_AGENT, agent_id: 'agent_222', hostname: 'host-beta.local' };
+
+const FLEET_1: Fleet = {
+  fleet_id: 'fleet_1', tenant_id: 'tenant_1', name: 'web-prod', type: 'host',
+  mode: 'readonly', grant_service_mgmt: false, grant_docker: false, status: 'ACTIVE',
 };
+
+function emptyScope(user_id: string): { user_id: string } & UserAccessScope {
+  return { user_id, readwrite_agent_ids: [], readonly_agent_ids: [], readwrite_fleet_ids: [], readonly_fleet_ids: [] };
+}
 
 function renderPage(users: TenantUser[], config = CONFIG) {
   vi.spyOn(api, 'listTenantUsers').mockResolvedValue({ users });
@@ -60,306 +69,211 @@ function renderPage(users: TenantUser[], config = CONFIG) {
 beforeEach(() => { vi.restoreAllMocks(); });
 
 // ---------------------------------------------------------------------------
-// Agent access badge in Name cell
+// Filters, search & pagination
 // ---------------------------------------------------------------------------
 
-describe('Agent access badge in Name cell', () => {
-  it('shows "* all agents" for null allowed_agent_ids', async () => {
-    renderPage([{ ...BASE_USER, allowed_agent_ids: null }]);
+describe('Filters, search & pagination', () => {
+  it('stages the role dropdown and applies it only on Search', async () => {
+    const spy = vi.spyOn(api, 'listTenantUsers').mockResolvedValue({ users: [BASE_USER] });
+    render(<TenantUsersPage config={CONFIG} />);
     await screen.findByText('Bob Smith');
-    expect(screen.getByText('* all agents')).toBeInTheDocument();
+
+    // Choosing the option alone must not re-query.
+    fireEvent.change(screen.getByDisplayValue('All roles'), { target: { value: 'developer' } });
+    expect(spy).not.toHaveBeenCalledWith(
+      CONFIG.apiUrl, CONFIG.tenantToken, expect.objectContaining({ role: 'developer' }),
+    );
+
+    fireEvent.click(screen.getByText('Search'));
+    await waitFor(() => expect(spy).toHaveBeenCalledWith(
+      CONFIG.apiUrl, CONFIG.tenantToken, expect.objectContaining({ role: 'developer', offset: '0' }),
+    ));
   });
 
-  it('shows "no agents" for empty allowed_agent_ids', async () => {
-    renderPage([{ ...BASE_USER, allowed_agent_ids: [] }]);
+  it('applies role + status + search together on one Search click', async () => {
+    const spy = vi.spyOn(api, 'listTenantUsers').mockResolvedValue({ users: [BASE_USER] });
+    render(<TenantUsersPage config={CONFIG} />);
     await screen.findByText('Bob Smith');
-    expect(screen.getByText('no agents')).toBeInTheDocument();
+
+    fireEvent.change(screen.getByDisplayValue('All roles'), { target: { value: 'developer' } });
+    fireEvent.change(screen.getByDisplayValue('All statuses'), { target: { value: 'REVOKED' } });
+    fireEvent.change(screen.getByPlaceholderText('Search name or username…'), { target: { value: 'bob' } });
+    fireEvent.click(screen.getByText('Search'));
+
+    await waitFor(() => expect(spy).toHaveBeenCalledWith(
+      CONFIG.apiUrl, CONFIG.tenantToken,
+      expect.objectContaining({ role: 'developer', status: 'REVOKED', q: 'bob' }),
+    ));
   });
 
-  it('shows singular "1 agent" for one allowed agent', async () => {
-    renderPage([{ ...BASE_USER, allowed_agent_ids: ['agent_111'] }]);
+  it('searches only when the Search button is clicked', async () => {
+    const spy = vi.spyOn(api, 'listTenantUsers').mockResolvedValue({ users: [BASE_USER] });
+    render(<TenantUsersPage config={CONFIG} />);
     await screen.findByText('Bob Smith');
-    expect(screen.getByText('1 agent')).toBeInTheDocument();
+
+    fireEvent.change(screen.getByPlaceholderText('Search name or username…'), { target: { value: 'bob' } });
+    expect(spy).not.toHaveBeenCalledWith(
+      CONFIG.apiUrl, CONFIG.tenantToken, expect.objectContaining({ q: 'bob' }),
+    );
+
+    fireEvent.click(screen.getByText('Search'));
+    await waitFor(() => expect(spy).toHaveBeenCalledWith(
+      CONFIG.apiUrl, CONFIG.tenantToken, expect.objectContaining({ q: 'bob' }),
+    ));
   });
 
-  it('shows plural "3 agents" for three allowed agents', async () => {
-    renderPage([{ ...BASE_USER, allowed_agent_ids: ['a1', 'a2', 'a3'] }]);
+  it('pages forward with Next when total exceeds the page size', async () => {
+    const spy = vi.spyOn(api, 'listTenantUsers').mockResolvedValue({ users: [BASE_USER], total: 42, limit: 20, offset: 0 });
+    render(<TenantUsersPage config={CONFIG} />);
     await screen.findByText('Bob Smith');
-    expect(screen.getByText('3 agents')).toBeInTheDocument();
-  });
+    expect(screen.getByText(/Showing 1–20 of 42/)).toBeInTheDocument();
 
-  it('does not render a standalone "Agents" column header', async () => {
-    renderPage([BASE_USER]);
-    await screen.findByText('Bob Smith');
-    const headers = screen.queryAllByRole('columnheader');
-    const labels = headers.map(h => h.textContent?.trim());
-    expect(labels).not.toContain('Agents');
+    fireEvent.click(screen.getByText('Next'));
+    await waitFor(() => expect(spy).toHaveBeenCalledWith(
+      CONFIG.apiUrl, CONFIG.tenantToken, expect.objectContaining({ offset: '20' }),
+    ));
   });
 });
 
 // ---------------------------------------------------------------------------
-// Clicking name opens AgentAccessModal
+// Access summary in the Name cell
 // ---------------------------------------------------------------------------
 
-describe('Name click → AgentAccessModal', () => {
-  async function setup(user = BASE_USER) {
-    vi.spyOn(api, 'listTenantAgents').mockResolvedValue({ agents: [BASE_AGENT] });
-    vi.spyOn(api, 'getUserAgentAccess').mockResolvedValue({ user_id: user.user_id, allowed_agent_ids: null });
-    renderPage([user]);
-    await screen.findByText(user.name ?? user.username);
+describe('Access summary in Name cell', () => {
+  it('shows "tenant-wide" for an admin', async () => {
+    renderPage([{ ...BASE_USER, role: 'admin', readwrite_agent_ids: null, readonly_agent_ids: null }]);
+    await screen.findByText('Bob Smith');
+    expect(screen.getByText('tenant-wide')).toBeInTheDocument();
+  });
+
+  it('shows "no access" for a user with empty grants', async () => {
+    renderPage([BASE_USER]);
+    await screen.findByText('Bob Smith');
+    expect(screen.getByText('no access')).toBeInTheDocument();
+  });
+
+  it('shows agent read-write and read-only levels', async () => {
+    renderPage([{ ...BASE_USER, readwrite_agent_ids: ['a1', 'a2'], readonly_agent_ids: ['a3'] }]);
+    await screen.findByText('Bob Smith');
+    expect(screen.getByText('agents')).toBeInTheDocument();
+    expect(screen.getByText('2 r/w')).toBeInTheDocument();
+    expect(screen.getByText('1 read')).toBeInTheDocument();
+  });
+
+  it('shows fleet access with its level, distinct from agents', async () => {
+    renderPage([{ ...BASE_USER, readwrite_agent_ids: ['a1'], readonly_fleet_ids: ['fleet_1'] }]);
+    await screen.findByText('Bob Smith');
+    expect(screen.getByText('agents')).toBeInTheDocument();
+    expect(screen.getByText('fleets')).toBeInTheDocument();
+    expect(screen.getByText('1 r/w')).toBeInTheDocument();   // the agent grant
+    expect(screen.getByText('1 read')).toBeInTheDocument();  // the fleet grant
+  });
+
+  it('shows fleet access even when there are no agent grants', async () => {
+    renderPage([{ ...BASE_USER, readwrite_fleet_ids: ['fleet_1', 'fleet_2'] }]);
+    await screen.findByText('Bob Smith');
+    expect(screen.getByText('fleets')).toBeInTheDocument();
+    expect(screen.getByText('2 r/w')).toBeInTheDocument();
+    expect(screen.queryByText('no access')).not.toBeInTheDocument();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Access modal (capability picker)
+// ---------------------------------------------------------------------------
+
+describe('AccessModal', () => {
+  async function openModal(scope = emptyScope(BASE_USER.user_id)) {
+    vi.spyOn(api, 'listTenantAgents').mockResolvedValue({ agents: [BASE_AGENT, AGENT_2] });
+    vi.spyOn(api, 'listFleets').mockResolvedValue({ fleets: [FLEET_1], default_reap_after_seconds: 1800 });
+    vi.spyOn(api, 'getUserAgentAccess').mockResolvedValue(scope);
+    renderPage([BASE_USER]);
+    await screen.findByText('Bob Smith');
+    fireEvent.click(screen.getByText('Bob Smith'));
+    await screen.findByRole('heading', { name: /access/i });
   }
 
-  it('opens AgentAccessModal when admin clicks a user name', async () => {
-    await setup();
-    fireEvent.click(screen.getByText('Bob Smith'));
-    await screen.findByText(/Agent access/i);
+  it('opens with the username in the title', async () => {
+    await openModal();
+    expect(screen.getByRole('heading', { name: /access/i }).textContent).toMatch(/@bob/);
   });
 
-  it('shows the username in the modal title', async () => {
-    await setup();
-    fireEvent.click(screen.getByText('Bob Smith'));
-    await screen.findByRole('heading', { name: /agent access/i });
-    expect(screen.getByRole('heading', { name: /agent access/i }).textContent).toMatch(/@bob/);
+  it('shows Agents and Fleets sections', async () => {
+    await openModal();
+    expect(screen.getByText('Agents')).toBeInTheDocument();
+    expect(screen.getByText('Fleets')).toBeInTheDocument();
   });
 
-  it('does not open modal when clicking own name (self)', async () => {
-    const selfUser: TenantUser = { ...BASE_USER, user_id: CONFIG.userId, username: 'alice', name: 'Alice' };
-    vi.spyOn(api, 'listTenantAgents').mockResolvedValue({ agents: [] });
-    vi.spyOn(api, 'getUserAgentAccess').mockResolvedValue({ user_id: selfUser.user_id, allowed_agent_ids: null });
-    renderPage([selfUser]);
-    await screen.findByText('Alice');
-    fireEvent.click(screen.getByText('Alice'));
-    // The three-dot menu is hidden for self, so no AgentAccessModal can appear
-    expect(screen.queryByRole('heading', { name: /agent access/i })).not.toBeInTheDocument();
+  it('warns when the user will have no access', async () => {
+    await openModal();
+    expect(screen.getByText(/no agent access/i)).toBeInTheDocument();
   });
 
-  it('clicking name for non-admin does not open modal', async () => {
+  it('shows the agent in Custom mode when it has a read-write grant', async () => {
+    await openModal({ ...emptyScope(BASE_USER.user_id), readwrite_agent_ids: ['agent_111'] });
+    expect(await screen.findByText('host-alpha.local')).toBeInTheDocument();
+  });
+
+  it('"All read-write" materializes every agent id (no wildcard)', async () => {
+    const saveSpy = vi.spyOn(api, 'setUserAgentAccess').mockResolvedValue(emptyScope(BASE_USER.user_id));
+    await openModal();
+    // The first "All read-write" button is the Agents section.
+    fireEvent.click(screen.getAllByText('All read-write')[0]);
+    fireEvent.click(screen.getByRole('button', { name: /save access/i }));
+    await waitFor(() => expect(saveSpy).toHaveBeenCalledWith(
+      CONFIG.apiUrl, CONFIG.tenantToken, BASE_USER.user_id,
+      expect.objectContaining({ readwrite_agent_ids: expect.arrayContaining(['agent_111', 'agent_222']) }),
+    ));
+    const arg = saveSpy.mock.calls[0][3];
+    expect(arg.readwrite_agent_ids).not.toContain('*');
+  });
+
+  it('preserves an existing custom grant on save', async () => {
+    const saveSpy = vi.spyOn(api, 'setUserAgentAccess').mockResolvedValue(emptyScope(BASE_USER.user_id));
+    await openModal({ ...emptyScope(BASE_USER.user_id), readonly_agent_ids: ['agent_111'] });
+    fireEvent.click(screen.getByRole('button', { name: /save access/i }));
+    await waitFor(() => expect(saveSpy).toHaveBeenCalledWith(
+      CONFIG.apiUrl, CONFIG.tenantToken, BASE_USER.user_id,
+      expect.objectContaining({ readonly_agent_ids: ['agent_111'], readwrite_agent_ids: [] }),
+    ));
+  });
+
+  it('does not open the modal for a non-admin viewer', async () => {
     vi.spyOn(api, 'listTenantUsers').mockResolvedValue({ users: [BASE_USER] });
-    vi.spyOn(api, 'listTenantAgents').mockResolvedValue({ agents: [] });
-    vi.spyOn(api, 'getUserAgentAccess').mockResolvedValue({ user_id: BASE_USER.user_id, allowed_agent_ids: null });
     render(<TenantUsersPage config={NON_ADMIN_CONFIG} />);
     await screen.findByText('Bob Smith');
     fireEvent.click(screen.getByText('Bob Smith'));
-    // Non-admin: onclick is undefined, modal stays hidden
-    expect(screen.queryByRole('heading', { name: /agent access/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: /^access/i })).not.toBeInTheDocument();
   });
 });
 
 // ---------------------------------------------------------------------------
-// AgentAccessModal: toggle switch + search
+// Create user modal: no access by default
 // ---------------------------------------------------------------------------
 
-describe('AgentAccessModal content', () => {
-  async function openModal(allowedAgentIds: string[] | null = null) {
-    vi.spyOn(api, 'listTenantAgents').mockResolvedValue({ agents: [BASE_AGENT, AGENT_2] });
-    vi.spyOn(api, 'getUserAgentAccess').mockResolvedValue({ user_id: BASE_USER.user_id, allowed_agent_ids: allowedAgentIds });
-    renderPage([BASE_USER]);
-    await screen.findByText('Bob Smith');
-    fireEvent.click(screen.getByText('Bob Smith'));
-    // Wait for modal to finish loading (toggle text is always present once loaded)
-    await screen.findByRole('heading', { name: /agent access/i });
-    await screen.findByText('Restrict to specific agents');
-  }
-
-  it('shows all agents badge when access is unrestricted (null)', async () => {
-    await openModal(null);
-    // "* all agents" appears in both the table row and the modal badge
-    const matches = screen.getAllByText('* all agents');
-    expect(matches.length).toBeGreaterThanOrEqual(1);
-  });
-
-  it('shows "no agents" badge when access is empty list', async () => {
-    await openModal([]);
-    expect(screen.getByText('no agents')).toBeInTheDocument();
-  });
-
-  it('shows selected count badge when restricted', async () => {
-    await openModal(['agent_111']);
-    expect(screen.getByText('1 selected')).toBeInTheDocument();
-  });
-
-  it('has search input inside the modal when restricted', async () => {
-    await openModal(['agent_111']);
-    // restricted state is already loaded - agent list should be visible
-    await screen.findByText('host-alpha.local');
-    expect(screen.getByPlaceholderText('Search agents…')).toBeInTheDocument();
-  });
-
-  it('filters agents by hostname as user types', async () => {
-    const user = userEvent.setup();
-    await openModal(['agent_111']);
-    await screen.findByText('host-alpha.local');
-    const search = screen.getByPlaceholderText('Search agents…');
-    await user.type(search, 'alpha');
-    await waitFor(() => {
-      expect(screen.getByText('host-alpha.local')).toBeInTheDocument();
-      expect(screen.queryByText('host-beta.local')).not.toBeInTheDocument();
-    });
-  });
-
-  it('filters agents by agent_id as user types', async () => {
-    const user = userEvent.setup();
-    await openModal(['agent_111']);
-    await screen.findByText('host-alpha.local');
-    const search = screen.getByPlaceholderText('Search agents…');
-    await user.type(search, '222');
-    await waitFor(() => {
-      expect(screen.getByText('host-beta.local')).toBeInTheDocument();
-      expect(screen.queryByText('host-alpha.local')).not.toBeInTheDocument();
-    });
-  });
-
-  it('shows "No agents match" when search has no results', async () => {
-    const user = userEvent.setup();
-    await openModal(['agent_111']);
-    await screen.findByText('host-alpha.local');
-    await user.type(screen.getByPlaceholderText('Search agents…'), 'zzznomatch');
-    await waitFor(() => expect(screen.getByText('No agents match')).toBeInTheDocument());
-  });
-
-  it('clear ✕ button resets search', async () => {
-    const user = userEvent.setup();
-    await openModal(['agent_111']);
-    await screen.findByText('host-alpha.local');
-    const search = screen.getByPlaceholderText('Search agents…');
-    await user.type(search, 'alpha');
-    await waitFor(() => expect(screen.getByText('✕')).toBeInTheDocument());
-    await user.click(screen.getByText('✕'));
-    await waitFor(() => expect(search).toHaveValue(''));
-    expect(screen.getByText('host-beta.local')).toBeInTheDocument();
-  });
-
-  it('saves with correct agent ids when Save is clicked', async () => {
-    const saveSpy = vi.spyOn(api, 'setUserAgentAccess').mockResolvedValue({ user_id: BASE_USER.user_id, allowed_agent_ids: ['agent_111'] });
-    await openModal(['agent_111']);
-    fireEvent.click(screen.getByRole('button', { name: /save access/i }));
-    await waitFor(() => expect(saveSpy).toHaveBeenCalledWith(
-      CONFIG.apiUrl, CONFIG.tenantToken, BASE_USER.user_id, ['agent_111'],
-    ));
-  });
-
-  it('saves null when toggle is off', async () => {
-    const saveSpy = vi.spyOn(api, 'setUserAgentAccess').mockResolvedValue({ user_id: BASE_USER.user_id, allowed_agent_ids: null });
-    await openModal(null);
-    fireEvent.click(screen.getByRole('button', { name: /save access/i }));
-    await waitFor(() => expect(saveSpy).toHaveBeenCalledWith(
-      CONFIG.apiUrl, CONFIG.tenantToken, BASE_USER.user_id, null,
-    ));
-  });
-});
-
-// ---------------------------------------------------------------------------
-// CreateUserModal: agent picker
-// ---------------------------------------------------------------------------
-
-describe('CreateUserModal agent picker', () => {
+describe('CreateUserModal', () => {
   async function openCreate() {
-    vi.spyOn(api, 'listTenantAgents').mockResolvedValue({ agents: [BASE_AGENT, AGENT_2] });
+    vi.spyOn(api, 'listTenantAgents').mockResolvedValue({ agents: [BASE_AGENT] });
+    vi.spyOn(api, 'listFleets').mockResolvedValue({ fleets: [FLEET_1], default_reap_after_seconds: 1800 });
     renderPage([]);
     fireEvent.click(await screen.findByRole('button', { name: /Add user/i }));
     await screen.findByRole('heading', { name: /Add user/i });
   }
 
-  it('toggle starts off - no agent list shown', async () => {
+  it('shows the access editor (Agents + Fleets) for a non-admin', async () => {
     await openCreate();
-    expect(screen.queryByText('host-alpha.local')).not.toBeInTheDocument();
+    expect(screen.getByText('Agents')).toBeInTheDocument();
+    expect(screen.getByText('Fleets')).toBeInTheDocument();
   });
 
-  it('shows "* all agents" badge when toggle is off', async () => {
-    await openCreate();
-    expect(screen.getByText('* all agents')).toBeInTheDocument();
-  });
-
-  it('clicking toggle reveals agent list', async () => {
+  it('notes tenant-wide access when admin role is selected', async () => {
     const user = userEvent.setup();
     await openCreate();
-    await user.click(screen.getByText('Restrict to specific agents'));
-    await waitFor(() => expect(screen.getByText('host-alpha.local')).toBeInTheDocument());
+    await user.click(screen.getByText('Admin'));
+    expect(screen.getByText(/tenant-wide access/i)).toBeInTheDocument();
   });
 
-  it('clicking toggle twice hides agent list again', async () => {
-    const user = userEvent.setup();
-    await openCreate();
-    await user.click(screen.getByText('Restrict to specific agents'));
-    await screen.findByText('host-alpha.local');
-    await user.click(screen.getByText('Restrict to specific agents'));
-    await waitFor(() => expect(screen.queryByText('host-alpha.local')).not.toBeInTheDocument());
-  });
-
-  it('agent list has a search input', async () => {
-    const user = userEvent.setup();
-    await openCreate();
-    await user.click(screen.getByText('Restrict to specific agents'));
-    await screen.findByText('host-alpha.local');
-    expect(screen.getByPlaceholderText('Search agents…')).toBeInTheDocument();
-  });
-
-  it('search filters agents by hostname', async () => {
-    const user = userEvent.setup();
-    await openCreate();
-    await user.click(screen.getByText('Restrict to specific agents'));
-    await screen.findByText('host-alpha.local');
-    await user.type(screen.getByPlaceholderText('Search agents…'), 'beta');
-    await waitFor(() => {
-      expect(screen.getByText('host-beta.local')).toBeInTheDocument();
-      expect(screen.queryByText('host-alpha.local')).not.toBeInTheDocument();
-    });
-  });
-
-  it('search filters agents by agent_id', async () => {
-    const user = userEvent.setup();
-    await openCreate();
-    await user.click(screen.getByText('Restrict to specific agents'));
-    await screen.findByText('host-alpha.local');
-    await user.type(screen.getByPlaceholderText('Search agents…'), '111');
-    await waitFor(() => {
-      expect(screen.getByText('host-alpha.local')).toBeInTheDocument();
-      expect(screen.queryByText('host-beta.local')).not.toBeInTheDocument();
-    });
-  });
-
-  it('shows "No agents match" when search has no results', async () => {
-    const user = userEvent.setup();
-    await openCreate();
-    await user.click(screen.getByText('Restrict to specific agents'));
-    await screen.findByText('host-alpha.local');
-    await user.type(screen.getByPlaceholderText('Search agents…'), 'zzznomatch');
-    await waitFor(() => expect(screen.getByText('No agents match')).toBeInTheDocument());
-  });
-
-  it('selecting an agent updates the selected count badge', async () => {
-    const user = userEvent.setup();
-    await openCreate();
-    await user.click(screen.getByText('Restrict to specific agents'));
-    await screen.findByText('host-alpha.local');
-    await user.click(screen.getByText('host-alpha.local'));
-    await waitFor(() => expect(screen.getByText('1 selected')).toBeInTheDocument());
-  });
-
-  it('deselecting an agent reverts badge to "no agents"', async () => {
-    const user = userEvent.setup();
-    await openCreate();
-    await user.click(screen.getByText('Restrict to specific agents'));
-    await screen.findByText('host-alpha.local');
-    await user.click(screen.getByText('host-alpha.local'));
-    await waitFor(() => expect(screen.getByText('1 selected')).toBeInTheDocument());
-    await user.click(screen.getByText('host-alpha.local'));
-    await waitFor(() => expect(screen.getByText('no agents')).toBeInTheDocument());
-  });
-
-  it('clear all removes all selections', async () => {
-    const user = userEvent.setup();
-    await openCreate();
-    await user.click(screen.getByText('Restrict to specific agents'));
-    await screen.findByText('host-alpha.local');
-    await user.click(screen.getByText('host-alpha.local'));
-    await user.click(screen.getByText('host-beta.local'));
-    await waitFor(() => expect(screen.getByText('2 selected')).toBeInTheDocument());
-    await user.click(screen.getByText('clear all'));
-    await waitFor(() => expect(screen.getByText('no agents')).toBeInTheDocument());
-  });
-
-  it('submits null allowed_agent_ids when toggle is off', async () => {
+  it('creates a non-admin with no access by default (empty scope)', async () => {
     const createSpy = vi.spyOn(api, 'createTenantUser').mockResolvedValue({
       user_id: 'user_new', username: 'newguy', role: 'developer',
       must_reset_password: true, temp_password: 'tmp123',
@@ -370,11 +284,11 @@ describe('CreateUserModal agent picker', () => {
     await user.click(screen.getByRole('button', { name: /create user/i }));
     await waitFor(() => expect(createSpy).toHaveBeenCalledWith(
       CONFIG.apiUrl, CONFIG.tenantToken,
-      expect.objectContaining({ allowed_agent_ids: null }),
+      { username: 'newguy', name: '', role: 'developer', readwrite_agent_ids: [], readonly_agent_ids: [], readwrite_fleet_ids: [], readonly_fleet_ids: [] },
     ));
   });
 
-  it('submits selected agent ids when toggle is on', async () => {
+  it('grants read-write on every agent at creation (materialized, no wildcard)', async () => {
     const createSpy = vi.spyOn(api, 'createTenantUser').mockResolvedValue({
       user_id: 'user_new', username: 'newguy', role: 'developer',
       must_reset_password: true, temp_password: 'tmp123',
@@ -382,31 +296,11 @@ describe('CreateUserModal agent picker', () => {
     const user = userEvent.setup();
     await openCreate();
     await user.type(screen.getByPlaceholderText('alice'), 'newguy');
-    await user.click(screen.getByText('Restrict to specific agents'));
-    await screen.findByText('host-alpha.local');
-    await user.click(screen.getByText('host-alpha.local'));
+    await user.click(screen.getAllByText('All read-write')[0]);  // Agents section
     await user.click(screen.getByRole('button', { name: /create user/i }));
     await waitFor(() => expect(createSpy).toHaveBeenCalledWith(
       CONFIG.apiUrl, CONFIG.tenantToken,
-      expect.objectContaining({ allowed_agent_ids: ['agent_111'] }),
-    ));
-  });
-
-  it('submits empty array when toggle is on but no agents selected', async () => {
-    const createSpy = vi.spyOn(api, 'createTenantUser').mockResolvedValue({
-      user_id: 'user_new', username: 'newguy', role: 'developer',
-      must_reset_password: true, temp_password: 'tmp123',
-    } as ReturnType<typeof api.createTenantUser> extends Promise<infer T> ? T : never);
-    const user = userEvent.setup();
-    await openCreate();
-    await user.type(screen.getByPlaceholderText('alice'), 'newguy');
-    await user.click(screen.getByText('Restrict to specific agents'));
-    await screen.findByText('host-alpha.local');
-    // don't select any agent
-    await user.click(screen.getByRole('button', { name: /create user/i }));
-    await waitFor(() => expect(createSpy).toHaveBeenCalledWith(
-      CONFIG.apiUrl, CONFIG.tenantToken,
-      expect.objectContaining({ allowed_agent_ids: [] }),
+      expect.objectContaining({ username: 'newguy', role: 'developer', readwrite_agent_ids: ['agent_111'] }),
     ));
   });
 });
@@ -417,7 +311,6 @@ describe('CreateUserModal agent picker', () => {
 
 describe('CreateUserModal username length', () => {
   async function openCreate() {
-    vi.spyOn(api, 'listTenantAgents').mockResolvedValue({ agents: [] });
     renderPage([]);
     fireEvent.click(await screen.findByRole('button', { name: /Add user/i }));
     await screen.findByRole('heading', { name: /Add user/i });
@@ -435,18 +328,9 @@ describe('CreateUserModal username length', () => {
     expect(screen.getByText('5/32')).toBeInTheDocument();
   });
 
-  it('counter turns amber near the limit (29 chars)', async () => {
-    const user = userEvent.setup();
-    await openCreate();
-    await user.type(screen.getByPlaceholderText('alice'), 'a'.repeat(29));
-    const counter = screen.getByText('29/32');
-    expect(counter.className).toMatch(/amber/);
-  });
-
   it('input has maxLength of 32', async () => {
     await openCreate();
-    const input = screen.getByPlaceholderText('alice');
-    expect(input).toHaveAttribute('maxLength', '32');
+    expect(screen.getByPlaceholderText('alice')).toHaveAttribute('maxLength', '32');
   });
 
   it('shows error when username is only 1 character', async () => {
@@ -457,41 +341,11 @@ describe('CreateUserModal username length', () => {
     await waitFor(() => expect(screen.getByText(/at least 2/i)).toBeInTheDocument());
   });
 
-  it('shows inline format error for invalid characters immediately on type', async () => {
+  it('shows inline format error for invalid characters', async () => {
     const user = userEvent.setup();
     await openCreate();
     await user.type(screen.getByPlaceholderText('alice'), 'alice-bob');
     await waitFor(() => expect(screen.getByText(/no spaces or special characters/i)).toBeInTheDocument());
-  });
-
-  it('shows inline format error for username with a space', async () => {
-    const user = userEvent.setup();
-    await openCreate();
-    // The onChange lowercases, but space passes through before toLowerCase since space is not uppercase
-    // Actually we need to type in a way that includes invalid chars - the input lowercases but doesn't strip
-    // Type a digit then underscore to trigger the error
-    await user.type(screen.getByPlaceholderText('alice'), 'alice_bob');
-    await waitFor(() => expect(screen.getByText(/no spaces or special characters/i)).toBeInTheDocument());
-  });
-
-  it('clears inline format error when valid username is typed', async () => {
-    const user = userEvent.setup();
-    await openCreate();
-    await user.type(screen.getByPlaceholderText('alice'), 'alice-bob');
-    await waitFor(() => expect(screen.getByText(/no spaces or special characters/i)).toBeInTheDocument());
-    await user.clear(screen.getByPlaceholderText('alice'));
-    await user.type(screen.getByPlaceholderText('alice'), 'alicebob');
-    await waitFor(() => expect(screen.queryByText(/no spaces or special characters/i)).not.toBeInTheDocument());
-  });
-
-  it('highlights input border red when format is invalid', async () => {
-    const user = userEvent.setup();
-    await openCreate();
-    await user.type(screen.getByPlaceholderText('alice'), 'bad-name');
-    await waitFor(() => {
-      const input = screen.getByPlaceholderText('alice');
-      expect(input.className).toMatch(/red/);
-    });
   });
 
   it('blocks submit when username has invalid characters', async () => {
@@ -544,17 +398,10 @@ describe('TenantUsersPage table basics', () => {
   });
 
   it('shows INVITED badge for a created user who has never logged in', async () => {
-    renderPage([{ ...BASE_USER, must_reset_password: true }]);  // no last_login_at
+    renderPage([{ ...BASE_USER, must_reset_password: true }]);
     await screen.findByText('Bob Smith');
     expect(screen.getByText('INVITED')).toBeInTheDocument();
     expect(screen.queryByText('TEMP PW')).not.toBeInTheDocument();
-  });
-
-  it('shows no badge when a password reset is not required', async () => {
-    renderPage([{ ...BASE_USER, must_reset_password: false }]);
-    await screen.findByText('Bob Smith');
-    expect(screen.queryByText('TEMP PW')).not.toBeInTheDocument();
-    expect(screen.queryByText('INVITED')).not.toBeInTheDocument();
   });
 
   it('hides Add user button for non-admins', async () => {

@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback, useEffect } from 'react';
+import { useState, useRef, useCallback, useEffect, Children, cloneElement, isValidElement } from 'react';
 import { createPortal } from 'react-dom';
 
 export interface ColDef<T> {
@@ -26,7 +26,8 @@ export function DataTable<T>({ columns, rows, renderRow, fallback, tableId }: Pr
   const dropdownRef = useRef<HTMLDivElement>(null);
   const btnRef = useRef<HTMLButtonElement>(null);
   const dragging = useRef<{ col: number; startX: number; startW: number } | null>(null);
-  const tableUid = useRef(`dt-${Math.random().toString(36).slice(2, 8)}`).current;
+  const dragCol = useRef<number | null>(null);
+  const [overCol, setOverCol] = useState<number | null>(null);
 
   const [hiddenCols, setHiddenCols] = useState<Set<number>>(() => {
     const defaults = new Set<number>(
@@ -39,6 +40,25 @@ export function DataTable<T>({ columns, rows, renderRow, fallback, tableId }: Pr
       } catch {}
     }
     return defaults;
+  });
+
+  // Column display order (indices into `columns`), reorderable by dragging headers.
+  const [order, setOrder] = useState<number[]>(() => {
+    const identity = columns.map((_, i) => i);
+    if (tableId) {
+      try {
+        const saved = localStorage.getItem(`dt_order_${tableId}`);
+        if (saved) {
+          const arr: number[] = JSON.parse(saved);
+          // Only trust a saved order that's a permutation of the current columns.
+          if (Array.isArray(arr) && arr.length === columns.length &&
+              [...arr].sort((a, b) => a - b).every((v, i) => v === i)) {
+            return arr;
+          }
+        }
+      } catch {}
+    }
+    return identity;
   });
 
   // Close picker on outside click
@@ -66,6 +86,18 @@ export function DataTable<T>({ columns, rows, renderRow, fallback, tableId }: Pr
     });
   };
 
+  const moveCol = (from: number, to: number) => {
+    if (from === to) return;
+    setOrder(prev => {
+      const arr = prev.filter(i => i !== from);
+      const ti = arr.indexOf(to);
+      if (ti < 0) return prev;
+      arr.splice(ti, 0, from);   // drop before the target column
+      if (tableId) { try { localStorage.setItem(`dt_order_${tableId}`, JSON.stringify(arr)); } catch {} }
+      return arr;
+    });
+  };
+
   const handleSort = (i: number) => {
     if (!columns[i].sortValue) return;
     if (sortCol === i) {
@@ -88,6 +120,7 @@ export function DataTable<T>({ columns, rows, renderRow, fallback, tableId }: Pr
 
   const onResizeStart = useCallback((e: React.MouseEvent, col: number) => {
     e.preventDefault();
+    e.stopPropagation();
     const th = (e.currentTarget as HTMLElement).closest('th') as HTMLElement;
     const startW = th.offsetWidth;
     dragging.current = { col, startX: e.clientX, startW };
@@ -107,9 +140,27 @@ export function DataTable<T>({ columns, rows, renderRow, fallback, tableId }: Pr
     document.addEventListener('mouseup', onUp);
   }, []);
 
-  // Pickable columns = columns with a non-empty label
-  const pickable = columns.map((c, i) => ({ ...c, i })).filter(c => c.label);
+  // Visible columns in display order.
+  const displayCols = order.filter(i => !hiddenCols.has(i));
+  // Pickable columns = columns with a non-empty label (kept in display order)
+  const pickable = order.map(i => ({ ...columns[i], i })).filter(c => c.label);
   const visibleCount = columns.length - hiddenCols.size;
+
+  // Reorder (and drop hidden) a rendered row's <td> children to match the header order.
+  const arrangeRow = (node: React.ReactNode): React.ReactNode => {
+    if (!isValidElement(node)) return node;
+    const el = node as React.ReactElement<{ children?: React.ReactNode }>;
+    const cells = Children.toArray(el.props.children);
+    // Only rearrange when the row's cell count lines up with the column count.
+    if (cells.length !== columns.length) return node;
+    const arranged = displayCols.map((ci, pos) => {
+      const cell = cells[ci];
+      return isValidElement(cell)
+        ? cloneElement(cell as React.ReactElement, { key: `c${ci}-${pos}` })
+        : cell;
+    });
+    return cloneElement(el, undefined, arranged);
+  };
 
   return (
     <div>
@@ -184,22 +235,26 @@ export function DataTable<T>({ columns, rows, renderRow, fallback, tableId }: Pr
         </div>
       </div>
 
-      {hiddenCols.size > 0 && (
-        <style>{[...hiddenCols].map(i =>
-          `.${tableUid} thead th:nth-child(${i + 1}), .${tableUid} tbody td:nth-child(${i + 1}) { display: none; }`
-        ).join(' ')}</style>
-      )}
       <div className="overflow-x-auto">
-      <table className={`w-full text-sm ${tableUid}`}>
+      <table className="w-full text-sm">
         <thead>
           <tr className="border-b border-gray-200 bg-gray-50/80">
-            {columns.map((col, i) => {
+            {displayCols.map(i => {
+              const col = columns[i];
               const sortable = !!col.sortValue;
               const active = sortCol === i;
+              const draggable = !!col.label;
               return (
                 <th
                   key={i}
-                  className="relative text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wider whitespace-nowrap select-none"
+                  draggable={draggable}
+                  onDragStart={draggable ? e => { dragCol.current = i; if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move'; } : undefined}
+                  onDragEnd={draggable ? () => { dragCol.current = null; setOverCol(null); } : undefined}
+                  onDragOver={draggable ? e => { e.preventDefault(); setOverCol(i); } : undefined}
+                  onDragLeave={draggable ? () => setOverCol(null) : undefined}
+                  onDrop={draggable ? e => { e.preventDefault(); if (dragCol.current !== null) moveCol(dragCol.current, i); dragCol.current = null; setOverCol(null); } : undefined}
+                  title={draggable ? 'Drag to reorder - drag the right edge to resize' : undefined}
+                  className={`relative text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wider whitespace-nowrap select-none ${draggable ? 'cursor-move' : ''} ${overCol === i ? 'bg-indigo-100' : ''}`}
                   style={minWidths[i] ? { minWidth: minWidths[i] } : undefined}
                 >
                   <span
@@ -215,6 +270,7 @@ export function DataTable<T>({ columns, rows, renderRow, fallback, tableId }: Pr
                   </span>
                   <div
                     onMouseDown={e => onResizeStart(e, i)}
+                    onClick={e => e.stopPropagation()}
                     className="absolute right-0 top-0 h-full w-1 cursor-col-resize hover:bg-indigo-300 transition-colors"
                   />
                 </th>
@@ -225,12 +281,12 @@ export function DataTable<T>({ columns, rows, renderRow, fallback, tableId }: Pr
         <tbody className="divide-y divide-gray-100">
           {rows.length === 0 && fallback !== undefined ? (
             <tr>
-              <td colSpan={columns.length} className="text-center py-14 text-gray-400 text-sm">
+              <td colSpan={displayCols.length} className="text-center py-14 text-gray-400 text-sm">
                 {fallback}
               </td>
             </tr>
           ) : (
-            sorted.map(row => renderRow(row))
+            sorted.map(row => arrangeRow(renderRow(row)))
           )}
         </tbody>
       </table>

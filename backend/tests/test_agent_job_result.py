@@ -167,6 +167,23 @@ class TestAgentJobResult:
         assert record["job_id"] == JOB_ID
         assert record["approval_id"].startswith("appr_")
 
+    def test_blocked_creates_fleet_scoped_approval_for_member(self):
+        # A blocked write on a fleet member raises a fleet-scoped pending request.
+        member = {**_AGENT, "fleet_id": "fleet_a"}
+        job_with_meta = {**_JOB_RUNNING, "tenant_id": "tenant_1", "command": "rm -rf /tmp/x", "created_by": "user_1"}
+        with patch("handlers.agent_job_result._verify_agent_token", return_value=member), \
+             patch("handlers.agent_job_result.jobs_repo") as jr, \
+             patch("handlers.agent_job_result.approvals_repo") as apr, \
+             patch("handlers.agent_job_result.users_repo") as ur:
+            jr.get.return_value = job_with_meta
+            apr.exists_pending_fleet.return_value = False
+            ur.get.return_value = {"user_id": "user_1", "name": "Alice"}
+            handle_agent_job_result(JOB_ID, {**_VALID_BODY, "blocked": True, "status": "FAILED"}, "tok")
+        apr.exists_pending_fleet.assert_called_once_with("fleet_a", "rm -rf /tmp/x")
+        apr.exists_pending.assert_not_called()
+        record = apr.create.call_args[0][0]
+        assert record["fleet_id"] == "fleet_a" and record["agent_id"] is None
+
     def test_blocked_skips_create_when_pending_exists(self):
         job_with_meta = {**_JOB_RUNNING, "tenant_id": "tenant_1", "command": "rm -rf /tmp/x", "created_by": "user_1"}
         with patch("handlers.agent_job_result._verify_agent_token", return_value=_AGENT), \

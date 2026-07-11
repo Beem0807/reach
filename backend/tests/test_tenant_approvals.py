@@ -78,19 +78,19 @@ class TestHandleListMyPending:
     def test_scopes_to_requester_and_pending(self):
         r, ar = self._call()
         ar.search_by_tenant.assert_called_once_with(
-            TENANT_ID, status="pending", agent_id=None, agent_ids=None, requested_by=USER_ID,
+            TENANT_ID, status="pending", agent_id=None, agent_ids=None, fleet_id=None, fleet_ids=None, requested_by=USER_ID,
             kind=None, q=None, limit=20, offset=0)
 
     def test_agent_id_filter_passed_through(self):
         r, ar = self._call(query={"agent_id": AGENT_ID})
         ar.search_by_tenant.assert_called_once_with(
-            TENANT_ID, status="pending", agent_id=AGENT_ID, agent_ids=None, requested_by=USER_ID,
+            TENANT_ID, status="pending", agent_id=AGENT_ID, agent_ids=None, fleet_id=None, fleet_ids=None, requested_by=USER_ID,
             kind=None, q=None, limit=20, offset=0)
 
     def test_type_search_and_paging_passed_through(self):
         r, ar = self._call(query={"type": "k8s", "q": "team-a", "limit": "5", "offset": "10"})
         ar.search_by_tenant.assert_called_once_with(
-            TENANT_ID, status="pending", agent_id=None, agent_ids=None, requested_by=USER_ID,
+            TENANT_ID, status="pending", agent_id=None, agent_ids=None, fleet_id=None, fleet_ids=None, requested_by=USER_ID,
             kind="k8s", q="team-a", limit=5, offset=10)
 
     def test_invalid_type_returns_400(self):
@@ -116,7 +116,7 @@ class TestHandleListMyPending:
 
     def test_approved_all_agents_restricted_scoped_to_allowed(self):
         # A restricted developer's "all agents" approved view is limited to their agents.
-        restricted = {**_USER, "allowed_agent_ids": [AGENT_ID]}
+        restricted = {**_USER, "readwrite_agent_ids": [AGENT_ID]}
         with patch("handlers.tenant_approvals._verify_tenant_token", return_value=restricted), \
              patch("handlers.tenant_approvals.agents_repo") as agr, \
              patch("handlers.tenant_approvals.approvals_repo") as ar:
@@ -130,7 +130,7 @@ class TestHandleListMyPending:
         assert kwargs["agent_ids"] == [AGENT_ID]
 
     def test_agent_id_no_access_returns_404(self):
-        no_access_user = {**_USER, "allowed_agent_ids": ["agent_other"]}
+        no_access_user = {**_USER, "readwrite_agent_ids": ["agent_other"]}
         with patch("handlers.tenant_approvals._verify_tenant_token", return_value=no_access_user), \
              patch("handlers.tenant_approvals.agents_repo") as agr, \
              patch("handlers.tenant_approvals.approvals_repo"):
@@ -185,7 +185,21 @@ class TestHandleListAgentApproved:
         assert r["statusCode"] == 200
         body = json.loads(r["body"])
         assert "docker ps" in body["approved_commands"]
-        apr.list_by_agent.assert_called_once_with(AGENT_ID, status="approved")
+        apr.list_by_agent.assert_called_once_with(AGENT_ID, status="approved", requested_by=None)
+
+    def test_fleet_member_draws_from_fleet(self):
+        # A member's effective approved list comes from its fleet, not per-agent.
+        member = {**_AGENT, "fleet_id": "fleet_a"}
+        with patch("handlers.tenant_approvals._verify_tenant_token", return_value=_USER), \
+             patch("handlers.tenant_approvals.agents_repo") as agr, \
+             patch("handlers.tenant_approvals.can_access_agent", return_value=True), \
+             patch("handlers.tenant_approvals.approvals_repo") as apr:
+            agr.get.return_value = member
+            apr.list_by_fleet.return_value = [_APPROVED]
+            r = handle_list_agent_approved(AGENT_ID, "tok", status="approved")
+        assert r["statusCode"] == 200
+        apr.list_by_fleet.assert_called_once_with("fleet_a", status="approved", requested_by=None)
+        apr.list_by_agent.assert_not_called()
 
     def test_approved_includes_approvals_detail(self):
         r, _ = self._call(status="approved", items=[_APPROVED])
@@ -332,7 +346,7 @@ class TestHandleTenantListAllApprovals:
 
     def test_restricted_operator_scoped_to_allowed_agents(self):
         # A restricted operator's "all agents" list is limited to their agents.
-        restricted = {**_OPERATOR, "allowed_agent_ids": [AGENT_ID]}
+        restricted = {**_OPERATOR, "readwrite_agent_ids": [AGENT_ID]}
         with patch("handlers.tenant_approvals._verify_tenant_token", return_value=restricted), \
              patch("handlers.tenant_approvals.approvals_repo") as ar, \
              patch("handlers.tenant_approvals.agents_repo") as agr:
@@ -346,7 +360,7 @@ class TestHandleTenantListAllApprovals:
         assert kwargs["agent_ids"] == [AGENT_ID]
 
     def test_restricted_operator_specific_inaccessible_agent_sees_nothing(self):
-        restricted = {**_OPERATOR, "allowed_agent_ids": [AGENT_ID]}
+        restricted = {**_OPERATOR, "readwrite_agent_ids": [AGENT_ID]}
         with patch("handlers.tenant_approvals._verify_tenant_token", return_value=restricted), \
              patch("handlers.tenant_approvals.approvals_repo") as ar, \
              patch("handlers.tenant_approvals.agents_repo") as agr:
@@ -359,17 +373,17 @@ class TestHandleTenantListAllApprovals:
     def test_status_filter_passed_to_repo(self):
         r, ar = self._call(query={"status": "approved"}, approvals=[_APPROVED])
         ar.search_by_tenant.assert_called_once_with(
-            TENANT_ID, status="approved", agent_id=None, agent_ids=None, kind=None, q=None, limit=20, offset=0)
+            TENANT_ID, status="approved", agent_id=None, agent_ids=None, fleet_id=None, fleet_ids=None, scope=None, kind=None, q=None, limit=20, offset=0)
 
     def test_no_status_filter_passes_none(self):
         r, ar = self._call(query={})
         ar.search_by_tenant.assert_called_once_with(
-            TENANT_ID, status=None, agent_id=None, agent_ids=None, kind=None, q=None, limit=20, offset=0)
+            TENANT_ID, status=None, agent_id=None, agent_ids=None, fleet_id=None, fleet_ids=None, scope=None, kind=None, q=None, limit=20, offset=0)
 
     def test_type_and_search_and_paging_passed_to_repo(self):
         r, ar = self._call(query={"type": "k8s", "q": "team-a", "limit": "10", "offset": "20"})
         ar.search_by_tenant.assert_called_once_with(
-            TENANT_ID, status=None, agent_id=None, agent_ids=None, kind="k8s", q="team-a", limit=10, offset=20)
+            TENANT_ID, status=None, agent_id=None, agent_ids=None, fleet_id=None, fleet_ids=None, scope=None, kind="k8s", q="team-a", limit=10, offset=20)
 
     def test_invalid_type_returns_400(self):
         r, _ = self._call(query={"type": "vm"})
@@ -456,16 +470,24 @@ class TestHandleTenantReviewApproval:
 
     def test_restricted_operator_cannot_review_inaccessible_agent(self):
         # Operator scoped to a different agent than the approval's → hidden (404).
-        restricted = {**_OPERATOR, "allowed_agent_ids": ["other_agent"]}
+        restricted = {**_OPERATOR, "readwrite_agent_ids": ["other_agent"]}
         r, ar = self._call(user=restricted)
         assert r["statusCode"] == 404
         ar.update_status.assert_not_called()
 
     def test_restricted_operator_can_review_allowed_agent(self):
-        restricted = {**_OPERATOR, "allowed_agent_ids": [AGENT_ID]}
+        restricted = {**_OPERATOR, "readwrite_agent_ids": [AGENT_ID]}
         r, ar = self._call(user=restricted)
         assert r["statusCode"] == 200
         ar.update_status.assert_called_once()
+
+    def test_readonly_operator_cannot_review(self):
+        # Read-only access to the agent → can view but not approve/deny (approvals gate writes).
+        ro = {**_OPERATOR, "readwrite_agent_ids": [], "readonly_agent_ids": [AGENT_ID]}
+        r, ar = self._call(user=ro)
+        assert r["statusCode"] == 403
+        assert "read-only" in json.loads(r["body"])["error"]
+        ar.update_status.assert_not_called()
 
     def _call_capturing_audit(self, action="approve", approval=_PENDING_APPROVAL, body=None):
         with patch("handlers.tenant_approvals._verify_tenant_token", return_value=_OPERATOR), \
@@ -659,6 +681,20 @@ class TestHandleTenantCreateApproval:
         r, _ = self._call(user=_DEV, body={"agent_id": AGENT_ID})
         assert r["statusCode"] == 400
 
+    def test_readonly_user_cannot_create_approval(self):
+        # A read-only grant on the agent blocks creating approvals (they're always
+        # for writes), even though the user can access the agent.
+        ro_dev = {**_DEV, "readonly_agent_ids": [AGENT_ID]}
+        r, ar = self._call(user=ro_dev, body={"agent_id": AGENT_ID, "command": "rm x"})
+        assert r["statusCode"] == 403
+        assert "read-only" in json.loads(r["body"])["error"]
+        ar.create.assert_not_called()
+
+    def test_readwrite_user_can_create_approval(self):
+        rw_dev = {**_DEV, "readwrite_agent_ids": [AGENT_ID]}
+        r, ar = self._call(user=rw_dev, body={"agent_id": AGENT_ID, "command": "ls"})
+        assert r["statusCode"] == 201
+
     def test_missing_agent_id_returns_400(self):
         r, _ = self._call(body={"command": "ls"})
         assert r["statusCode"] == 400
@@ -668,7 +704,7 @@ class TestHandleTenantCreateApproval:
         assert r["statusCode"] == 404
 
     def test_restricted_user_cannot_request_inaccessible_agent(self):
-        restricted = {**_DEV, "allowed_agent_ids": ["other_agent"]}
+        restricted = {**_DEV, "readwrite_agent_ids": ["other_agent"]}
         r, ar = self._call(user=restricted, body={"agent_id": AGENT_ID, "command": "ls"})
         assert r["statusCode"] == 404
         ar.create.assert_not_called()
@@ -818,10 +854,26 @@ class TestHandleTenantDeleteApproval:
         ar.delete.assert_called_once_with("appr_del")
 
     def test_restricted_operator_cannot_delete_inaccessible_agent(self):
-        restricted = {**_OPERATOR, "allowed_agent_ids": ["other_agent"]}
+        restricted = {**_OPERATOR, "readwrite_agent_ids": ["other_agent"]}
         r, ar = self._call(user=restricted)
         assert r["statusCode"] == 404
         ar.delete.assert_not_called()
+
+    def test_can_delete_fleet_approval(self):
+        # A fleet approval has agent_id=None; delete must resolve the fleet, not the
+        # (missing) agent - otherwise every fleet approval is undeletable.
+        fleet_appr = {**_FULL_APPROVAL, "approval_id": "appr_del", "tenant_id": TENANT_ID,
+                      "agent_id": None, "fleet_id": "fleet_1"}
+        with patch("handlers.tenant_approvals._verify_tenant_token", return_value=_OPERATOR), \
+             patch("handlers.tenant_approvals.fleets_repo") as fr, \
+             patch("handlers.tenant_approvals.agents_repo") as agr, \
+             patch("handlers.tenant_approvals.approvals_repo") as ar:
+            fr.get.return_value = {"fleet_id": "fleet_1", "tenant_id": TENANT_ID, "name": "web"}
+            ar.get.return_value = fleet_appr
+            r = handle_tenant_delete_approval("appr_del", "tok")
+        assert r["statusCode"] == 200
+        ar.delete.assert_called_once_with("appr_del")
+        agr.get.assert_not_called()  # must NOT look up an agent for a fleet approval
 
     def test_approval_not_found_returns_404(self):
         with patch("handlers.tenant_approvals._verify_tenant_token", return_value=_ADMIN), \
@@ -880,3 +932,112 @@ class TestDeleteApprovalHandler:
         with patch("handlers.tenant_approvals.handle_tenant_delete_approval", return_value=_OK) as h:
             delete_approval_handler(_evt(path={"approval_id": "appr_1"}), None)
         h.assert_called_once_with("appr_1", "tok")
+
+
+# ---------------------------------------------------------------------------
+# Fleet-scoped approvals
+# ---------------------------------------------------------------------------
+
+FLEET_ID = "fleet_a"
+_FLEET = {"fleet_id": FLEET_ID, "tenant_id": TENANT_ID, "name": "web-asg"}
+# A fleet member: an agent that belongs to a fleet (approvals live at the fleet).
+_MEMBER_AGENT = {"agent_id": "agent_m", "tenant_id": TENANT_ID, "fleet_id": FLEET_ID}
+_FLEET_OPERATOR = {**_OPERATOR, "readwrite_fleet_ids": [FLEET_ID], "readonly_fleet_ids": []}
+
+
+class TestFleetScopedCreate:
+    def _call(self, body=None, user=_OPERATOR, fleet=_FLEET, agent=_AGENT, active=None):
+        with patch("handlers.tenant_approvals._verify_tenant_token", return_value=user), \
+             patch("handlers.tenant_approvals.agents_repo") as agr, \
+             patch("handlers.tenant_approvals.fleets_repo") as fr, \
+             patch("handlers.tenant_approvals.approvals_repo") as ar:
+            agr.get.return_value = agent
+            fr.get.return_value = fleet
+            ar.list_by_fleet.return_value = active or []
+            ar.create.return_value = None
+            r = handle_tenant_create_approval(body or {}, "tok")
+        return r, ar
+
+    def test_operator_preapproves_fleet_approval(self):
+        # An operator with write access to the fleet pre-approves (status approved).
+        r, ar = self._call(user=_FLEET_OPERATOR, body={"fleet_id": FLEET_ID, "command": "docker ps"})
+        assert r["statusCode"] == 200
+        ar.create.assert_called_once()
+        created = ar.create.mock_calls[0].args[0]
+        assert created["fleet_id"] == FLEET_ID and created["agent_id"] is None
+        assert created["status"] == "approved"
+
+    def test_developer_creates_pending_fleet_approval(self):
+        dev = {**_DEV, "readwrite_fleet_ids": [FLEET_ID], "readonly_fleet_ids": []}
+        r, ar = self._call(user=dev, body={"fleet_id": FLEET_ID, "command": "docker ps"})
+        assert r["statusCode"] == 201
+        created = ar.create.mock_calls[0].args[0]
+        assert created["fleet_id"] == FLEET_ID and created["status"] == "pending"
+
+    def test_agent_and_fleet_both_returns_400(self):
+        r, _ = self._call(body={"agent_id": AGENT_ID, "fleet_id": FLEET_ID, "command": "ls"})
+        assert r["statusCode"] == 400
+
+    def test_neither_agent_nor_fleet_returns_400(self):
+        r, _ = self._call(body={"command": "ls"})
+        assert r["statusCode"] == 400
+
+    def test_fleet_member_agent_rejected(self):
+        # Approving a command on a fleet member's agent_id is not allowed - use the fleet.
+        r, _ = self._call(body={"agent_id": "agent_m", "command": "ls"}, agent=_MEMBER_AGENT)
+        assert r["statusCode"] == 409
+        assert "fleet member" in json.loads(r["body"])["error"]
+
+    def test_unknown_fleet_returns_404(self):
+        r, _ = self._call(user=_FLEET_OPERATOR, body={"fleet_id": FLEET_ID, "command": "ls"}, fleet=None)
+        assert r["statusCode"] == 404
+
+    def test_readonly_fleet_cannot_create(self):
+        ro = {**_OPERATOR, "readwrite_fleet_ids": [], "readonly_fleet_ids": [FLEET_ID]}
+        r, ar = self._call(user=ro, body={"fleet_id": FLEET_ID, "command": "ls"})
+        assert r["statusCode"] == 403
+        ar.create.assert_not_called()
+
+    def test_inaccessible_fleet_hidden(self):
+        scoped = {**_OPERATOR, "readwrite_fleet_ids": ["other_fleet"], "readonly_fleet_ids": []}
+        r, _ = self._call(user=scoped, body={"fleet_id": FLEET_ID, "command": "ls"})
+        assert r["statusCode"] in (403, 404)
+
+    def test_duplicate_fleet_approval_returns_409(self):
+        existing = {**_APPROVED, "command": "docker ps", "fleet_id": FLEET_ID, "agent_id": None}
+        r, _ = self._call(user=_FLEET_OPERATOR, body={"fleet_id": FLEET_ID, "command": "docker ps"}, active=[existing])
+        assert r["statusCode"] == 409
+
+
+class TestFleetScopedReview:
+    _FLEET_PENDING = {**_PENDING_APPROVAL, "agent_id": None, "fleet_id": FLEET_ID}
+
+    def _call(self, action="approve", user=_FLEET_OPERATOR, approval=None, fleet=_FLEET):
+        approval = approval or self._FLEET_PENDING
+        with patch("handlers.tenant_approvals._verify_tenant_token", return_value=user), \
+             patch("handlers.tenant_approvals.agents_repo") as agr, \
+             patch("handlers.tenant_approvals.fleets_repo") as fr, \
+             patch("handlers.tenant_approvals.approvals_repo") as ar:
+            agr.get.return_value = _AGENT
+            fr.get.return_value = fleet
+            ar.get.return_value = approval
+            ar.update_status.return_value = None
+            r = handle_tenant_review_approval("appr_rev", action, "tok", None)
+        return r, ar
+
+    def test_writable_fleet_operator_can_approve(self):
+        r, ar = self._call(action="approve")
+        assert r["statusCode"] == 200
+        ar.update_status.assert_called_once()
+
+    def test_readonly_fleet_operator_cannot_review(self):
+        ro = {**_OPERATOR, "readwrite_fleet_ids": [], "readonly_fleet_ids": [FLEET_ID]}
+        r, ar = self._call(user=ro)
+        assert r["statusCode"] == 403
+        ar.update_status.assert_not_called()
+
+    def test_inaccessible_fleet_hidden(self):
+        scoped = {**_OPERATOR, "readwrite_fleet_ids": ["other_fleet"], "readonly_fleet_ids": []}
+        r, ar = self._call(user=scoped)
+        assert r["statusCode"] == 404
+        ar.update_status.assert_not_called()

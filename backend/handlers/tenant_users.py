@@ -21,11 +21,26 @@ def _require_admin(tp: dict) -> bool:
     return tp.get("role") == "admin"
 
 
+def _fleet_member_grant_error(readwrite_agent_ids, readonly_agent_ids, tenant_id: str):
+    """Fleet members have ephemeral agent_ids (they churn as an ASG scales), so they
+    must be granted via their fleet, never by individual agent_id. Return an error
+    dict if either per-agent list names a fleet member, else None. The "*" wildcard
+    is a broad grant, not a specific id, so it's allowed."""
+    ids = {i for lst in (readwrite_agent_ids, readonly_agent_ids) for i in (lst or []) if i != "*"}
+    if not ids:
+        return None
+    members = {a["agent_id"] for a in agents_repo.list_by_tenant(tenant_id) if a.get("fleet_id")}
+    bad = sorted(ids & members)
+    if bad:
+        return _err(f"{bad[0]} is a fleet member - grant access via its fleet, not by agent id")
+    return None
+
+
 def _grant_exceeds_actor_scope(token_payload: dict, requested, tenant_id: str) -> bool:
-    """True if `requested` (allowed_agent_ids being granted) exceeds the acting
+    """True if `requested` (readwrite_agent_ids being granted) exceeds the acting
     admin's own agent access. Admins can only delegate access they hold:
 
-    - unrestricted actor (allowed_agent_ids is None) may grant anything, incl. null
+    - unrestricted actor (readwrite_agent_ids is None) may grant anything, incl. null
     - restricted actor may not grant tenant-wide (null), nor any agent outside their set
 
     The actor's scope is read fresh from their user record, not the token.
@@ -39,12 +54,33 @@ def _grant_exceeds_actor_scope(token_payload: dict, requested, tenant_id: str) -
     return any(a not in actor_agents for a in requested)
 
 
-def handle_list_tenant_users(token_payload: dict) -> dict:
+def _user_matches_query(u: dict, q: str) -> bool:
+    return q in (u.get("username") or "").lower() or q in (u.get("name") or "").lower()
+
+
+def handle_list_tenant_users(token_payload: dict, role=None, status=None, q=None,
+                             limit=None, offset=0) -> dict:
     if not _require_admin(token_payload):
         return _err("forbidden", 403)
     tenant_id = token_payload["tenant_id"]
     users = users_repo.list_by_tenant(tenant_id)
-    return _ok({"users": [_safe(u) for u in users]})
+
+    # Optional filters: exact role, exact status, and a substring over username/name.
+    if role:
+        users = [u for u in users if u.get("role") == role]
+    if status:
+        users = [u for u in users if (u.get("status") or "").upper() == status.upper()]
+    ql = (q or "").strip().lower()
+    if ql:
+        users = [u for u in users if _user_matches_query(u, ql)]
+
+    # Opt-in pagination: with no `limit`, return the full set (back-compat for the CLI
+    # and any caller that wants everything). With a `limit`, return a page + the total.
+    if limit is None:
+        return _ok({"users": [_safe(u) for u in users]})
+    total = len(users)
+    page = users[offset:offset + limit]
+    return _ok({"users": [_safe(u) for u in page], "total": total, "limit": limit, "offset": offset})
 
 
 def handle_create_tenant_user(body: dict, token_payload: dict, ip: str = "") -> dict:
@@ -67,19 +103,35 @@ def handle_create_tenant_user(body: dict, token_payload: dict, ip: str = "") -> 
     if role not in VALID_ROLES:
         return _err(f"role must be one of {VALID_ROLES}")
 
-    allowed_agent_ids_raw = body.get("allowed_agent_ids")  # None = all agents (*)
-    if allowed_agent_ids_raw is not None:
-        if not isinstance(allowed_agent_ids_raw, list) or not all(isinstance(i, str) for i in allowed_agent_ids_raw):
-            return _err("allowed_agent_ids must be null or a list of agent ID strings")
-    allowed_agent_ids = allowed_agent_ids_raw
+    raw = {f: body.get(f) for f in _SCOPE_FIELDS}
+    for field, v in raw.items():
+        if v is not None and (not isinstance(v, list) or not all(isinstance(i, str) for i in v)):
+            return _err(f"{field} must be null or a list of ID strings")
+        if v and "*" in v:
+            return _err("wildcard '*' is not allowed - list every id explicitly")
 
-    # Admins are the tenant trust root: always tenant-wide, never agent-scoped. This
-    # guarantees at least one role can reach every agent (no agent can be orphaned).
-    if role == "admin" and allowed_agent_ids is not None:
-        return _err(_ADMIN_SCOPE_ERR)
+    if role == "admin":
+        # Admins are the tenant trust root: always tenant-wide, never scoped. This
+        # guarantees at least one role can reach every agent (none orphaned).
+        if any(raw[f] for f in _SCOPE_FIELDS):
+            return _err(_ADMIN_SCOPE_ERR)
+        scope = {f: None for f in _SCOPE_FIELDS}
+    else:
+        # No access by default: a developer/operator starts with no access and is
+        # granted explicitly (per agent/fleet, read-only or read-write). Omitted → [].
+        scope = {f: (raw[f] if raw[f] is not None else []) for f in _SCOPE_FIELDS}
+        if set(scope["readwrite_agent_ids"]) & set(scope["readonly_agent_ids"]):
+            return _err("an agent cannot be both read-write and read-only; lists must be disjoint")
+        if set(scope["readwrite_fleet_ids"]) & set(scope["readonly_fleet_ids"]):
+            return _err("a fleet cannot be both read-write and read-only; lists must be disjoint")
+        fleet_err = _fleet_member_grant_error(scope["readwrite_agent_ids"], scope["readonly_agent_ids"], tenant_id)
+        if fleet_err:
+            return fleet_err
 
-    # An admin can only grant agent access they hold themselves.
-    if _grant_exceeds_actor_scope(token_payload, allowed_agent_ids, tenant_id):
+    # An admin can only grant agent access they hold themselves (union of both lists).
+    rw_a, ro_a = scope["readwrite_agent_ids"], scope["readonly_agent_ids"]
+    granted = None if rw_a is None else (rw_a + (ro_a or []))
+    if _grant_exceeds_actor_scope(token_payload, granted, tenant_id):
         return _err("you can only grant access to agents you have access to", 403)
 
     # Check uniqueness
@@ -99,8 +151,7 @@ def handle_create_tenant_user(body: dict, token_payload: dict, ip: str = "") -> 
         "role":               role,
         "must_reset_password": True,
         "status":             "ACTIVE",
-        "allowed_agent_ids":  allowed_agent_ids,
-        "allowed_fleet_ids":  None,
+        **scope,
         "created_at":         _iso(),
     })
 
@@ -112,7 +163,7 @@ def handle_create_tenant_user(body: dict, token_payload: dict, ip: str = "") -> 
         actor_role=token_payload.get("role"),
         resource_type="user",
         resource_id=user_id,
-        metadata={"username": username, "role": role, "allowed_agent_ids": allowed_agent_ids},
+        metadata={"username": username, "role": role, **scope},
         ip_address=ip,
     )
 
@@ -226,10 +277,10 @@ def handle_set_user_role(user_id: str, body: dict, token_payload: dict, ip: str 
         return _err("user not found", 404)
 
     users_repo.set_role(user_id, role)
-    # Promotion to admin implies tenant-wide access; drop any prior agent scope so
-    # the admin isn't left artificially restricted.
-    if role == "admin" and user.get("allowed_agent_ids") is not None:
-        users_repo.set_allowed_agents(user_id, None)
+    # Promotion to admin implies tenant-wide access; drop any prior agent/fleet scope
+    # (read-write and read-only) so the admin isn't left artificially restricted.
+    if role == "admin" and is_agent_restricted(user):
+        users_repo.set_agent_access(user_id, None, None, None, None)
     audit.write(
         "user.role_changed",
         tenant_id=tenant_id,
@@ -280,7 +331,10 @@ def _safe(u: dict) -> dict:
         "last_login_at":       u.get("last_login_at"),
         "disabled_at":         u.get("disabled_at"),
         "created_at":          u.get("created_at"),
-        "allowed_agent_ids":   u.get("allowed_agent_ids"),
+        "readwrite_agent_ids":   u.get("readwrite_agent_ids"),
+        "readonly_agent_ids":  u.get("readonly_agent_ids"),
+        "readwrite_fleet_ids":   u.get("readwrite_fleet_ids"),
+        "readonly_fleet_ids":  u.get("readonly_fleet_ids"),
     }
 
 
@@ -291,7 +345,16 @@ def handle_get_user_agents(user_id: str, token_payload: dict) -> dict:
     user = users_repo.get(user_id)
     if not user or user.get("tenant_id") != tenant_id:
         return _err("user not found", 404)
-    return _ok({"user_id": user_id, "allowed_agent_ids": user.get("allowed_agent_ids")})
+    return _ok({
+        "user_id": user_id,
+        "readwrite_agent_ids": user.get("readwrite_agent_ids"),
+        "readonly_agent_ids": user.get("readonly_agent_ids"),
+        "readwrite_fleet_ids": user.get("readwrite_fleet_ids"),
+        "readonly_fleet_ids": user.get("readonly_fleet_ids"),
+    })
+
+
+_SCOPE_FIELDS = ("readwrite_agent_ids", "readonly_agent_ids", "readwrite_fleet_ids", "readonly_fleet_ids")
 
 
 def handle_set_user_agents(user_id: str, body: dict, token_payload: dict) -> dict:
@@ -301,24 +364,51 @@ def handle_set_user_agents(user_id: str, body: dict, token_payload: dict) -> dic
     user = users_repo.get(user_id)
     if not user or user.get("tenant_id") != tenant_id:
         return _err("user not found", 404)
-    prev = user.get("allowed_agent_ids")  # None = all agents
-    agent_ids = body.get("allowed_agent_ids")  # None = allow all agents
-    if agent_ids is not None:
-        if not isinstance(agent_ids, list) or not all(isinstance(i, str) for i in agent_ids):
-            return _err("allowed_agent_ids must be null or a list of agent ID strings")
 
-    # Admins are always tenant-wide - you can't scope one to specific agents.
-    if user.get("role") == "admin" and agent_ids is not None:
+    # Read-write and read-only lists partition access by capability, for agents and
+    # fleets alike. A field omitted from the body is left unchanged (so you can set
+    # agent grants without clobbering fleet grants); an explicit value replaces it.
+    scope: dict = {}
+    for field in _SCOPE_FIELDS:
+        if field in body:
+            v = body[field]
+            if v is not None and (not isinstance(v, list) or not all(isinstance(i, str) for i in v)):
+                return _err(f"{field} must be null or a list of ID strings")
+            if v and "*" in v:
+                return _err("wildcard '*' is not allowed - list every id explicitly")
+            scope[field] = v
+        else:
+            scope[field] = user.get(field)
+
+    # An id can't be both read-write and read-only (within agents, and within fleets).
+    if scope["readwrite_agent_ids"] is not None and scope["readonly_agent_ids"] is not None \
+            and set(scope["readwrite_agent_ids"]) & set(scope["readonly_agent_ids"]):
+        return _err("an agent cannot be both read-write and read-only; lists must be disjoint")
+    if scope["readwrite_fleet_ids"] is not None and scope["readonly_fleet_ids"] is not None \
+            and set(scope["readwrite_fleet_ids"]) & set(scope["readonly_fleet_ids"]):
+        return _err("a fleet cannot be both read-write and read-only; lists must be disjoint")
+
+    # Fleet members can't be granted by individual agent id - use the fleet.
+    fleet_err = _fleet_member_grant_error(scope["readwrite_agent_ids"], scope["readonly_agent_ids"], tenant_id)
+    if fleet_err:
+        return fleet_err
+
+    # Admins are always tenant-wide - you can't scope one to specific agents/fleets.
+    if user.get("role") == "admin" and any(scope[f] for f in _SCOPE_FIELDS):
         return _err(_ADMIN_SCOPE_ERR)
 
-    # An admin can only grant agent access they hold themselves (this also stops a
-    # restricted admin from widening their own scope).
-    if _grant_exceeds_actor_scope(token_payload, agent_ids, tenant_id):
+    # An admin can only grant agent access they hold themselves - the containment check
+    # covers the union of the read-write and read-only agent lists.
+    rw_a, ro_a = scope["readwrite_agent_ids"], scope["readonly_agent_ids"]
+    granted = None if rw_a is None else (rw_a + (ro_a or []))
+    if _grant_exceeds_actor_scope(token_payload, granted, tenant_id):
         return _err("you can only grant access to agents you have access to", 403)
 
-    users_repo.set_allowed_agents(user_id, agent_ids)
-    added = sorted(set(agent_ids or []) - set(prev or [])) if prev is not None and agent_ids is not None else None
-    removed = sorted(set(prev or []) - set(agent_ids or [])) if prev is not None and agent_ids is not None else None
+    users_repo.set_agent_access(user_id, scope["readwrite_agent_ids"], scope["readonly_agent_ids"],
+                                scope["readwrite_fleet_ids"], scope["readonly_fleet_ids"])
+    # Diff the read-write agent list for a readable audit trail (previous/current/added/removed).
+    prev, current = user.get("readwrite_agent_ids"), scope["readwrite_agent_ids"]
+    both_lists = prev is not None and current is not None
     audit.write(
         "user.agents_changed",
         tenant_id=tenant_id,
@@ -330,12 +420,13 @@ def handle_set_user_agents(user_id: str, body: dict, token_payload: dict) -> dic
         metadata={
             "target_username": user.get("username"),
             "previous": prev,
-            "current": agent_ids,
-            "added": added,
-            "removed": removed,
+            "current": current,
+            "added": sorted(set(current) - set(prev)) if both_lists else None,
+            "removed": sorted(set(prev) - set(current)) if both_lists else None,
+            **scope,
         },
     )
-    return _ok({"user_id": user_id, "allowed_agent_ids": agent_ids})
+    return _ok({"user_id": user_id, **scope})
 
 
 # ---------------------------------------------------------------------------
@@ -368,7 +459,19 @@ def list_users_handler(event, context):
     payload, err = _auth(event)
     if err:
         return err
-    return handle_list_tenant_users(payload)
+    qs = event.get("queryStringParameters") or {}
+    limit = None
+    if qs.get("limit") is not None:
+        try:
+            limit = max(1, min(int(qs["limit"]), 100))
+        except (ValueError, TypeError):
+            limit = 20
+    try:
+        offset = max(0, int(qs.get("offset", 0)))
+    except (ValueError, TypeError):
+        offset = 0
+    return handle_list_tenant_users(payload, role=qs.get("role"), status=qs.get("status"),
+                                    q=qs.get("q"), limit=limit, offset=offset)
 
 
 def create_user_handler(event, context):

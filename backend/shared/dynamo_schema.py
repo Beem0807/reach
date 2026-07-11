@@ -19,11 +19,32 @@ TABLES = [
             {"AttributeName": "tenant_id", "AttributeType": "S"},
             {"AttributeName": "install_token_hash", "AttributeType": "S"},
             {"AttributeName": "agent_token_hash", "AttributeType": "S"},
+            {"AttributeName": "fleet_id", "AttributeType": "S"},
+            {"AttributeName": "machine_fingerprint", "AttributeType": "S"},
         ],
         "GlobalSecondaryIndexes": [
             {"IndexName": "tenant-index", "KeySchema": [{"AttributeName": "tenant_id", "KeyType": "HASH"}]},
             {"IndexName": "install-token-hash-index", "KeySchema": [{"AttributeName": "install_token_hash", "KeyType": "HASH"}]},
             {"IndexName": "agent-token-hash-index", "KeySchema": [{"AttributeName": "agent_token_hash", "KeyType": "HASH"}]},
+            {"IndexName": "fleet-index", "KeySchema": [
+                {"AttributeName": "fleet_id", "KeyType": "HASH"},
+                {"AttributeName": "machine_fingerprint", "KeyType": "RANGE"},
+            ]},
+        ],
+    },
+    {
+        "TableName": "reach-fleets",
+        "KeySchema": [{"AttributeName": "fleet_id", "KeyType": "HASH"}],
+        "AttributeDefinitions": [
+            {"AttributeName": "fleet_id", "AttributeType": "S"},
+            {"AttributeName": "tenant_id", "AttributeType": "S"},
+            {"AttributeName": "join_token_hash", "AttributeType": "S"},
+            {"AttributeName": "prev_join_token_hash", "AttributeType": "S"},
+        ],
+        "GlobalSecondaryIndexes": [
+            {"IndexName": "tenant-index", "KeySchema": [{"AttributeName": "tenant_id", "KeyType": "HASH"}]},
+            {"IndexName": "join-token-hash-index", "KeySchema": [{"AttributeName": "join_token_hash", "KeyType": "HASH"}]},
+            {"IndexName": "prev-join-token-hash-index", "KeySchema": [{"AttributeName": "prev_join_token_hash", "KeyType": "HASH"}]},
         ],
     },
     {
@@ -61,6 +82,7 @@ TABLES = [
             {"AttributeName": "status", "AttributeType": "S"},
             {"AttributeName": "tenant_id", "AttributeType": "S"},
             {"AttributeName": "created_at", "AttributeType": "S"},
+            {"AttributeName": "run_id", "AttributeType": "S"},
         ],
         "GlobalSecondaryIndexes": [
             {"IndexName": "agent-status-index", "KeySchema": [
@@ -71,6 +93,31 @@ TABLES = [
                 {"AttributeName": "tenant_id", "KeyType": "HASH"},
                 {"AttributeName": "created_at", "KeyType": "RANGE"},
             ]},
+            # All jobs from one fan-out (run) - powers run status + idempotency dedupe.
+            {"IndexName": "run-index", "KeySchema": [
+                {"AttributeName": "run_id", "KeyType": "HASH"},
+            ]},
+        ],
+    },
+    {
+        "TableName": "reach-runs",
+        "KeySchema": [{"AttributeName": "run_id", "KeyType": "HASH"}],
+        "AttributeDefinitions": [
+            {"AttributeName": "run_id", "AttributeType": "S"},
+            {"AttributeName": "tenant_id", "AttributeType": "S"},
+            {"AttributeName": "fleet_id", "AttributeType": "S"},
+            {"AttributeName": "created_at", "AttributeType": "S"},
+        ],
+        "GlobalSecondaryIndexes": [
+            {"IndexName": "tenant-runs-index", "KeySchema": [
+                {"AttributeName": "tenant_id", "KeyType": "HASH"},
+                {"AttributeName": "created_at", "KeyType": "RANGE"},
+            ]},
+            # Sparse (only fleet runs carry fleet_id): a fleet's runs newest-first.
+            {"IndexName": "fleet-runs-index", "KeySchema": [
+                {"AttributeName": "fleet_id", "KeyType": "HASH"},
+                {"AttributeName": "created_at", "KeyType": "RANGE"},
+            ]},
         ],
     },
     {
@@ -79,12 +126,17 @@ TABLES = [
         "AttributeDefinitions": [
             {"AttributeName": "approval_id", "AttributeType": "S"},
             {"AttributeName": "agent_id", "AttributeType": "S"},
+            {"AttributeName": "fleet_id", "AttributeType": "S"},
             {"AttributeName": "tenant_id", "AttributeType": "S"},
             {"AttributeName": "created_at", "AttributeType": "S"},
         ],
         "GlobalSecondaryIndexes": [
             {"IndexName": "agent-approvals-index", "KeySchema": [
                 {"AttributeName": "agent_id", "KeyType": "HASH"},
+                {"AttributeName": "created_at", "KeyType": "RANGE"},
+            ]},
+            {"IndexName": "fleet-approvals-index", "KeySchema": [
+                {"AttributeName": "fleet_id", "KeyType": "HASH"},
                 {"AttributeName": "created_at", "KeyType": "RANGE"},
             ]},
             {"IndexName": "tenant-approvals-index", "KeySchema": [

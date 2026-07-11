@@ -22,10 +22,10 @@ Globals:
           - HasChartRepo
           - !Ref ReleasesChartRepo
           - !Sub "${ReleasesS3Base}/charts/reach-agent"
-        APPROVAL_RETENTION_DAYS: !Ref ApprovalRetentionDays
-        JOB_RETENTION_DAYS: !Ref JobRetentionDays
+        # Retention windows (approval/job/run/agent-history) and the fan-out cap are
+        # per-tenant settings now, not env vars. The platform-level audit trail
+        # (tenant_id IS NULL) keeps its own deployment-wide window here.
         AUDIT_RETENTION_DAYS: !Ref AuditRetentionDays
-        AGENT_HISTORY_RETENTION_DAYS: !Ref AgentHistoryRetentionDays
   HttpApi:
     CorsConfiguration:
       AllowMethods:
@@ -62,22 +62,10 @@ Parameters:
     Type: String
     Default: ""
     Description: Helm chart repo URL for the generated k8s helm command. Empty derives it from ReleasesS3Base (<base>/charts/reach-agent).
-  ApprovalRetentionDays:
-    Type: Number
-    Default: 7
-    Description: Days to retain terminal approval records (denied, expired) before the daily cleanup deletes them
-  JobRetentionDays:
-    Type: Number
-    Default: 7
-    Description: Days to retain terminal job records (SUCCEEDED, FAILED, REJECTED, EXPIRED) before the daily cleanup deletes them
   AuditRetentionDays:
     Type: Number
     Default: 90
-    Description: Days to retain audit log records before the daily cleanup deletes them
-  AgentHistoryRetentionDays:
-    Type: Number
-    Default: 30
-    Description: Days to retain agent heartbeat and status history records before the daily cleanup deletes them
+    Description: Days to retain platform-level audit log records (tenant_id IS NULL) before the daily cleanup deletes them. Per-tenant audit/job/approval/run/agent-history retention and the fan-out cap are tenant settings, not stack parameters.
 
 Conditions:
   # Chart repo explicitly set vs. derived from ReleasesS3Base.
@@ -103,6 +91,10 @@ Resources:
           AttributeType: S
         - AttributeName: agent_token_hash
           AttributeType: S
+        - AttributeName: fleet_id
+          AttributeType: S
+        - AttributeName: machine_fingerprint
+          AttributeType: S
       KeySchema:
         - AttributeName: agent_id
           KeyType: HASH
@@ -124,6 +116,57 @@ Resources:
         - IndexName: agent-token-hash-index
           KeySchema:
             - AttributeName: agent_token_hash
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+        # Sparse index (only fleet members have fleet_id): idempotent re-enroll
+        # resolves a fleet member by (fleet_id, machine_fingerprint).
+        - IndexName: fleet-index
+          KeySchema:
+            - AttributeName: fleet_id
+              KeyType: HASH
+            - AttributeName: machine_fingerprint
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  FleetsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: reach-fleets
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: fleet_id
+          AttributeType: S
+        - AttributeName: tenant_id
+          AttributeType: S
+        - AttributeName: join_token_hash
+          AttributeType: S
+        - AttributeName: prev_join_token_hash
+          AttributeType: S
+      KeySchema:
+        - AttributeName: fleet_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: tenant-index
+          KeySchema:
+            - AttributeName: tenant_id
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+        # A host enrolls by its reusable join token hash (or the previous one during
+        # a rotation grace window) - resolved like the per-agent install token.
+        - IndexName: join-token-hash-index
+          KeySchema:
+            - AttributeName: join_token_hash
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+        - IndexName: prev-join-token-hash-index
+          KeySchema:
+            - AttributeName: prev_join_token_hash
               KeyType: HASH
           Projection:
             ProjectionType: ALL
@@ -201,6 +244,8 @@ Resources:
           AttributeType: S
         - AttributeName: created_at
           AttributeType: S
+        - AttributeName: run_id
+          AttributeType: S
       KeySchema:
         - AttributeName: job_id
           KeyType: HASH
@@ -221,6 +266,49 @@ Resources:
               KeyType: RANGE
           Projection:
             ProjectionType: ALL
+        - IndexName: run-index
+          KeySchema:
+            - AttributeName: run_id
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+
+  RunsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: reach-runs
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: run_id
+          AttributeType: S
+        - AttributeName: tenant_id
+          AttributeType: S
+        - AttributeName: fleet_id
+          AttributeType: S
+        - AttributeName: created_at
+          AttributeType: S
+      KeySchema:
+        - AttributeName: run_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: tenant-runs-index
+          KeySchema:
+            - AttributeName: tenant_id
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: fleet-runs-index
+          KeySchema:
+            - AttributeName: fleet_id
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
 
   ApprovalsTable:
     Type: AWS::DynamoDB::Table
@@ -234,6 +322,8 @@ Resources:
           AttributeType: S
         - AttributeName: agent_id
           AttributeType: S
+        - AttributeName: fleet_id
+          AttributeType: S
         - AttributeName: tenant_id
           AttributeType: S
         - AttributeName: created_at
@@ -245,6 +335,14 @@ Resources:
         - IndexName: agent-approvals-index
           KeySchema:
             - AttributeName: agent_id
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: fleet-approvals-index
+          KeySchema:
+            - AttributeName: fleet_id
               KeyType: HASH
             - AttributeName: created_at
               KeyType: RANGE
@@ -384,6 +482,7 @@ Resources:
                   - !GetAtt ApiTokensTable.Arn
                   - !GetAtt AuditLogsTable.Arn
                   - !GetAtt AgentHistoryTable.Arn
+                  - !GetAtt FleetsTable.Arn
                   - !Sub "${AgentsTable.Arn}/index/*"
                   - !Sub "${UsersTable.Arn}/index/*"
                   - !Sub "${JobsTable.Arn}/index/*"
@@ -392,6 +491,7 @@ Resources:
                   - !Sub "${AuditLogsTable.Arn}/index/*"
                   - !Sub "${TenantsTable.Arn}/index/*"
                   - !Sub "${AgentHistoryTable.Arn}/index/*"
+                  - !Sub "${FleetsTable.Arn}/index/*"
 
   # -----------------------------------------------------------------------
   # Agent endpoints
@@ -448,6 +548,19 @@ Resources:
             Path: /agent/rotate-token
             Method: POST
 
+  AgentDeregisterFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-agent-deregister
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.agent_deregister.agent_deregister_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /agent/deregister
+            Method: POST
+
   # -----------------------------------------------------------------------
   # Tenant endpoints - job execution, agent lookup, approval checks (CLI)
   # -----------------------------------------------------------------------
@@ -475,6 +588,84 @@ Resources:
           Type: HttpApi
           Properties:
             Path: /jobs
+            Method: POST
+
+  FanoutByTagFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-fanout-by-tag
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.jobs_fanout.fanout_by_tag_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /jobs/fanout
+            Method: POST
+
+  ListTagRunsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-list-tag-runs
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.jobs_fanout.list_tag_runs_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /jobs/runs
+            Method: GET
+
+  GetRunFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-get-run
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.runs.get_run_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /tenant/runs/{run_id}
+            Method: GET
+
+  PauseRunFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-pause-run
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.run_control.pause_run_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /tenant/runs/{run_id}/pause
+            Method: POST
+
+  ResumeRunFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-resume-run
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.run_control.resume_run_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /tenant/runs/{run_id}/resume
+            Method: POST
+
+  CancelRunFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-cancel-run
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.run_control.cancel_run_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /tenant/runs/{run_id}/cancel
             Method: POST
 
   ListJobsFunction:
@@ -555,6 +746,72 @@ Resources:
             Path: /agents/{agent_id}/approved-commands
             Method: GET
 
+  # CLI/MCP fleet surface (API-token, access-scoped)
+  CliListFleetsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-cli-list-fleets
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.cli_fleets.list_fleets_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /fleets
+            Method: GET
+
+  CliListFleetAgentsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-cli-list-fleet-agents
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.cli_fleets.list_fleet_agents_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /fleets/{fleet_id}/agents
+            Method: GET
+
+  CliListFleetApprovedFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-cli-list-fleet-approved
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.cli_fleets.list_fleet_approved_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /fleets/{fleet_id}/approvals
+            Method: GET
+
+  CliListFleetRunsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-cli-list-fleet-runs
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.cli_fleets.list_fleet_runs_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /fleets/{fleet_id}/runs
+            Method: GET
+
+  CliFleetFanoutFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-cli-fleet-fanout
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.cli_fleets.fleet_fanout_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /fleets/{fleet_id}/jobs
+            Method: POST
+
   # -----------------------------------------------------------------------
   # Tenant console auth endpoints
   # -----------------------------------------------------------------------
@@ -596,6 +853,32 @@ Resources:
           Properties:
             Path: /tenant/me
             Method: GET
+
+  TenantGetSettingsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-tenant-get-settings
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.tenant_settings.get_tenant_settings_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /tenant/settings
+            Method: GET
+
+  TenantUpdateSettingsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-tenant-update-settings
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.tenant_settings.update_tenant_settings_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /tenant/settings
+            Method: PUT
 
   # -----------------------------------------------------------------------
   # Tenant console user management endpoints
@@ -870,6 +1153,32 @@ Resources:
             Path: /admin/tenants/{tenant_id}
             Method: DELETE
 
+  AdminGetTenantSettingsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-admin-get-tenant-settings
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.tenant_settings.admin_get_tenant_settings_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /admin/tenants/{tenant_id}/settings
+            Method: GET
+
+  AdminUpdateTenantSettingsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-admin-update-tenant-settings
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.tenant_settings.admin_update_tenant_settings_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /admin/tenants/{tenant_id}/settings
+            Method: PUT
+
   AdminListUsersFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -1002,6 +1311,113 @@ Resources:
           Properties:
             Path: /tenant/agent-versions
             Method: GET
+
+  # -----------------------------------------------------------------------
+  # Tenant admin - fleets (reusable-join-token groups of host agents)
+  # -----------------------------------------------------------------------
+  TenantListFleetsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-tenant-list-fleets
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.tenant_fleets.list_fleets_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /tenant/fleets
+            Method: GET
+
+  TenantCreateFleetFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-tenant-create-fleet
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.tenant_fleets.create_fleet_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /tenant/fleets
+            Method: POST
+
+  TenantUpdateFleetFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-tenant-update-fleet
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.tenant_fleets.update_fleet_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /tenant/fleets/{fleet_id}
+            Method: PUT
+
+  TenantRotateFleetTokenFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-tenant-rotate-fleet-token
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.tenant_fleets.rotate_fleet_token_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /tenant/fleets/{fleet_id}/rotate-token
+            Method: POST
+
+  TenantRevokeFleetFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-tenant-revoke-fleet
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.tenant_fleets.revoke_fleet_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /tenant/fleets/{fleet_id}/revoke
+            Method: POST
+
+  TenantDeleteFleetFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-tenant-delete-fleet
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.tenant_fleets.delete_fleet_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /tenant/fleets/{fleet_id}
+            Method: DELETE
+
+  TenantRemoveFleetMemberFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-tenant-remove-fleet-member
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.tenant_fleets.remove_fleet_member_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /tenant/fleets/{fleet_id}/members/{agent_id}
+            Method: DELETE
+
+  TenantResolveFleetGrantsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-tenant-resolve-fleet-grants
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.tenant_fleets.resolve_fleet_grants_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /tenant/fleets/{fleet_id}/resolve-grants
+            Method: POST
 
   TenantCreateAgentFunction:
     Type: AWS::Serverless::Function

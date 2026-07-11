@@ -16,6 +16,28 @@ from shared.versions import available_versions, valid_version
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
+def _grant_agent_to_user(target: dict, agent_id: str, readonly: bool) -> bool:
+    """Append agent_id to a restricted user's read-write (or read-only) agent list,
+    keeping the two disjoint. Unrestricted users (readwrite_agent_ids is None - i.e.
+    admins) already see every agent, so they're skipped. Returns True if granted."""
+    rw = target.get("readwrite_agent_ids")
+    if rw is None:
+        return False
+    rw = list(rw)
+    ro = list(target.get("readonly_agent_ids") or [])
+    if readonly:
+        if agent_id not in ro:
+            ro.append(agent_id)
+        rw = [a for a in rw if a != agent_id]
+    else:
+        if agent_id not in rw:
+            rw.append(agent_id)
+        ro = [a for a in ro if a != agent_id]
+    users_repo.set_agent_access(target["user_id"], rw, ro,
+                                target.get("readwrite_fleet_ids"), target.get("readonly_fleet_ids"))
+    return True
+
+
 _S3_BASE = os.environ.get("RELEASES_S3_BASE", "https://reach-releases.s3.amazonaws.com")
 # The default (unpinned) host install always tracks the newest release under
 # agent/latest/; a specific version is chosen per-agent at create time.
@@ -110,9 +132,11 @@ def handle_create_tenant_agent(body: dict, raw_token: str, api_url: str) -> dict
     if version and version.lower() != "latest" and valid_version(version) is None:
         return _err("invalid version")
 
-    grant_user_ids = body.get("grant_user_ids") or []
-    if not isinstance(grant_user_ids, list) or not all(isinstance(i, str) for i in grant_user_ids):
-        return _err("grant_user_ids must be a list of user ID strings")
+    grant_user_ids = body.get("grant_user_ids") or []            # granted read-write
+    grant_readonly_user_ids = body.get("grant_readonly_user_ids") or []  # granted read-only
+    for lst, name in ((grant_user_ids, "grant_user_ids"), (grant_readonly_user_ids, "grant_readonly_user_ids")):
+        if not isinstance(lst, list) or not all(isinstance(i, str) for i in lst):
+            return _err(f"{name} must be a list of user ID strings")
     # Docker / service-management grants are host-only; k8s access is RBAC-driven.
     if agent_type == "k8s":
         grant_service_mgmt = False
@@ -140,25 +164,25 @@ def handle_create_tenant_agent(body: dict, raw_token: str, api_url: str) -> dict
     })
 
     # A restricted creator (a scoped operator) must be able to manage the agent they
-    # just created, so grant themselves access to it. Admins are tenant-wide already.
+    # just created, so grant themselves read-write access. Admins are tenant-wide.
     if is_agent_restricted(user):
-        current = list(user.get("allowed_agent_ids") or [])
-        if agent_id not in current:
-            users_repo.set_allowed_agents(user["user_id"], current + [agent_id])
+        _grant_agent_to_user(user, agent_id, readonly=False)
 
-    # Optionally grant the new agent to specific restricted users. Unrestricted users
-    # (allowed_agent_ids is None) already see every agent, so they're skipped.
+    # Optionally grant the new agent to specific restricted users, read-only or
+    # read-write. Unrestricted users (readwrite_agent_ids is None) already see every
+    # agent, so they're skipped. A read-write grant wins over a read-only one.
     granted_user_ids: list = []
-    for uid in dict.fromkeys(grant_user_ids):  # de-dupe, preserve order
+    rw_ids = list(dict.fromkeys(grant_user_ids))
+    for uid in rw_ids:
         target = users_repo.get(uid)
-        if not target or target.get("tenant_id") != user["tenant_id"]:
+        if target and target.get("tenant_id") == user["tenant_id"] and _grant_agent_to_user(target, agent_id, readonly=False):
+            granted_user_ids.append(uid)
+    for uid in dict.fromkeys(grant_readonly_user_ids):
+        if uid in rw_ids:
             continue
-        current = target.get("allowed_agent_ids")
-        if current is None:  # unrestricted - nothing to grant
-            continue
-        if agent_id not in current:
-            users_repo.set_allowed_agents(uid, list(current) + [agent_id])
-        granted_user_ids.append(uid)
+        target = users_repo.get(uid)
+        if target and target.get("tenant_id") == user["tenant_id"] and _grant_agent_to_user(target, agent_id, readonly=True):
+            granted_user_ids.append(uid)
 
     audit.write(
         "agent.created",
@@ -194,6 +218,8 @@ def handle_reissue_tenant_install_token(agent_id: str, body: dict, raw_token: st
     agent = _get_agent(agent_id, user)
     if not agent:
         return _err("agent not found", 404)
+    if agent.get("fleet_id"):
+        return _err("fleet agents enroll via the fleet join token; reissue is not available", 409)
 
     force = bool(body.get("force", False))
     grant_service_mgmt = bool(body.get("grant_service_mgmt", False))
@@ -352,6 +378,9 @@ def handle_remove_tenant_agent(agent_id: str, raw_token: str) -> dict:
         return _err(f"agent must be DELETED before removing (current: {agent.get('status')})", 409)
 
     agents_repo.delete(agent_id)
+    # The record is truly gone now - purge its approvals so a future id reuse can't
+    # inherit a stale pre-approval.
+    approvals_repo.delete_by_agent(agent_id)
     audit.write(
         "agent.removed",
         tenant_id=user["tenant_id"],
@@ -375,6 +404,8 @@ def handle_set_tenant_agent_tags(agent_id: str, body: dict, raw_token: str) -> d
     agent = _get_agent(agent_id, user)
     if not agent:
         return _err("agent not found", 404)
+    if agent.get("fleet_id"):
+        return _err("fleet agents inherit tags from the fleet; set them on the fleet instead", 409)
     tags = body.get("tags", [])
     err = validate_tags(tags)
     if err:
@@ -432,6 +463,8 @@ def handle_set_tenant_agent_mode(agent_id: str, body: dict, raw_token: str) -> d
     agent = _get_agent(agent_id, user)
     if not agent:
         return _err("agent not found", 404)
+    if agent.get("fleet_id"):
+        return _err("fleet agents inherit mode from the fleet; change it on the fleet instead", 409)
     prev_mode = agent.get("mode")
     agents_repo.update_policy(agent_id, mode)
     if prev_mode != mode:

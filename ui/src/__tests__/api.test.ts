@@ -652,7 +652,7 @@ describe('listAgentHistory', () => {
 
 describe('getUserAgentAccess', () => {
   it('calls GET /tenant/users/{id}/agents', async () => {
-    mockFetch({ user_id: USER, allowed_agent_ids: null });
+    mockFetch({ user_id: USER, readwrite_agent_ids: null });
     await getUserAgentAccess(URL, TOKEN, USER);
     const [url, opts] = (fetch as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(url).toBe(`${URL}/tenant/users/${USER}/agents`);
@@ -661,20 +661,25 @@ describe('getUserAgentAccess', () => {
 });
 
 describe('setUserAgentAccess', () => {
-  it('sends PUT with allowed_agent_ids', async () => {
-    mockFetch({ user_id: USER, allowed_agent_ids: [AGENT] });
-    await setUserAgentAccess(URL, TOKEN, USER, [AGENT]);
+  const scope = {
+    readwrite_agent_ids: [AGENT], readonly_agent_ids: [],
+    readwrite_fleet_ids: [], readonly_fleet_ids: [],
+  };
+  it('sends PUT with the full access scope', async () => {
+    mockFetch({ user_id: USER, ...scope });
+    await setUserAgentAccess(URL, TOKEN, USER, scope);
     const [url, opts] = (fetch as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(url).toBe(`${URL}/tenant/users/${USER}/agents`);
     expect(opts.method).toBe('PUT');
-    expect(JSON.parse(opts.body)).toEqual({ allowed_agent_ids: [AGENT] });
+    expect(JSON.parse(opts.body)).toEqual(scope);
   });
 
-  it('passes null to revoke all access restrictions', async () => {
-    mockFetch({ user_id: USER, allowed_agent_ids: null });
-    await setUserAgentAccess(URL, TOKEN, USER, null);
+  it('sends read-only and fleet grants', async () => {
+    const s = { readwrite_agent_ids: [], readonly_agent_ids: [AGENT], readwrite_fleet_ids: ['fleet_1'], readonly_fleet_ids: [] };
+    mockFetch({ user_id: USER, ...s });
+    await setUserAgentAccess(URL, TOKEN, USER, s);
     const [, opts] = (fetch as ReturnType<typeof vi.fn>).mock.calls[0];
-    expect(JSON.parse(opts.body)).toEqual({ allowed_agent_ids: null });
+    expect(JSON.parse(opts.body)).toEqual(s);
   });
 });
 

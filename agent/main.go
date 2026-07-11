@@ -428,6 +428,60 @@ func rotateToken(cfg *Config) error {
 }
 
 // ---------------------------------------------------------------------------
+// Deregister (fleet scale-in)
+// ---------------------------------------------------------------------------
+
+type DeregisterRequest struct {
+	MachineFingerprint string `json:"machine_fingerprint"`
+}
+
+type DeregisterResponse struct {
+	Deregistered bool   `json:"deregistered"`
+	Error        string `json:"error"`
+}
+
+// systemIsShuttingDown reports whether the whole OS is going down (reboot,
+// poweroff, or an ASG instance terminating) as opposed to just this service being
+// restarted. Both deliver SIGTERM, but systemd's manager state is "stopping" only
+// during a real shutdown - a plain `systemctl restart reach-agent` leaves it
+// "running". Anything we can't positively confirm as "stopping" is treated as a
+// restart, so a normal restart never deregisters the fleet member. The reaper is
+// the backstop if a genuine shutdown is somehow misread here.
+func systemIsShuttingDown() bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	// `systemctl is-system-running` prints the state to stdout and exits non-zero
+	// for any state other than "running" (including "stopping"), so read stdout
+	// regardless of the exit status; only give up if we got nothing back.
+	out, err := exec.CommandContext(ctx, "systemctl", "is-system-running").Output()
+	if err != nil && len(out) == 0 {
+		return false
+	}
+	return strings.TrimSpace(string(out)) == "stopping"
+}
+
+// deregister removes this host from its fleet immediately (best-effort), instead
+// of waiting for the server-side reaper. The backend ignores anything that isn't a
+// host fleet member, so a non-fleet host calling this is a harmless no-op (409).
+func deregister(cfg *Config) {
+	payload := DeregisterRequest{MachineFingerprint: cfg.MachineFingerprint}
+	var result DeregisterResponse
+	status, err := apiPost(cfg.APIURL, "/agent/deregister", cfg.AgentToken, payload, &result)
+	if err != nil {
+		log.Printf("Deregister request failed: %v", err)
+		return
+	}
+	switch {
+	case status == 200 && result.Deregistered:
+		log.Printf("Deregistered from fleet on shutdown")
+	case status == 409:
+		log.Printf("Deregister skipped (not a fleet member): %s", result.Error)
+	default:
+		log.Printf("Deregister returned %d: %s", status, result.Error)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Execute command
 // ---------------------------------------------------------------------------
 
@@ -739,6 +793,20 @@ func run(ctx context.Context) error {
 	// Optional Prometheus /metrics endpoint (k8s only, opt-in via the chart which
 	// sets REACH_METRICS_ADDR). No-op when unset - host installs stay port-free.
 	startMetricsServer(ctx, os.Getenv("REACH_METRICS_ADDR"), cfg.Type)
+
+	// Fleet scale-in: a host deregisters from its fleet when the machine is going
+	// down (ASG instance terminating), so the member is removed at once rather than
+	// waiting for the reaper. Fires only on signal-driven shutdown (ctx cancelled)
+	// AND only when the OS itself is stopping - never on a plain service restart,
+	// and never on a permanent-error idle. The backend no-ops (409) for non-fleet
+	// hosts, so it's always safe to attempt.
+	if cfg.Type == "host" {
+		defer func() {
+			if ctx.Err() != nil && cfg.AgentToken != "" && systemIsShuttingDown() {
+				deregister(cfg)
+			}
+		}()
+	}
 
 	for {
 		touchHealthFile(healthFile)

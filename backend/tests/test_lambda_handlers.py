@@ -52,7 +52,7 @@ class TestAdminTenantHandlers:
         from handlers.admin_tenants import list_tenants_handler
         with patch("handlers.admin_tenants.handle_list_tenants", return_value=_OK) as h:
             r = list_tenants_handler(_evt(), None)
-        h.assert_called_once_with(ADMIN)
+        h.assert_called_once_with(ADMIN, q=None, limit=None, offset=0)
         assert r == _OK
 
     def test_list_tenants_handler_missing_auth(self):
@@ -181,7 +181,7 @@ class TestAdminUserHandlers:
         from handlers.admin_users import list_users_handler
         with patch("handlers.admin_users.handle_list_users", return_value=_OK) as h:
             list_users_handler(_evt(path={"tenant_id": "tenant_1"}), None)
-        h.assert_called_once_with("tenant_1", ADMIN)
+        h.assert_called_once_with("tenant_1", ADMIN, q=None, limit=None, offset=0)
 
     def test_list_users_handler_missing_auth(self):
         from handlers.admin_users import list_users_handler
@@ -524,7 +524,7 @@ class TestCreateJobHandler:
         body = {"agent_id": "a", "command": "ls"}
         with patch("handlers.create_job.handle_create_job", return_value=_OK) as h:
             create_job_handler(_evt(body=body), None)
-        h.assert_called_once_with(body, ADMIN)
+        h.assert_called_once_with(body, ADMIN, "")
 
     def test_missing_auth(self):
         from handlers.create_job import create_job_handler
@@ -581,13 +581,15 @@ class TestListAgentsHandler:
         from handlers.list_agents import list_agents_handler
         with patch("handlers.list_agents.handle_list_agents", return_value=_OK) as h:
             list_agents_handler(_evt(qs={"tag": "env:prod"}), None)
-        h.assert_called_once_with(ADMIN, "env:prod")
+        h.assert_called_once_with(ADMIN, "env:prod", q=None, mode=None, access=None,
+                                  agent_type=None, fleet=None, limit=None, offset=0)
 
     def test_delegates_without_tag(self):
         from handlers.list_agents import list_agents_handler
         with patch("handlers.list_agents.handle_list_agents", return_value=_OK) as h:
             list_agents_handler(_evt(), None)
-        h.assert_called_once_with(ADMIN, None)
+        h.assert_called_once_with(ADMIN, None, q=None, mode=None, access=None,
+                                  agent_type=None, fleet=None, limit=None, offset=0)
 
     def test_missing_auth(self):
         from handlers.list_agents import list_agents_handler
@@ -643,7 +645,7 @@ class TestMeHandler:
 class TestHeartbeatHandler:
     def test_delegates_and_returns_result(self):
         from handlers.heartbeat import heartbeat_handler
-        result = {"marked_inactive": 2, "expired_jobs": 1, "expired_approvals": 0, "deleted_approvals": 0, "deleted_jobs": 0, "deleted_audit_logs": 0, "deleted_agent_history": 0}
+        result = {"marked_inactive": 2, "reaped_members": 0, "expired_jobs": 1, "expired_approvals": 0, "deleted_approvals": 0, "deleted_jobs": 0, "deleted_runs": 0, "deleted_audit_logs": 0, "deleted_agent_history": 0}
         with patch("handlers.heartbeat.handle_heartbeat_check", return_value=result):
             r = heartbeat_handler({}, None)
         assert r == result

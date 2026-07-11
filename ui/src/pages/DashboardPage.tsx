@@ -15,6 +15,8 @@ const JOB_STATUS_STYLE: Record<Job['status'], string> = {
   FAILED:    'bg-red-50 text-red-700',
   REJECTED:  'bg-red-50 text-red-700',
   EXPIRED:   'bg-gray-100 text-gray-500',
+  HELD:      'bg-slate-100 text-slate-500',
+  CANCELED:  'bg-gray-100 text-gray-500',
 };
 
 function fmtDate(iso: string) {
@@ -38,6 +40,8 @@ const ACTION_META: Record<string, { label: string; dot: string; text: string }> 
   'agent.deleted':         { label: 'agent deleted',   dot: 'bg-red-400',     text: 'text-red-700' },
   'agent.removed':         { label: 'agent removed',   dot: 'bg-gray-500',    text: 'text-gray-700' },
   'agent.unreachable':          { label: 'agent offline',      dot: 'bg-amber-400',   text: 'text-amber-700' },
+  'agent.reaped':               { label: 'fleet member reaped', dot: 'bg-red-400',    text: 'text-red-700' },
+  'agent.deregistered':         { label: 'agent deregistered', dot: 'bg-gray-500',    text: 'text-gray-700' },
   'agent.recovered':            { label: 'agent recovered',    dot: 'bg-emerald-500', text: 'text-emerald-700' },
   'agent.install_token_reissued': { label: 'token reissued',  dot: 'bg-amber-400',   text: 'text-amber-700' },
   'agent.tags_changed':         { label: 'tags changed',       dot: 'bg-purple-500',  text: 'text-purple-700' },
@@ -49,6 +53,14 @@ const ACTION_META: Record<string, { label: string; dot: string; text: string }> 
   'approval.pre_approved':      { label: 'pre-approved',       dot: 'bg-emerald-400', text: 'text-emerald-700' },
   'approval.deleted':           { label: 'approval deleted',   dot: 'bg-gray-400',    text: 'text-gray-600' },
   'tenant.deleted':             { label: 'tenant deleted',     dot: 'bg-red-500',     text: 'text-red-700' },
+  'fleet.created':              { label: 'fleet created',      dot: 'bg-emerald-500', text: 'text-emerald-700' },
+  'fleet.updated':              { label: 'fleet updated',      dot: 'bg-purple-500',  text: 'text-purple-700' },
+  'fleet.token_rotated':        { label: 'fleet token rotated', dot: 'bg-amber-400',  text: 'text-amber-700' },
+  'fleet.member_detached':      { label: 'fleet member removed', dot: 'bg-gray-500',  text: 'text-gray-700' },
+  'fleet.grants_reconciled':    { label: 'fleet grants reconciled', dot: 'bg-amber-400', text: 'text-amber-700' },
+  'fleet.grant_mismatch_accepted': { label: 'fleet grant mismatch accepted', dot: 'bg-amber-400', text: 'text-amber-700' },
+  'fleet.revoked':              { label: 'fleet revoked',      dot: 'bg-red-500',     text: 'text-red-700' },
+  'fleet.deleted':              { label: 'fleet deleted',      dot: 'bg-red-500',     text: 'text-red-700' },
   'api_token.created':     { label: 'token created',   dot: 'bg-indigo-400',  text: 'text-indigo-700' },
   'api_token.revoked':     { label: 'token revoked',   dot: 'bg-red-400',     text: 'text-red-700' },
 };

@@ -1,6 +1,6 @@
 # Policy modes & approvals
 
-Every agent runs in one of three **policy modes**, set in the tenant console (**Agents → [agent] → Policy**) or via the API (`PUT /tenant/agents/{id}/policy/mode`). The mode determines how each command is evaluated before it runs. Host and Kubernetes agents share the same three modes but classify and enforce them differently - see [Host vs Kubernetes enforcement](#host-vs-kubernetes-enforcement).
+Every agent runs in one of three **policy modes**, set in the tenant console (**Agents → [agent] → Policy**) or via the API (`PUT /tenant/agents/{id}/policy/mode`). The mode determines how each command is evaluated before it runs. Host and Kubernetes agents share the same three modes but classify and enforce them differently - see [Host vs Kubernetes enforcement](#host-vs-kubernetes-enforcement). (Members of a **fleet** inherit the fleet's mode instead of being set individually - changing the fleet's mode propagates to every member; see [SELF_HOSTING → Managing fleets](SELF_HOSTING.md#managing-fleets).)
 
 For the internal enforcement design and the full `kubectl` verb classification, see [ARCHITECTURE.md](ARCHITECTURE.md#kubernetes-agents); for the always-blocked command reference, see [SELF_HOSTING.md](SELF_HOSTING.md); for the threat model, [SECURITY.md](SECURITY.md).
 
@@ -42,20 +42,26 @@ Reads are always allowed - you do not need to add read commands to any list. Wri
 
 On **Kubernetes** agents the flow is different - the backend gates the write at submission, before dispatch. An unapproved write is recorded as a `REJECTED` job and a pending approval is raised; the agent never receives it. See [Host vs Kubernetes enforcement](#host-vs-kubernetes-enforcement).
 
+For a member of a **fleet**, approvals are **fleet-scoped** rather than per-agent: pre-approve a command once on the fleet and every member inherits it, and a member's blocked write raises a single fleet-scoped request. This is what makes `approved` mode practical for an autoscaling fleet where individual instances come and go. Manage them from the fleet (tenant console → **Fleets → [fleet]**, or `POST /tenant/approvals` with `fleet_id`).
+
 The match is prefix-based with a word boundary: approving `docker logs` permits `docker logs myapp --tail 100` but not `docker rm myapp`.
 
-**Viewing approvals from the CLI:**
+**Approvals from the CLI:**
 
 ```bash
 reach approvals list                      # effective approved commands (default agent)
 reach approvals list --agent prod         # effective approved commands for a specific agent
-reach approvals list --pending            # your pending requests (default agent)
-reach approvals list --denied             # your denied requests (default agent)
-reach approvals list --expired            # your expired approvals (default agent)
-reach approvals list --agent prod --pending  # any of the above for a specific agent
+reach approvals list --pending            # your pending requests (--denied / --expired too)
+reach approvals request "<cmd>" --agent prod   # request approval (developer) / pre-approve (operator)
+reach approvals approve <approval-id>     # operator+: approve a pending request (agent or fleet)
+reach approvals deny <approval-id>        # operator+: deny a pending request
+
+# fleet approvals are shared by every member and live under `reach fleets approvals`:
+reach fleets approvals list <fleet>       # effective approved commands for the fleet
+reach fleets approvals request <fleet> "<cmd>"  # request / pre-approve for the whole fleet
 ```
 
-The output adapts to the agent type: **host** agents show the command; **Kubernetes** agents show the structured rule as `verb / resource / namespace / name` columns (with `✱` for wildcard fields). `--pending`, `--denied`, and `--expired` show only your own records; expired entries are visually marked so you can see why a command stopped working.
+The output adapts to the agent type: **host** agents show the command; **Kubernetes** agents show the structured rule as `verb / resource / namespace / name` columns (with `✱` for wildcard fields). `--pending`, `--denied`, and `--expired` show only your own records; expired entries are visually marked so you can see why a command stopped working. `approve`/`deny` act on an approval **id** and work for both agent and fleet approvals.
 
 ## Host vs Kubernetes enforcement
 
@@ -107,11 +113,11 @@ Policy modes bound *what an agent may run*. A separate layer bounds *which users
 
 **Roles** (per tenant user): `developer` submits jobs and requests/views approvals; `operator` adds reviewing and managing approvals and agents; `admin` adds managing users, tags, policy, and audit logs.
 
-**Agent scoping.** On top of role, `developer` and `operator` users can be restricted to a subset of agents (`allowed_agent_ids`). The restriction is enforced the same way everywhere - an out-of-scope agent is invisible in the agent list, and any job, approval (list / request / review / delete), or job-history call for it returns "not found". A user with no restriction (the default) sees every agent in the tenant.
+**Agent scoping.** On top of role, non-admin users are scoped to a subset of agents/fleets, granted as **read-only** or **read-write** (`readwrite_*` / `readonly_*` lists for agents and fleets). Non-admins have **no access by default**. Read access (the union of all grants) is enforced the same way everywhere - an out-of-scope agent is invisible in the agent list, and any job, approval, or job-history call for it returns "not found". A **read-only** grant additionally rejects write commands (and approval creation) with `403` in any mode - it narrows, but never bypasses, the agent's own policy mode. There is **no wildcard**: only admins are tenant-wide, and granting a non-admin "all agents" lists every id explicitly (so new agents aren't auto-included). Fleet members are granted via their **fleet**, not by individual agent id (their ids churn as the autoscaler scales).
 
-**Admins are the trust root and are always tenant-wide** - they cannot be scoped to a subset. This guarantees at least one role can always reach every agent, so no agent can be orphaned by scoping. Because user management is admin-only, the account granting access always holds every agent. Two supporting rules keep this consistent:
+**Admins are the trust root and are always tenant-wide** - they cannot be scoped. This guarantees at least one role can always reach every agent, so no agent can be orphaned by scoping. Because user management is admin-only, the account granting access always holds every agent. Two supporting rules keep this consistent:
 
-- Promoting a scoped user to `admin` clears their agent scope.
-- An `operator` who creates an agent is automatically granted access to it, so a scoped operator can manage what they just created. When creating an agent, an admin can also grant it to specific restricted users up front.
+- Promoting a scoped user to `admin` clears their agent/fleet scope.
+- An `operator` who creates an agent is automatically granted **read-write** access to it, so a scoped operator can manage what they just created.
 
 **Approvals follow the same scope.** In the console, an operator/admin reviews all pending/approved approvals for the agents they can access; a developer sees the pending requests **they** submitted, plus the agent-wide **approved** command set for any agent they can access.

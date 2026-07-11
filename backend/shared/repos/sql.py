@@ -48,6 +48,11 @@ class _Agent(_Base):
     grant_docker = Column(Boolean, default=False)
     service_mgmt_detected = Column(Boolean)
     docker_detected = Column(Boolean)
+    # A fleet member whose grants mismatch the fleet can be *reconciled* (host fixed)
+    # or *accepted* as an intentional exception. When accepted, this stores the fleet
+    # grant signature it was accepted against, so the mismatch stops being flagged -
+    # and re-flags if the fleet grants change again. Null = no accepted exception.
+    grants_exception = Column(String)
     # k8s effective RBAC (self-reported via SelfSubjectRulesReview). The raw rule
     # set, its hash, and the hash the operator last acknowledged. Drift = the
     # current hash differs from the acknowledged one (computed in _enrich_agent).
@@ -63,7 +68,10 @@ class _Approval(_Base):
     __tablename__ = "approvals"
     approval_id = Column(String, primary_key=True)
     tenant_id = Column(String, nullable=False, index=True)
-    agent_id = Column(String, nullable=False, index=True)
+    # An approval targets exactly one of: a standalone agent, or a fleet (which
+    # applies to all its members). Fleet members never carry agent-scoped approvals.
+    agent_id = Column(String, index=True)
+    fleet_id = Column(String, index=True)
     command = Column(Text)
     # Structured rule for k8s agents ({verb, resource, namespace, name}); None for
     # host agents, which match on the command text above. none_as_null keeps host
@@ -79,12 +87,51 @@ class _Approval(_Base):
     reviewed_by = Column(String)
 
 
+class _Fleet(_Base):
+    __tablename__ = "fleets"
+    __table_args__ = (UniqueConstraint('tenant_id', 'name', name='ix_fleets_tenant_name'),)
+    fleet_id = Column(String, primary_key=True)
+    tenant_id = Column(String, nullable=False, index=True)
+    name = Column(String, nullable=False)
+    # Fleets are host-only: members are host agents that enroll via the join token
+    # (k8s already has one-agent-per-cluster identity, so it has no fleet concept).
+    mode = Column(String, nullable=False, default="readonly")    # least-privilege default
+    grant_service_mgmt = Column(Boolean, default=False)
+    grant_docker = Column(Boolean, default=False)
+    # Tags are set at the fleet level and inherited by every member; members can't
+    # set their own. Editing them propagates to all current members.
+    tags = Column(JSON, default=list)
+    # Reusable join token: any number of agents enroll with it (unlike the
+    # per-agent one-time install token). Looked up by hash directly, like
+    # install_token_hash. prev_* keeps the previous token valid during a rotation
+    # grace window so an autoscaler's launch/instance template can be updated without dropping joins.
+    join_token_hash = Column(String, index=True, unique=True)
+    prev_join_token_hash = Column(String, index=True)
+    prev_join_token_expires_at = Column(Integer)
+    status = Column(String, nullable=False, default='ACTIVE', server_default='ACTIVE')  # ACTIVE | REVOKED
+    # Members are ephemeral (autoscaler cattle): reaped this many seconds after their last
+    # heartbeat. None falls back to the global default in the cleanup job.
+    reap_after_seconds = Column(Integer)
+    # Blast-radius ceiling: the max members a single fan-out may hit. Null = deployment
+    # default. Operator-set in the console; a hard cap, never overridable per-call.
+    max_fanout = Column(Integer)
+    # Advanced: fleet-level override of the tenant's staged-rollout policy for fleet runs.
+    # {"read": {mode, on_failure}, "write": {...}} - a set read/write branch wins over the
+    # tenant default (see shared.waves.resolve_policy).
+    wave_policy = Column(JSON)
+    created_at = Column(String)
+    created_by = Column(String)
+
+
 class _Tenant(_Base):
     __tablename__ = "tenants"
     tenant_id = Column(String, primary_key=True)
     name = Column(String, unique=True)
     status = Column(String, default='ACTIVE', server_default='ACTIVE')
     created_at = Column(String)
+    # Per-tenant overrides for retention windows + the fan-out cap (see shared/settings).
+    # Only keys the tenant set; missing keys fall back to the platform default.
+    settings = Column(JSON)
 
 
 class _User(_Base):
@@ -100,8 +147,13 @@ class _User(_Base):
     disabled_at = Column(String)
     last_login_at = Column(String)
     created_at = Column(String)
-    allowed_agent_ids = Column(JSON)
-    allowed_fleet_ids = Column(JSON)
+    readwrite_agent_ids = Column(JSON)
+    readwrite_fleet_ids = Column(JSON)
+    # Write-capability overlay: among the agents this user can access, those whose
+    # agent_id (or fleet_id) appears here are read-only - the user may run read
+    # commands but not writes. None = read-write on everything accessible.
+    readonly_agent_ids = Column(JSON)
+    readonly_fleet_ids = Column(JSON)
     status = Column(String, default='ACTIVE', server_default='ACTIVE')
 
 
@@ -150,7 +202,22 @@ class _Job(_Base):
     job_id = Column(String, primary_key=True)
     tenant_id = Column(String, nullable=False, index=True)
     agent_id = Column(String, nullable=False, index=True)
+    # Jobs from one fan-out share a run_id so they can be grouped as a "run".
+    run_id = Column(String, index=True)
+    # The tag a tag fan-out (POST /jobs/fanout) selected on, retained so a standalone
+    # "run" can show which tag it targeted. Null for fleet fan-outs and single jobs.
+    run_tag = Column(String)
+    # The fleet a fleet fan-out (POST /fleets/{id}/jobs) targeted, stored so a fleet
+    # "run" groups durably by the fleet - not by joining jobs back to member records,
+    # which vanish when autoscaler members are reaped/detached. Null for tag/single jobs.
+    run_fleet_id = Column(String)
+    # Staged rollout: a job's wave index within its run. Wave 0 dispatches immediately
+    # (PENDING); later waves are created HELD and released one wave at a time as the
+    # prior wave completes. 0 for single-wave (non-staged) fan-outs and one-off jobs.
+    wave = Column(Integer, default=0)
     command = Column(Text, nullable=False)
+    # PENDING (dispatchable) | HELD (staged, not yet released) | RUNNING | SUCCEEDED |
+    # FAILED | REJECTED | EXPIRED | CANCELED. Agents only ever receive PENDING.
     status = Column(String, nullable=False, default="PENDING")
     mode = Column(String)
     is_write = Column(Boolean, nullable=True)
@@ -163,6 +230,33 @@ class _Job(_Base):
     started_at = Column(String)
     completed_at = Column(String)
     expires_at = Column(Integer)
+
+
+class _Run(_Base):
+    """A fan-out (fleet or tag) as a first-class entity, so a run's identity, intent
+    (dispatched / skipped / capped), and status survive independently of its member
+    jobs (which are purged on retention). Counts are cached and refreshed as results
+    land, so the summary is authoritative even after the jobs are gone."""
+    __tablename__ = "runs"
+    run_id = Column(String, primary_key=True)
+    tenant_id = Column(String, nullable=False, index=True)
+    fleet_id = Column(String, index=True)   # null for tag (standalone) runs
+    tag = Column(String)
+    command = Column(Text)
+    created_by = Column(String)
+    created_at = Column(String, index=True)
+    dispatched = Column(Integer)            # member jobs created (across all waves)
+    skipped_count = Column(Integer)         # members skipped (inactive / read-only access / ...)
+    skipped = Column(JSON)                  # bounded [{agent_id, hostname, reason}] - why they didn't run
+    idempotency_key = Column(String)
+    state = Column(String)                  # pending|running|paused|succeeded|partial|failed|empty|canceled
+    counts = Column(JSON)                   # cached {ok, failed, pending, running}
+    parent_run_id = Column(String)          # retry/re-run lineage (future)
+    # Staged rollout: the resolved plan {"waves": [sizes...], "failure_threshold": f},
+    # the wave currently in flight, and the total wave count. Null/1 = single wave.
+    rollout = Column(JSON)
+    current_wave = Column(Integer, default=0)
+    wave_total = Column(Integer, default=1)
 
 
 def _iso() -> str:
@@ -294,6 +388,33 @@ class AgentRepo:
             rows = db.execute(select(_Agent).where(_Agent.tenant_id == tenant_id)).scalars().all()
             return [_enrich_agent(_to_dict(r)) for r in rows]
 
+    def list_by_fleet(self, fleet_id: str) -> list:
+        """A single fleet's members, via the fleet_id index (not a tenant-wide scan) -
+        the hot path for large fleets (member list, fan-out, reaper). Returns raw rows;
+        callers that need the standalone-agent enrichment use list_by_tenant instead."""
+        with SessionLocal() as db:
+            rows = db.execute(
+                select(_Agent).where(_Agent.fleet_id == fleet_id).order_by(_Agent.agent_id)
+            ).scalars().all()
+            return [_to_dict(r) for r in rows]
+
+    def fleet_member_groups(self, tenant_id: str) -> list:
+        """Grouped member facts for per-fleet stats (counts + grant mismatch) WITHOUT
+        loading every member: one GROUP BY whose result set is tiny (fleets x a few
+        status/grant combos) even for fleets with thousands of members."""
+        from sqlalchemy import func
+        with SessionLocal() as db:
+            rows = db.execute(
+                select(_Agent.fleet_id, _Agent.status, _Agent.grant_service_mgmt,
+                       _Agent.grant_docker, _Agent.grants_exception, func.count())
+                .where(_Agent.tenant_id == tenant_id, _Agent.fleet_id.isnot(None))
+                .group_by(_Agent.fleet_id, _Agent.status, _Agent.grant_service_mgmt,
+                          _Agent.grant_docker, _Agent.grants_exception)
+            ).all()
+            return [{"fleet_id": f, "status": s, "grant_service_mgmt": sm,
+                     "grant_docker": dk, "grants_exception": exc, "count": c}
+                    for f, s, sm, dk, exc, c in rows]
+
     def mark_inactive(self, agent_id: str) -> bool:
         with SessionLocal() as db:
             result = db.execute(
@@ -307,6 +428,75 @@ class AgentRepo:
     def create(self, agent: dict) -> None:
         with SessionLocal() as db:
             db.add(_Agent(**agent))
+            db.commit()
+
+    def get_by_fleet_and_fingerprint(self, fleet_id: str, machine_fingerprint: str) -> Optional[dict]:
+        """A fleet member for idempotent re-enroll: same machine reinstalling must
+        re-use its record, not create a duplicate."""
+        if not fleet_id or not machine_fingerprint:
+            return None
+        with SessionLocal() as db:
+            row = db.execute(
+                select(_Agent).where(
+                    _Agent.fleet_id == fleet_id,
+                    _Agent.machine_fingerprint == machine_fingerprint,
+                )
+            ).scalars().first()
+            return _enrich_agent(_to_dict(row))
+
+    def reenroll(self, agent_id: str, fields: dict) -> None:
+        """Re-issue an existing fleet member's agent token on reinstall. Unlike
+        claim(), this applies regardless of current status (ACTIVE/INACTIVE)."""
+        with SessionLocal() as db:
+            db.execute(
+                update(_Agent)
+                .where(_Agent.agent_id == agent_id)
+                .values(
+                    status="ACTIVE",
+                    agent_token_hash=fields["agent_token_hash"],
+                    machine_fingerprint=fields["machine_fingerprint"],
+                    hostname=fields["hostname"],
+                    agent_version=fields["agent_version"],
+                    claimed_at=fields["claimed_at"],
+                    active_until=fields["active_until"],
+                    last_heartbeat_at=fields["claimed_at"],
+                    token_issued_at=fields["token_issued_at"],
+                )
+            )
+            db.commit()
+
+    def detach_fleet(self, fleet_id: str) -> int:
+        """Un-fleet all of a fleet's members (they become standalone agents)."""
+        with SessionLocal() as db:
+            result = db.execute(update(_Agent).where(_Agent.fleet_id == fleet_id).values(fleet_id=None))
+            db.commit()
+            return result.rowcount or 0
+
+    def delete_by_fleet(self, fleet_id: str) -> int:
+        """Delete every agent record in a fleet."""
+        with SessionLocal() as db:
+            result = db.execute(sa_delete(_Agent).where(_Agent.fleet_id == fleet_id))
+            db.commit()
+            return result.rowcount or 0
+
+    def set_mode_by_fleet(self, fleet_id: str, mode: str) -> int:
+        """Propagate a fleet's mode to all its members."""
+        with SessionLocal() as db:
+            result = db.execute(update(_Agent).where(_Agent.fleet_id == fleet_id).values(mode=mode))
+            db.commit()
+            return result.rowcount or 0
+
+    def set_tags_by_fleet(self, fleet_id: str, tags: list) -> int:
+        """Propagate a fleet's tags to all its members."""
+        with SessionLocal() as db:
+            result = db.execute(update(_Agent).where(_Agent.fleet_id == fleet_id).values(tags=tags))
+            db.commit()
+            return result.rowcount or 0
+
+    def detach_from_fleet(self, agent_id: str) -> None:
+        """Remove a single agent from its fleet (becomes a standalone agent)."""
+        with SessionLocal() as db:
+            db.execute(update(_Agent).where(_Agent.agent_id == agent_id).values(fleet_id=None))
             db.commit()
 
     def update_policy(self, agent_id: str, mode: str) -> None:
@@ -323,6 +513,20 @@ class AgentRepo:
             rows = db.execute(
                 select(_Agent).where(
                     _Agent.status == "ACTIVE",
+                    _Agent.last_heartbeat_at.isnot(None),
+                    _Agent.last_heartbeat_at < cutoff_iso,
+                )
+            ).scalars().all()
+            return [_enrich_agent(_to_dict(r)) for r in rows]
+
+    def scan_reapable_fleet_members(self, cutoff_iso: str) -> list:
+        """Fleet members whose last heartbeat is older than cutoff - candidates for
+        reaping. Caller applies each member's fleet-specific reap window precisely."""
+        with SessionLocal() as db:
+            rows = db.execute(
+                select(_Agent).where(
+                    _Agent.fleet_id.isnot(None),
+                    _Agent.status.in_(("ACTIVE", "INACTIVE")),
                     _Agent.last_heartbeat_at.isnot(None),
                     _Agent.last_heartbeat_at < cutoff_iso,
                 )
@@ -393,6 +597,12 @@ class AgentRepo:
             db.execute(update(_Agent).where(_Agent.agent_id == agent_id).values(**values))
             db.commit()
 
+    def set_grants_exception(self, agent_id: str, signature: Optional[str]) -> None:
+        """Record (or clear, with None) an accepted fleet-grant-mismatch exception."""
+        with SessionLocal() as db:
+            db.execute(update(_Agent).where(_Agent.agent_id == agent_id).values(grants_exception=signature))
+            db.commit()
+
 
 class JobRepo:
     def create(self, job: dict) -> None:
@@ -424,6 +634,36 @@ class JobRepo:
             db.execute(update(_Job).where(_Job.job_id == job_id).values(status="EXPIRED"))
             db.commit()
 
+    def release_wave(self, run_id: str, wave: int) -> list:
+        """Flip a staged run's wave from HELD to PENDING so agents pick it up. Guarded by
+        status==HELD (idempotent: a concurrent release only flips once). Returns the
+        released job rows (agent_id/job_id) so the caller can reactivate the agents."""
+        with SessionLocal() as db:
+            rows = db.execute(
+                select(_Job).where(_Job.run_id == run_id, _Job.wave == wave, _Job.status == "HELD")
+            ).scalars().all()
+            released = [_to_dict(r) for r in rows]
+            if released:
+                db.execute(
+                    update(_Job)
+                    .where(_Job.run_id == run_id, _Job.wave == wave, _Job.status == "HELD")
+                    .values(status="PENDING")
+                )
+                db.commit()
+            return released
+
+    def cancel_staged(self, run_id: str) -> int:
+        """Cancel every not-yet-released (HELD) job of a run - the remaining waves. Jobs
+        already dispatched (PENDING/RUNNING) are left to finish. Returns the count."""
+        with SessionLocal() as db:
+            result = db.execute(
+                update(_Job)
+                .where(_Job.run_id == run_id, _Job.status == "HELD")
+                .values(status="CANCELED")
+            )
+            db.commit()
+            return result.rowcount
+
     def expire_stale(self, pending_cutoff_iso: str) -> int:
         with SessionLocal() as db:
             result = db.execute(
@@ -434,16 +674,14 @@ class JobRepo:
             db.commit()
             return result.rowcount
 
-    def delete_stale(self, before_iso: str) -> int:
+    def delete_stale(self, before_iso: str, tenant_id: Optional[str] = None) -> int:
         from sqlalchemy import delete as sql_delete
         terminal = ("SUCCEEDED", "FAILED", "REJECTED", "EXPIRED")
+        conds = [_Job.status.in_(terminal), _Job.created_at < before_iso]
+        if tenant_id is not None:
+            conds.append(_Job.tenant_id == tenant_id)
         with SessionLocal() as db:
-            result = db.execute(
-                sql_delete(_Job).where(
-                    _Job.status.in_(terminal),
-                    _Job.created_at < before_iso,
-                )
-            )
+            result = db.execute(sql_delete(_Job).where(*conds))
             db.commit()
             return result.rowcount
 
@@ -488,6 +726,66 @@ class JobRepo:
             rows = db.execute(stmt).scalars().all()
             return [_to_dict(r) for r in rows]
 
+    def list_by_run(self, tenant_id: str, run_id: str) -> list:
+        """Every job in one fan-out (a "run"), via the indexed run_id. Powers run
+        status and idempotency-key dedupe."""
+        with SessionLocal() as db:
+            rows = db.execute(
+                select(_Job).where(_Job.tenant_id == tenant_id, _Job.run_id == run_id)
+            ).scalars().all()
+            return [_to_dict(r) for r in rows]
+
+
+class RunRepo:
+    def create(self, run: dict) -> None:
+        with SessionLocal() as db:
+            db.add(_Run(**run))
+            db.commit()
+
+    def get(self, run_id: str) -> Optional[dict]:
+        with SessionLocal() as db:
+            return _to_dict(db.get(_Run, run_id))
+
+    def set_counts(self, run_id: str, state: str, counts: dict, current_wave: Optional[int] = None) -> None:
+        values = {"state": state, "counts": counts}
+        if current_wave is not None:
+            values["current_wave"] = current_wave
+        with SessionLocal() as db:
+            db.execute(update(_Run).where(_Run.run_id == run_id).values(**values))
+            db.commit()
+
+    def set_state(self, run_id: str, state: str) -> None:
+        """Set only the run's control state (pause/cancel), leaving cached counts alone."""
+        with SessionLocal() as db:
+            db.execute(update(_Run).where(_Run.run_id == run_id).values(state=state))
+            db.commit()
+
+    def list_by_tenant(self, tenant_id: str, limit: int = 50, cursor: Optional[str] = None) -> list:
+        with SessionLocal() as db:
+            stmt = select(_Run).where(_Run.tenant_id == tenant_id)
+            if cursor:
+                stmt = stmt.where(_Run.created_at < cursor)   # newest-first cursor page
+            rows = db.execute(stmt.order_by(_Run.created_at.desc()).limit(limit)).scalars().all()
+            return [_to_dict(r) for r in rows]
+
+    def list_by_fleet(self, fleet_id: str, limit: int = 50, cursor: Optional[str] = None) -> list:
+        with SessionLocal() as db:
+            stmt = select(_Run).where(_Run.fleet_id == fleet_id)
+            if cursor:
+                stmt = stmt.where(_Run.created_at < cursor)
+            rows = db.execute(stmt.order_by(_Run.created_at.desc()).limit(limit)).scalars().all()
+            return [_to_dict(r) for r in rows]
+
+    def delete_stale(self, before_iso: str, tenant_id: Optional[str] = None) -> int:
+        from sqlalchemy import delete as sql_delete
+        conds = [_Run.created_at < before_iso]
+        if tenant_id is not None:
+            conds.append(_Run.tenant_id == tenant_id)
+        with SessionLocal() as db:
+            result = db.execute(sql_delete(_Run).where(*conds))
+            db.commit()
+            return result.rowcount
+
 
 class TenantRepo:
     def get(self, tenant_id: str) -> Optional[dict]:
@@ -517,13 +815,112 @@ class TenantRepo:
             db.execute(update(_Tenant).where(_Tenant.tenant_id == tenant_id).values(status=status))
             db.commit()
 
+    def set_settings(self, tenant_id: str, settings: dict) -> None:
+        with SessionLocal() as db:
+            db.execute(update(_Tenant).where(_Tenant.tenant_id == tenant_id).values(settings=settings))
+            db.commit()
+
     def delete_cascade(self, tenant_id: str) -> None:
         with SessionLocal() as db:
             db.execute(sa_delete(_Approval).where(_Approval.tenant_id == tenant_id))
+            db.execute(sa_delete(_Run).where(_Run.tenant_id == tenant_id))
             db.execute(sa_delete(_Job).where(_Job.tenant_id == tenant_id))
             db.execute(sa_delete(_User).where(_User.tenant_id == tenant_id))
             db.execute(sa_delete(_Agent).where(_Agent.tenant_id == tenant_id))
             db.execute(sa_delete(_Tenant).where(_Tenant.tenant_id == tenant_id))
+            db.commit()
+
+
+class FleetRepo:
+    def get(self, fleet_id: str) -> Optional[dict]:
+        with SessionLocal() as db:
+            return _to_dict(db.get(_Fleet, fleet_id))
+
+    def get_by_name(self, tenant_id: str, name: str) -> Optional[dict]:
+        with SessionLocal() as db:
+            row = db.execute(
+                select(_Fleet).where(_Fleet.tenant_id == tenant_id, _Fleet.name == name)
+            ).scalar_one_or_none()
+            return _to_dict(row)
+
+    def get_by_join_token_hash(self, token_hash: str, now: int) -> Optional[dict]:
+        """Resolve a fleet by its current join token, or its previous token while
+        still inside the rotation grace window. Empty hash short-circuits."""
+        if not token_hash:
+            return None
+        with SessionLocal() as db:
+            row = db.execute(
+                select(_Fleet).where(_Fleet.join_token_hash == token_hash)
+            ).scalar_one_or_none()
+            if row is None:
+                row = db.execute(
+                    select(_Fleet).where(
+                        _Fleet.prev_join_token_hash == token_hash,
+                        _Fleet.prev_join_token_expires_at.isnot(None),
+                        _Fleet.prev_join_token_expires_at > now,
+                    )
+                ).scalar_one_or_none()
+            return _to_dict(row)
+
+    def create(self, fleet: dict) -> None:
+        try:
+            with SessionLocal() as db:
+                db.add(_Fleet(**fleet))
+                db.commit()
+        except IntegrityError:
+            raise NameTakenError(fleet.get("name", ""))
+
+    def list_by_tenant(self, tenant_id: str) -> list:
+        with SessionLocal() as db:
+            rows = db.execute(select(_Fleet).where(_Fleet.tenant_id == tenant_id)).scalars().all()
+            return [_to_dict(r) for r in rows]
+
+    def scan_all(self) -> list:
+        """Every fleet across all tenants - used by the heartbeat reaper."""
+        with SessionLocal() as db:
+            rows = db.execute(select(_Fleet)).scalars().all()
+            return [_to_dict(r) for r in rows]
+
+    def member_counts(self, tenant_id: str) -> dict:
+        """{fleet_id: member_count} across the tenant's agents (single query)."""
+        from sqlalchemy import func
+        with SessionLocal() as db:
+            rows = db.execute(
+                select(_Agent.fleet_id, func.count())
+                .where(_Agent.tenant_id == tenant_id, _Agent.fleet_id.isnot(None))
+                .group_by(_Agent.fleet_id)
+            ).all()
+            return {fid: cnt for fid, cnt in rows}
+
+    def rotate_token(self, fleet_id: str, new_hash: str,
+                     prev_hash: Optional[str], prev_expires_at: Optional[int]) -> None:
+        with SessionLocal() as db:
+            db.execute(update(_Fleet).where(_Fleet.fleet_id == fleet_id).values(
+                join_token_hash=new_hash,
+                prev_join_token_hash=prev_hash,
+                prev_join_token_expires_at=prev_expires_at,
+                status='ACTIVE',
+            ))
+            db.commit()
+
+    def set_status(self, fleet_id: str, status: str) -> None:
+        with SessionLocal() as db:
+            db.execute(update(_Fleet).where(_Fleet.fleet_id == fleet_id).values(status=status))
+            db.commit()
+
+    def update_settings(self, fleet_id: str, fields: dict) -> None:
+        if not fields:
+            return
+        try:
+            with SessionLocal() as db:
+                db.execute(update(_Fleet).where(_Fleet.fleet_id == fleet_id).values(**fields))
+                db.commit()
+        except IntegrityError:
+            raise NameTakenError(fields.get("name", ""))
+
+    def delete(self, fleet_id: str) -> None:
+        with SessionLocal() as db:
+            db.execute(sa_delete(_Fleet).where(_Fleet.fleet_id == fleet_id))
             db.commit()
 
 
@@ -557,7 +954,19 @@ class UserRepo:
 
     def set_allowed_agents(self, user_id: str, agent_ids: list) -> None:
         with SessionLocal() as db:
-            db.execute(update(_User).where(_User.user_id == user_id).values(allowed_agent_ids=agent_ids))
+            db.execute(update(_User).where(_User.user_id == user_id).values(readwrite_agent_ids=agent_ids))
+            db.commit()
+
+    def set_agent_access(self, user_id: str, readwrite_agent_ids, readonly_agent_ids,
+                         readwrite_fleet_ids=None, readonly_fleet_ids=None) -> None:
+        """Set the full access scope: read-write / read-only, agents and fleets."""
+        with SessionLocal() as db:
+            db.execute(update(_User).where(_User.user_id == user_id).values(
+                readwrite_agent_ids=readwrite_agent_ids,
+                readonly_agent_ids=readonly_agent_ids,
+                readwrite_fleet_ids=readwrite_fleet_ids,
+                readonly_fleet_ids=readonly_fleet_ids,
+            ))
             db.commit()
 
     def get_by_username(self, tenant_id: str, username: str) -> Optional[dict]:
@@ -615,17 +1024,19 @@ class UserRepo:
             rows = db.execute(
                 select(_User).where(
                     _User.tenant_id == tenant_id,
-                    _User.allowed_agent_ids.isnot(None),
+                    (_User.readwrite_agent_ids.isnot(None)) | (_User.readonly_agent_ids.isnot(None)),
                 )
             ).scalars().all()
             for row in rows:
-                current = row.allowed_agent_ids or []
-                if agent_id in current:
-                    db.execute(
-                        update(_User)
-                        .where(_User.user_id == row.user_id)
-                        .values(allowed_agent_ids=[a for a in current if a != agent_id])
-                    )
+                values = {}
+                allowed = row.readwrite_agent_ids or []
+                if agent_id in allowed:
+                    values["readwrite_agent_ids"] = [a for a in allowed if a != agent_id]
+                readonly = row.readonly_agent_ids or []
+                if agent_id in readonly:
+                    values["readonly_agent_ids"] = [a for a in readonly if a != agent_id]
+                if values:
+                    db.execute(update(_User).where(_User.user_id == row.user_id).values(**values))
             db.commit()
 
 
@@ -643,6 +1054,25 @@ class ApprovalRepo:
         from sqlalchemy import desc
         with SessionLocal() as db:
             stmt = select(_Approval).where(_Approval.agent_id == agent_id)
+            if status is not None:
+                stmt = stmt.where(_Approval.status == status)
+            if requested_by is not None:
+                stmt = stmt.where(_Approval.requested_by == requested_by)
+            stmt = stmt.order_by(desc(_Approval.created_at))
+            if cursor is not None:
+                stmt = stmt.where(_Approval.created_at < cursor)
+            if limit is not None:
+                stmt = stmt.limit(limit)
+            rows = db.execute(stmt).scalars().all()
+            results = [_to_dict(r) for r in rows]
+            if status == "approved":
+                results = self._lazy_expire(results, db)
+            return results
+
+    def list_by_fleet(self, fleet_id: str, status: Optional[str] = None, requested_by: Optional[str] = None, limit: Optional[int] = None, cursor: Optional[str] = None) -> list:
+        from sqlalchemy import desc
+        with SessionLocal() as db:
+            stmt = select(_Approval).where(_Approval.fleet_id == fleet_id)
             if status is not None:
                 stmt = stmt.where(_Approval.status == status)
             if requested_by is not None:
@@ -681,9 +1111,9 @@ class ApprovalRepo:
             return results
 
     def search_by_tenant(self, tenant_id: str, *, status: Optional[str] = None, agent_id: Optional[str] = None,
-                         agent_ids: Optional[list] = None,
-                         requested_by: Optional[str] = None, kind: Optional[str] = None, q: Optional[str] = None,
-                         limit: int = 20, offset: int = 0) -> tuple:
+                         agent_ids: Optional[list] = None, fleet_id: Optional[str] = None, fleet_ids: Optional[list] = None,
+                         scope: Optional[str] = None, requested_by: Optional[str] = None, kind: Optional[str] = None,
+                         q: Optional[str] = None, limit: int = 20, offset: int = 0) -> tuple:
         """Server-side search + pagination for the tenant/developer approvals views.
 
         Filters run in SQL: status, agent, requester, kind (host = no rule, k8s =
@@ -695,12 +1125,25 @@ class ApprovalRepo:
         from sqlalchemy import desc, or_
         with SessionLocal() as db:
             stmt = select(_Approval).where(_Approval.tenant_id == tenant_id)
+            # Scope: an approval is in view if it matches any given agent/fleet filter.
+            # No filters at all → the whole tenant (unrestricted). An empty allow-list
+            # matches nothing, so a fully-restricted user sees nothing.
+            scope_conds = []
             if agent_id is not None:
-                stmt = stmt.where(_Approval.agent_id == agent_id)
+                scope_conds.append(_Approval.agent_id == agent_id)
+            if fleet_id is not None:
+                scope_conds.append(_Approval.fleet_id == fleet_id)
             if agent_ids is not None:
-                # Scope to an explicit allow-list of agents (e.g. an agent-restricted
-                # operator). An empty list matches nothing, so they see nothing.
-                stmt = stmt.where(_Approval.agent_id.in_(agent_ids))
+                scope_conds.append(_Approval.agent_id.in_(agent_ids))
+            if fleet_ids is not None:
+                scope_conds.append(_Approval.fleet_id.in_(fleet_ids))
+            if scope_conds:
+                stmt = stmt.where(or_(*scope_conds))
+            # scope filter: 'agent' = standalone (no fleet), 'fleet' = fleet-scoped.
+            if scope == "agent":
+                stmt = stmt.where(_Approval.fleet_id.is_(None))
+            elif scope == "fleet":
+                stmt = stmt.where(_Approval.fleet_id.isnot(None))
             if status is not None:
                 stmt = stmt.where(_Approval.status == status)
             if requested_by is not None:
@@ -736,6 +1179,17 @@ class ApprovalRepo:
             ).scalar_one_or_none()
             return row is not None
 
+    def exists_pending_fleet(self, fleet_id: str, command: str) -> bool:
+        with SessionLocal() as db:
+            row = db.execute(
+                select(_Approval).where(
+                    _Approval.fleet_id == fleet_id,
+                    _Approval.command == command,
+                    _Approval.status == "pending",
+                ).limit(1)
+            ).scalar_one_or_none()
+            return row is not None
+
     def update_status(self, approval_id: str, status: str, reviewed_at: str, reviewed_by: str, expires_at: Optional[str] = None) -> None:
         with SessionLocal() as db:
             db.execute(
@@ -757,17 +1211,18 @@ class ApprovalRepo:
             db.commit()
             return result.rowcount
 
-    def delete_stale(self, before_iso: str) -> int:
+    def delete_stale(self, before_iso: str, tenant_id: Optional[str] = None) -> int:
         from sqlalchemy import delete as sql_delete, or_, and_
-        with SessionLocal() as db:
-            result = db.execute(
-                sql_delete(_Approval).where(
-                    or_(
-                        and_(_Approval.status == "denied", _Approval.reviewed_at < before_iso),
-                        and_(_Approval.status == "expired", _Approval.expires_at < before_iso),
-                    )
-                )
+        conds = [
+            or_(
+                and_(_Approval.status == "denied", _Approval.reviewed_at < before_iso),
+                and_(_Approval.status == "expired", _Approval.expires_at < before_iso),
             )
+        ]
+        if tenant_id is not None:
+            conds.append(_Approval.tenant_id == tenant_id)
+        with SessionLocal() as db:
+            result = db.execute(sql_delete(_Approval).where(*conds))
             db.commit()
             return result.rowcount
 
@@ -776,6 +1231,22 @@ class ApprovalRepo:
         with SessionLocal() as db:
             db.execute(sql_delete(_Approval).where(_Approval.approval_id == approval_id))
             db.commit()
+
+    def delete_by_agent(self, agent_id: str) -> int:
+        """Purge every approval scoped to an agent - used when the agent is removed so
+        no stale pre-approval could authorize a command on a future id reuse."""
+        with SessionLocal() as db:
+            result = db.execute(sa_delete(_Approval).where(_Approval.agent_id == agent_id))
+            db.commit()
+            return result.rowcount or 0
+
+    def delete_by_fleet(self, fleet_id: str) -> int:
+        """Purge every approval scoped to a fleet - used when the fleet is revoked
+        (members removed) or deleted."""
+        with SessionLocal() as db:
+            result = db.execute(sa_delete(_Approval).where(_Approval.fleet_id == fleet_id))
+            db.commit()
+            return result.rowcount or 0
 
     @staticmethod
     def _lazy_expire(records: list, db) -> list:
@@ -901,11 +1372,12 @@ class AgentHistoryRepo:
             ).scalars().all()
             return [_to_dict(r) for r in rows]
 
-    def delete_stale(self, before_iso: str) -> int:
+    def delete_stale(self, before_iso: str, tenant_id: Optional[str] = None) -> int:
+        conds = [_AgentHistory.created_at < before_iso]
+        if tenant_id is not None:
+            conds.append(_AgentHistory.tenant_id == tenant_id)
         with SessionLocal() as db:
-            result = db.execute(
-                sa_delete(_AgentHistory).where(_AgentHistory.created_at < before_iso)
-            )
+            result = db.execute(sa_delete(_AgentHistory).where(*conds))
             db.commit()
             return result.rowcount
 
@@ -927,7 +1399,8 @@ class AuditRepo:
     def list_platform(self, limit: int = 100, cursor: Optional[str] = None,
                       action: Optional[str] = None, actor: Optional[str] = None,
                       resource: Optional[str] = None, ip: Optional[str] = None,
-                      since: Optional[str] = None, until: Optional[str] = None) -> list:
+                      since: Optional[str] = None, until: Optional[str] = None,
+                      tenant: Optional[str] = None) -> list:
         """Platform-level audit events (tenant_id IS NULL or any)."""
         from sqlalchemy import desc
         with SessionLocal() as db:
@@ -940,6 +1413,8 @@ class AuditRepo:
                 stmt = stmt.where(_AuditLog.created_at <= until)
             if action:
                 stmt = stmt.where(_AuditLog.action == action)
+            if tenant:
+                stmt = stmt.where(_AuditLog.tenant_id.ilike(f"%{tenant}%"))
             if actor:
                 stmt = stmt.where(_AuditLog.actor_name.ilike(f"%{actor}%"))
             if resource:
@@ -977,10 +1452,17 @@ class AuditRepo:
             stmt = stmt.limit(limit)
             return [_audit_to_dict(r) for r in db.execute(stmt).scalars().all()]
 
-    def delete_stale(self, before_iso: str) -> int:
+    def delete_stale(self, before_iso: str, tenant_id: Optional[str] = None,
+                     platform_only: bool = False) -> int:
+        """Purge audit rows older than the cutoff. Scope with ``tenant_id`` (a tenant's
+        own trail) or ``platform_only`` (the tenant_id IS NULL platform trail). With
+        neither, purges every scope (back-compat)."""
+        conds = [_AuditLog.created_at < before_iso]
+        if tenant_id is not None:
+            conds.append(_AuditLog.tenant_id == tenant_id)
+        elif platform_only:
+            conds.append(_AuditLog.tenant_id.is_(None))
         with SessionLocal() as db:
-            result = db.execute(
-                sa_delete(_AuditLog).where(_AuditLog.created_at < before_iso)
-            )
+            result = db.execute(sa_delete(_AuditLog).where(*conds))
             db.commit()
             return result.rowcount

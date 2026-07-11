@@ -66,6 +66,30 @@ class TestHandleListUsers:
             r = handle_list_users(TENANT_ID, ADMIN)
         assert json.loads(r["body"])["users"] == []
 
+    def _roster(self, n):
+        return [{**_USER, "user_id": f"u{i:02d}", "username": f"user{i:02d}", "name": f"User {i:02d}"}
+                for i in range(n)]
+
+    def test_pagination_returns_page_and_total(self):
+        with patch("handlers.admin_users._verify_admin", return_value=True), \
+             patch("handlers.admin_users.tenants_repo") as tr, \
+             patch("handlers.admin_users.users_repo") as ur:
+            tr.get.return_value = _TENANT
+            ur.list_by_tenant.return_value = self._roster(30)
+            r = handle_list_users(TENANT_ID, ADMIN, limit=20, offset=0)
+        body = json.loads(r["body"])
+        assert body["total"] == 30 and len(body["users"]) == 20 and body["offset"] == 0
+
+    def test_q_filters_and_no_page_meta_without_limit(self):
+        with patch("handlers.admin_users._verify_admin", return_value=True), \
+             patch("handlers.admin_users.tenants_repo") as tr, \
+             patch("handlers.admin_users.users_repo") as ur:
+            tr.get.return_value = _TENANT
+            ur.list_by_tenant.return_value = [{**_USER, "username": "alice"}, {**_USER, "user_id": "u2", "username": "bob"}]
+            r = handle_list_users(TENANT_ID, ADMIN, q="ali")
+        body = json.loads(r["body"])
+        assert [u["username"] for u in body["users"]] == ["alice"] and "total" not in body
+
 
 class TestListUsersHandler:
     def _evt(self, headers=None, path=None):
@@ -82,4 +106,4 @@ class TestListUsersHandler:
     def test_delegates_to_handler(self):
         with patch("handlers.admin_users.handle_list_users", return_value={"statusCode": 200, "body": '{"users":[]}'}) as h:
             list_users_handler(self._evt(), None)
-        h.assert_called_once_with(TENANT_ID, ADMIN)
+        h.assert_called_once_with(TENANT_ID, ADMIN, q=None, limit=None, offset=0)

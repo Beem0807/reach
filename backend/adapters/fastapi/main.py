@@ -41,6 +41,16 @@ from handlers.tenant_agents import (
     handle_get_agent_history,
     handle_list_agent_versions,
 )
+from handlers.tenant_fleets import (
+    handle_create_fleet,
+    handle_list_fleets,
+    handle_update_fleet,
+    handle_rotate_fleet_token,
+    handle_revoke_fleet,
+    handle_delete_fleet,
+    handle_remove_fleet_member,
+    handle_resolve_fleet_grants,
+)
 from handlers.tenant_approvals import (
     handle_list_my_pending,
     handle_list_agent_approved,
@@ -49,15 +59,32 @@ from handlers.tenant_approvals import (
     handle_tenant_create_approval,
     handle_tenant_delete_approval,
 )
+from handlers.cli_fleets import (
+    handle_cli_list_fleets,
+    handle_cli_list_fleet_agents,
+    handle_cli_list_fleet_approved,
+    handle_cli_list_fleet_runs,
+    handle_cli_fleet_fanout,
+)
+from handlers.tenant_settings import (
+    handle_get_tenant_settings,
+    handle_update_tenant_settings,
+    handle_admin_get_tenant_settings,
+    handle_admin_update_tenant_settings,
+)
 from handlers.audit_logs import handle_list_platform_audit_logs, handle_list_tenant_audit_logs
 from handlers.admin_users import handle_list_users
 from shared.tenant_auth import verify_tenant_token
 from shared.auth import _verify_tenant_token
 from handlers.agent_claim import handle_agent_claim
 from handlers.agent_job_result import handle_agent_job_result
+from handlers.agent_deregister import handle_agent_deregister
 from handlers.agent_rotate_token import handle_agent_rotate_token
 from handlers.agent_sync import handle_agent_sync
 from handlers.create_job import handle_create_job
+from handlers.jobs_fanout import handle_fanout_by_tag, handle_list_tag_runs
+from handlers.runs import handle_get_run
+from handlers.run_control import handle_pause_run, handle_resume_run, handle_cancel_run
 from handlers.me import handle_me
 from handlers.get_agent import handle_get_agent
 from handlers.get_job import handle_get_job
@@ -141,7 +168,12 @@ if os.path.isdir(_UI_DIST):
 # ---------------------------------------------------------------------------
 
 @app.post("/agent/claim")
-@limiter.limit("5/hour")
+# Claims are unauthenticated (the token is in the body), so this is keyed by
+# client IP. A fleet join token enrolls many hosts, and behind a NAT they share
+# one egress IP - so this must tolerate ASG scale-out bursts from a single IP.
+# Install/join tokens are 256-bit, so brute force is infeasible regardless; this
+# limit is purely anti-DoS. Tune via a shared store for very large fleets.
+@limiter.limit("120/minute")
 async def agent_claim(request: Request):
     try:
         body = await request.json()
@@ -176,6 +208,19 @@ async def agent_rotate_token(request: Request):
     return _resp(handle_agent_rotate_token(body, token))
 
 
+@app.post("/agent/deregister")
+@limiter.limit("60/minute")
+async def agent_deregister(request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    return _resp(handle_agent_deregister(body, token))
+
+
 @app.post("/agent/jobs/{job_id}/result")
 @limiter.limit("60/minute")
 async def agent_job_result(job_id: str, request: Request):
@@ -203,7 +248,7 @@ async def me(request: Request):
 
 
 @app.post("/jobs", status_code=201)
-@limiter.limit("30/minute")
+@limiter.limit("60/minute")
 async def create_job(request: Request):
     token = _token(request)
     if not token:
@@ -212,7 +257,74 @@ async def create_job(request: Request):
         body = await request.json()
     except Exception:
         return JSONResponse({"error": "invalid JSON body"}, status_code=400)
-    return _resp(handle_create_job(body, token))
+    ip = request.client.host if request.client else ""
+    return _resp(handle_create_job(body, token, ip))
+
+
+@app.post("/jobs/fanout", status_code=201)
+@limiter.limit("60/minute")
+async def fanout_by_tag(request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    ip = request.client.host if request.client else ""
+    return _resp(handle_fanout_by_tag(body, token, ip))
+
+
+@app.get("/jobs/runs")
+@limiter.limit("120/minute")
+async def list_tag_runs(request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    try:
+        limit = max(1, min(int(request.query_params.get("limit", 20)), 100))
+    except (ValueError, TypeError):
+        limit = 20
+    return _resp(handle_list_tag_runs(token, limit=limit, cursor=request.query_params.get("cursor") or None))
+
+
+@app.get("/tenant/runs/{run_id}")
+@limiter.limit("120/minute")
+async def get_run(run_id: str, request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    return _resp(handle_get_run(token, run_id))
+
+
+@app.post("/tenant/runs/{run_id}/pause")
+@limiter.limit("60/minute")
+async def pause_run(run_id: str, request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    ip = request.client.host if request.client else ""
+    return _resp(handle_pause_run(run_id, token, ip))
+
+
+@app.post("/tenant/runs/{run_id}/resume")
+@limiter.limit("60/minute")
+async def resume_run(run_id: str, request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    ip = request.client.host if request.client else ""
+    return _resp(handle_resume_run(run_id, token, ip))
+
+
+@app.post("/tenant/runs/{run_id}/cancel")
+@limiter.limit("60/minute")
+async def cancel_run(run_id: str, request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    ip = request.client.host if request.client else ""
+    return _resp(handle_cancel_run(run_id, token, ip))
 
 
 @app.get("/jobs")
@@ -223,12 +335,14 @@ async def list_jobs(request: Request):
         return JSONResponse({"error": "missing Authorization header"}, status_code=401)
     qs = request.query_params
     agent_filter = qs.get("agent_id")
+    fleet_filter = qs.get("fleet_id")
+    batch_filter = qs.get("run_id")
     cursor = qs.get("cursor")
     try:
         limit = max(1, min(int(qs.get("limit", 20)), 100))
     except (ValueError, TypeError):
         limit = 20
-    return _resp(handle_list_jobs(token, agent_filter, limit, cursor))
+    return _resp(handle_list_jobs(token, agent_filter, limit, cursor, fleet_id=fleet_filter, run_id=batch_filter, q=qs.get("q")))
 
 
 @app.get("/jobs/{job_id}")
@@ -241,13 +355,25 @@ async def get_job(job_id: str, request: Request):
 
 
 @app.get("/agents")
-@limiter.limit("60/minute")
+@limiter.limit("120/minute")
 async def list_agents(request: Request):
     token = _token(request)
     if not token:
         return JSONResponse({"error": "missing Authorization header"}, status_code=401)
-    tag = request.query_params.get("tag")
-    return _resp(handle_list_agents(token, tag))
+    qs = request.query_params
+    tag = qs.get("tag")
+    q = qs.get("q")
+    limit = None
+    offset = 0
+    if "limit" in qs:
+        try:
+            limit = int(qs.get("limit"))
+            offset = int(qs.get("offset") or 0)
+        except (ValueError, TypeError):
+            return JSONResponse({"error": "limit and offset must be integers"}, status_code=400)
+    return _resp(handle_list_agents(token, tag, q=q, mode=qs.get("mode"), access=qs.get("access"),
+                                    agent_type=qs.get("type"), fleet=qs.get("fleet"),
+                                    limit=limit, offset=offset))
 
 
 @app.get("/agents/{agent_id}")
@@ -260,7 +386,7 @@ async def get_agent(agent_id: str, request: Request):
 
 
 @app.get("/approvals/pending")
-@limiter.limit("60/minute")
+@limiter.limit("120/minute")
 async def list_my_pending(request: Request):
     token = _token(request)
     if not token:
@@ -270,13 +396,78 @@ async def list_my_pending(request: Request):
 
 
 @app.get("/agents/{agent_id}/approved-commands")
-@limiter.limit("60/minute")
+@limiter.limit("120/minute")
 async def list_agent_approved(agent_id: str, request: Request):
     token = _token(request)
     if not token:
         return JSONResponse({"error": "missing Authorization header"}, status_code=401)
     status = request.query_params.get("status", "approved")
     return _resp(handle_list_agent_approved(agent_id, token, status=status))
+
+
+# CLI/MCP fleet surface (API-token, access-scoped) - see handlers/cli_fleets.py.
+@app.get("/fleets")
+@limiter.limit("120/minute")
+async def cli_list_fleets(request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    return _resp(handle_cli_list_fleets(token))
+
+
+@app.get("/fleets/{fleet_id}/agents")
+@limiter.limit("120/minute")
+async def cli_list_fleet_agents(fleet_id: str, request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    qs = request.query_params
+    limit = None
+    offset = 0
+    if "limit" in qs:
+        try:
+            limit = int(qs.get("limit"))
+            offset = int(qs.get("offset") or 0)
+        except (ValueError, TypeError):
+            return JSONResponse({"error": "limit and offset must be integers"}, status_code=400)
+    return _resp(handle_cli_list_fleet_agents(fleet_id, token, q=qs.get("q"), limit=limit, offset=offset))
+
+
+@app.get("/fleets/{fleet_id}/approvals")
+@limiter.limit("120/minute")
+async def cli_list_fleet_approved(fleet_id: str, request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    status = request.query_params.get("status", "approved")
+    return _resp(handle_cli_list_fleet_approved(fleet_id, token, status=status))
+
+
+@app.get("/fleets/{fleet_id}/runs")
+@limiter.limit("120/minute")
+async def cli_list_fleet_runs(fleet_id: str, request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    try:
+        limit = max(1, min(int(request.query_params.get("limit", 20)), 100))
+    except (ValueError, TypeError):
+        limit = 20
+    return _resp(handle_cli_list_fleet_runs(fleet_id, token, limit=limit, cursor=request.query_params.get("cursor") or None))
+
+
+@app.post("/fleets/{fleet_id}/jobs", status_code=201)
+@limiter.limit("60/minute")
+async def cli_fleet_fanout(fleet_id: str, request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    ip = request.client.host if request.client else ""
+    return _resp(handle_cli_fleet_fanout(fleet_id, body, token, ip))
 
 
 # ---------------------------------------------------------------------------
@@ -318,7 +509,16 @@ async def list_tenants(request: Request):
     token = _token(request)
     if not token:
         return JSONResponse({"error": "missing Authorization header"}, status_code=401)
-    return _resp(handle_list_tenants(token))
+    qs = request.query_params
+    limit = None
+    offset = 0
+    if "limit" in qs:
+        try:
+            limit = int(qs.get("limit"))
+            offset = int(qs.get("offset") or 0)
+        except (ValueError, TypeError):
+            return JSONResponse({"error": "limit and offset must be integers"}, status_code=400)
+    return _resp(handle_list_tenants(token, q=qs.get("q"), limit=limit, offset=offset))
 
 
 @app.post("/admin/tenants/{tenant_id}/disable")
@@ -350,6 +550,29 @@ async def delete_tenant(tenant_id: str, request: Request):
     return _resp(handle_delete_tenant(tenant_id, token))
 
 
+@app.get("/admin/tenants/{tenant_id}/settings")
+@limiter.limit("120/minute")
+async def admin_get_tenant_settings(tenant_id: str, request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    return _resp(handle_admin_get_tenant_settings(tenant_id, token))
+
+
+@app.put("/admin/tenants/{tenant_id}/settings")
+@limiter.limit("30/minute")
+async def admin_update_tenant_settings(tenant_id: str, request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    ip = request.client.host if request.client else ""
+    return _resp(handle_admin_update_tenant_settings(tenant_id, body, token, ip))
+
+
 @app.post("/admin/tenants/{tenant_id}/admin-users", status_code=201)
 @limiter.limit("20/minute")
 async def create_platform_tenant_user(tenant_id: str, request: Request):
@@ -370,7 +593,16 @@ async def list_users(tenant_id: str, request: Request):
     token = _token(request)
     if not token:
         return JSONResponse({"error": "missing Authorization header"}, status_code=401)
-    return _resp(handle_list_users(tenant_id, token))
+    qs = request.query_params
+    limit = None
+    offset = 0
+    if "limit" in qs:
+        try:
+            limit = int(qs.get("limit"))
+            offset = int(qs.get("offset") or 0)
+        except (ValueError, TypeError):
+            return JSONResponse({"error": "limit and offset must be integers"}, status_code=400)
+    return _resp(handle_list_users(tenant_id, token, q=qs.get("q"), limit=limit, offset=offset))
 
 
 @app.post("/admin/tenants/{tenant_id}/users/{user_id}/reset-password")
@@ -432,7 +664,7 @@ async def list_agents_admin(request: Request):
 
 
 @app.get("/admin/audit-logs")
-@limiter.limit("60/minute")
+@limiter.limit("120/minute")
 async def platform_audit_logs(request: Request):
     token = _token(request)
     if not token:
@@ -446,7 +678,7 @@ async def platform_audit_logs(request: Request):
     return _resp(handle_list_platform_audit_logs(token, limit, cursor,
         action=qs.get("action"), actor=qs.get("actor"),
         resource=qs.get("resource"), ip=qs.get("ip"),
-        since=qs.get("since"), until=qs.get("until")))
+        since=qs.get("since"), until=qs.get("until"), tenant=qs.get("tenant")))
 
 
 # ---------------------------------------------------------------------------
@@ -499,7 +731,7 @@ async def tenant_me(request: Request):
 # ---------------------------------------------------------------------------
 
 @app.get("/tenant/users")
-@limiter.limit("60/minute")
+@limiter.limit("120/minute")
 async def tenant_list_users(request: Request):
     token = _token(request)
     if not token:
@@ -507,7 +739,17 @@ async def tenant_list_users(request: Request):
     payload = verify_tenant_token(token)
     if not payload:
         return JSONResponse({"error": "unauthorized"}, status_code=401)
-    return _resp(handle_list_tenant_users(payload))
+    qs = request.query_params
+    limit = None
+    offset = 0
+    if "limit" in qs:
+        try:
+            limit = int(qs.get("limit"))
+            offset = int(qs.get("offset") or 0)
+        except (ValueError, TypeError):
+            return JSONResponse({"error": "limit and offset must be integers"}, status_code=400)
+    return _resp(handle_list_tenant_users(payload, role=qs.get("role"), status=qs.get("status"),
+                                          q=qs.get("q"), limit=limit, offset=offset))
 
 
 @app.post("/tenant/users", status_code=201)
@@ -610,7 +852,7 @@ async def tenant_reset_user_password(user_id: str, request: Request):
 
 
 @app.get("/tenant/users/{user_id}/agents")
-@limiter.limit("60/minute")
+@limiter.limit("120/minute")
 async def tenant_get_user_agents(user_id: str, request: Request):
     token = _token(request)
     if not token:
@@ -622,7 +864,7 @@ async def tenant_get_user_agents(user_id: str, request: Request):
 
 
 @app.put("/tenant/users/{user_id}/agents")
-@limiter.limit("30/minute")
+@limiter.limit("60/minute")
 async def tenant_set_user_agents(user_id: str, request: Request):
     token = _token(request)
     if not token:
@@ -642,12 +884,144 @@ async def tenant_set_user_agents(user_id: str, request: Request):
 # ---------------------------------------------------------------------------
 
 @app.get("/tenant/agent-versions")
+@limiter.limit("120/minute")
 async def tenant_agent_versions(request: Request):
     token = _token(request)
     if not token:
         return JSONResponse({"error": "missing Authorization header"}, status_code=401)
     agent_type = request.query_params.get("type", "host")
     return _resp(handle_list_agent_versions(agent_type, token))
+
+
+# ---------------------------------------------------------------------------
+# Tenant admin - fleets (reusable-join-token groups of host agents)
+# ---------------------------------------------------------------------------
+
+@app.get("/tenant/settings")
+@limiter.limit("120/minute")
+async def tenant_get_settings(request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    return _resp(handle_get_tenant_settings(token))
+
+
+@app.put("/tenant/settings")
+@limiter.limit("30/minute")
+async def tenant_update_settings(request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    ip = request.client.host if request.client else ""
+    return _resp(handle_update_tenant_settings(body, token, ip))
+
+
+@app.get("/tenant/fleets")
+@limiter.limit("120/minute")
+async def tenant_list_fleets(request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    qs = request.query_params
+    limit = None
+    offset = 0
+    if "limit" in qs:
+        try:
+            limit = int(qs.get("limit"))
+            offset = int(qs.get("offset") or 0)
+        except (ValueError, TypeError):
+            return JSONResponse({"error": "limit and offset must be integers"}, status_code=400)
+    return _resp(handle_list_fleets(token, q=qs.get("q"), limit=limit, offset=offset))
+
+
+@app.post("/tenant/fleets", status_code=201)
+@limiter.limit("20/minute")
+async def tenant_create_fleet(request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    api_url = str(request.base_url).rstrip("/")
+    return _resp(handle_create_fleet(body, token, api_url))
+
+
+@app.put("/tenant/fleets/{fleet_id}")
+@limiter.limit("60/minute")
+async def tenant_update_fleet(fleet_id: str, request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    return _resp(handle_update_fleet(fleet_id, body, token))
+
+
+@app.post("/tenant/fleets/{fleet_id}/rotate-token", status_code=201)
+@limiter.limit("10/minute")
+async def tenant_rotate_fleet_token(fleet_id: str, request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    api_url = str(request.base_url).rstrip("/")
+    return _resp(handle_rotate_fleet_token(fleet_id, body, token, api_url))
+
+
+@app.post("/tenant/fleets/{fleet_id}/revoke")
+@limiter.limit("20/minute")
+async def tenant_revoke_fleet(fleet_id: str, request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    return _resp(handle_revoke_fleet(fleet_id, body, token))
+
+
+@app.delete("/tenant/fleets/{fleet_id}")
+@limiter.limit("20/minute")
+async def tenant_delete_fleet(fleet_id: str, request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    return _resp(handle_delete_fleet(fleet_id, token))
+
+
+@app.delete("/tenant/fleets/{fleet_id}/members/{agent_id}")
+@limiter.limit("60/minute")
+async def tenant_remove_fleet_member(fleet_id: str, agent_id: str, request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    return _resp(handle_remove_fleet_member(fleet_id, agent_id, token))
+
+
+@app.post("/tenant/fleets/{fleet_id}/resolve-grants")
+@limiter.limit("20/minute")
+async def tenant_resolve_fleet_grants(fleet_id: str, request: Request):
+    """Resolve a fleet member's grant mismatch: body {resolution: reconcile|accept, agent_id?}."""
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    return _resp(handle_resolve_fleet_grants(fleet_id, token, body.get("resolution"), agent_id=body.get("agent_id")))
 
 
 @app.post("/tenant/agents", status_code=201)
@@ -679,7 +1053,7 @@ async def tenant_reissue_install_token(agent_id: str, request: Request):
 
 
 @app.post("/tenant/agents/{agent_id}/revoke")
-@limiter.limit("30/minute")
+@limiter.limit("60/minute")
 async def tenant_revoke_agent(agent_id: str, request: Request):
     token = _token(request)
     if not token:
@@ -697,7 +1071,7 @@ async def tenant_remove_agent(agent_id: str, request: Request):
 
 
 @app.delete("/tenant/agents/{agent_id}")
-@limiter.limit("30/minute")
+@limiter.limit("60/minute")
 async def tenant_delete_agent(agent_id: str, request: Request):
     token = _token(request)
     if not token:
@@ -706,7 +1080,7 @@ async def tenant_delete_agent(agent_id: str, request: Request):
 
 
 @app.put("/tenant/agents/{agent_id}/tags")
-@limiter.limit("30/minute")
+@limiter.limit("60/minute")
 async def tenant_set_agent_tags(agent_id: str, request: Request):
     token = _token(request)
     if not token:
@@ -728,7 +1102,7 @@ async def tenant_request_agent_rotation(agent_id: str, request: Request):
 
 
 @app.post("/tenant/agents/{agent_id}/acknowledge-capability")
-@limiter.limit("30/minute")
+@limiter.limit("60/minute")
 async def tenant_acknowledge_capability(agent_id: str, request: Request):
     token = _token(request)
     if not token:
@@ -741,7 +1115,7 @@ async def tenant_acknowledge_capability(agent_id: str, request: Request):
 
 
 @app.put("/tenant/agents/{agent_id}/policy/mode")
-@limiter.limit("30/minute")
+@limiter.limit("60/minute")
 async def tenant_set_agent_mode(agent_id: str, request: Request):
     token = _token(request)
     if not token:
@@ -754,7 +1128,7 @@ async def tenant_set_agent_mode(agent_id: str, request: Request):
 
 
 @app.get("/tenant/agents/{agent_id}/history")
-@limiter.limit("60/minute")
+@limiter.limit("120/minute")
 async def tenant_agent_history(agent_id: str, request: Request):
     token = _token(request)
     if not token:
@@ -769,7 +1143,7 @@ async def tenant_agent_history(agent_id: str, request: Request):
 # ---------------------------------------------------------------------------
 
 @app.get("/tenant/approvals")
-@limiter.limit("60/minute")
+@limiter.limit("120/minute")
 async def tenant_list_all_approvals(request: Request):
     token = _token(request)
     if not token:
@@ -778,7 +1152,7 @@ async def tenant_list_all_approvals(request: Request):
 
 
 @app.post("/tenant/approvals", status_code=201)
-@limiter.limit("30/minute")
+@limiter.limit("60/minute")
 async def tenant_create_approval(request: Request):
     token = _token(request)
     if not token:
@@ -791,7 +1165,7 @@ async def tenant_create_approval(request: Request):
 
 
 @app.put("/tenant/approvals/{approval_id}/approve")
-@limiter.limit("60/minute")
+@limiter.limit("120/minute")
 async def tenant_approve_approval(approval_id: str, request: Request):
     token = _token(request)
     if not token:
@@ -804,7 +1178,7 @@ async def tenant_approve_approval(approval_id: str, request: Request):
 
 
 @app.put("/tenant/approvals/{approval_id}/deny")
-@limiter.limit("60/minute")
+@limiter.limit("120/minute")
 async def tenant_deny_approval(approval_id: str, request: Request):
     token = _token(request)
     if not token:
@@ -817,7 +1191,7 @@ async def tenant_deny_approval(approval_id: str, request: Request):
 
 
 @app.delete("/tenant/approvals/{approval_id}")
-@limiter.limit("30/minute")
+@limiter.limit("60/minute")
 async def tenant_delete_approval(approval_id: str, request: Request):
     token = _token(request)
     if not token:
@@ -830,7 +1204,7 @@ async def tenant_delete_approval(approval_id: str, request: Request):
 # ---------------------------------------------------------------------------
 
 @app.get("/tenant/api-tokens")
-@limiter.limit("60/minute")
+@limiter.limit("120/minute")
 async def tenant_list_tokens(request: Request):
     token = _token(request)
     if not token:
@@ -859,7 +1233,7 @@ async def tenant_create_token(request: Request):
 
 
 @app.patch("/tenant/api-tokens/{token_id}")
-@limiter.limit("30/minute")
+@limiter.limit("60/minute")
 async def tenant_rename_token(token_id: str, request: Request):
     token = _token(request)
     if not token:
@@ -893,7 +1267,7 @@ async def tenant_revoke_token(token_id: str, request: Request):
 # ---------------------------------------------------------------------------
 
 @app.get("/tenant/audit-logs")
-@limiter.limit("60/minute")
+@limiter.limit("120/minute")
 async def tenant_audit_logs(request: Request):
     token = _token(request)
     if not token:

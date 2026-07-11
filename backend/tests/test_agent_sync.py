@@ -161,6 +161,23 @@ class TestAgentSync:
         assert set(body["jobs"][0]["approved_commands"]) == {"docker ps", "git status"}
         apr.list_by_agent.assert_called_once_with(AGENT_ID, status="approved")
 
+    def test_fleet_member_draws_approved_commands_from_fleet(self):
+        # A fleet member inherits its fleet's approvals, not per-agent ones.
+        member = {**_AGENT_ACTIVE, "mode": "approved", "fleet_id": "fleet_a"}
+        job_approved_mode = {**_JOB_PENDING, "mode": "approved"}
+        with patch("handlers.agent_sync._verify_agent_token", return_value=member), \
+             patch("handlers.agent_sync.agents_repo"), \
+             patch("handlers.agent_sync.approvals_repo") as apr, \
+             patch("handlers.agent_sync.jobs_repo") as jr:
+            jr.get_pending_for_agent.return_value = [job_approved_mode]
+            jr.set_running.return_value = True
+            apr.list_by_fleet.return_value = [{"command": "docker ps", "status": "approved"}]
+            r = handle_agent_sync(_VALID_BODY, "tok")
+        body = json.loads(r["body"])
+        assert body["jobs"][0]["approved_commands"] == ["docker ps"]
+        apr.list_by_fleet.assert_called_once_with("fleet_a", status="approved")
+        apr.list_by_agent.assert_not_called()
+
     def test_non_approved_mode_sends_empty_approved_commands(self):
         r = self._call(jobs=[_JOB_PENDING])  # default mode is "wild"
         body = json.loads(r["body"])

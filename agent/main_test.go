@@ -498,6 +498,48 @@ func TestAPIPost(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// deregister (fleet scale-in)
+// ---------------------------------------------------------------------------
+
+func TestDeregister(t *testing.T) {
+	t.Run("posts fingerprint and token to /agent/deregister", func(t *testing.T) {
+		var gotPath, gotAuth, gotMethod string
+		var gotBody DeregisterRequest
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotPath, gotAuth, gotMethod = r.URL.Path, r.Header.Get("Authorization"), r.Method
+			json.NewDecoder(r.Body).Decode(&gotBody)
+			w.WriteHeader(200)
+			w.Write([]byte(`{"deregistered":true}`))
+		}))
+		defer srv.Close()
+
+		deregister(&Config{APIURL: srv.URL, AgentToken: "tok", MachineFingerprint: "fp-1"})
+		if gotMethod != "POST" || gotPath != "/agent/deregister" {
+			t.Errorf("request = %s %s, want POST /agent/deregister", gotMethod, gotPath)
+		}
+		if gotAuth != "Bearer tok" {
+			t.Errorf("auth = %q, want 'Bearer tok'", gotAuth)
+		}
+		if gotBody.MachineFingerprint != "fp-1" {
+			t.Errorf("fingerprint = %q, want 'fp-1'", gotBody.MachineFingerprint)
+		}
+	})
+
+	t.Run("tolerates 409 not-a-fleet-member", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(409)
+			w.Write([]byte(`{"error":"agent is not a fleet member"}`))
+		}))
+		defer srv.Close()
+		deregister(&Config{APIURL: srv.URL, AgentToken: "tok", MachineFingerprint: "fp"}) // must not panic
+	})
+
+	t.Run("tolerates connection failure", func(t *testing.T) {
+		deregister(&Config{APIURL: "http://127.0.0.1:1", AgentToken: "tok"}) // must not panic
+	})
+}
+
+// ---------------------------------------------------------------------------
 // claim
 // ---------------------------------------------------------------------------
 

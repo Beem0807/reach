@@ -76,15 +76,30 @@ The CLI and MCP server both poll `GET /jobs/{id}` until the job reaches a termin
 
 A Python CLI (`reach`) that authenticates with an API token (`tok_`) and talks to the backend over HTTPS. Manages a local config file (`~/.reach/config.json`) with the API URL, API token, default agent, and aliases.
 
-Notable commands: `exec`, `job`, `history`, `agents`, `approvals` (with `--pending`/`--denied`/`--expired` flags), `agent-init`, `mcp`, `man`.
+Notable commands: `exec` (single agent, or `--tag` to fan out to standalone agents; type-homogeneous host/k8s), `job`, `jobs`, `runs`/`run` (tag fan-out runs across standalone agents), `agents` (`list`/`show`/`use`), `fleets` (`list`/`show`/`use`/`agents`/`exec`/`jobs`/`runs`/`run`/`approvals`), `approvals` (`list`/`request`/`approve`/`deny`), `agent-init`, `mcp`, `man`. Fan-outs (`reach fleets exec`, `reach exec --tag`) confirm first and create a first-class **run** (a row in the `runs` table with a `run_id`), so a run's identity, intent (dispatched/skipped), and status survive independently of its member jobs (which are purged on retention). A **single-agent `reach exec`** also confirms before a **write** (destructive) command - a `dry_run` classifies it server-side and the CLI prompts unless `--force`/`--json` - so `rm -rf` on one host isn't unprompted either; reads run straight through. **Every** eligible member runs, but never more than the per-fleet fan-out cap (`max_fanout`, operator-set) at a time: above the cap the run proceeds in **waves** of the cap (`--max-targets` lowers the wave size, can't raise it above the cap), advancing per the tenant/fleet wave policy (auto/manual, stop/continue). Poll a run with `GET /tenant/runs/{run_id}` and control a staged one with pause/resume/cancel; an `idempotency_key` makes a retried fan-out reuse the same run instead of double-dispatching. Global `--json` emits raw JSON for scripting; exit codes are `0` ok / `1` remote command failed / `2` reach-level error.
 
 ### MCP server (`cli/reach/mcp_server.py`)
 
-Launched as a subprocess by an MCP-compatible client (Claude Code, Cursor, etc.) and communicates over stdio using JSON-RPC. Exposes the same operations as the CLI as structured tools: `get_context`, `whoami`, `list_agents`, `get_agent`, `exec_command`, `get_job`, `list_history`, `list_approved_commands`, `list_pending_approvals`. The client manages the process lifecycle - no hosting or ports needed.
+Launched as a subprocess by an MCP-compatible client (Claude Code, Cursor, etc.) and communicates over stdio using JSON-RPC. Exposes the same operations as the CLI as structured tools: `get_context`, `whoami`, `list_agents`, `get_agent`, `exec_command`, `exec_by_tag` (confirm-gated tag fan-out), `list_tag_runs`/`list_tag_run` (tag fan-out history), `get_job`, `list_history`; and for fleets `list_fleets`, `list_fleet_agents`, `list_fleet_jobs`, `list_fleet_runs`, `list_fleet_run`, `list_fleet_approved`, `fleet_exec` (confirm-gated fan-out); plus `list_approved_commands`, `list_pending_approvals`. Destructive commands are two-step: a `confirm=false` dry-run preview must be shown to the user before a `confirm=true` dispatch - this gates the fan-outs (`fleet_exec`, `exec_by_tag`) and also a single-agent **write** via `exec_command` (reads run straight through). The MCP surface is deliberately **read-only for approvals** - it exposes no create/approve/deny tool, so an AI can't file a request and approve it itself (approval stays a human control; use the console or CLI). The client manages the process lifecycle - no hosting or ports needed.
 
 `get_context` is the entry point for each session - it returns the authenticated user, the configured default agent (with live mode and access_level), and local aliases in a single call, so the LLM is oriented before it submits any commands.
 
 The MCP server is installed as part of the CLI package (`reach-mcp` entry point).
+
+### Console (`ui/`)
+
+A React/Vite single-page app served at `/ui`, with two audiences behind separate session
+logins. The **tenant console** (admin/operator/developer) manages agents, fleets, approvals,
+API tokens, users, and settings, and browses jobs, fan-out runs, and the tenant audit log. It
+can also **launch work**: a single-agent job from an agent row, a fleet fan-out from a fleet,
+and a tag fan-out - plus top-level **Create job / New run** launchers on the Jobs page. These
+are **write-gated** (only targets the user has read-write access to are runnable; inactive
+agents are shown disabled), and **every** run - single-agent job or fan-out - shows a
+**dry-run preview + confirm** before dispatching (the single-agent preview classifies the
+command read/write and shows the agent's mode; fan-outs show the blast radius + wave plan). The **platform-admin console** manages tenants (create/enable/disable),
+can **override a tenant's settings** past its bounds (audit-logged), and reads the platform-wide
+audit log with a tenant filter. Both consoles use the same JSON API as the CLI (session-token
+auth); the console never gets a capability the API doesn't already enforce server-side.
 
 ### Backend (`backend/`)
 
@@ -102,9 +117,10 @@ nginx is required in front of uvicorn for the Docker deployment. Long-polling co
 
 A background scheduler (APScheduler on FastAPI, EventBridge on Lambda) runs every minute to:
 - Mark agents `INACTIVE` if no heartbeat in the last 45 seconds
+- **Reap dead fleet members** whose last heartbeat is older than their fleet's `reap_after_seconds` (default `FLEET_REAP_AFTER_SECONDS`, 30 min)
 - Expire `PENDING` jobs older than 1 hour to `EXPIRED`
 - At the top of every hour: mark `approved` approval records with `expires_at` in the past as `expired`
-- At midnight UTC: delete records past their retention window - `denied`/`expired` approvals older than `APPROVAL_RETENTION_DAYS` (7), terminal jobs older than `JOB_RETENTION_DAYS` (7), audit logs older than `AUDIT_RETENTION_DAYS` (90), and agent status history older than `AGENT_HISTORY_RETENTION_DAYS` (30)
+- At midnight UTC: sweep each tenant and delete records past **that tenant's** retention settings - `denied`/`expired` approvals, terminal jobs, fan-out runs, tenant audit entries, and agent status history (defaults 7/7/30/90/30 days). The platform-level audit trail (`tenant_id IS NULL`) is swept separately with the deployment-wide `AUDIT_RETENTION_DAYS` (90)
 
 ### Agent (`agent/`)
 
@@ -148,15 +164,16 @@ The storage abstraction (`backend/shared/repos/base.py`) defines a common interf
 
 ## Token model
 
-Three token types, none stored raw - only `HMAC-SHA256(TOKEN_PEPPER, token)` hashes are persisted:
+Four token types, none stored raw - only `HMAC-SHA256(TOKEN_PEPPER, token)` hashes are persisted:
 
 | Token | Prefix | Issued by | Used by | Lifetime |
 |---|---|---|---|---|
 | Install token | `install_` | `POST /tenant/agents` (tenant admin) | Agent (once, at claim) | 24 hours |
+| Fleet join token | `fleet_` | `POST /tenant/fleets` (tenant admin) | Any host installer (**reusable**, at claim) | Until rotated or revoked |
 | Agent token | `agent_` | Backend (at claim) | Agent (every sync) | 30 days, auto-rotated |
 | API token | `tok_` | `POST /tenant/api-tokens` (any tenant user) | CLI / MCP server | Until revoked |
 
-The install token is one-time use and is cleared after a successful claim. The agent token is bound to a machine fingerprint - a token replayed from a different machine is rejected. The agent rotates its own token every 30 days with no lockout window (old token is valid until the new one is persisted). Tenant admins can also request an immediate rotation via `POST /tenant/agents/{id}/request-rotation`; the flag is cleared atomically by `update_agent_token_hash` when the new token is stored.
+The install token is one-time use and is cleared after a successful claim. The **fleet join token** is the exception: it is deliberately **reusable** - every host that claims with it enrolls into the fleet - and does not expire until you rotate or revoke it (see [Fleets](#fleets)). The agent token is bound to a machine fingerprint - a token replayed from a different machine is rejected. The agent rotates its own token every 30 days with no lockout window (old token is valid until the new one is persisted). Tenant admins can also request an immediate rotation via `POST /tenant/agents/{id}/request-rotation`; the flag is cleared atomically by `update_agent_token_hash` when the new token is stored.
 
 **Credential-only identity.** The agent never sends or stores an `agent_id`. At
 claim it presents the **install token**, and the backend looks the agent up by
@@ -187,7 +204,7 @@ CREATED ──(claim)──► ACTIVE ──(heartbeat gap)──► INACTIVE
 - **CREATED** - registered, never claimed. Install token valid for 24 hours.
 - **ACTIVE** - claimed and syncing. Transitions to INACTIVE after 45 seconds without a heartbeat.
 - **INACTIVE** - missed heartbeats. Auto-recovers to ACTIVE on next successful sync (no manual intervention needed).
-- **REVOKED** - access permanently cut. The agent can no longer sync (the sync endpoint rejects non-ACTIVE/INACTIVE status with 403). Removed from all users' allowed-agent lists at revoke time. Can be resurrected to CREATED by reissuing an install token (`POST /tenant/agents/{id}/reissue-install-token`), which clears the agent token, machine fingerprint, and claimed-at fields so the machine can re-install.
+- **REVOKED** - access permanently cut. The agent can no longer sync (the sync endpoint rejects non-ACTIVE/INACTIVE status with 403). Removed from all users' agent access lists (read-write and read-only) at revoke time. Can be resurrected to CREATED by reissuing an install token (`POST /tenant/agents/{id}/reissue-install-token`), which clears the agent token, machine fingerprint, and claimed-at fields so the machine can re-install.
 - **DELETED** - soft-deleted. Record stays in the database for audit purposes. Cannot sync or be reissued. Advance to this state only after REVOKED. Hidden from the user-facing endpoints (`GET /agents`, `GET /agents/{id}` return 404) but still actionable by tenant admins so the remove step can be completed.
 - **[gone]** - permanently removed from the database via the remove action. No record remains.
 
@@ -202,6 +219,94 @@ The three-step decommission sequence prevents accidental hard-deletes:
 To undo a revoke: call `POST /tenant/agents/{id}/reissue-install-token`. This resets the agent to CREATED with a fresh install token and is the only way to restore a REVOKED agent. DELETED agents cannot be reissued - remove and create a new agent instead.
 
 The heartbeat checker runs every minute and scans for ACTIVE agents whose `last_heartbeat_at` is older than 45 seconds.
+
+---
+
+## Fleets
+
+A **fleet** is a reusable **join token** for host agents, built for autoscaling groups
+of any flavour - AWS ASGs, GCP MIGs, Azure VMSS, Nomad, on-prem autoscalers, or any
+"cattle, not pets" fleet of identical hosts. You bake the join token into the group's
+launch/instance template (user-data or startup script); every instance that scales in
+claims with it and auto-enrolls as a host agent, inheriting the fleet's **mode**,
+**tags**, and **grants**. Fleets are **host-only** - k8s agents have
+one-agent-per-cluster identity, so the reusable-token model doesn't apply.
+
+**Enrollment.** `POST /agent/claim` detects the `fleet_` prefix and routes to fleet
+enrollment: it mints a new host agent, or **idempotently re-enrolls** an existing one
+keyed on `(fleet_id, machine_fingerprint)`. So an instance that reboots and re-claims
+reuses its record (and `agent_id`) instead of creating a duplicate. The claim is
+keyed by **IP** and rate-limited at 120/min so a NAT-shared autoscaling group can enroll many
+instances at once; the 256-bit token makes that limit purely anti-DoS.
+
+**Inheritance.** Members inherit the fleet's mode, tags, and grants at claim, and are
+managed *through the fleet*: changing a fleet's **mode** or **tags** propagates to
+every current member, and per-member `set mode`/`set tags`/`reissue` are blocked
+(`409`). **Grants** behave differently from mode/tags: they're baked into the host at
+install (sudoers / docker group), so editing a fleet's grants can't be pushed to a
+running member remotely. An edit changes what *new* instances enroll with (re-issue the
+launch-template command by rotating the join token) and marks existing members as a
+**grant mismatch** (member grants ≠ fleet grants) - the console flags the count and
+per-member. You reconcile out of band (re-provision/replace the host), then `POST
+/tenant/fleets/{id}/resolve-grants` with `{"resolution": "reconcile"}` sets the mismatched
+members' grants to match the fleet. This is deliberately **distinct from a capability/RBAC
+*acknowledge*** (which accepts observed reality): reconciling asserts a fix, so it is
+**verified against detection** - a member is only reconciled if the host actually reports
+the granted capability (`*_detected`); hosts that don't are returned as `blocked`, so a
+mismatch can't be cleared on a host that was never re-provisioned. If a member is
+*deliberately* allowed to differ, **accept** it instead (same endpoint, `{"resolution":
+"accept"}`): the member keeps its real grants (nothing falsified) but stops being flagged - recorded
+against a **(member grants, fleet grants)** signature, so it auto-re-flags if *either*
+side changes afterwards (the fleet grants are edited, or the member's own grants shift to
+a new mismatch, e.g. a later capability-acknowledge). The exception is also **dropped
+the moment the member matches the fleet again** (lazy-cleared on the next agent read), so
+a later return to the same divergence must be accepted afresh rather than staying silently
+suppressed.
+Rotating a member's own agent token and acknowledging capabilities still work per-agent.
+
+**Approvals are fleet-scoped.** A member has no per-agent approvals - approvals target the
+**fleet** (`agent_id` is null, `fleet_id` set), and every member inherits them. This keeps
+`approved` mode workable for churning autoscaler instances: pre-approve a command once on the fleet
+and each new instance picks it up on its first sync. When a member's write is blocked, the
+backend raises a **fleet-scoped** pending request (deduplicated per fleet, not per agent), and
+a member's sync draws its approved-command allow-list from the fleet. Creating a per-agent
+approval for a member's `agent_id` is rejected (`409`). Access follows the same rule as agents:
+reviewing/pre-approving a fleet approval requires **read-write** access to that fleet.
+
+**Approvals are cascade-deleted when their target is torn down**, so a stale pre-approval can
+never outlive the agent/fleet it was scoped to (and can't be inherited by a future id reuse):
+permanently **removing** an agent purges its `agent_id` approvals; **revoking a fleet with
+`members=remove`** and **deleting a fleet** purge its `fleet_id` approvals. (Soft-deleting an
+agent or revoking a fleet with `members=keep` leaves them - the agent is inert / the members live
+on as standalone agents - until the hard-remove/delete step or the retention sweep.)
+
+**Token rotation.** `POST /tenant/fleets/{id}/rotate-token` issues a new join token
+while keeping the previous one valid for a grace window (default 24h, `grace_seconds`
+configurable, `0` = immediate). This lets you update the launch template before the
+old token stops working - stored as `prev_join_token_hash` + `prev_join_token_expires_at`.
+
+**Scale.** A fleet can hold thousands of members (autoscaling cattle), so per-fleet
+operations - the member list (`GET /fleets/{id}/agents`), fan-out, fleet-job filtering,
+grant reconcile/accept - query by `fleet_id` directly (`agents_repo.list_by_fleet`, an
+indexed lookup: the `ix_agents_fleet_id` Postgres index / the `fleet-index` DynamoDB GSI)
+rather than scanning and filtering every agent in the tenant. Member **counts** for the
+fleet list come from a single `GROUP BY` (`member_counts`), not by loading members.
+
+**Leaving a fleet.** Three paths:
+
+| Path | Trigger | Effect |
+|---|---|---|
+| Detach | `DELETE /tenant/fleets/{id}/members/{agent_id}` | Member becomes a standalone individual agent, keeping its config/history and regaining individual controls |
+| Deregister | Agent calls `POST /agent/deregister` on **machine shutdown** | Member removes itself immediately on autoscaler scale-in (a plain service restart does **not** deregister - see below) |
+| Reap | Heartbeat sweep, past the reap window | The backend deletes members that stopped heartbeating (see [Automatic expiry and cleanup](#automatic-expiry-and-cleanup)) |
+
+**Deregister vs. reap.** Both remove a scaled-in instance; deregister is the fast path
+and the reaper is the backstop. On graceful shutdown (`SIGTERM`) a host distinguishes a
+real machine shutdown from a `systemctl restart` via systemd's manager state
+(`systemctl is-system-running` == `stopping`), and only deregisters on a genuine
+shutdown - so restarting the service never churns the member record. If the deregister
+call is missed (network, crash, non-systemd host), the reaper still removes the member
+after its reap window (`reap_after_seconds`, or the deployment default).
 
 ---
 
@@ -251,7 +356,7 @@ When the agent receives a job in approved mode, it also receives the current app
 - If the command matches an entry in the approved list (prefix match with word boundary), it runs normally - the write is explicitly permitted.
 - **Linux:** if not approved, runs under Landlock. If Landlock blocks the command (permission denied), the agent posts `blocked=true, is_write=true` in the job result.
 - **macOS:** if not approved and `is_write=true`, the agent returns `blocked=true, is_write=true` immediately without running the command.
-- The backend receives `blocked=true`, updates `is_write` on the job record, looks up the requesting user, and creates a pending record in the `approvals` table.
+- The backend receives `blocked=true`, updates `is_write` on the job record, looks up the requesting user, and creates a pending record in the `approvals` table - scoped to the agent, or to its **fleet** if the agent is a fleet member (see [Fleets](#fleets)).
 - An operator or admin can review these records (tenant console → Approvals, or the `/tenant/approvals` endpoints) and approve or deny them.
 - Once approved, the command prefix is included in the approved list on the next sync, and the command runs without restriction.
 
@@ -376,10 +481,11 @@ Expiry happens through two mechanisms that run in parallel:
 
 **Lazy expiry on read** - whenever `list_by_agent` or `list_by_tenant` is called with `status="approved"`, the repo checks the returned records against the current time. Any record with `expires_at <= now` is immediately marked `expired` in the database before the response is returned. This keeps the effective list accurate between scheduled sweeps.
 
-**Scheduled sweeps** - the heartbeat checker (running every minute) performs two time-based sweeps:
+**Scheduled sweeps** - the heartbeat checker (running every minute) performs several time-based sweeps:
 
+- **Every minute** - marks ACTIVE agents with no heartbeat in 45s as `INACTIVE`, and **reaps dead fleet members**: any fleet member whose last heartbeat is older than its fleet's `reap_after_seconds` (falling back to `FLEET_REAP_AFTER_SECONDS`, default 30 min) is deleted, writing an `agent.reaped` history + audit entry first. This is the backstop for autoscaler instances that scaled in without a clean `POST /agent/deregister`.
 - **Top of every hour** - scans for all `approved` records with `expires_at < now` and bulk-marks them `expired`. Catches any records missed between lazy-expiry reads.
-- **Start of every day (00:00 UTC)** - deletes terminal records (`denied` and `expired`) older than `APPROVAL_RETENTION_DAYS` (default 7, configurable via env var). Prevents unbounded table growth.
+- **Start of every day (00:00 UTC)** - sweeps each tenant and deletes terminal approvals, stale jobs, fan-out runs, tenant audit entries, and agent history past **that tenant's** retention settings (defaults 7/7/30/90/30 days; tenant admin can change them, platform admin can override). The cross-tenant platform audit trail uses the deployment-wide `AUDIT_RETENTION_DAYS`. Prevents unbounded table growth.
 
 The lazy expiry and the hourly sweep are idempotent and safe to run concurrently - both use conditional writes (`status = 'approved'` guard) so double-processing a record is harmless.
 
@@ -412,16 +518,26 @@ Every resource (agent, user, job, approval) belongs to a tenant. The backend enf
 
 ## Agent access control
 
-Within a tenant, individual users can be further restricted to a subset of agents. This is separate from tenant isolation and is enforced at the handler layer via `can_access_agent(user, agent)` in `shared/access.py`.
+Within a tenant, non-admin users are scoped to a subset of agents/fleets, **read-only or read-write**. This is separate from tenant isolation and is enforced via `can_access_agent(user, agent)` (read) and `can_write_agent(user, agent)` (write) in `shared/access.py`.
 
-A user record can carry two optional restriction fields:
+**Admins are always tenant-wide** (unrestricted). Every other user has **no access by default** and is granted explicitly. A user record carries four scope lists, partitioned by capability:
 
 | Field | Effect |
 |---|---|
-| `allowed_agent_ids` | User can only access agents whose `agent_id` is in this list |
-| `allowed_fleet_ids` | User can only access agents whose `fleet_id` is in this list |
+| `readwrite_agent_ids` | Agents this user can **read and write** (run write commands, subject to the agent's mode) |
+| `readonly_agent_ids` | Agents this user can **read** (read commands + view) but not write |
+| `readwrite_fleet_ids` | Fleets whose members are read-write for this user |
+| `readonly_fleet_ids` | Fleets whose members are read-only for this user |
 
-If both fields are `None` (the default), the user is unrestricted and can access any agent in their tenant.
+Semantics:
+
+- **Read access** = the union of all four lists. **Write access** = the `readwrite_*` lists only.
+- **No wildcard.** Only admins are tenant-wide (via `None` lists). Granting a non-admin "all agents" means every agent id listed explicitly, so newly created agents are not auto-included (grant them at creation via `grant_user_ids`, or re-grant). A `*` entry is rejected.
+- All four `None` → unrestricted (admins, or an explicitly tenant-wide account). For a non-admin the default is **empty lists = no access**.
+- The read-write and read-only lists are a **partition** (an id can't be in both); if it ever is, the read-write grant wins.
+- **Fleet members can't be granted by individual `agent_id`** - their ids are ephemeral (they churn as an autoscaler scales), so a specific fleet-member id in the `*_agent_ids` lists is rejected. Grant access to them via their **fleet** (`readwrite_fleet_ids` / `readonly_fleet_ids`) instead.
+
+Both helpers are role-aware only through the data: admins are created with `None` lists (unrestricted); non-admins with empty lists (no access) grow their grants via `PUT /tenant/users/{id}/agents`, which sets all four lists. The read-only cap is enforced at **job submission** and **approval creation** - a read-only user's write is rejected `403` in *any* mode (it never bypasses the agent's own policy mode, it just stops this user attempting the write).
 
 `can_access_agent` is called on every operation that touches a specific agent, including:
 

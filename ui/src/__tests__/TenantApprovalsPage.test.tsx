@@ -55,6 +55,7 @@ const K8S_APPROVAL: Approval = {
 
 function renderOperator(approvals: Approval[] = [APPROVAL_1, APPROVAL_2]) {
   vi.spyOn(api, 'listTenantAgents').mockResolvedValue({ agents: [] });
+  vi.spyOn(api, 'listFleets').mockResolvedValue({ fleets: [], default_reap_after_seconds: 1800 });
   vi.spyOn(api, 'listAllTenantApprovals').mockResolvedValue({ approvals });
   return render(<TenantApprovalsPage config={CONFIG} />);
 }
@@ -173,6 +174,40 @@ describe('operator view rendering', () => {
     const denyButtons    = screen.getAllByRole('button', { name: /^Deny$/ });
     expect(approveButtons.length).toBe(2);
     expect(denyButtons.length).toBe(2);
+  });
+
+  it('switches to fleet scope: queries with scope=fleet and shows the fleet picker', async () => {
+    vi.spyOn(api, 'listTenantAgents').mockResolvedValue({ agents: [] });
+    vi.spyOn(api, 'listFleets').mockResolvedValue({
+      fleets: [{ fleet_id: 'fleet_a', name: 'web-asg', tenant_id: 'tenant_1', status: 'ACTIVE', mode: 'approved', created_at: '2026-06-01T00:00:00Z' } as unknown as import('../types').Fleet],
+      default_reap_after_seconds: 1800,
+    });
+    const listSpy = vi.spyOn(api, 'listAllTenantApprovals').mockResolvedValue({ approvals: [] });
+    render(<TenantApprovalsPage config={CONFIG} />);
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Fleets' }));
+
+    await waitFor(() => {
+      expect(listSpy.mock.calls.some(c => (c[2] as Record<string, string>)?.scope === 'fleet')).toBe(true);
+    });
+    expect(await screen.findByText('All fleets')).toBeInTheDocument();
+  });
+
+  it('renders a fleet-scoped approval with the fleet name and a fleet badge', async () => {
+    const fleetApproval: Approval = {
+      approval_id: 'appr_f1',
+      agent_id: null,
+      fleet_id: 'fleet_a',
+      fleet_name: 'web-asg',
+      scope: 'fleet',
+      tenant_id: 'tenant_1',
+      command: 'docker restart app',
+      status: 'pending',
+      created_at: '2026-06-01T10:00:00Z',
+    };
+    renderOperator([fleetApproval]);
+    expect(await screen.findByText('web-asg')).toBeInTheDocument();
+    expect(screen.getByText('fleet')).toBeInTheDocument();
   });
 });
 

@@ -41,6 +41,12 @@ export function UsersPage({ config }: { config: Config }) {
   const [tenants, setTenants] = useState<Tenant[]>([]);
   const [tenantId, setTenantId] = useState('');
   const [users, setUsers] = useState<User[]>([]);
+  const PAGE = 20;
+  const [total, setTotal] = useState(0);
+  const [offset, setOffset] = useState(0);
+  const [search, setSearch] = useState('');
+  const [query, setQuery] = useState('');
+  const applySearch = () => { setQuery(search.trim()); setOffset(0); };
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [modal, setModal] = useState<ModalType>(null);
@@ -61,13 +67,17 @@ export function UsersPage({ config }: { config: Config }) {
   const loadUsers = useCallback(() => {
     if (!tenantId) return;
     setLoading(true);
-    listUsers(apiUrl, adminToken, tenantId)
-      .then(r => setUsers(r.users))
+    const params: Record<string, string> = { limit: String(PAGE), offset: String(offset) };
+    if (query) params.q = query;
+    listUsers(apiUrl, adminToken, tenantId, params)
+      .then(r => { setUsers(r.users); setTotal(r.total ?? r.users.length); })
       .catch(() => setError('Failed to load users'))
       .finally(() => setLoading(false));
-  }, [apiUrl, adminToken, tenantId]);
+  }, [apiUrl, adminToken, tenantId, query, offset]);
 
   useEffect(() => { setUsers([]); loadUsers(); }, [loadUsers]);
+  // Switching tenant resets to the first page.
+  useEffect(() => { setOffset(0); setSearch(''); setQuery(''); }, [tenantId]);
 
   const handleResetPw = async (u: User) => {
     const r = await platformResetUserPassword(apiUrl, adminToken, tenantId, u.user_id);
@@ -147,9 +157,23 @@ export function UsersPage({ config }: { config: Config }) {
         <div className="flex flex-col items-center justify-center py-24 text-center">
           <p className="text-sm text-gray-400">Select a tenant above to manage users.</p>
         </div>
-      ) : loading ? (
+      ) : loading && users.length === 0 ? (
         <div className="flex justify-center py-16"><Spinner /></div>
       ) : (
+       <>
+        <div className="flex items-center gap-2 mb-4">
+          <input
+            value={search}
+            onChange={e => setSearch(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter') applySearch(); }}
+            placeholder="Search name or username…"
+            className="border border-gray-300 rounded-lg px-3 py-1.5 text-sm bg-white shadow-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 w-72"
+          />
+          <button onClick={applySearch} className="text-sm text-white bg-slate-800 hover:bg-slate-700 rounded-lg px-3 py-1.5">Search</button>
+          {query && (
+            <button onClick={() => { setSearch(''); setQuery(''); setOffset(0); }} className="text-sm text-indigo-600 hover:text-indigo-800" aria-label="Clear search">✕</button>
+          )}
+        </div>
         <div className="bg-white rounded-xl border border-gray-200 shadow-sm overflow-hidden">
           <DataTable
             columns={[
@@ -212,7 +236,25 @@ export function UsersPage({ config }: { config: Config }) {
               </tr>
             )}
           />
+          {total > PAGE && (
+            <div className="flex items-center justify-between px-4 py-3 border-t border-gray-100 bg-gray-50/60 text-sm text-gray-600">
+              <span>Showing {offset + 1}–{Math.min(offset + PAGE, total)} of {total}</span>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => setOffset(Math.max(0, offset - PAGE))}
+                  disabled={offset === 0 || loading}
+                  className="px-3 py-1 rounded-md border border-gray-300 bg-white disabled:opacity-40 hover:bg-gray-50"
+                >Prev</button>
+                <button
+                  onClick={() => setOffset(offset + PAGE)}
+                  disabled={offset + PAGE >= total || loading}
+                  className="px-3 py-1 rounded-md border border-gray-300 bg-white disabled:opacity-40 hover:bg-gray-50"
+                >Next</button>
+              </div>
+            </div>
+          )}
         </div>
+       </>
       )}
 
       {modal === 'create' && tenantId && (

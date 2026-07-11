@@ -23,9 +23,35 @@ def upgrade() -> None:
         sa.Column('name', sa.String(), nullable=True),
         sa.Column('status', sa.String(), nullable=True, server_default='ACTIVE'),
         sa.Column('created_at', sa.String(), nullable=True),
+        sa.Column('settings', sa.JSON(), nullable=True),
         sa.PrimaryKeyConstraint('tenant_id'),
     )
     op.create_index('ix_tenants_name', 'tenants', ['name'], unique=True)
+
+    op.create_table(
+        'fleets',
+        sa.Column('fleet_id', sa.String(), nullable=False),
+        sa.Column('tenant_id', sa.String(), nullable=False),
+        sa.Column('name', sa.String(), nullable=False),
+        sa.Column('mode', sa.String(), nullable=False, server_default='readonly'),
+        sa.Column('grant_service_mgmt', sa.Boolean(), nullable=True, server_default=sa.false()),
+        sa.Column('grant_docker', sa.Boolean(), nullable=True, server_default=sa.false()),
+        sa.Column('tags', sa.JSON(), nullable=True),
+        sa.Column('join_token_hash', sa.String(), nullable=True),
+        sa.Column('prev_join_token_hash', sa.String(), nullable=True),
+        sa.Column('prev_join_token_expires_at', sa.Integer(), nullable=True),
+        sa.Column('status', sa.String(), nullable=False, server_default='ACTIVE'),
+        sa.Column('reap_after_seconds', sa.Integer(), nullable=True),
+        sa.Column('max_fanout', sa.Integer(), nullable=True),
+        sa.Column('wave_policy', sa.JSON(), nullable=True),
+        sa.Column('created_at', sa.String(), nullable=True),
+        sa.Column('created_by', sa.String(), nullable=True),
+        sa.PrimaryKeyConstraint('fleet_id'),
+    )
+    op.create_index('ix_fleets_tenant_id', 'fleets', ['tenant_id'])
+    op.create_index('ix_fleets_tenant_name', 'fleets', ['tenant_id', 'name'], unique=True)
+    op.create_index('ix_fleets_join_token_hash', 'fleets', ['join_token_hash'], unique=True)
+    op.create_index('ix_fleets_prev_join_token_hash', 'fleets', ['prev_join_token_hash'])
 
     op.create_table(
         'users',
@@ -33,8 +59,10 @@ def upgrade() -> None:
         sa.Column('tenant_id', sa.String(), nullable=False),
         sa.Column('name', sa.String(), nullable=True),
         sa.Column('created_at', sa.String(), nullable=True),
-        sa.Column('allowed_agent_ids', sa.JSON(), nullable=True),
-        sa.Column('allowed_fleet_ids', sa.JSON(), nullable=True),
+        sa.Column('readwrite_agent_ids', sa.JSON(), nullable=True),
+        sa.Column('readwrite_fleet_ids', sa.JSON(), nullable=True),
+        sa.Column('readonly_agent_ids', sa.JSON(), nullable=True),
+        sa.Column('readonly_fleet_ids', sa.JSON(), nullable=True),
         sa.Column('status', sa.String(), nullable=True, server_default='ACTIVE'),
         # Password-based login fields
         sa.Column('username', sa.String(), nullable=True),
@@ -78,9 +106,13 @@ def upgrade() -> None:
         sa.Column('grant_docker', sa.Boolean(), nullable=True, server_default=sa.false()),
         sa.Column('service_mgmt_detected', sa.Boolean(), nullable=True),
         sa.Column('docker_detected', sa.Boolean(), nullable=True),
+        sa.Column('grants_exception', sa.String(), nullable=True),
         sa.PrimaryKeyConstraint('agent_id'),
     )
     op.create_index('ix_agents_tenant_id', 'agents', ['tenant_id'])
+    # Per-fleet lookups (member list, fan-out, reaper) query by fleet_id directly
+    # instead of scanning all of a tenant's agents - essential for large fleets.
+    op.create_index('ix_agents_fleet_id', 'agents', ['fleet_id'])
     # Credential-only auth: agents are looked up by token hash, never by a
     # client-supplied agent_id. Unique so each hash maps to one agent.
     op.create_index('ix_agents_install_token_hash', 'agents', ['install_token_hash'], unique=True)
@@ -91,6 +123,10 @@ def upgrade() -> None:
         sa.Column('job_id', sa.String(), nullable=False),
         sa.Column('tenant_id', sa.String(), nullable=False),
         sa.Column('agent_id', sa.String(), nullable=False),
+        sa.Column('run_id', sa.String(), nullable=True),
+        sa.Column('run_tag', sa.String(), nullable=True),
+        sa.Column('run_fleet_id', sa.String(), nullable=True),
+        sa.Column('wave', sa.Integer(), nullable=True),
         sa.Column('created_by', sa.String(), nullable=True),
         sa.Column('command', sa.Text(), nullable=False),
         sa.Column('status', sa.String(), nullable=False),
@@ -108,14 +144,41 @@ def upgrade() -> None:
     )
     op.create_index('ix_jobs_tenant_id', 'jobs', ['tenant_id'])
     op.create_index('ix_jobs_agent_id', 'jobs', ['agent_id'])
+    op.create_index('ix_jobs_run_id', 'jobs', ['run_id'])
     op.create_index('ix_jobs_created_at', 'jobs', ['created_at'])
     op.create_index('ix_jobs_created_by', 'jobs', ['created_by'])
+
+    op.create_table(
+        'runs',
+        sa.Column('run_id', sa.String(), nullable=False),
+        sa.Column('tenant_id', sa.String(), nullable=False),
+        sa.Column('fleet_id', sa.String(), nullable=True),
+        sa.Column('tag', sa.String(), nullable=True),
+        sa.Column('command', sa.Text(), nullable=True),
+        sa.Column('created_by', sa.String(), nullable=True),
+        sa.Column('created_at', sa.String(), nullable=True),
+        sa.Column('dispatched', sa.Integer(), nullable=True),
+        sa.Column('skipped_count', sa.Integer(), nullable=True),
+        sa.Column('skipped', sa.JSON(), nullable=True),
+        sa.Column('idempotency_key', sa.String(), nullable=True),
+        sa.Column('state', sa.String(), nullable=True),
+        sa.Column('counts', sa.JSON(), nullable=True),
+        sa.Column('parent_run_id', sa.String(), nullable=True),
+        sa.Column('rollout', sa.JSON(), nullable=True),
+        sa.Column('current_wave', sa.Integer(), nullable=True),
+        sa.Column('wave_total', sa.Integer(), nullable=True),
+        sa.PrimaryKeyConstraint('run_id'),
+    )
+    op.create_index('ix_runs_tenant_id', 'runs', ['tenant_id'])
+    op.create_index('ix_runs_fleet_id', 'runs', ['fleet_id'])
+    op.create_index('ix_runs_created_at', 'runs', ['created_at'])
 
     op.create_table(
         'approvals',
         sa.Column('approval_id', sa.String(), nullable=False),
         sa.Column('tenant_id', sa.String(), nullable=False),
-        sa.Column('agent_id', sa.String(), nullable=False),
+        sa.Column('agent_id', sa.String(), nullable=True),
+        sa.Column('fleet_id', sa.String(), nullable=True),
         sa.Column('command', sa.Text(), nullable=False),
         sa.Column('k8s_rule', sa.JSON(), nullable=True),
         sa.Column('requested_by', sa.String(), nullable=False),
@@ -130,6 +193,7 @@ def upgrade() -> None:
     )
     op.create_index('ix_approvals_tenant_id', 'approvals', ['tenant_id'])
     op.create_index('ix_approvals_agent_id', 'approvals', ['agent_id'])
+    op.create_index('ix_approvals_fleet_id', 'approvals', ['fleet_id'])
     op.create_index('ix_approvals_created_at', 'approvals', ['created_at'])
 
     # API tokens - named tokens created by tenant admins for CLI/MCP
@@ -192,6 +256,7 @@ def downgrade() -> None:
     op.drop_index('ix_agent_history_created_at', table_name='agent_history')
     op.drop_index('ix_agent_history_tenant_id', table_name='agent_history')
     op.drop_index('ix_agent_history_agent_id', table_name='agent_history')
+    op.drop_table('runs')
     op.drop_table('agent_history')
     op.drop_index('ix_tenants_name', table_name='tenants')
     op.drop_table('audit_logs')
@@ -200,4 +265,5 @@ def downgrade() -> None:
     op.drop_table('jobs')
     op.drop_table('agents')
     op.drop_table('users')
+    op.drop_table('fleets')
     op.drop_table('tenants')

@@ -65,21 +65,35 @@ def handle_agent_job_result(job_id: str, body: dict, raw_token: str) -> dict:
         "is_write": is_write,
     })
 
-    if blocked and not approvals_repo.exists_pending(agent_id, job.get("command")):
-        user = users_repo.get(job.get("created_by"))
-        approvals_repo.create({
-            "approval_id": "appr_" + secrets.token_urlsafe(12),
-            "tenant_id": job.get("tenant_id"),
-            "agent_id": agent_id,
-            "command": job.get("command"),
-            "requested_by": job.get("created_by"),
-            "requester_name": user.get("name") if user else None,
-            "job_id": job_id,
-            "status": "pending",
-            "created_at": _iso(),
-            "reviewed_at": None,
-            "reviewed_by": None,
-        })
+    # Keep the run's cached counts/state current as each member reports (so the run
+    # summary is authoritative even after member jobs are purged on retention).
+    if job.get("run_id"):
+        from handlers.runs import refresh_run
+        refresh_run(job.get("tenant_id"), job.get("run_id"))
+
+    if blocked:
+        # A fleet member's approvals live at the fleet level (not per-agent), so a
+        # blocked write raises a fleet-scoped pending request.
+        command = job.get("command")
+        fleet_id = agent.get("fleet_id")
+        already = (approvals_repo.exists_pending_fleet(fleet_id, command) if fleet_id
+                   else approvals_repo.exists_pending(agent_id, command))
+        if not already:
+            user = users_repo.get(job.get("created_by"))
+            approvals_repo.create({
+                "approval_id": "appr_" + secrets.token_urlsafe(12),
+                "tenant_id": job.get("tenant_id"),
+                "agent_id": None if fleet_id else agent_id,
+                "fleet_id": fleet_id,
+                "command": command,
+                "requested_by": job.get("created_by"),
+                "requester_name": user.get("name") if user else None,
+                "job_id": job_id,
+                "status": "pending",
+                "created_at": _iso(),
+                "reviewed_at": None,
+                "reviewed_by": None,
+            })
 
     return _ok({"ok": True})
 

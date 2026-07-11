@@ -30,6 +30,16 @@ const CONFIG: Record<string, BadgeConfig> = {
   FAILED:    { cls: 'bg-red-50 text-red-600 ring-red-600/20',            dot: 'bg-red-500' },
   REJECTED:  { cls: 'bg-orange-50 text-orange-700 ring-orange-600/20',   dot: 'bg-orange-400' },
   EXPIRED:   { cls: 'bg-gray-50 text-gray-500 ring-gray-500/20',         dot: 'bg-gray-400' },
+  HELD:      { cls: 'bg-slate-50 text-slate-600 ring-slate-500/20',      dot: 'bg-slate-400' },
+  CANCELED:  { cls: 'bg-gray-100 text-gray-500 ring-gray-500/20',        dot: 'bg-gray-400' },
+  // Run state
+  running:   { cls: 'bg-blue-50 text-blue-700 ring-blue-600/20',         dot: 'bg-blue-500 animate-pulse' },
+  succeeded: { cls: 'bg-emerald-50 text-emerald-700 ring-emerald-600/20',dot: 'bg-emerald-500' },
+  partial:   { cls: 'bg-amber-50 text-amber-700 ring-amber-600/20',      dot: 'bg-amber-400' },
+  failed:    { cls: 'bg-red-50 text-red-600 ring-red-600/20',            dot: 'bg-red-500' },
+  paused:    { cls: 'bg-violet-50 text-violet-700 ring-violet-600/20',   dot: 'bg-violet-500' },
+  canceled:  { cls: 'bg-gray-100 text-gray-500 ring-gray-500/20',        dot: 'bg-gray-400' },
+  empty:     { cls: 'bg-gray-50 text-gray-500 ring-gray-500/20',         dot: 'bg-gray-400' },
 };
 
 export function Badge({ value }: { value: string }) {

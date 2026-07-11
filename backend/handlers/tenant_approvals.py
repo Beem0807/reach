@@ -5,11 +5,12 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
 
 import shared.audit as audit
-from shared.access import accessible_agent_ids, can_access_agent, is_agent_restricted
+from shared.access import (accessible_agent_ids, can_access_agent, can_access_fleet,
+                           can_write_agent, can_write_fleet, is_agent_restricted)
 from shared.auth import _bearer, _verify_tenant_token
 from shared.policy import normalize_k8s_rule, rule_to_command
 from shared.response import _err, _iso, _ok
-from shared.store import agents_repo, approvals_repo
+from shared.store import agents_repo, approvals_repo, fleets_repo
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -61,16 +62,20 @@ def handle_list_my_pending(query: dict, raw_token: str) -> dict:
     if status not in ("pending", "approved"):
         return _err("status must be pending or approved", 400)
 
-    agent_ids = None
+    agent_ids = fleet_ids = fleet_id = None
     if agent_id:
         agent = agents_repo.get(agent_id)
         if not agent or not can_access_agent(user, agent):
             return _err("agent not found", 404)
+        # A fleet member's approvals live at the fleet, so query the fleet instead.
+        if agent.get("fleet_id"):
+            fleet_id, agent_id = agent["fleet_id"], None
     elif status == "approved" and is_agent_restricted(user):
         # Approved commands are agent-wide; with no specific agent chosen, show the
-        # approved commands across every agent this developer can access. Unrestricted
-        # developers fall through with agent_ids=None (all tenant agents).
+        # approved commands across every agent and fleet this developer can access.
+        # Unrestricted developers fall through with None (all tenant agents/fleets).
         agent_ids = accessible_agent_ids(user, agents_repo.list_by_tenant(user["tenant_id"]))
+        fleet_ids = [f["fleet_id"] for f in fleets_repo.list_by_tenant(user["tenant_id"]) if can_access_fleet(user, f)]
 
     try:
         limit = int(query.get("limit") or 20)
@@ -85,6 +90,8 @@ def handle_list_my_pending(query: dict, raw_token: str) -> dict:
         status=status,
         agent_id=agent_id,
         agent_ids=agent_ids,
+        fleet_id=fleet_id,
+        fleet_ids=fleet_ids,
         # Pending is the caller's own; approved is the agent's shared allowlist.
         requested_by=user["user_id"] if status == "pending" else None,
         kind=kind,
@@ -110,17 +117,26 @@ def handle_list_agent_approved(agent_id: str, raw_token: str, status: str = "app
     if not agent or not can_access_agent(user, agent):
         return _err("agent not found", 404)
 
+    # A fleet member has no per-agent approvals - its effective (and own) approval
+    # records live at the fleet, so query there instead.
+    fleet_id = agent.get("fleet_id")
+
+    def _list(status_val, own):
+        requested_by = user["user_id"] if own else None
+        if fleet_id:
+            return approvals_repo.list_by_fleet(fleet_id, status=status_val, requested_by=requested_by)
+        return approvals_repo.list_by_agent(agent_id, status=status_val, requested_by=requested_by)
+
     if status == "approved":
-        items = approvals_repo.list_by_agent(agent_id, status="approved")
-    elif status in ("pending", "denied"):
-        items = approvals_repo.list_by_agent(agent_id, status=status, requested_by=user["user_id"])
-    elif status == "expired":
-        items = approvals_repo.list_by_agent(agent_id, status="expired", requested_by=user["user_id"])
+        items = _list("approved", own=False)
+    elif status in ("pending", "denied", "expired"):
+        items = _list(status, own=True)
     else:
         return _err(f"invalid status '{status}'; use approved, pending, denied, or expired", 400)
 
     approved_commands = [a["command"] for a in items] if status == "approved" else []
-    return _ok({"approved_commands": approved_commands, "approvals": items})
+    # Surface fleet membership so the CLI can redirect to the fleet approvals view.
+    return _ok({"approved_commands": approved_commands, "approvals": items, "agent_fleet_id": fleet_id})
 
 
 def handle_tenant_list_all_approvals(query: dict, raw_token: str) -> dict:
@@ -132,10 +148,15 @@ def handle_tenant_list_all_approvals(query: dict, raw_token: str) -> dict:
         return _err("forbidden", 403)
 
     agent_id = (query.get("agent_id") or "").strip() or None
+    fleet_id = (query.get("fleet_id") or "").strip() or None
     status = (query.get("status") or "").strip() or None
     kind = (query.get("type") or "").strip().lower() or None
     if kind not in (None, "host", "k8s"):
         return _err("type must be host or k8s", 400)
+    # scope narrows to standalone-agent ('agent') or fleet ('fleet') approvals.
+    scope = (query.get("scope") or "").strip().lower() or None
+    if scope not in (None, "agent", "fleet"):
+        return _err("scope must be agent or fleet", 400)
     q = (query.get("q") or "").strip() or None
 
     try:
@@ -146,29 +167,43 @@ def handle_tenant_list_all_approvals(query: dict, raw_token: str) -> dict:
     limit = max(1, min(limit, 100))
     offset = max(0, offset)
 
-    # Agent scoping applies to every role the same way: an agent-restricted operator
-    # (or admin) only sees approvals for the agents they're assigned to. If they ask
-    # for a specific agent they can't access, they see nothing.
-    agent_ids = None
+    # Scoping applies to every role the same way: a scoped operator/admin only sees
+    # approvals for the agents and fleets they're assigned to (asking for one they
+    # can't access shows nothing). Approvals target an agent OR a fleet.
+    agent_ids = fleet_ids = None
     if is_agent_restricted(user):
-        allowed = accessible_agent_ids(user, agents_repo.list_by_tenant(user["tenant_id"]))
+        allowed_agents = accessible_agent_ids(user, agents_repo.list_by_tenant(user["tenant_id"]))
+        allowed_fleets = [f["fleet_id"] for f in fleets_repo.list_by_tenant(user["tenant_id"]) if can_access_fleet(user, f)]
         if agent_id is not None:
-            agent_ids = [agent_id] if agent_id in allowed else []
+            agent_ids = [agent_id] if agent_id in allowed_agents else []
             agent_id = None
+        elif fleet_id is not None:
+            fleet_ids = [fleet_id] if fleet_id in allowed_fleets else []
+            fleet_id = None
+        elif scope == "agent":
+            agent_ids = allowed_agents
+        elif scope == "fleet":
+            fleet_ids = allowed_fleets
         else:
-            agent_ids = allowed
+            agent_ids, fleet_ids = allowed_agents, allowed_fleets
 
     approvals, total = approvals_repo.search_by_tenant(
         user["tenant_id"], status=status, agent_id=agent_id, agent_ids=agent_ids,
-        kind=kind, q=q, limit=limit, offset=offset,
+        fleet_id=fleet_id, fleet_ids=fleet_ids, scope=scope, kind=kind, q=q, limit=limit, offset=offset,
     )
-    _cache: dict = {}
-    def _hostname(aid: str):
-        if aid not in _cache:
-            a = agents_repo.get(aid)
-            _cache[aid] = (a or {}).get("hostname")
-        return _cache[aid]
-    enriched = [{**a, "agent_hostname": _hostname(a["agent_id"])} for a in approvals]
+    _ac: dict = {}
+    _fc: dict = {}
+    def _labels(a: dict) -> dict:
+        if a.get("fleet_id"):
+            fid = a["fleet_id"]
+            if fid not in _fc:
+                _fc[fid] = (fleets_repo.get(fid) or {}).get("name")
+            return {"scope": "fleet", "fleet_name": _fc[fid], "agent_hostname": None}
+        aid = a.get("agent_id")
+        if aid not in _ac:
+            _ac[aid] = (agents_repo.get(aid) or {}).get("hostname") if aid else None
+        return {"scope": "agent", "agent_hostname": _ac[aid], "fleet_name": None}
+    enriched = [{**a, **_labels(a)} for a in approvals]
     return _ok({"approvals": enriched, "total": total, "limit": limit, "offset": offset})
 
 
@@ -183,10 +218,20 @@ def handle_tenant_review_approval(approval_id: str, action: str, raw_token: str,
     if not approval or approval.get("tenant_id") != user["tenant_id"]:
         return _err("approval not found", 404)
 
-    # An agent-restricted operator can only act on approvals for their agents.
-    agent = agents_repo.get(approval.get("agent_id"))
-    if not agent or not can_access_agent(user, agent):
-        return _err("approval not found", 404)
+    # Approvals gate write commands, so reviewing one requires read-write access to
+    # the target (agent or fleet). Read-only / out-of-scope reviewers are blocked.
+    if approval.get("fleet_id"):
+        fleet = fleets_repo.get(approval["fleet_id"])
+        if not fleet or not can_access_fleet(user, fleet):
+            return _err("approval not found", 404)
+        if not can_write_fleet(user, fleet):
+            return _err("you have read-only access to this fleet", 403)
+    else:
+        agent = agents_repo.get(approval.get("agent_id"))
+        if not agent or not can_access_agent(user, agent):
+            return _err("approval not found", 404)
+        if not can_write_agent(user, agent):
+            return _err("you have read-only access to this agent", 403)
 
     current_status = approval.get("status")
     if current_status in ("denied", "expired"):
@@ -227,23 +272,51 @@ def handle_tenant_review_approval(approval_id: str, action: str, raw_token: str,
 
 
 def handle_tenant_create_approval(body: dict, raw_token: str) -> dict:
-    """Create an approval. Operators/admins create directly approved; developers create pending."""
+    """Create an approval for a standalone agent or a whole fleet. Operators/admins
+    create directly approved; developers create pending. Fleet members carry no
+    agent-scoped approvals - they inherit their fleet's."""
     user = _verify_tenant_token(raw_token)
     if not user:
         return _err("unauthorized", 401)
 
     agent_id = (body or {}).get("agent_id", "").strip()
-    if not agent_id:
-        return _err("agent_id is required", 400)
+    fleet_id = (body or {}).get("fleet_id", "").strip()
+    if agent_id and fleet_id:
+        return _err("specify either agent_id or fleet_id, not both", 400)
+    if not agent_id and not fleet_id:
+        return _err("agent_id or fleet_id is required", 400)
 
-    agent = agents_repo.get(agent_id)
-    if not agent or agent.get("tenant_id") != user["tenant_id"]:
-        return _err("agent not found", 404)
-    # Requesting/pre-approving is bound by agent access, same as every other path.
-    if not can_access_agent(user, agent):
-        return _err("agent not found", 404)
+    if fleet_id:
+        # Fleet approval: applies to every current and future member. Fleets are
+        # host-only, so these are always command-based (never k8s rules).
+        fleet = fleets_repo.get(fleet_id)
+        if not fleet or fleet.get("tenant_id") != user["tenant_id"] or not can_access_fleet(user, fleet):
+            return _err("fleet not found", 404)
+        if not can_write_fleet(user, fleet):
+            return _err("you have read-only access to this fleet", 403)
+        is_k8s = False
+        scope_agent_id, scope_fleet_id = None, fleet_id
+        scope_meta = {"fleet_id": fleet_id}
 
-    is_k8s = (agent.get("type") or "host") == "k8s"
+        def _active(status, requested_by=None):
+            return approvals_repo.list_by_fleet(fleet_id, status=status, requested_by=requested_by)
+    else:
+        agent = agents_repo.get(agent_id)
+        if not agent or agent.get("tenant_id") != user["tenant_id"] or not can_access_agent(user, agent):
+            return _err("agent not found", 404)
+        # Fleet members are approved at the fleet level, never by individual agent id.
+        if agent.get("fleet_id"):
+            return _err("this agent is a fleet member - approve commands on its fleet, not the agent", 409)
+        # Approvals only ever cover write commands, so a read-only user has no business
+        # creating one (a pending request or a pre-approval) for this agent.
+        if not can_write_agent(user, agent):
+            return _err("you have read-only access to this agent", 403)
+        is_k8s = (agent.get("type") or "host") == "k8s"
+        scope_agent_id, scope_fleet_id = agent_id, None
+        scope_meta = {"agent_id": agent_id}
+
+        def _active(status, requested_by=None):
+            return approvals_repo.list_by_agent(agent_id, status=status, requested_by=requested_by)
 
     if not _require_role(user, "operator"):
         # Developer path: single command/rule → pending
@@ -261,12 +334,12 @@ def handle_tenant_create_approval(body: dict, raw_token: str) -> dict:
         def _same(a):
             return a.get("k8s_rule") == k8s_rule if is_k8s else a.get("command") == command
 
-        active = approvals_repo.list_by_agent(agent_id, status="approved")
+        active = _active("approved")
         if any(_same(a) for a in active):
-            return _err("an equivalent rule already has an active approval for this agent"
-                        if is_k8s else "command already has an active approval for this agent", 409)
+            return _err("an equivalent rule already has an active approval here"
+                        if is_k8s else "command already has an active approval here", 409)
 
-        pending = approvals_repo.list_by_agent(agent_id, status="pending", requested_by=user["user_id"])
+        pending = _active("pending", user["user_id"])
         if any(_same(a) for a in pending):
             return _err("you already have a pending request for this rule"
                         if is_k8s else "you already have a pending request for this command", 409)
@@ -276,7 +349,8 @@ def handle_tenant_create_approval(body: dict, raw_token: str) -> dict:
         approval = {
             "approval_id": "appr_" + secrets.token_urlsafe(12),
             "tenant_id": user["tenant_id"],
-            "agent_id": agent_id,
+            "agent_id": scope_agent_id,
+            "fleet_id": scope_fleet_id,
             "command": command,
             "k8s_rule": k8s_rule,
             "requested_by": user.get("user_id", ""),
@@ -297,9 +371,9 @@ def handle_tenant_create_approval(body: dict, raw_token: str) -> dict:
             actor_role=user.get("role", ""),
             resource_type="approval",
             resource_id=approval["approval_id"],
-            metadata={"command": command, "agent_id": agent_id},
+            metadata={"command": command, **scope_meta},
         )
-        logger.info("Approval request (pending) created for agent=%s command=%s by user=%s", agent_id, command, user.get("user_id"))
+        logger.info("Approval request (pending) created for %s command=%s by user=%s", scope_meta, command, user.get("user_id"))
         return _ok(approval, 201)
 
     # Operator/admin path: create directly as approved, supports bulk + duration.
@@ -348,7 +422,7 @@ def handle_tenant_create_approval(body: dict, raw_token: str) -> dict:
     if not ok:
         return _err(f"invalid duration '{duration}'; use 1h, 8h, 24h, 7d, permanent, or Nh/Nd", 400)
 
-    active = approvals_repo.list_by_agent(agent_id, status="approved")
+    active = _active("approved")
     active_commands = {a["command"] for a in active}
     active_rules = [a.get("k8s_rule") for a in active if a.get("k8s_rule")]
     now = _iso()
@@ -365,7 +439,8 @@ def handle_tenant_create_approval(body: dict, raw_token: str) -> dict:
         approval = {
             "approval_id": "appr_" + secrets.token_urlsafe(12),
             "tenant_id": user["tenant_id"],
-            "agent_id": agent_id,
+            "agent_id": scope_agent_id,
+            "fleet_id": scope_fleet_id,
             "command": command,
             "k8s_rule": rule,
             "requested_by": user.get("user_id", ""),
@@ -388,15 +463,15 @@ def handle_tenant_create_approval(body: dict, raw_token: str) -> dict:
             actor_name=reviewer,
             actor_role=user.get("role", ""),
             resource_type="approval",
-            resource_id=agent_id,
-            metadata={"commands": [a["command"] for a in created], "agent_id": agent_id, "expires_at": expires_at, "count": len(created)},
+            resource_id=scope_agent_id or scope_fleet_id,
+            metadata={"commands": [a["command"] for a in created], **scope_meta, "expires_at": expires_at, "count": len(created)},
         )
-    logger.info("Pre-approved %d commands for agent=%s by user=%s (%d skipped)", len(created), agent_id, user.get("user_id"), len(skipped))
+    logger.info("Pre-approved %d commands for %s by user=%s (%d skipped)", len(created), scope_meta, user.get("user_id"), len(skipped))
 
     if bulk:
         return _ok({"created": created, "skipped": skipped})
     if skipped:
-        return _err("command already has an active approval for this agent", 409)
+        return _err("command already has an active approval here", 409)
     return _ok(created[0])
 
 
@@ -410,10 +485,16 @@ def handle_tenant_delete_approval(approval_id: str, raw_token: str) -> dict:
     approval = approvals_repo.get(approval_id)
     if not approval or approval.get("tenant_id") != user["tenant_id"]:
         return _err("approval not found", 404)
-    # An agent-restricted operator can only delete approvals for their agents.
-    agent = agents_repo.get(approval.get("agent_id"))
-    if not agent or not can_access_agent(user, agent):
-        return _err("approval not found", 404)
+    # A scoped operator can only delete approvals for the agents/fleets they can
+    # access. A fleet approval has no agent_id - check the fleet instead.
+    if approval.get("fleet_id"):
+        fleet = fleets_repo.get(approval["fleet_id"])
+        if not fleet or not can_access_fleet(user, fleet):
+            return _err("approval not found", 404)
+    else:
+        agent = agents_repo.get(approval.get("agent_id"))
+        if not agent or not can_access_agent(user, agent):
+            return _err("approval not found", 404)
 
     approvals_repo.delete(approval_id)
     audit.write(

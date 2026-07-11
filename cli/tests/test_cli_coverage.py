@@ -145,14 +145,14 @@ class TestWhoamiOptionalFields:
 # ---------------------------------------------------------------------------
 
 class TestAgentsListHttpError:
-    def test_http_error_exits_1(self):
+    def test_http_error_exits_2(self):
         import requests
         mock_resp = MagicMock(status_code=500, text="internal error")
         mock_client = MagicMock()
         mock_client.list_agents.side_effect = requests.HTTPError(response=mock_resp)
         with _mock_cfg(), patch("reach.main.ReachClient", return_value=mock_client):
             result = runner.invoke(app, ["agents", "list"])
-        assert result.exit_code == 1
+        assert result.exit_code == 2
         assert "500" in result.output
 
 
@@ -161,7 +161,7 @@ class TestAgentsListHttpError:
 # ---------------------------------------------------------------------------
 
 class TestExecTimeout:
-    def test_timeout_exits_1_with_message(self):
+    def test_timeout_exits_2_with_message(self):
         mock_client = MagicMock()
         mock_client.create_job.return_value = {"job_id": "job_1"}
         # get_job always returns PENDING so we hit the timeout
@@ -169,10 +169,10 @@ class TestExecTimeout:
         with _mock_cfg(), patch("reach.main.ReachClient", return_value=mock_client), \
              patch("reach.main.time.monotonic", side_effect=[0, 0, 999]):
             result = runner.invoke(app, ["exec", "--timeout", "1", "--", "ls"])
-        assert result.exit_code == 1
-        assert "Timed out" in result.output
+        assert result.exit_code == 2
+        assert "timed out" in result.output.lower()
 
-    def test_poll_http_error_exits_1(self):
+    def test_poll_http_error_exits_2(self):
         import requests
         mock_resp = MagicMock(status_code=500, text="poll error")
         mock_client = MagicMock()
@@ -181,7 +181,7 @@ class TestExecTimeout:
         with _mock_cfg(), patch("reach.main.ReachClient", return_value=mock_client), \
              patch("reach.main.time.monotonic", return_value=0):
             result = runner.invoke(app, ["exec", "--timeout", "60", "--", "ls"])
-        assert result.exit_code == 1
+        assert result.exit_code == 2
         assert "poll" in result.output.lower() or "Error" in result.output
 
 
@@ -190,14 +190,14 @@ class TestExecTimeout:
 # ---------------------------------------------------------------------------
 
 class TestHistoryHttpError:
-    def test_http_error_exits_1(self):
+    def test_http_error_exits_2(self):
         import requests
         mock_resp = MagicMock(status_code=403, text="forbidden")
         mock_client = MagicMock()
         mock_client.list_jobs.side_effect = requests.HTTPError(response=mock_resp)
         with _mock_cfg(), patch("reach.main.ReachClient", return_value=mock_client):
-            result = runner.invoke(app, ["history"])
-        assert result.exit_code == 1
+            result = runner.invoke(app, ["jobs"])
+        assert result.exit_code == 2
         assert "403" in result.output
 
 
@@ -353,18 +353,18 @@ class TestPrintJobResultTrailingNewline:
 # ---------------------------------------------------------------------------
 
 class TestProfileDelete:
-    def test_delete_unknown_profile_exits_1(self):
+    def test_delete_unknown_profile_exits_2(self):
         full = {"active_profile": "default", "profiles": {"default": {}}}
         with patch("reach.main.cfg_module.load", return_value=full):
             result = runner.invoke(app, ["profile", "delete", "nonexistent"])
-        assert result.exit_code == 1
+        assert result.exit_code == 2
         assert "not found" in result.output
 
-    def test_delete_active_profile_exits_1(self):
+    def test_delete_active_profile_exits_2(self):
         full = {"active_profile": "default", "profiles": {"default": {}}}
         with patch("reach.main.cfg_module.load", return_value=full):
             result = runner.invoke(app, ["profile", "delete", "default"])
-        assert result.exit_code == 1
+        assert result.exit_code == 2
         assert "active" in result.output
 
     def test_delete_cancelled_exits_0(self):

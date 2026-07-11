@@ -13,6 +13,7 @@ import types
 from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 
 # ---------------------------------------------------------------------------
 # Stub the FastMCP SDK so importing mcp_server works without the dependency.
@@ -196,7 +197,8 @@ class TestExecCommand:
         assert r["status"] == "SUCCEEDED"
         assert r["job_id"] == "job_1"
         assert "topsecretvalue" not in r["stdout"]
-        client.create_job.assert_called_once_with("agent_a", "env")
+        # A read runs straight through (dry-run pre-check reports is_write False) and dispatches.
+        client.create_job.assert_any_call("agent_a", "env")
 
     def test_resolves_alias_for_agent(self):
         client, p = _mock_client(default_agent="")
@@ -229,6 +231,59 @@ class TestExecCommand:
         assert r["status"] == "PENDING"
         assert "Timed out" in r["error"]
         client.get_job.assert_not_called()
+
+
+class TestExecCommandConfirmGate:
+    """Single-agent writes are confirm-gated (symmetry with fleet_exec / exec_by_tag)."""
+
+    def _write_client(self):
+        client, p = _mock_client(default_agent="agent_a")
+
+        def _create(agent_id, command, dry_run=False):
+            if dry_run:
+                return {"dry_run": True, "is_write": True, "hostname": "web-01",
+                        "mode": "wild", "agent_id": agent_id, "command": command,
+                        "approval_required": False}
+            return {"job_id": "job_1"}
+
+        client.create_job.side_effect = _create
+        client.get_job.return_value = {"status": "SUCCEEDED", "exit_code": 0, "stdout": "ok", "stderr": ""}
+        return client, p
+
+    def test_write_returns_preview_without_dispatch(self):
+        client, p = self._write_client()
+        with p:
+            r = m.exec_command("rm -rf /tmp/x", agent_id="agent_a")
+        assert r["preview"] is True and r["confirmed"] is False and r["is_write"] is True
+        # Only the dry-run classification ran; nothing was dispatched.
+        assert client.create_job.call_count == 1
+        assert client.create_job.call_args.kwargs.get("dry_run") is True
+
+    def test_write_dispatches_with_confirm(self):
+        client, p = self._write_client()
+        with p:
+            r = m.exec_command("rm -rf /tmp/x", agent_id="agent_a", confirm=True)
+        assert r["status"] == "SUCCEEDED"
+        client.create_job.assert_any_call("agent_a", "rm -rf /tmp/x")   # dispatched
+
+    def test_read_runs_without_confirm(self):
+        client, p = _mock_client(default_agent="agent_a")
+        client.create_job.side_effect = lambda agent_id, command, dry_run=False: (
+            {"dry_run": True, "is_write": False} if dry_run else {"job_id": "job_1"})
+        client.get_job.return_value = {"status": "SUCCEEDED", "exit_code": 0, "stdout": "ok", "stderr": ""}
+        with p:
+            r = m.exec_command("uptime", agent_id="agent_a")
+        assert r["status"] == "SUCCEEDED"
+
+    def test_dry_run_error_surfaced(self):
+        # A readonly-mode write is rejected 403 at the dry-run gate; surface it, don't dispatch.
+        client, p = _mock_client(default_agent="agent_a")
+        resp = MagicMock(status_code=403, content=b'{"error":"command not permitted in readonly mode"}')
+        resp.json.return_value = {"error": "command not permitted in readonly mode"}
+        client.create_job.side_effect = requests.HTTPError(response=resp)
+        with p:
+            r = m.exec_command("rm -rf /tmp/x", agent_id="agent_a")
+        assert r["error"] == "command not permitted in readonly mode"
 
 
 class TestGetJob:
@@ -283,3 +338,182 @@ class TestApprovalTools:
         with p:
             m.list_pending_approvals()
         client.list_agent_approved.assert_called_once_with("agent_a", status="pending")
+
+
+class TestFleetExecConfirmGate:
+    def test_default_is_dry_run_preview(self):
+        client, p = _mock_client()
+        client.list_fleets.return_value = {"fleets": [{"fleet_id": "fleet_1", "name": "web-asg"}]}
+        # The preview is a server dry-run: the resolved plan, nothing dispatched.
+        client.fleet_fanout.return_value = {
+            "dry_run": True, "fleet_id": "fleet_1", "fleet_name": "web-asg",
+            "command": "systemctl restart app", "mode": "approved", "matched": 1,
+            "wave_size": 1, "wave_strategy": "manual", "failure_policy": "stop",
+            "wave_total": 1, "is_write": True, "approval_required": True, "skipped": []}
+        with p:
+            r = m.fleet_exec("systemctl restart app", "web-asg")
+        assert r["preview"] is True and r["confirmed"] is False
+        assert r["matched"] == 1 and r["wave_strategy"] == "manual" and r["approval_required"] is True
+        client.fleet_fanout.assert_called_once_with("fleet_1", "systemctl restart app", max_targets=None, dry_run=True)
+
+    def test_confirm_true_returns_bounded_run_summary(self):
+        client, p = _mock_client()
+        client.list_fleets.return_value = {"fleets": [{"fleet_id": "fleet_1", "name": "web-asg"}]}
+        client.fleet_fanout.return_value = {"run_id": "batch_a", "dispatched": 2, "skipped": []}
+        # Bounded summary comes from run_status, not per-job stdout dumps.
+        client.get_run.return_value = {"run_id": "batch_a", "state": "partial", "terminal": True,
+                                       "counts": {"ok": 1, "failed": 1, "pending": 0, "running": 0},
+                                       "failures": [{"agent_id": "agent_m2", "exit_code": 1, "stderr": "boom"}]}
+        with p:
+            r = m.fleet_exec("uptime", "web-asg", confirm=True)
+        assert r["confirmed"] is True and r["run_id"] == "batch_a"
+        assert r["state"] == "partial" and r["counts"]["failed"] == 1
+        assert r["failures"][0]["agent_id"] == "agent_m2"
+        assert "results" not in r   # no per-member stdout dump
+        client.fleet_fanout.assert_called_once_with("fleet_1", "uptime", max_targets=None, idempotency_key=None)
+
+    def test_cap_exceeded_returns_hint(self):
+        import requests
+        client, p = _mock_client()
+        client.list_fleets.return_value = {"fleets": [{"fleet_id": "fleet_1", "name": "web-asg"}]}
+        resp = MagicMock(status_code=409, content=b"{}")
+        resp.json.return_value = {"error": "30 targets exceeds the fan-out safety cap of 25."}
+        client.fleet_fanout.side_effect = requests.HTTPError(response=resp)
+        with p:
+            r = m.fleet_exec("uptime", "web-asg", confirm=True)
+        assert "cap" in r["error"] and "max_targets" in r["hint"]
+
+    def test_run_status_tool(self):
+        client, p = _mock_client()
+        client.get_run.return_value = {"run_id": "batch_a", "state": "succeeded", "terminal": True,
+                                       "counts": {"ok": 3, "failed": 0, "pending": 0, "running": 0}, "failures": []}
+        with p:
+            r = m.run_status("batch_a")
+        assert r["state"] == "succeeded" and r["counts"]["ok"] == 3
+
+    def test_server_staged_run_reports_wave_info(self):
+        # Staging is policy-driven server-side; a staged dispatch response surfaces waves.
+        client, p = _mock_client()
+        client.list_fleets.return_value = {"fleets": [{"fleet_id": "fleet_1", "name": "web-asg"}]}
+        client.fleet_fanout.return_value = {"run_id": "run_s", "dispatched": 2, "wave_total": 3,
+                                            "skipped": []}
+        client.get_run.return_value = {"run_id": "run_s", "state": "running", "terminal": False,
+                                       "counts": {"ok": 0, "failed": 0, "pending": 2, "running": 0},
+                                       "current_wave": 0, "staged": 3, "failures": []}
+        with p:
+            r = m.fleet_exec("deploy.sh", "web-asg", confirm=True, timeout=0)
+        client.fleet_fanout.assert_called_once_with(
+            "fleet_1", "deploy.sh", max_targets=None, idempotency_key=None)
+        assert r["staged"] is True and r["wave_total"] == 3
+
+
+class TestRunControlTools:
+    def test_run_pause(self):
+        client, p = _mock_client()
+        client.pause_run.return_value = {"run_id": "run_s", "state": "paused"}
+        with p:
+            r = m.run_pause("run_s")
+        assert r["state"] == "paused"
+        client.pause_run.assert_called_once_with("run_s")
+
+    def test_run_resume(self):
+        client, p = _mock_client()
+        client.resume_run.return_value = {"run_id": "run_s", "state": "running"}
+        with p:
+            r = m.run_resume("run_s")
+        assert r["state"] == "running"
+
+    def test_run_cancel(self):
+        client, p = _mock_client()
+        client.cancel_run.return_value = {"run_id": "run_s", "state": "canceled", "canceled": 3}
+        with p:
+            r = m.run_cancel("run_s")
+        assert r["state"] == "canceled"
+
+    def test_run_pause_404(self):
+        import requests
+        client, p = _mock_client()
+        resp = requests.Response(); resp.status_code = 404
+        client.pause_run.side_effect = requests.HTTPError(response=resp)
+        with p:
+            r = m.run_pause("nope")
+        assert "error" in r
+
+    def test_unknown_fleet_errors(self):
+        client, p = _mock_client()
+        client.list_fleets.return_value = {"fleets": []}
+        with p:
+            r = m.fleet_exec("uptime", "nope", confirm=True)
+        assert "error" in r
+        client.fleet_fanout.assert_not_called()
+
+
+class TestNoApprovalWriteTools:
+    def test_ai_cannot_create_approve_or_deny(self):
+        # Approvals are a human review control: the MCP surface exposes no tool to
+        # create, approve, or deny them (only read-only visibility). This prevents an
+        # AI from requesting a command and then approving it itself.
+        assert not hasattr(m, "request_approval")
+        assert not hasattr(m, "approve_approval")
+        assert not hasattr(m, "deny_approval")
+
+
+class TestExecByTagConfirmGate:
+    def test_preview_by_default_shows_wave_plan(self):
+        client, p = _mock_client()
+        client.fanout_by_tag.return_value = {
+            "dry_run": True, "tag": "env:prod", "type": "host", "command": "uptime",
+            "matched": 3, "wave_size": 3, "wave_strategy": "auto", "failure_policy": "continue",
+            "wave_total": 1, "skipped": []}
+        with p:
+            r = m.exec_by_tag("uptime", "env:prod")
+        assert r["preview"] is True and r["confirmed"] is False
+        assert r["wave_size"] == 3 and r["wave_strategy"] == "auto"
+        client.fanout_by_tag.assert_called_once_with("env:prod", "uptime", agent_type=None, dry_run=True)
+        client.create_job.assert_not_called()
+
+    def test_confirm_dispatches_via_fanout(self):
+        client, p = _mock_client()
+        client.fanout_by_tag.return_value = {"tag": "env:prod", "type": "host", "run_id": "run_t",
+                                             "dispatched": 2, "skipped": [], "wave_total": 1}
+        client.get_run.return_value = {"run_id": "run_t", "state": "succeeded", "terminal": True,
+                                       "counts": {"ok": 2, "failed": 0, "pending": 0, "running": 0}, "failures": []}
+        with p:
+            r = m.exec_by_tag("uptime", "env:prod", confirm=True)
+        assert r["confirmed"] is True and r["dispatched"] == 2 and r["run_id"] == "run_t"
+        client.fanout_by_tag.assert_any_call("env:prod", "uptime", agent_type=None, dry_run=False)
+
+    def test_ambiguous_type_surfaces_error(self):
+        import requests
+        client, p = _mock_client()
+        resp = requests.Response(); resp.status_code = 409
+        resp._content = b'{"error": "tag matches both host and k8s agents; pass type=host or type=k8s"}'
+        client.fanout_by_tag.side_effect = requests.HTTPError(response=resp)
+        with p:
+            r = m.exec_by_tag("uptime", "env:prod")
+        assert "both host and k8s" in r["error"]
+
+
+class TestTagRuns:
+    def test_list_tag_runs_delegates(self):
+        client, p = _mock_client()
+        client.list_tag_runs.return_value = {"runs": [{"run_id": "batch_t", "tag": "env:prod"}]}
+        with p:
+            r = m.list_tag_runs()
+        assert r["runs"][0]["tag"] == "env:prod"
+        client.list_tag_runs.assert_called_once_with(limit=20)
+
+    def test_list_tag_runs_caps_limit(self):
+        client, p = _mock_client()
+        client.list_tag_runs.return_value = {"runs": []}
+        with p:
+            m.list_tag_runs(limit=500)
+        client.list_tag_runs.assert_called_once_with(limit=100)
+
+    def test_list_tag_run_expands_batch(self):
+        client, p = _mock_client()
+        client.list_jobs.return_value = {"jobs": [{"job_id": "j1", "run_tag": "env:prod"}]}
+        with p:
+            r = m.list_tag_run("batch_t")
+        assert r["jobs"][0]["job_id"] == "j1"
+        client.list_jobs.assert_called_once_with(run_id="batch_t", limit=100)

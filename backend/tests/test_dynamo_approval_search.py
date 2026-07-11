@@ -114,3 +114,91 @@ class TestCaseInsensitiveWrite:
         with patch.object(dynamo, "_TABLE_APPROVALS", t):
             dynamo.ApprovalRepo().search_by_tenant("t1", q="DoCkEr", limit=100)
         assert "FilterExpression" in t.query.call_args.kwargs
+
+
+class TestFleetScoping:
+    def test_list_by_fleet_uses_fleet_index(self):
+        t = _table([{"approval_id": "f1", "fleet_id": "fleet_1", "command": "docker ps", "status": "approved"}])
+        with patch.object(dynamo, "_TABLE_APPROVALS", t):
+            items = dynamo.ApprovalRepo().list_by_fleet("fleet_1", status="approved")
+        assert t.query.call_args.kwargs["IndexName"] == "fleet-approvals-index"
+        assert items[0]["fleet_id"] == "fleet_1"
+
+    def test_exists_pending_fleet_uses_fleet_index(self):
+        t = _table([{"approval_id": "f1", "fleet_id": "fleet_1", "command": "docker ps", "status": "pending"}])
+        with patch.object(dynamo, "_TABLE_APPROVALS", t):
+            assert dynamo.ApprovalRepo().exists_pending_fleet("fleet_1", "docker ps") is True
+        assert t.query.call_args.kwargs["IndexName"] == "fleet-approvals-index"
+
+    def test_exists_pending_fleet_false_when_no_match(self):
+        t = _table([])
+        with patch.object(dynamo, "_TABLE_APPROVALS", t):
+            assert dynamo.ApprovalRepo().exists_pending_fleet("fleet_1", "docker ps") is False
+
+    def test_search_fleet_ids_builds_filter(self):
+        t = _table([{"approval_id": "f1", "fleet_id": "fleet_1", "command": "x", "status": "pending"}])
+        with patch.object(dynamo, "_TABLE_APPROVALS", t):
+            dynamo.ApprovalRepo().search_by_tenant("t1", fleet_ids=["fleet_1"], limit=100)
+        assert "FilterExpression" in t.query.call_args.kwargs
+
+    def test_empty_agent_and_fleet_scope_returns_nothing(self):
+        t = _table([HOST])
+        with patch.object(dynamo, "_TABLE_APPROVALS", t):
+            items, total = dynamo.ApprovalRepo().search_by_tenant("t1", agent_ids=[], fleet_ids=[], limit=100)
+        assert items == [] and total == 0
+        t.query.assert_not_called()
+
+
+class TestScopeFilter:
+    def test_scope_agent_excludes_fleet(self):
+        items = [
+            {"approval_id": "a1", "agent_id": "a", "command": "x", "status": "pending"},
+            {"approval_id": "f1", "fleet_id": "fleet_1", "command": "y", "status": "pending"},
+        ]
+        t = _table(items)
+        with patch.object(dynamo, "_TABLE_APPROVALS", t):
+            rows, total = dynamo.ApprovalRepo().search_by_tenant("t1", scope="agent", limit=100)
+        assert total == 1 and rows[0]["approval_id"] == "a1"
+
+    def test_scope_fleet_excludes_agents(self):
+        items = [
+            {"approval_id": "a1", "agent_id": "a", "command": "x", "status": "pending"},
+            {"approval_id": "f1", "fleet_id": "fleet_1", "command": "y", "status": "pending"},
+        ]
+        t = _table(items)
+        with patch.object(dynamo, "_TABLE_APPROVALS", t):
+            rows, total = dynamo.ApprovalRepo().search_by_tenant("t1", scope="fleet", limit=100)
+        assert total == 1 and rows[0]["approval_id"] == "f1"
+
+
+class TestCascadeDelete:
+    def _table_batch(self, items):
+        t = MagicMock()
+        t.query.return_value = {"Items": items}
+        batch = MagicMock()
+        t.batch_writer.return_value.__enter__.return_value = batch
+        return t, batch
+
+    def test_delete_by_agent_uses_agent_index_and_batch_deletes(self):
+        t, batch = self._table_batch([{"approval_id": "a1"}, {"approval_id": "a2"}])
+        with patch.object(dynamo, "_TABLE_APPROVALS", t):
+            n = dynamo.ApprovalRepo().delete_by_agent("agent_1")
+        assert n == 2
+        assert t.query.call_args.kwargs["IndexName"] == "agent-approvals-index"
+        deleted = {c.kwargs["Key"]["approval_id"] for c in batch.delete_item.call_args_list}
+        assert deleted == {"a1", "a2"}
+
+    def test_delete_by_fleet_uses_fleet_index(self):
+        t, batch = self._table_batch([{"approval_id": "f1"}])
+        with patch.object(dynamo, "_TABLE_APPROVALS", t):
+            n = dynamo.ApprovalRepo().delete_by_fleet("fleet_1")
+        assert n == 1
+        assert t.query.call_args.kwargs["IndexName"] == "fleet-approvals-index"
+        batch.delete_item.assert_called_once_with(Key={"approval_id": "f1"})
+
+    def test_delete_by_agent_no_rows_skips_batch(self):
+        t, batch = self._table_batch([])
+        with patch.object(dynamo, "_TABLE_APPROVALS", t):
+            n = dynamo.ApprovalRepo().delete_by_agent("ghost")
+        assert n == 0
+        batch.delete_item.assert_not_called()

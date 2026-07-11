@@ -4,6 +4,7 @@ import { listTenants, createTenant, disableTenant, enableTenant, listUsers, list
 import { Modal } from '../components/Modal';
 import { Spinner } from '../components/Spinner';
 import { RefreshButton } from '../components/RefreshButton';
+import { TenantSettingsOverrideModal } from '../components/TenantSettingsOverrideModal';
 import { tenantPalette, tenantInitials } from '../utils';
 
 function fmtDate(iso?: string) {
@@ -13,20 +14,30 @@ function fmtDate(iso?: string) {
 
 export function TenantsPage({ config }: { config: Config }) {
   const { apiUrl, adminToken } = config;
+  const PAGE = 20;
   const [tenants, setTenants] = useState<Tenant[]>([]);
+  const [total, setTotal] = useState(0);
+  const [offset, setOffset] = useState(0);
+  const [search, setSearch] = useState('');
+  const [query, setQuery] = useState('');
+  const applySearch = () => { setQuery(search.trim()); setOffset(0); };
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [creating, setCreating] = useState(false);
   const [newName, setNewName] = useState('');
   const [disableTarget, setDisableTarget] = useState<Tenant | null>(null);
   const [enableTarget, setEnableTarget] = useState<Tenant | null>(null);
+  const [settingsTarget, setSettingsTarget] = useState<Tenant | null>(null);
   const [counts, setCounts] = useState<Record<string, { users: number; agents: number }>>({});
 
   const loadTenants = useCallback(() => {
     setLoading(true);
-    listTenants(apiUrl, adminToken)
+    const params: Record<string, string> = { limit: String(PAGE), offset: String(offset) };
+    if (query) params.q = query;
+    listTenants(apiUrl, adminToken, params)
       .then(r => {
         setTenants(r.tenants);
+        setTotal(r.total ?? r.tenants.length);
         Promise.allSettled(
           r.tenants.map(t =>
             Promise.all([
@@ -44,7 +55,7 @@ export function TenantsPage({ config }: { config: Config }) {
       })
       .catch(() => setError('Failed to load tenants'))
       .finally(() => setLoading(false));
-  }, [apiUrl, adminToken]);
+  }, [apiUrl, adminToken, query, offset]);
 
   useEffect(() => { loadTenants(); }, [loadTenants]);
 
@@ -102,6 +113,20 @@ export function TenantsPage({ config }: { config: Config }) {
           <span className="shrink-0">⚠</span>{error}
         </div>
       )}
+
+      <div className="flex items-center gap-2 mb-4">
+        <input
+          value={search}
+          onChange={e => setSearch(e.target.value)}
+          onKeyDown={e => { if (e.key === 'Enter') applySearch(); }}
+          placeholder="Search tenants by name or ID…"
+          className="border border-gray-300 rounded-lg px-3 py-1.5 text-sm bg-white shadow-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 w-72"
+        />
+        <button onClick={applySearch} className="text-sm text-white bg-slate-800 hover:bg-slate-700 rounded-lg px-3 py-1.5">Search</button>
+        {query && (
+          <button onClick={() => { setSearch(''); setQuery(''); setOffset(0); }} className="text-sm text-indigo-600 hover:text-indigo-800" aria-label="Clear search">✕</button>
+        )}
+      </div>
 
       {loading && tenants.length === 0 ? (
         <div className="flex justify-center py-16"><Spinner /></div>
@@ -164,6 +189,12 @@ export function TenantsPage({ config }: { config: Config }) {
                   </div>
                   <div className="flex items-center gap-1">
                     <button
+                      onClick={() => setSettingsTarget(t)}
+                      className="text-xs font-medium px-2.5 py-1 rounded-md text-slate-500 hover:text-slate-800 hover:bg-slate-100 transition-colors"
+                    >
+                      Settings
+                    </button>
+                    <button
                       onClick={() => t.status === 'DISABLED' ? setEnableTarget(t) : setDisableTarget(t)}
                       className={`text-xs font-medium px-2.5 py-1 rounded-md transition-colors ${
                         t.status === 'DISABLED'
@@ -178,6 +209,24 @@ export function TenantsPage({ config }: { config: Config }) {
               </div>
             );
           })}
+        </div>
+      )}
+
+      {total > PAGE && (
+        <div className="flex items-center justify-between mt-5 text-sm text-gray-600">
+          <span>Showing {offset + 1}–{Math.min(offset + PAGE, total)} of {total}</span>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setOffset(Math.max(0, offset - PAGE))}
+              disabled={offset === 0 || loading}
+              className="px-3 py-1 rounded-md border border-gray-300 bg-white disabled:opacity-40 hover:bg-gray-50"
+            >Prev</button>
+            <button
+              onClick={() => setOffset(offset + PAGE)}
+              disabled={offset + PAGE >= total || loading}
+              className="px-3 py-1 rounded-md border border-gray-300 bg-white disabled:opacity-40 hover:bg-gray-50"
+            >Next</button>
+          </div>
         </div>
       )}
 
@@ -222,6 +271,15 @@ export function TenantsPage({ config }: { config: Config }) {
           tenant={enableTarget}
           onClose={() => setEnableTarget(null)}
           onConfirm={handleEnable}
+        />
+      )}
+
+      {settingsTarget && (
+        <TenantSettingsOverrideModal
+          config={config}
+          tenantId={settingsTarget.tenant_id}
+          tenantName={settingsTarget.name}
+          onClose={() => setSettingsTarget(null)}
         />
       )}
     </div>

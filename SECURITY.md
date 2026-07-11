@@ -28,6 +28,7 @@ Only the latest released version receives security fixes. Older versions are not
 
 - **Accidental dangerous commands** - a global blocklist (fork bombs, `rm -rf /`, raw disk wipes, privileged container escapes, reverse shells) is enforced server-side before any job is queued, regardless of mode.
 - **AI agent overreach** - `readonly` mode blocks writes server-side before they reach the agent. `approved` mode requires explicit admin pre-approval for each write command; unapproved writes are blocked and surfaced as a pending approval record, not silently dropped or executed.
+- **AI self-approval** - the MCP server (what an AI drives) is **read-only for approvals**: it exposes no tool to create, approve, or deny an approval, so an AI cannot request a command and then approve it for itself. Approval review stays a human action (console, or the CLI with an operator's own token). Multi-machine fan-outs over MCP (`fleet_exec`, `exec_by_tag`) are **confirm-gated** - a dry-run preview must be returned to the user before a `confirm=true` dispatch.
 - **Exposed inbound SSH** - agents communicate outbound-only over HTTPS. No ports are opened on the remote machine. No SSH keys to distribute or rotate.
 - **Unapproved production writes** - in `approved` mode, the agent cannot execute a write command unless an admin has explicitly allowlisted it. The allowlist is enforced both server-side and locally on the agent (Landlock on Linux, `is_write` flag enforcement on macOS).
 - **Token theft across machines** - agent tokens are bound to a machine fingerprint at claim time. A token captured from one machine cannot be replayed from another.
@@ -54,11 +55,15 @@ For full architectural detail see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 **Console session tokens** - the web console issues short-lived (8-hour) HS256 session tokens that are distinct from API tokens and are never persisted server-side. The platform admin session is signed with `ADMIN_PASSWORD`; the tenant console session is signed with a dedicated `SESSION_SIGNING_KEY` and carries the user's tenant and role. Both signing secrets are **safe to rotate** - doing so only invalidates active sessions, so users simply log in again. This is deliberately separate from `TOKEN_PEPPER` (which hashes stored credentials and cannot be rotated without reissuing everything), so session-key rotation never touches stored tokens. The CLI and MCP server do **not** use session tokens - they authenticate with long-lived API tokens (`tok_`).
 
+**API-token scope** - an API token authenticates as its owning user with that user's **role**, and covers the operational surface: jobs, agents, fleets, and approvals (create/approve/deny, role-permitting). It is **rejected** on the sensitive console tier - user management, API-token management, and audit logs - which require an interactive session login. So a leaked API token cannot create users, mint or revoke tokens, or read audit logs; the blast radius is bounded to that user's operational role, and the token can be revoked from the console. See [API.md → Authentication](API.md#authentication).
+
 **Constant-time comparison** - passwords, token hashes, session signatures, and `ADMIN_PASSWORD` are all compared with `hmac.compare_digest` to avoid leaking information through timing.
 
 **Agent token binding** - agent tokens are bound to a machine fingerprint at claim time. A token stolen from one machine cannot be replayed from another.
 
 **Install token** - one-time use, 24-hour expiry, cleared from disk after a successful claim. It is also **bound to the agent's type**: a token minted for a `k8s` agent cannot be redeemed by the host installer, or a `host` token by the k8s image (the claim is rejected `403`). This keeps a token from being used to enroll an agent whose runtime doesn't match the RBAC / capability configuration it was created with.
+
+**Fleet join token** - a fleet's join token is deliberately **reusable and long-lived** (it enrolls a whole autoscaling group), so it is a higher-value credential than a one-time install token: anyone who obtains it can enroll rogue **host** agents into that fleet, inheriting the fleet's mode and grants. It is host-only (a fleet claim with `type: k8s` is rejected) and is mitigated like any long-lived secret - **rotate** it (`Fleets → Rotate`, with a grace window so the old token keeps working until you update the launch template) and **revoke** the fleet if it leaks. Each enrolled instance still receives its own machine-fingerprint-bound **agent token**, so a stolen join token lets an attacker enroll *new* rogue agents but does not grant existing members' credentials. Keep it in your autoscaler's instance startup config (AWS user-data, GCP startup-script, Azure custom-data, …), protected by that platform's secret handling, not in source control.
 
 **Tenant isolation** - user tokens can only access agents and jobs within their own tenant. The storage layer enforces this; there is no client-side filtering.
 
@@ -119,6 +124,7 @@ This is **defense-in-depth, not a guarantee.** It catches structurally recogniza
 | `ADMIN_PASSWORD` | Your environment / secrets manager | Raw (you set it) |
 | `TOKEN_PEPPER` | Your environment / secrets manager | Raw (you set it) |
 | Install token | **Host:** agent config file until claim, then cleared. **k8s:** the bootstrap Secret (or `--set`) | Raw until claim, then gone |
+| Fleet join token | Autoscaler instance startup config - user-data / startup-script (reusable across instances) | Raw - **protect it** (rotatable/revocable) |
 | Agent token | **Host:** agent config file (`/etc/reach-agent/config.json`). **k8s:** a Kubernetes Secret the agent manages - **never written to the pod filesystem** | Raw - **protect it** |
 | API token (`tok_`) | Returned once at creation; not stored by the backend | Raw - user must store it |
 | All token hashes | Database (DynamoDB or PostgreSQL) | `HMAC-SHA256(TOKEN_PEPPER, token)` only |
@@ -132,6 +138,8 @@ On a **host**, the agent config file is written with `0600` permissions and owne
 **Agent tokens** rotate automatically every 30 days. The agent checks token age on each poll and calls `POST /agent/rotate-token` using the current still-valid token. The new token is written to disk atomically before the old one is invalidated - no lockout window.
 
 Tenant admins can also trigger an out-of-band rotation from the tenant console under **Agents → [agent] → Request rotation**. This sets a flag on the agent record; the agent self-rotates on its next sync and the flag is cleared. The agent stays connected throughout.
+
+**Fleet join tokens** are rotated from the tenant console under **Fleets → [fleet] → Rotate**. Rotation issues a new join token while keeping the previous one valid for a grace window (default 24h, or immediate) so you can update the autoscaler's launch/instance template before the old token stops working. Revoking the fleet invalidates the token entirely and stops all new enrollment.
 
 **User API tokens** do not expire automatically. Revoke individual tokens from the tenant console under **API Tokens**, or revoke all tokens for a user under **Users → [user] → Revoke all tokens**.
 
@@ -152,7 +160,7 @@ Tenant admins can also trigger an out-of-band rotation from the tenant console u
 
 Other users are unaffected in both cases.
 
-**Restrict a user to specific agents**: from the tenant console, go to **Users → [user] → Agent Access**. Set an explicit list of agents the user can see - all others return 404. Pass an empty list to lock them out of all agents without deleting the account.
+**Scope a user's agent access**: from the tenant console, go to **Users → [user] → Access**. Non-admins start with **no access** and are granted specific agents/fleets as **read-only** or **read-write** (admins are always tenant-wide). Read access hides everything else (404); a read-only grant additionally blocks write commands (403) in any mode. See [SELF_HOSTING → Per-user agent access](SELF_HOSTING.md#per-user-agent-access).
 
 ---
 
@@ -166,13 +174,13 @@ Every command submitted through Reach creates a **job record** with:
 - Exit code, stdout, stderr, and duration
 - Timestamps for creation, start, and completion
 
-Terminal job records are deleted by the daily cleanup after `JOB_RETENTION_DAYS` (default 7).
+Terminal job records are deleted by the daily cleanup after the tenant's `job_retention_days` setting (default 7).
 
-Job history is available in the tenant console under **Jobs**, and platform-wide in the platform admin console under **Audit Logs**. The audit log covers 35+ event types including platform and tenant logins (success and failure), user management, agent lifecycle events (create, revoke, rotate, unreachable, recover), policy changes, approval requests/reviews/pre-approvals, and API-token operations. See the full action list in [API.md](API.md#audit-log-actions). Audit entries are retained for `AUDIT_RETENTION_DAYS` (default 90) before the daily cleanup deletes them; agent status-history records for `AGENT_HISTORY_RETENTION_DAYS` (default 30).
+Job history is available in the tenant console under **Jobs**, and platform-wide in the platform admin console under **Audit Logs**. The audit log covers 35+ event types including platform and tenant logins (success and failure), user management, agent lifecycle events (create, revoke, rotate, unreachable, recover), policy changes, approval requests/reviews/pre-approvals, and API-token operations. See the full action list in [API.md](API.md#audit-log-actions). A tenant's own audit entries are retained for its `audit_retention_days` setting (default 90); agent status-history records for `agent_history_retention_days` (default 30). Cross-tenant platform-admin audit entries follow the deployment-wide `AUDIT_RETENTION_DAYS` env var (default 90).
 
-In `approved` mode, every blocked write also creates an **approval record** - a persistent log of what was attempted, who attempted it, and when. Denied and expired approval records are retained for `APPROVAL_RETENTION_DAYS` (default 7) before cleanup. Approved records persist until manually deleted.
+In `approved` mode, every blocked write also creates an **approval record** - a persistent log of what was attempted, who attempted it, and when. Denied and expired approval records are retained for the tenant's `approval_retention_days` setting (default 7) before cleanup. Approved records persist until manually deleted.
 
-The four retention windows are independent environment variables: `APPROVAL_RETENTION_DAYS` (7), `JOB_RETENTION_DAYS` (7), `AUDIT_RETENTION_DAYS` (90), and `AGENT_HISTORY_RETENTION_DAYS` (30). For compliance-grade logging that outlives these windows, forward DynamoDB Streams or PostgreSQL WAL to your preferred log sink.
+Per-tenant retention windows are **tenant settings**, edited under **Settings** in the tenant console (defaults: `approval_retention_days` 7, `job_retention_days` 7, `run_retention_days` 30, `audit_retention_days` 90, `agent_history_retention_days` 30) and overridable by the platform admin. Only the cross-tenant platform audit trail uses the `AUDIT_RETENTION_DAYS` env var. For compliance-grade logging that outlives these windows, forward DynamoDB Streams or PostgreSQL WAL to your preferred log sink.
 
 ---
 
@@ -214,12 +222,12 @@ An attacker with **agent config file access on the remote machine**:
 **Agent policy**
 - Run production agents in `approved` mode. Allowlist only the commands your automation actually needs.
 - Avoid `wild` mode on shared or production machines. Reserve it for personal dev boxes where you are the only user.
-- Restrict users to specific agents rather than granting full tenant access where possible.
+- Grant each user the least access they need: non-admins start with none, so add specific agents/fleets, and prefer **read-only** where they don't need to run writes. Keep the `admin` role (tenant-wide) to as few people as possible.
 
 **Monitoring**
 - Alert on unexpected platform admin activity - `admin.login` / `admin.login_failed` events from unknown IPs, and new tenants or user changes outside a deployment window. Repeated `admin.login_failed` entries indicate a brute-force attempt against `ADMIN_PASSWORD`.
 - Monitor the tenant audit log for policy changes, approval decisions, and repeated `user.login_failed` events (failed logins against tenant accounts) outside normal operations.
-- Set `APPROVAL_RETENTION_DAYS` long enough for your incident response window (14–30 days recommended for production), and `AUDIT_RETENTION_DAYS` long enough for your audit/compliance window (the default is 90).
+- Set each tenant's `approval_retention_days` setting long enough for your incident response window (14–30 days recommended for production), and its `audit_retention_days` (plus the platform-wide `AUDIT_RETENTION_DAYS` env for the cross-tenant trail) long enough for your audit/compliance window (the default is 90).
 
 **Token hygiene**
 - Share API tokens over a secure channel (not plaintext Slack/email). Tokens are shown once at creation.

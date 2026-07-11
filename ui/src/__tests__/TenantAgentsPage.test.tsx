@@ -38,6 +38,65 @@ function renderPage(agents: Agent[]) {
 
 beforeEach(() => { vi.restoreAllMocks(); });
 
+describe('search + pagination', () => {
+  it('sends the search query to the server only when Search is clicked', async () => {
+    const spy = vi.spyOn(api, 'listTenantAgents').mockResolvedValue({ agents: [BASE_AGENT], total: 1, limit: 20, offset: 0 });
+    vi.spyOn(api, 'listFleets').mockResolvedValue({ fleets: [], default_reap_after_seconds: 1800 });
+    render(<TenantAgentsPage config={CONFIG} />);
+    await screen.findByText('myhost.local');
+    fireEvent.change(screen.getByPlaceholderText(/Search agents/), { target: { value: 'web-01' } });
+    // Typing alone does NOT call the API with q.
+    expect(spy).not.toHaveBeenCalledWith(CONFIG.apiUrl, CONFIG.tenantToken, expect.objectContaining({ q: 'web-01' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Search' }));
+    await waitFor(() =>
+      expect(spy).toHaveBeenCalledWith(CONFIG.apiUrl, CONFIG.tenantToken,
+        expect.objectContaining({ q: 'web-01', limit: '20', offset: '0' })),
+    );
+  });
+
+  it('shows a pager and advances the offset when there are more than one page', async () => {
+    const spy = vi.spyOn(api, 'listTenantAgents').mockResolvedValue({ agents: [BASE_AGENT], total: 45, limit: 20, offset: 0 });
+    vi.spyOn(api, 'listFleets').mockResolvedValue({ fleets: [], default_reap_after_seconds: 1800 });
+    render(<TenantAgentsPage config={CONFIG} />);
+    await screen.findByText(/Showing 1–1 of 45/);
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    await waitFor(() =>
+      expect(spy).toHaveBeenCalledWith(CONFIG.apiUrl, CONFIG.tenantToken,
+        expect.objectContaining({ offset: '20' })),
+    );
+  });
+
+  it('populates the tag dropdown from the server facet, not the current page', async () => {
+    // The page holds one agent with no tags, yet the facet lists the whole tenant's tags.
+    vi.spyOn(api, 'listTenantAgents').mockResolvedValue({
+      agents: [BASE_AGENT], total: 1, limit: 20, offset: 0, all_tags: ['env:prod', 'team:core'],
+    });
+    vi.spyOn(api, 'listFleets').mockResolvedValue({ fleets: [], default_reap_after_seconds: 1800 });
+    render(<TenantAgentsPage config={CONFIG} />);
+    await screen.findByText('myhost.local');
+    fireEvent.click(screen.getByRole('button', { name: /Tags/ }));
+    expect(screen.getByText('env')).toBeInTheDocument();
+    expect(screen.getByText('team')).toBeInTheDocument();
+  });
+
+  it('applies a staged tag filter to the server only on Search', async () => {
+    const spy = vi.spyOn(api, 'listTenantAgents').mockResolvedValue({
+      agents: [BASE_AGENT], total: 1, limit: 20, offset: 0, all_tags: ['env:prod'],
+    });
+    vi.spyOn(api, 'listFleets').mockResolvedValue({ fleets: [], default_reap_after_seconds: 1800 });
+    render(<TenantAgentsPage config={CONFIG} />);
+    await screen.findByText('myhost.local');
+
+    fireEvent.click(screen.getByRole('button', { name: /Tags/ }));
+    fireEvent.click(screen.getByText('env'));           // stage the tag
+    expect(spy).not.toHaveBeenCalledWith(CONFIG.apiUrl, CONFIG.tenantToken, expect.objectContaining({ tag: 'env:prod' }));
+
+    fireEvent.click(screen.getByRole('button', { name: 'Search' }));
+    await waitFor(() => expect(spy).toHaveBeenCalledWith(
+      CONFIG.apiUrl, CONFIG.tenantToken, expect.objectContaining({ tag: 'env:prod' })));
+  });
+});
+
 // ---------------------------------------------------------------------------
 // CapabilityCell states - Docker column
 // ---------------------------------------------------------------------------
@@ -379,14 +438,25 @@ describe('Agent type column and filter', () => {
     ...BASE_AGENT, agent_id: 'agent_k8s', hostname: 'cluster-1', type: 'k8s',
   };
 
-  it('filters the table to the selected type', async () => {
-    renderPage([HOST_AGENT, K8S_AGENT]);
+  it('filters the table to the selected type on Search (server-side)', async () => {
+    // The dropdown just stages the filter; the server applies it when Search is clicked.
+    const spy = vi.spyOn(api, 'listTenantAgents').mockImplementation((_u, _t, params = {}) =>
+      Promise.resolve({ agents: params.type === 'k8s' ? [K8S_AGENT] : [HOST_AGENT, K8S_AGENT] }));
+    vi.spyOn(api, 'listFleets').mockResolvedValue({ fleets: [], default_reap_after_seconds: 1800 });
+    render(<TenantAgentsPage config={CONFIG} />);
     await screen.findByText('host-1');
-    expect(screen.getByText('cluster-1')).toBeInTheDocument();
 
+    // Selecting the type alone does NOT re-query.
     await userEvent.selectOptions(screen.getByDisplayValue('All types'), 'k8s');
+    expect(spy).not.toHaveBeenCalledWith(CONFIG.apiUrl, CONFIG.tenantToken, expect.objectContaining({ type: 'k8s' }));
+    expect(screen.getByText('host-1')).toBeInTheDocument();
+
+    // Clicking Search applies it and the server returns only the k8s agent.
+    fireEvent.click(screen.getByRole('button', { name: 'Search' }));
+    await waitFor(() => expect(spy).toHaveBeenCalledWith(
+      CONFIG.apiUrl, CONFIG.tenantToken, expect.objectContaining({ type: 'k8s' })));
+    await waitFor(() => expect(screen.queryByText('host-1')).not.toBeInTheDocument());
     expect(screen.getByText('cluster-1')).toBeInTheDocument();
-    expect(screen.queryByText('host-1')).not.toBeInTheDocument();
   });
 
   it('shows n/a for docker and service-mgmt on k8s agents', async () => {

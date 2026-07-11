@@ -45,6 +45,8 @@ ACTIVE_TENANT = {"tenant_id": "tenant_acme", "name": "Acme", "status": "ACTIVE"}
 
 # Filter kwargs forwarded to handlers/repos when no query-string filters are set.
 NO_FILTERS = dict(action=None, actor=None, resource=None, ip=None, since=None, until=None)
+# The platform handler additionally forwards a tenant filter (platform-only).
+PLATFORM_NO_FILTERS = {**NO_FILTERS, "tenant": None}
 
 
 def _tenant_patch():
@@ -87,6 +89,12 @@ class TestPlatformAuditLogs:
             r = handle_list_platform_audit_logs(ADMIN, limit=100)
         body = json.loads(r["body"])
         assert "next_cursor" not in body
+
+    def test_tenant_filter_forwarded(self):
+        with patch("handlers.audit_logs.audit_repo") as ar:
+            ar.list_platform.return_value = []
+            handle_list_platform_audit_logs(ADMIN, tenant="acme")
+        assert ar.list_platform.call_args.kwargs["tenant"] == "acme"
 
 
 class TestTenantAuditLogs:
@@ -147,12 +155,12 @@ class TestPlatformAuditLogsHandler:
     def test_delegates_with_defaults(self):
         with patch("handlers.audit_logs.handle_list_platform_audit_logs", return_value=_OK_RESP) as h:
             platform_audit_logs_handler(_evt(), None)
-        h.assert_called_once_with(ADMIN, limit=100, cursor=None, **NO_FILTERS)
+        h.assert_called_once_with(ADMIN, limit=100, cursor=None, **PLATFORM_NO_FILTERS)
 
     def test_delegates_with_limit_and_cursor(self):
         with patch("handlers.audit_logs.handle_list_platform_audit_logs", return_value=_OK_RESP) as h:
             platform_audit_logs_handler(_evt(qs={"limit": "20", "cursor": "2026-01-01"}), None)
-        h.assert_called_once_with(ADMIN, limit=20, cursor="2026-01-01", **NO_FILTERS)
+        h.assert_called_once_with(ADMIN, limit=20, cursor="2026-01-01", **PLATFORM_NO_FILTERS)
 
 
 class TestTenantAuditLogsHandler:
@@ -175,3 +183,21 @@ class TestTenantAuditLogsHandler:
                 None,
             )
         h.assert_called_once_with(ADMIN_TENANT_TOKEN, limit=50, cursor="ts_abc", **NO_FILTERS)
+
+
+class TestFastapiPlatformAuditRoute:
+    """The FastAPI adapter must forward every filter the handler accepts - the route
+    parity test only checks paths exist, so query-param forwarding is guarded here."""
+
+    def _client(self):
+        from fastapi.testclient import TestClient
+        from adapters.fastapi.main import app
+        return TestClient(app, raise_server_exceptions=False)
+
+    def test_route_forwards_tenant_filter(self):
+        with patch("adapters.fastapi.main.handle_list_platform_audit_logs",
+                   return_value=_OK_RESP) as h:
+            self._client().get("/admin/audit-logs?tenant=acme&action=user.login",
+                               headers={"authorization": "Bearer x"})
+        assert h.call_args.kwargs["tenant"] == "acme"
+        assert h.call_args.kwargs["action"] == "user.login"

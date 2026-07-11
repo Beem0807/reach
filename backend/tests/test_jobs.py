@@ -97,10 +97,75 @@ class TestCreateJob:
         assert body["job_id"].startswith("job_")
         assert body["status"] == "PENDING"
 
+    def test_dry_run_classifies_without_creating_or_auditing(self):
+        with patch("handlers.create_job._verify_tenant_token", return_value=USER), \
+             patch("handlers.create_job.agents_repo") as ar, \
+             patch("handlers.create_job.audit") as aud, \
+             patch("handlers.create_job.jobs_repo") as jr:
+            ar.get.return_value = _AGENT_ACTIVE
+            r = handle_create_job({"agent_id": AGENT_ID, "command": "rm -rf /tmp/x", "dry_run": True}, "tok")
+        body = json.loads(r["body"])
+        assert body["dry_run"] is True and body["is_write"] is True
+        assert body["agent_id"] == AGENT_ID and body["type"] == "host"  # heuristic classification
+        jr.create.assert_not_called()
+        aud.write.assert_not_called()
+
+    def test_dry_run_read_is_not_write(self):
+        r = self._call({"agent_id": AGENT_ID, "command": "uptime", "dry_run": True})
+        body = json.loads(r["body"])
+        assert body["dry_run"] is True and body["is_write"] is False
+
+    def test_dispatch_writes_job_audit_event(self):
+        with patch("handlers.create_job._verify_tenant_token", return_value=USER), \
+             patch("handlers.create_job.agents_repo") as ar, \
+             patch("handlers.create_job.audit") as aud, \
+             patch("handlers.create_job.jobs_repo"):
+            ar.get.return_value = _AGENT_ACTIVE
+            handle_create_job({"agent_id": AGENT_ID, "command": "ls"}, "tok", ip="5.6.7.8")
+        aud.write.assert_called_once()
+        args, kwargs = aud.write.call_args
+        assert args[0] == "job.dispatched"
+        assert kwargs["ip_address"] == "5.6.7.8"
+        assert kwargs["resource_type"] == "job"
+        assert kwargs["metadata"]["agent_id"] == AGENT_ID and kwargs["metadata"]["is_write"] is False
+
+    def test_rejected_write_writes_no_job_audit(self):
+        # An unapproved k8s write is REJECTED (queued for approval), not dispatched -> no job.dispatched.
+        k8s = {**_AGENT_ACTIVE, "type": "k8s", "mode": "approved"}
+        with patch("handlers.create_job._verify_tenant_token", return_value=USER), \
+             patch("handlers.create_job.agents_repo") as ar, \
+             patch("handlers.create_job.approvals_repo") as apr, \
+             patch("handlers.create_job.audit") as aud, \
+             patch("handlers.create_job.jobs_repo"):
+            ar.get.return_value = k8s
+            apr.list_by_agent.return_value = []
+            r = handle_create_job({"agent_id": AGENT_ID, "command": "kubectl delete pods -n prod"}, "tok")
+        assert json.loads(r["body"])["status"] == "REJECTED"
+        for c in aud.write.call_args_list:
+            assert c.args[0] != "job.dispatched"
+
     def test_no_access_returns_404(self):
-        restricted_user = {**USER, "allowed_agent_ids": ["agent_other"]}
+        restricted_user = {**USER, "readwrite_agent_ids": ["agent_other"]}
         r = self._call({"agent_id": AGENT_ID, "command": "ls"}, user=restricted_user)
         assert r["statusCode"] == 404
+
+    # Per-user read-only capability: a read-only grant blocks writes in ANY mode,
+    # but read commands still run.
+    def test_readonly_user_blocked_from_write_even_in_wild(self):
+        ro_user = {**USER, "readonly_agent_ids": [AGENT_ID]}
+        r = self._call({"agent_id": AGENT_ID, "command": "rm file.txt"}, agent=_AGENT_ACTIVE, user=ro_user)
+        assert r["statusCode"] == 403
+        assert "read-only" in json.loads(r["body"])["error"]
+
+    def test_readonly_user_can_still_read(self):
+        ro_user = {**USER, "readonly_agent_ids": [AGENT_ID]}
+        r = self._call({"agent_id": AGENT_ID, "command": "docker ps"}, agent=_AGENT_ACTIVE, user=ro_user)
+        assert r["statusCode"] == 201
+
+    def test_readwrite_user_can_write(self):
+        rw_user = {**USER, "readwrite_agent_ids": [AGENT_ID]}
+        r = self._call({"agent_id": AGENT_ID, "command": "rm file.txt"}, agent=_AGENT_ACTIVE, user=rw_user)
+        assert r["statusCode"] == 201
 
 
 _AGENT_K8S_READONLY = {"agent_id": AGENT_ID, "tenant_id": TENANT, "status": "ACTIVE", "mode": "readonly", "type": "k8s"}
@@ -218,7 +283,7 @@ class TestGetJob:
         assert r["statusCode"] == 404
 
     def test_inaccessible_agent_returns_404(self):
-        restricted_user = {**USER, "allowed_agent_ids": ["agent_other"]}
+        restricted_user = {**USER, "readwrite_agent_ids": ["agent_other"]}
         r = self._call(user=restricted_user)
         assert r["statusCode"] == 404
 
@@ -234,6 +299,14 @@ class TestGetJob:
         assert body["command"] == "docker ps"
         assert body["status"] == "SUCCEEDED"
         assert body["stdout"] == "output"
+
+    def test_fleet_member_job_is_fetchable(self):
+        # A fleet member's job is fetchable by id like any other (fleet-aware access).
+        member = {**_AGENT_ACTIVE, "fleet_id": "fleet_1"}
+        fleet_user = {**USER, "readwrite_fleet_ids": ["fleet_1"], "readonly_fleet_ids": []}
+        r = self._call(user=fleet_user, agent=member)
+        assert r["statusCode"] == 200
+        assert json.loads(r["body"])["job_id"] == "job_1"
 
     def test_pending_expired_job_marked_expired(self):
         expired_job = {**_JOB, "status": "PENDING", "expires_at": 1}  # long past
@@ -305,8 +378,43 @@ class TestListJobs:
         call_args = jr.list_by_tenant.call_args[0]
         assert "agent_a" in call_args
 
+    def test_batch_expansion_survives_reaped_members(self):
+        # A fleet fan-out batch expands via run_id even after its members are reaped:
+        # the jobs carry run_fleet_id, so access is gated by the fleet (not per-agent,
+        # which would drop jobs whose agent record is gone).
+        reaped = [
+            {**_JOB, "job_id": "j1", "agent_id": "gone_1", "run_id": "batch_r", "run_fleet_id": "fleet_1"},
+            {**_JOB, "job_id": "j2", "agent_id": "gone_2", "run_id": "batch_r", "run_fleet_id": "fleet_1"},
+        ]
+        with patch("handlers.list_jobs._verify_tenant_token", return_value=USER), \
+             patch("handlers.list_jobs.jobs_repo") as jr, \
+             patch("handlers.list_jobs.fleets_repo") as flr, \
+             patch("handlers.list_jobs.agents_repo") as agr:
+            jr.list_by_run.return_value = reaped
+            flr.get.return_value = {"fleet_id": "fleet_1", "tenant_id": TENANT}
+            agr.get.return_value = None   # members reaped - no agent records
+            r = handle_list_jobs("tok", None, 20, run_id="batch_r")
+        body = json.loads(r["body"])
+        assert r["statusCode"] == 200
+        assert {j["job_id"] for j in body["jobs"]} == {"j1", "j2"}
+        # agent_fleet_id falls back to the stamped fleet id when the agent is gone.
+        assert all(j["agent_fleet_id"] == "fleet_1" for j in body["jobs"])
+
+    def test_batch_expansion_denied_for_inaccessible_fleet(self):
+        restricted_user = {**USER, "readwrite_fleet_ids": ["fleet_other"], "readonly_fleet_ids": [],
+                           "readwrite_agent_ids": [], "readonly_agent_ids": []}
+        job = {**_JOB, "run_id": "batch_r", "run_fleet_id": "fleet_1"}
+        with patch("handlers.list_jobs._verify_tenant_token", return_value=restricted_user), \
+             patch("handlers.list_jobs.jobs_repo") as jr, \
+             patch("handlers.list_jobs.fleets_repo") as flr, \
+             patch("handlers.list_jobs.agents_repo"):
+            jr.list_by_run.return_value = [job]
+            flr.get.return_value = {"fleet_id": "fleet_1", "tenant_id": TENANT}
+            r = handle_list_jobs("tok", None, 20, run_id="batch_r")
+        assert r["statusCode"] == 404
+
     def test_agent_filter_inaccessible_returns_404(self):
-        restricted_user = {**USER, "allowed_agent_ids": ["agent_other"]}
+        restricted_user = {**USER, "readwrite_agent_ids": ["agent_other"]}
         r = self._call(agent_id=AGENT_ID, user=restricted_user)
         assert r["statusCode"] == 404
 
@@ -335,7 +443,7 @@ class TestListJobs:
 
     def test_no_agent_filter_excludes_inaccessible_jobs(self):
         job_other = {**_JOB, "job_id": "job_2", "agent_id": "agent_other"}
-        restricted_user = {**USER, "allowed_agent_ids": [AGENT_ID]}
+        restricted_user = {**USER, "readwrite_agent_ids": [AGENT_ID]}
         def fake_get(aid):
             if aid == AGENT_ID:
                 return _AGENT_ACTIVE
@@ -349,3 +457,68 @@ class TestListJobs:
         jobs = json.loads(r["body"])["jobs"]
         assert len(jobs) == 1
         assert jobs[0]["job_id"] == "job_1"
+
+
+# ---------------------------------------------------------------------------
+# handle_list_jobs - fleet scope
+# ---------------------------------------------------------------------------
+
+_FLEET = {"fleet_id": "fleet_1", "tenant_id": TENANT, "name": "web-asg", "status": "ACTIVE"}
+_MEMBER = {"agent_id": "agent_m1", "tenant_id": TENANT, "fleet_id": "fleet_1", "status": "ACTIVE"}
+_MJOB = {**_JOB, "job_id": "job_m", "agent_id": "agent_m1"}
+_OTHER_JOB = {**_JOB, "job_id": "job_o", "agent_id": "agent_other"}
+
+
+class TestListFleetJobs:
+    def _call(self, jobs, fleet=_FLEET, members=None, user=USER):
+        members = members if members is not None else [_MEMBER]
+        with patch("handlers.list_jobs._verify_tenant_token", return_value=user), \
+             patch("handlers.list_jobs.jobs_repo") as jr, \
+             patch("handlers.list_jobs.agents_repo") as agr, \
+             patch("handlers.list_jobs.fleets_repo") as fr:
+            jr.list_by_tenant.return_value = jobs
+            agr.list_by_fleet.return_value = members
+            agr.get.side_effect = lambda aid: next((m for m in members if m["agent_id"] == aid), None)
+            fr.get.return_value = fleet
+            return handle_list_jobs("tok", None, 20, fleet_id="fleet_1")
+
+    def test_filters_to_fleet_members(self):
+        r = self._call([_MJOB, _OTHER_JOB])
+        jobs = json.loads(r["body"])["jobs"]
+        assert [j["job_id"] for j in jobs] == ["job_m"]
+
+    def test_unknown_fleet_404(self):
+        r = self._call([_MJOB], fleet=None)
+        assert r["statusCode"] == 404
+
+    def test_no_access_fleet_404(self):
+        restricted = {**USER, "readwrite_fleet_ids": ["other"], "readonly_fleet_ids": []}
+        r = self._call([_MJOB], user=restricted)
+        assert r["statusCode"] == 404
+
+
+class TestListJobsByBatch:
+    def test_filters_to_batch(self):
+        # The run detail reads the exact member jobs via the indexed run_id.
+        run_jobs = [
+            {**_JOB, "job_id": "j1", "agent_id": "agent_a", "run_id": "batch_a"},
+            {**_JOB, "job_id": "j2", "agent_id": "agent_b", "run_id": "batch_a"},
+        ]
+        with patch("handlers.list_jobs._verify_tenant_token", return_value=USER), \
+             patch("handlers.list_jobs.jobs_repo") as jr, \
+             patch("handlers.list_jobs.agents_repo") as agr:
+            jr.list_by_run.return_value = run_jobs
+            agr.get.return_value = _AGENT_ACTIVE
+            r = handle_list_jobs("tok", None, 20, run_id="batch_a")
+        ids = [j["job_id"] for j in json.loads(r["body"])["jobs"]]
+        assert ids == ["j1", "j2"]
+        jr.list_by_run.assert_called_once_with(TENANT, "batch_a")
+
+    def test_jobs_carry_run_id(self):
+        with patch("handlers.list_jobs._verify_tenant_token", return_value=USER), \
+             patch("handlers.list_jobs.jobs_repo") as jr, \
+             patch("handlers.list_jobs.agents_repo") as agr:
+            jr.list_by_tenant.return_value = [{**_JOB, "run_id": "batch_z"}]
+            agr.get.return_value = _AGENT_ACTIVE
+            r = handle_list_jobs("tok", None, 20)
+        assert json.loads(r["body"])["jobs"][0]["run_id"] == "batch_z"

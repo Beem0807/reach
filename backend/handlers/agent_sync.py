@@ -134,7 +134,11 @@ def handle_agent_sync(body: dict, raw_token: str) -> dict:
     pending_jobs = jobs_repo.get_pending_for_agent(agent_id)
     approved_commands: list = []
     if any(j.get("mode") == "approved" for j in pending_jobs):
-        approved_commands = [a["command"] for a in approvals_repo.list_by_agent(agent_id, status="approved")]
+        # Fleet members inherit their fleet's approvals; standalone agents use their own.
+        fleet_id = agent.get("fleet_id")
+        approved = (approvals_repo.list_by_fleet(fleet_id, status="approved") if fleet_id
+                    else approvals_repo.list_by_agent(agent_id, status="approved"))
+        approved_commands = [a["command"] for a in approved]
 
     jobs_payload = []
     for job in pending_jobs:

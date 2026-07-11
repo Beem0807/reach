@@ -5,11 +5,13 @@ import { TenantUsersPage } from './pages/TenantUsersPage';
 import { TenantApiTokensPage } from './pages/TenantApiTokensPage';
 import { AuditLogsPage } from './pages/AuditLogsPage';
 import { TenantAgentsPage } from './pages/TenantAgentsPage';
+import { FleetsPage } from './pages/FleetsPage';
 import { TenantJobsPage } from './pages/TenantJobsPage';
 import { TenantApprovalsPage } from './pages/TenantApprovalsPage';
+import { TenantSettingsPage } from './pages/TenantSettingsPage';
 import { DashboardPage } from './pages/DashboardPage';
 
-type TenantPage = 'dashboard' | 'users' | 'agents' | 'jobs' | 'approvals' | 'api-tokens' | 'audit-logs';
+type TenantPage = 'dashboard' | 'users' | 'agents' | 'fleets' | 'jobs' | 'approvals' | 'api-tokens' | 'audit-logs' | 'settings';
 
 type NavItem = {
   id: TenantPage;
@@ -49,6 +51,18 @@ const NAV_ITEMS: NavItem[] = [
   {
     id: 'agents',
     label: 'Agents',
+    minRole: 'developer',
+    icon: (
+      <svg className="w-[18px] h-[18px] shrink-0" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor">
+        <path strokeLinecap="round" strokeLinejoin="round" d="M21.75 17.25v-.228a4.5 4.5 0 00-.12-1.03l-2.268-9.64a3.375 3.375 0 00-3.285-2.602H7.923a3.375 3.375 0 00-3.285 2.602l-2.268 9.64a4.5 4.5 0 00-.12 1.03v.228m19.5 0a3 3 0 01-3 3H5.25a3 3 0 01-3-3m19.5 0a3 3 0 00-3-3H5.25a3 3 0 00-3 3m16.5 0h.008v.008h-.008v-.008zm-3 0h.008v.008h-.008v-.008z" />
+      </svg>
+    ),
+  },
+  {
+    id: 'fleets',
+    label: 'Fleets',
+    // Developers can view the fleets they're granted (read-only); management actions
+    // inside the page are gated to operator+.
     minRole: 'developer',
     icon: (
       <svg className="w-[18px] h-[18px] shrink-0" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor">
@@ -93,6 +107,17 @@ const NAV_ITEMS: NavItem[] = [
     icon: (
       <svg className="w-[18px] h-[18px] shrink-0" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor">
         <path strokeLinecap="round" strokeLinejoin="round" d="M9 12h3.75M9 15h3.75M9 18h3.75m3 .75H18a2.25 2.25 0 002.25-2.25V6.108c0-1.135-.845-2.098-1.976-2.192a48.424 48.424 0 00-1.123-.08m-5.801 0c-.065.21-.1.433-.1.664 0 .414.336.75.75.75h4.5a.75.75 0 00.75-.75 2.25 2.25 0 00-.1-.664m-5.8 0A2.251 2.251 0 0113.5 2.25H15c1.012 0 1.867.668 2.15 1.586m-5.8 0c-.376.023-.75.05-1.124.08C9.095 4.01 8.25 4.973 8.25 6.108V19.5a2.25 2.25 0 002.25 2.25h.75m0-3.375h3.75m-3.75 3.375h3.75M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+      </svg>
+    ),
+  },
+  {
+    id: 'settings',
+    label: 'Settings',
+    minRole: 'admin',
+    icon: (
+      <svg className="w-[18px] h-[18px] shrink-0" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor">
+        <path strokeLinecap="round" strokeLinejoin="round" d="M9.594 3.94c.09-.542.56-.94 1.11-.94h2.593c.55 0 1.02.398 1.11.94l.213 1.281c.063.374.313.686.645.87.074.04.147.083.22.127.325.196.72.257 1.075.124l1.217-.456a1.125 1.125 0 011.37.49l1.296 2.247a1.125 1.125 0 01-.26 1.431l-1.003.827c-.293.24-.438.613-.431.992a6.759 6.759 0 010 .255c-.007.378.138.75.43.99l1.005.828c.424.35.534.954.26 1.43l-1.298 2.247a1.125 1.125 0 01-1.369.491l-1.217-.456c-.355-.133-.75-.072-1.076.124a6.57 6.57 0 01-.22.128c-.331.183-.581.495-.644.869l-.213 1.28c-.09.543-.56.941-1.11.941h-2.594c-.55 0-1.019-.398-1.11-.94l-.213-1.281c-.062-.374-.312-.686-.644-.87a6.52 6.52 0 01-.22-.127c-.325-.196-.72-.257-1.076-.124l-1.217.456a1.125 1.125 0 01-1.369-.49l-1.297-2.247a1.125 1.125 0 01.26-1.431l1.004-.827c.292-.24.437-.613.43-.992a6.932 6.932 0 010-.255c.007-.378-.138-.75-.43-.99l-1.004-.828a1.125 1.125 0 01-.26-1.43l1.297-2.247a1.125 1.125 0 011.37-.491l1.216.456c.356.133.751.072 1.076-.124.072-.044.146-.086.22-.128.332-.183.582-.495.644-.869l.214-1.281z" />
+        <path strokeLinecap="round" strokeLinejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
       </svg>
     ),
   },
@@ -246,6 +271,18 @@ function defaultPage(role: TenantRole): TenantPage {
 
 export function TenantApp({ config, onSignOut }: { config: TenantConfig; onSignOut: () => void }) {
   const [page, setPage] = useState<TenantPage>(() => defaultPage(config.role));
+  // When a fleet member is clicked, jump to Agents with that agent's detail open,
+  // so it's the exact same view (and actions) as the Agents page. We remember the
+  // originating fleet so the agent modal can offer a "Back to fleet" link.
+  const [focusAgentId, setFocusAgentId] = useState<string | null>(null);
+  const [backFleetId, setBackFleetId] = useState<string | null>(null);
+  const [focusFleetId, setFocusFleetId] = useState<string | null>(null);
+  const openAgent = (id: string, fromFleetId?: string) => {
+    setFocusAgentId(id); setBackFleetId(fromFleetId ?? null); setPage('agents');
+  };
+  const backToFleet = (fleetId: string) => {
+    setFocusAgentId(null); setBackFleetId(null); setFocusFleetId(fleetId); setPage('fleets');
+  };
 
   return (
     <div className="flex h-screen bg-gray-50 overflow-hidden">
@@ -253,13 +290,15 @@ export function TenantApp({ config, onSignOut }: { config: TenantConfig; onSignO
       <main className="flex-1 overflow-y-auto">
         {page === 'dashboard'  && <DashboardPage        config={config} />}
         {page === 'users'      && <TenantUsersPage     config={config} />}
-        {page === 'agents'     && <TenantAgentsPage    config={config} />}
+        {page === 'agents'     && <TenantAgentsPage    config={config} focusAgentId={focusAgentId} backFleetId={backFleetId} onBackToFleet={backToFleet} onFocusConsumed={() => setFocusAgentId(null)} />}
+        {page === 'fleets'     && <FleetsPage          config={config} onOpenAgent={openAgent} focusFleetId={focusFleetId} onFocusFleetConsumed={() => setFocusFleetId(null)} />}
         {page === 'jobs'       && <TenantJobsPage      config={config} />}
         {page === 'approvals'  && <TenantApprovalsPage config={config} />}
         {page === 'api-tokens' && <TenantApiTokensPage config={config} />}
         {page === 'audit-logs' && (
           <AuditLogsPage mode="tenant" apiUrl={config.apiUrl} token={config.tenantToken} />
         )}
+        {page === 'settings'   && <TenantSettingsPage config={config} />}
       </main>
     </div>
   );

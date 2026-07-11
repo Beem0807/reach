@@ -94,6 +94,10 @@ def handle_create_tenant_admin_user(tenant_id: str, body: dict, raw_token: str, 
     user_id = "user_" + secrets.token_urlsafe(12)
     now = _iso()
 
+    # Admins are tenant-wide (unrestricted); everyone else starts with no access by
+    # default and is granted agents/fleets explicitly from the tenant console.
+    empty = None if role == "admin" else []
+
     try:
         users_repo.create({
             "user_id":             user_id,
@@ -104,8 +108,10 @@ def handle_create_tenant_admin_user(tenant_id: str, body: dict, raw_token: str, 
             "role":                role,
             "must_reset_password": True,
             "status":              "ACTIVE",
-            "allowed_agent_ids":   None,
-            "allowed_fleet_ids":   None,
+            "readwrite_agent_ids":   empty,
+            "readwrite_fleet_ids":   empty,
+            "readonly_agent_ids":  empty,
+            "readonly_fleet_ids":  empty,
             "created_at":          now,
         })
     except NameTakenError:
@@ -193,11 +199,27 @@ def handle_platform_update_user_name(tenant_id: str, user_id: str, body: dict, r
     return _ok({"user_id": user_id, "name": name})
 
 
-def handle_list_tenants(raw_token: str) -> dict:
+def handle_list_tenants(raw_token: str, q=None, limit=None, offset=0) -> dict:
+    """List every tenant. Optional `q` filters by tenant name / id (substring).
+    Pagination is **opt-in**: pass `limit` for one page plus a `total`."""
     if not _verify_admin(raw_token):
         return _err("unauthorized", 401)
 
-    return _ok({"tenants": tenants_repo.list_all()})
+    tenants = tenants_repo.list_all()
+    ql = (q or "").strip().lower() or None
+    if ql:
+        tenants = [t for t in tenants
+                   if ql in (t.get("name") or "").lower() or ql in (t.get("tenant_id") or "").lower()]
+    tenants.sort(key=lambda t: ((t.get("name") or "").lower(), t.get("tenant_id") or ""))
+    total = len(tenants)
+    if limit is not None:
+        offset = max(0, offset)
+        limit = max(1, min(limit, 100))
+        tenants = tenants[offset:offset + limit]
+    result = {"tenants": tenants}
+    if limit is not None:
+        result.update(total=total, limit=limit, offset=offset)
+    return _ok(result)
 
 
 def handle_delete_tenant(tenant_id: str, raw_token: str) -> dict:
@@ -245,7 +267,18 @@ def list_tenants_handler(event, context):
     token = _token_from_event(event)
     if not token:
         return _err("missing Authorization header", 401)
-    return handle_list_tenants(token)
+    qs = event.get("queryStringParameters") or {}
+    limit = None
+    if qs.get("limit") is not None:
+        try:
+            limit = max(1, min(int(qs["limit"]), 100))
+        except (ValueError, TypeError):
+            limit = 20
+    try:
+        offset = max(0, int(qs.get("offset", 0)))
+    except (ValueError, TypeError):
+        offset = 0
+    return handle_list_tenants(token, q=qs.get("q"), limit=limit, offset=offset)
 
 
 def delete_tenant_handler(event, context):

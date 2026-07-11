@@ -53,6 +53,7 @@ That's it: your AI agent has **controlled, audited** access to the machine - no 
 - **Debug Docker containers without SSH** - `reach exec -- docker ps`, `docker logs`, `docker inspect` from anywhere
 - **Check Kubernetes pods from an in-cluster agent** - install the agent inside the cluster, run `kubectl` through it from your laptop
 - **Run approved operational commands on production** - lock agents to `approved` mode so only allowlisted commands run; everything else is blocked and queued for review
+- **Manage an autoscaling group as one fleet** - bake a fleet join token into your autoscaler's launch/instance template (AWS ASG, GCP MIG, Azure VMSS, …); instances auto-enroll on scale-out and clean themselves up on scale-in
 - **Give AI tools controlled machine access without exposing SSH** - no open ports, no VPN, no key distribution; the agent makes outbound HTTPS calls to your backend
 
 ## Why Reach?
@@ -76,12 +77,16 @@ The local and Lambda setup scripts do 1-3 for you. See [ARCHITECTURE.md](ARCHITE
 
 <table>
   <tr>
+    <td width="50%"><a href="docs/images/login.png"><img src="docs/images/login.png" alt="Sign in"></a><br><b>Sign in</b> - tenant-scoped console login (tenant name, username, password); platform admins sign in separately.</td>
     <td width="50%"><a href="docs/images/agents.png"><img src="docs/images/agents.png" alt="Agents list"></a><br><b>Agents</b> - every host and Kubernetes agent in your tenant, with status, policy mode, and cluster-RBAC drift at a glance.</td>
+  </tr>
+  <tr>
+    <td width="50%"><a href="docs/images/new-agent.png"><img src="docs/images/new-agent.png" alt="New agent"></a><br><b>New agent</b> - enroll a host or Kubernetes agent: pick a version, execution mode, and access.</td>
     <td width="50%"><a href="docs/images/rbac-drift.png"><img src="docs/images/rbac-drift.png" alt="Cluster RBAC drift"></a><br><b>Cluster RBAC drift</b> - an agent's effective permissions diffed against the acknowledged baseline, down to the exact verbs.</td>
   </tr>
   <tr>
+    <td width="50%"><a href="docs/images/fleets.png"><img src="docs/images/fleets.png" alt="Fleets"></a><br><b>Fleets</b> - reusable-join-token groups of host agents (autoscaling groups). Members inherit the fleet's mode, tags, and grants; grant drift is flagged and reconciled per member or fleet-wide.</td>
     <td width="50%"><a href="docs/images/jobs.png"><img src="docs/images/jobs.png" alt="Jobs history"></a><br><b>Jobs</b> - command history across the fleet; writes in <code>approved</code> mode are gated (note the rejected <code>kubectl delete</code>).</td>
-    <td width="50%"><a href="docs/images/new-agent.png"><img src="docs/images/new-agent.png" alt="New agent"></a><br><b>New agent</b> - enroll a host or Kubernetes agent: pick a version, execution mode, and access.</td>
   </tr>
 </table>
 
@@ -103,7 +108,7 @@ curl -fsSL https://reach-releases.s3.amazonaws.com/lambda-setup.sh | bash
 
 Both scripts are interactive, safe to re-run, and double as management tools (`--update`, `--down`, …).
 
-**Docker + PostgreSQL** (any cloud) - a plain container; finish setup in the console at `http://<your-api-url>/ui`:
+**Docker + PostgreSQL** (any cloud) - a plain container; finish setup in the console at `http://localhost:8000/ui` (or `http://<host>:8000/ui` on a remote box):
 ```bash
 docker run -d -p 8000:8000 \
   -e TOKEN_PEPPER="<your-pepper>" \
@@ -130,7 +135,7 @@ Full command reference, profiles, aliases, and MCP setup: **[cli/README.md](cli/
 
 ## Add a machine
 
-In the tenant console, go to **Agents → New agent**, choose the agent **type** (Host or Kubernetes) and a policy mode, and click Create. The console shows the install command for that type.
+In the tenant console, go to **Agents → New agent**, choose the agent **type** (Host or Kubernetes) and a policy mode, and click Create. The console shows the install command for that type. For a whole autoscaling group of identical hosts, create a **Fleet** instead (see below).
 
 ### Host
 
@@ -160,6 +165,16 @@ Deploys the agent as a **Deployment** - **one logical agent per cluster** (repli
 
 Full chart values, RBAC, and execution model: [deploy/helm/reach-agent](deploy/helm/reach-agent) and [agent/README.md](agent/README.md).
 
+### Fleet (autoscaling groups)
+
+For a fleet of interchangeable hosts (an **autoscaling group** - AWS ASG, GCP MIG, Azure VMSS, or any "cattle, not pets" set), create a **Fleet** in the console → **Fleets → New fleet**. A fleet is a **reusable join token**: bake the generated install line into your autoscaler's launch/instance template (user-data or startup script), and every instance that scales in auto-enrolls as a host agent, inheriting the fleet's mode, tags, and grants.
+
+- **Idempotent** - a rebooting instance re-uses its record (keyed on the machine fingerprint) rather than duplicating.
+- **Self-cleaning** - an instance that scales in deregisters on shutdown, and any it misses are reaped after the fleet's inactivity window.
+- **Managed as a group** - change the fleet's mode or tags and it propagates to every member; rotate the join token with a grace window so you can update the launch template first.
+
+Fleets are host-only (Kubernetes already gives you one-agent-per-cluster). Detach a member to make it a standalone agent, or revoke the whole fleet from the console → **Fleets**.
+
 ### After install
 
 Set an agent as your CLI default: `reach agents use <id|alias>`. Decommission any agent from the tenant console → **Agents**.
@@ -171,7 +186,7 @@ Set an agent as your CLI default: `reach agents use <id|alias>`. Decommission an
 The backend ships a web UI at `/ui` with two consoles (choose at login):
 
 - **Platform admin** (log in with `ADMIN_PASSWORD`) - cross-tenant administration: tenants, users across tenants, and platform-wide audit logs. It does **not** operate tenant agents or approvals.
-- **Tenant console** (username + password) - per-tenant operations: dashboard, agents, users (roles + per-user agent access), jobs, approvals, API tokens, and a tenant-scoped audit log.
+- **Tenant console** (username + password) - per-tenant operations: dashboard, agents, fleets, users (roles + per-user read-only/read-write access to agents and fleets), jobs, approvals, API tokens, and a tenant-scoped audit log.
 
 The CLI and MCP server authenticate with **API tokens** (created under **API Tokens**), not the admin password.
 
@@ -180,7 +195,7 @@ The CLI and MCP server authenticate with **API tokens** (created under **API Tok
 | View agents / job history | Tenant console → Agents / Jobs |
 | Change an agent's policy mode | Tenant console → Agents → [agent] → Policy |
 | Manage approvals | Tenant console → Approvals |
-| Restrict a user to specific agents | Tenant console → Users → [user] → Agent Access |
+| Grant a user read-only / read-write access to agents or fleets | Tenant console → Users → [user] → Access |
 | Audit log (tenant / platform) | Tenant console → Audit Logs / Platform admin → Audit Logs |
 
 Automating any of this? See [API.md](API.md).
@@ -190,14 +205,16 @@ Automating any of this? See [API.md](API.md).
 ## Using the CLI
 
 ```bash
-reach agents list                           # your machines, with mode + access level
+reach agents list                           # your standalone machines, with mode + access level
 reach exec -- <command>                     # run on the default machine
 reach exec --agent <id|alias> -- <command>  # run on a specific machine
+reach exec --tag env:prod -- <command>      # fan out to every standalone agent with a tag
 reach exec --no-wait -- <command>           # fire-and-forget; check with `reach job <id>`
-reach history                               # recent jobs
+reach jobs                                  # recent jobs
+reach fleets exec <fleet> -- <command>      # run on every member of a fleet
 ```
 
-Aliases, multi-deployment profiles, approvals, and the full command reference are in **[cli/README.md](cli/README.md)**.
+Aliases, multi-deployment profiles, fleets, approvals, `--json` output, and the full command reference are in **[cli/README.md](cli/README.md)**.
 
 **AI agents & MCP.** `reach agent-init` writes context for Claude Code / Cursor and prints the MCP config so your AI tool can call Reach as tools. The MCP server (`reach mcp`) is launched by your MCP client - add `{"mcpServers":{"reach":{"command":"reach","args":["mcp"]}}}` to its settings. See [cli/README.md](cli/README.md#mcp-server).
 
@@ -229,7 +246,7 @@ Use **`approved`** mode on production machines (set it when creating the agent, 
 
 ## Observability
 
-- **Audit log** (built-in) - every action recorded: logins, agent lifecycle (create/revoke/rotate/unreachable/recover), policy changes, approvals. Tenant-scoped or platform-wide, in the console or via the API (`GET /tenant/audit-logs`).
+- **Audit log** (built-in) - every action recorded: logins, agent lifecycle (create/revoke/rotate/unreachable/recover/reap), fleet operations (create/rotate/revoke/detach), policy changes, approvals. Tenant-scoped or platform-wide, in the console or via the API (`GET /tenant/audit-logs`).
 - **Prometheus metrics** (opt-in, Kubernetes agents) - `--set metrics.enabled=true` exposes `/metrics` (job/sync/blocked counters, leadership) with a `ServiceMonitor` and a `NetworkPolicy` locking the port to your Prometheus namespace. Off by default. See [agent/README.md → Metrics](agent/README.md#metrics-opt-in).
 
 ---
@@ -244,7 +261,7 @@ Use **`approved`** mode on production machines (set it when creating the agent, 
 | [deploy/helm/reach-agent](deploy/helm/reach-agent) | Kubernetes agent Helm chart - install, RBAC (`clusterAccess`), execution allowlist, and all values |
 | [SELF_HOSTING.md](SELF_HOSTING.md) | Deploy and operate your own backend (Local, AWS Lambda, Docker), setup, agent lifecycle, grants, blocked-command reference |
 | [API.md](API.md) | Complete HTTP endpoint reference, rate limits, pagination, audit-log actions |
-| [ARCHITECTURE.md](ARCHITECTURE.md) | How the pieces fit - command flow, token model, storage split, policy enforcement, approvals, multi-tenancy |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | How the pieces fit - command flow, token model, storage split, policy enforcement, approvals, fleets, multi-tenancy |
 | [SECURITY.md](SECURITY.md) | Threat model, token storage and rotation, revoking access, audit history, production hardening |
 
 ---

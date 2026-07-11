@@ -84,17 +84,17 @@ class TestHandleCreateTenantAgent:
     def test_restricted_operator_autogranted_new_agent(self):
         # A scoped operator who creates an agent gets access to it (can't create blind).
         op = {"user_id": "user_op", "tenant_id": TENANT_ID, "role": "operator",
-              "username": "op", "allowed_agent_ids": ["agent_existing"]}
+              "username": "op", "readwrite_agent_ids": ["agent_existing"]}
         with _auth(op), patch("handlers.tenant_agents.agents_repo") as ar, \
              patch("handlers.tenant_agents.users_repo") as ur:
             ar.create.return_value = None
             r = handle_create_tenant_agent({"mode": "wild"}, TOKEN, API_URL)
         assert r["statusCode"] == 201
         new_id = json.loads(r["body"])["agent_id"]
-        ur.set_allowed_agents.assert_called_once()
-        target_user, new_ids = ur.set_allowed_agents.call_args[0]
-        assert target_user == "user_op"
-        assert new_id in new_ids and "agent_existing" in new_ids
+        ur.set_agent_access.assert_called_once()
+        uid, rw, ro, _rwf, _rof = ur.set_agent_access.call_args[0]
+        assert uid == "user_op"
+        assert new_id in rw and "agent_existing" in rw
 
     def test_unrestricted_admin_no_autogrant(self):
         with _auth(_ADMIN), patch("handlers.tenant_agents.agents_repo") as ar, \
@@ -102,40 +102,54 @@ class TestHandleCreateTenantAgent:
             ar.create.return_value = None
             r = handle_create_tenant_agent({"mode": "wild"}, TOKEN, API_URL)
         assert r["statusCode"] == 201
-        ur.set_allowed_agents.assert_not_called()
+        ur.set_agent_access.assert_not_called()
 
     def test_grant_new_agent_to_restricted_user(self):
-        restricted = {"user_id": "user_r", "tenant_id": TENANT_ID, "allowed_agent_ids": ["agent_old"]}
+        restricted = {"user_id": "user_r", "tenant_id": TENANT_ID, "readwrite_agent_ids": ["agent_old"]}
         with _auth(_ADMIN), patch("handlers.tenant_agents.agents_repo") as ar, \
              patch("handlers.tenant_agents.users_repo") as ur:
             ar.create.return_value = None
             ur.get.return_value = restricted
             r = handle_create_tenant_agent({"mode": "wild", "grant_user_ids": ["user_r"]}, TOKEN, API_URL)
         new_id = json.loads(r["body"])["agent_id"]
-        ur.set_allowed_agents.assert_called_once()
-        uid_arg, ids_arg = ur.set_allowed_agents.call_args[0]
-        assert uid_arg == "user_r"
-        assert new_id in ids_arg and "agent_old" in ids_arg
+        ur.set_agent_access.assert_called_once()
+        uid, rw, ro, _rwf, _rof = ur.set_agent_access.call_args[0]
+        assert uid == "user_r"
+        assert new_id in rw and "agent_old" in rw
+
+    def test_grant_new_agent_readonly(self):
+        restricted = {"user_id": "user_r", "tenant_id": TENANT_ID,
+                      "readwrite_agent_ids": [], "readonly_agent_ids": []}
+        with _auth(_ADMIN), patch("handlers.tenant_agents.agents_repo") as ar, \
+             patch("handlers.tenant_agents.users_repo") as ur:
+            ar.create.return_value = None
+            ur.get.return_value = restricted
+            r = handle_create_tenant_agent({"mode": "wild", "grant_readonly_user_ids": ["user_r"]}, TOKEN, API_URL)
+        new_id = json.loads(r["body"])["agent_id"]
+        ur.set_agent_access.assert_called_once()
+        uid, rw, ro, _rwf, _rof = ur.set_agent_access.call_args[0]
+        assert uid == "user_r"
+        assert new_id in ro and new_id not in rw
 
     def test_grant_skips_unrestricted_user(self):
-        unrestricted = {"user_id": "user_u", "tenant_id": TENANT_ID, "allowed_agent_ids": None}
+        unrestricted = {"user_id": "user_u", "tenant_id": TENANT_ID, "readwrite_agent_ids": None}
         with _auth(_ADMIN), patch("handlers.tenant_agents.agents_repo") as ar, \
              patch("handlers.tenant_agents.users_repo") as ur:
             ar.create.return_value = None
             ur.get.return_value = unrestricted
             r = handle_create_tenant_agent({"mode": "wild", "grant_user_ids": ["user_u"]}, TOKEN, API_URL)
         assert r["statusCode"] == 201
-        ur.set_allowed_agents.assert_not_called()  # unrestricted already has access
+        ur.set_agent_access.assert_not_called()  # unrestricted already has access
 
     def test_grant_skips_cross_tenant_user(self):
-        other = {"user_id": "user_x", "tenant_id": "tenant_other", "allowed_agent_ids": ["a"]}
+        other = {"user_id": "user_x", "tenant_id": "tenant_other", "readwrite_agent_ids": ["a"]}
         with _auth(_ADMIN), patch("handlers.tenant_agents.agents_repo") as ar, \
              patch("handlers.tenant_agents.users_repo") as ur:
             ar.create.return_value = None
             ur.get.return_value = other
             r = handle_create_tenant_agent({"mode": "wild", "grant_user_ids": ["user_x"]}, TOKEN, API_URL)
         assert r["statusCode"] == 201
-        ur.set_allowed_agents.assert_not_called()
+        ur.set_agent_access.assert_not_called()
 
     def test_grant_user_ids_bad_shape_returns_400(self):
         with _auth(_ADMIN), patch("handlers.tenant_agents.agents_repo"):
@@ -315,13 +329,13 @@ class TestHandleRevokeTenantAgent:
 
     def test_scoped_operator_out_of_scope_returns_404(self):
         # A scoped operator can't manage an agent outside their access (hidden = 404).
-        scoped_op = {**_ADMIN, "role": "operator", "allowed_agent_ids": ["other_agent"]}
+        scoped_op = {**_ADMIN, "role": "operator", "readwrite_agent_ids": ["other_agent"]}
         r, ar = self._call(user=scoped_op)
         assert r["statusCode"] == 404
         ar.set_status.assert_not_called()
 
     def test_scoped_operator_in_scope_allowed(self):
-        scoped_op = {**_ADMIN, "role": "operator", "allowed_agent_ids": [AGENT_ID]}
+        scoped_op = {**_ADMIN, "role": "operator", "readwrite_agent_ids": [AGENT_ID]}
         r, _ = self._call(user=scoped_op)
         assert r["statusCode"] == 200
 
@@ -419,9 +433,11 @@ class TestHandleDeleteTenantAgent:
 
 class TestHandleRemoveTenantAgent:
     def _call(self, agent=_AGENT_DELETED, user=_ADMIN):
-        with _auth(user), patch("handlers.tenant_agents.agents_repo") as ar:
+        with _auth(user), patch("handlers.tenant_agents.agents_repo") as ar, \
+             patch("handlers.tenant_agents.approvals_repo") as apr:
             ar.get.return_value = agent
             ar.delete.return_value = None
+            self._apr = apr
             r = handle_remove_tenant_agent(AGENT_ID, TOKEN)
         return r, ar
 
@@ -451,6 +467,8 @@ class TestHandleRemoveTenantAgent:
         body = json.loads(r["body"])
         assert body["removed"] is True
         ar.delete.assert_called_once_with(AGENT_ID)
+        # The agent's approvals are purged so a future id reuse can't inherit them.
+        self._apr.delete_by_agent.assert_called_once_with(AGENT_ID)
 
 
 # ---------------------------------------------------------------------------
@@ -936,7 +954,7 @@ class TestHandleGetAgentHistory:
         assert r["statusCode"] == 404
 
     def test_scoped_operator_out_of_scope_returns_404(self):
-        scoped_op = {**_ADMIN, "role": "operator", "allowed_agent_ids": ["other_agent"]}
+        scoped_op = {**_ADMIN, "role": "operator", "readwrite_agent_ids": ["other_agent"]}
         with _auth(scoped_op), patch("handlers.tenant_agents.agents_repo") as ar:
             ar.get.return_value = _AGENT_ACTIVE
             r = handle_get_agent_history(AGENT_ID, TOKEN)

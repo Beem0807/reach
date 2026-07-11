@@ -1,6 +1,6 @@
 import logging
 
-from shared.access import can_access_agent
+from shared.access import can_access_agent, can_write_agent
 from shared.auth import _bearer, _verify_tenant_token
 from shared.response import _err, _ok
 from shared.store import agents_repo
@@ -31,6 +31,7 @@ def handle_get_agent(agent_id: str, raw_token: str) -> dict:
         "type": agent.get("type"),
         "mode": agent.get("mode", "wild"),
         "access_level": agent.get("access_level") or "open",
+        "writable": can_write_agent(user, agent),
         "tags": agent.get("tags") or [],
         "grant_service_mgmt": agent.get("grant_service_mgmt", False),
         "grant_docker": agent.get("grant_docker", False),

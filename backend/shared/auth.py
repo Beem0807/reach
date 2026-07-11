@@ -7,6 +7,9 @@ TOKEN_PEPPER = os.environ["TOKEN_PEPPER"]
 
 AGENT_TOKEN_PREFIX = "agent_"
 INSTALL_TOKEN_PREFIX = "install_"
+# Fleet join token: reusable, fleet-wide. Distinct prefix so the claim path can
+# route it to the fleet lookup instead of the per-agent install-token lookup.
+FLEET_TOKEN_PREFIX = "fleet_"
 
 
 def _hmac_token(raw: str) -> str:

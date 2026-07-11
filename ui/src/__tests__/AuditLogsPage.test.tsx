@@ -39,6 +39,9 @@ beforeEach(() => {
   vi.restoreAllMocks();
   vi.spyOn(api, 'listPlatformAuditLogs').mockResolvedValue({ logs: [LOG_LOGIN] });
   vi.spyOn(api, 'listTenantAuditLogs').mockResolvedValue({ logs: [LOG_LOGIN] });
+  vi.spyOn(api, 'listTenants').mockResolvedValue({
+    tenants: [{ tenant_id: 'tenant_acme', name: 'Acme Corp' }, { tenant_id: 'tenant_glob', name: 'Globex' }],
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -115,14 +118,14 @@ describe('AuditLogsPage - initial load', () => {
 describe('AuditLogsPage - action dropdown', () => {
   it('renders a select element with "All actions" default option', async () => {
     renderPlatform();
-    const sel = await screen.findByRole('combobox');
+    const sel = await screen.findByRole('combobox', { name: 'Filter by action' });
     expect(sel).toHaveValue('');
     expect(screen.getByRole('option', { name: 'All actions' })).toBeInTheDocument();
   });
 
   it('includes known action types as options', async () => {
     renderPlatform();
-    const sel = await screen.findByRole('combobox');
+    const sel = await screen.findByRole('combobox', { name: 'Filter by action' });
     const values = Array.from(sel.querySelectorAll('option')).map(o => (o as HTMLOptionElement).value);
     expect(values).toContain('user.login');
     expect(values).toContain('tenant.created');
@@ -135,7 +138,7 @@ describe('AuditLogsPage - action dropdown', () => {
     renderPlatform();
     await waitFor(() => expect(api.listPlatformAuditLogs).toHaveBeenCalledTimes(1));
 
-    fireEvent.change(await screen.findByRole('combobox'), { target: { value: 'user.login' } });
+    fireEvent.change(await screen.findByRole('combobox', { name: 'Filter by action' }), { target: { value: 'user.login' } });
     expect(api.listPlatformAuditLogs).toHaveBeenCalledTimes(1); // staged, not applied
 
     fireEvent.click(screen.getByRole('button', { name: 'Search' }));
@@ -144,7 +147,7 @@ describe('AuditLogsPage - action dropdown', () => {
 
   it('Search passes the selected action as a query param', async () => {
     renderPlatform();
-    fireEvent.change(await screen.findByRole('combobox'), { target: { value: 'tenant.created' } });
+    fireEvent.change(await screen.findByRole('combobox', { name: 'Filter by action' }), { target: { value: 'tenant.created' } });
     fireEvent.click(screen.getByRole('button', { name: 'Search' }));
 
     await waitFor(() =>
@@ -156,7 +159,7 @@ describe('AuditLogsPage - action dropdown', () => {
 
   it('selecting "All actions" then Search omits action from params', async () => {
     renderPlatform();
-    const sel = await screen.findByRole('combobox');
+    const sel = await screen.findByRole('combobox', { name: 'Filter by action' });
     fireEvent.change(sel, { target: { value: 'user.login' } });
     fireEvent.click(screen.getByRole('button', { name: 'Search' }));
     await waitFor(() => expect(api.listPlatformAuditLogs).toHaveBeenCalledTimes(2));
@@ -219,6 +222,25 @@ describe('AuditLogsPage - text filters (explicit Search)', () => {
       'http://api', 'tok', expect.objectContaining({ actor: 'alice', resource: 'user_abc' }),
     ));
   });
+
+  it('tenant filter dropdown is sent (by tenant_id) on Search in platform mode', async () => {
+    renderPlatform();
+    await waitFor(() => expect(api.listPlatformAuditLogs).toHaveBeenCalledTimes(1));
+    // Wait for the dropdown to populate from listTenants, then pick a tenant by id.
+    await screen.findByText('Globex');
+    fireEvent.change(screen.getByDisplayValue('All tenants'), { target: { value: 'tenant_glob' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Search' }));
+    await waitFor(() => expect(api.listPlatformAuditLogs).toHaveBeenLastCalledWith(
+      'http://api', 'tok', expect.objectContaining({ tenant: 'tenant_glob' }),
+    ));
+  });
+
+  it('does not render the tenant filter or load tenants in tenant mode', async () => {
+    renderTenant();
+    await waitFor(() => expect(api.listTenantAuditLogs).toHaveBeenCalledTimes(1));
+    expect(screen.queryByText('All tenants')).not.toBeInTheDocument();
+    expect(api.listTenants).not.toHaveBeenCalled();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -234,13 +256,13 @@ describe('AuditLogsPage - clear filters', () => {
 
   it('"Clear filters" appears when action is selected', async () => {
     renderPlatform();
-    fireEvent.change(await screen.findByRole('combobox'), { target: { value: 'user.login' } });
+    fireEvent.change(await screen.findByRole('combobox', { name: 'Filter by action' }), { target: { value: 'user.login' } });
     await screen.findByText('Clear filters');
   });
 
   it('"Clear filters" resets action dropdown to All actions', async () => {
     renderPlatform();
-    const sel = await screen.findByRole('combobox');
+    const sel = await screen.findByRole('combobox', { name: 'Filter by action' });
     fireEvent.change(sel, { target: { value: 'user.login' } });
     await screen.findByText('Clear filters');
     fireEvent.click(screen.getByText('Clear filters'));
@@ -250,7 +272,7 @@ describe('AuditLogsPage - clear filters', () => {
   it('"Clear filters" triggers a reload without filter params', async () => {
     renderPlatform();
     await waitFor(() => expect(api.listPlatformAuditLogs).toHaveBeenCalledTimes(1));
-    fireEvent.change(await screen.findByRole('combobox'), { target: { value: 'user.login' } });
+    fireEvent.change(await screen.findByRole('combobox', { name: 'Filter by action' }), { target: { value: 'user.login' } });
 
     fireEvent.click(screen.getByText('Clear filters'));
 
@@ -262,7 +284,7 @@ describe('AuditLogsPage - clear filters', () => {
 
   it('"Clear filters" button disappears after clearing', async () => {
     renderPlatform();
-    fireEvent.change(await screen.findByRole('combobox'), { target: { value: 'user.login' } });
+    fireEvent.change(await screen.findByRole('combobox', { name: 'Filter by action' }), { target: { value: 'user.login' } });
     await screen.findByText('Clear filters');
     fireEvent.click(screen.getByText('Clear filters'));
     await waitFor(() => expect(screen.queryByText('Clear filters')).not.toBeInTheDocument());
@@ -368,5 +390,67 @@ describe('AuditLogsPage - approval detail rendering', () => {
     renderTenant();
     await screen.findByText('rm -rf /tmp/x');
     expect(screen.getByText(/was approved/)).toBeInTheDocument();
+  });
+
+  it('renders a fleet run.dispatched with command, target and fan-out width', async () => {
+    const log: AuditLog = {
+      log_id: 'log_run', actor_name: 'dave', action: 'run.dispatched',
+      resource_type: 'run', resource_id: 'run_1', created_at: '2024-01-17T10:00:00Z',
+      metadata: { scope: 'fleet', fleet_name: 'web-tier', command: 'systemctl restart nginx',
+        dispatched: 4, wave_total: 2, is_write: true },
+    };
+    vi.spyOn(api, 'listTenantAuditLogs').mockResolvedValue({ logs: [log] });
+    renderTenant();
+    await screen.findByText('systemctl restart nginx');
+    expect(screen.getByText('web-tier')).toBeInTheDocument();
+    expect(screen.getByText(/4 agents/)).toBeInTheDocument();
+    expect(screen.getByText(/2 waves/)).toBeInTheDocument();
+    expect(screen.getByText('write')).toBeInTheDocument();
+  });
+
+  it('renders a job.dispatched with command and target host', async () => {
+    const log: AuditLog = {
+      log_id: 'log_job', actor_name: 'dan', action: 'job.dispatched',
+      resource_type: 'job', resource_id: 'job_1', created_at: '2024-01-17T10:00:00Z',
+      metadata: { agent_id: 'agent_1', hostname: 'web-01', command: 'systemctl restart nginx', mode: 'wild', is_write: true },
+    };
+    vi.spyOn(api, 'listTenantAuditLogs').mockResolvedValue({ logs: [log] });
+    renderTenant();
+    await screen.findByText('systemctl restart nginx');
+    expect(screen.getByText('web-01')).toBeInTheDocument();
+    expect(screen.getByText('write')).toBeInTheDocument();
+  });
+
+  it('renders a generic metadata summary for actions without a bespoke renderer', async () => {
+    const log: AuditLog = {
+      log_id: 'log_set', actor_name: 'erin', action: 'tenant.settings_updated',
+      resource_type: 'tenant', resource_id: 'tenant_1', created_at: '2024-01-17T10:00:00Z',
+      metadata: { keys: ['fanout_cap', 'wave_policy'] },
+    };
+    vi.spyOn(api, 'listTenantAuditLogs').mockResolvedValue({ logs: [log] });
+    renderTenant();
+    await screen.findByText('fanout_cap, wave_policy');
+  });
+});
+
+describe('AuditLogsPage - tenant column', () => {
+  const LOG_WITH_TENANT: AuditLog = {
+    log_id: 'log_t', actor_name: 'sam', action: 'run.dispatched',
+    tenant_id: 'tenant_acme', resource_type: 'run', resource_id: 'run_9',
+    created_at: '2024-01-18T10:00:00Z', metadata: { scope: 'tag', tag: 'env:prod', command: 'uptime' },
+  };
+
+  it('shows a Tenant column with the tenant_id in platform mode', async () => {
+    vi.spyOn(api, 'listPlatformAuditLogs').mockResolvedValue({ logs: [LOG_WITH_TENANT] });
+    renderPlatform();
+    expect(await screen.findByText('Tenant')).toBeInTheDocument();
+    expect(screen.getByText('tenant_acme')).toBeInTheDocument();
+  });
+
+  it('does not show the Tenant column in tenant mode', async () => {
+    vi.spyOn(api, 'listTenantAuditLogs').mockResolvedValue({ logs: [LOG_WITH_TENANT] });
+    renderTenant();
+    await screen.findByText('uptime');
+    expect(screen.queryByText('Tenant')).not.toBeInTheDocument();
   });
 });

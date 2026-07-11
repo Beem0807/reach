@@ -1,10 +1,10 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { createPortal } from 'react-dom';
-import type { TenantConfig, TenantUser, TenantRole, Agent } from '../types';
+import type { TenantConfig, TenantUser, TenantRole, Agent, Fleet, UserAccessScope } from '../types';
 import {
   listTenantUsers, createTenantUser, disableTenantUser, enableTenantUser, deleteTenantUser, revokeAllUserTokens,
   setTenantUserRole, resetTenantUserPassword,
-  getUserAgentAccess, setUserAgentAccess, listTenantAgents,
+  getUserAgentAccess, setUserAgentAccess, listTenantAgents, listFleets,
 } from '../api';
 import { Modal } from '../components/Modal';
 import { Spinner } from '../components/Spinner';
@@ -32,11 +32,47 @@ const ROLE_DESC: Record<TenantRole, string> = {
   developer: 'CLI/MCP access: run commands, view jobs.',
 };
 
+// Summary of a user's access for the users table: one line per resource type
+// (agents, fleets), each showing the read-write / read-only split.
+function accessSummary(u: TenantUser) {
+  if (u.role === 'admin') return <span className="text-[11px] text-gray-400" title="tenant-wide">tenant-wide</span>;
+  const rwA = u.readwrite_agent_ids ?? [], roA = u.readonly_agent_ids ?? [];
+  const rwF = u.readwrite_fleet_ids ?? [], roF = u.readonly_fleet_ids ?? [];
+
+  const line = (rw: number, ro: number, noun: string) => {
+    if (rw + ro === 0) return null;
+    return (
+      <span key={noun} className="text-[11px]">
+        <span className="text-gray-400">{noun}</span>{' '}
+        {rw > 0 && <span className="font-semibold text-indigo-500">{rw} r/w</span>}
+        {rw > 0 && ro > 0 && <span className="text-gray-300"> · </span>}
+        {ro > 0 && <span className="font-semibold text-sky-500">{ro} read</span>}
+      </span>
+    );
+  };
+  const rows = [line(rwA.length, roA.length, 'agents'), line(rwF.length, roF.length, 'fleets')].filter(Boolean);
+  if (rows.length === 0) return <span className="text-[11px] font-semibold text-red-500">no access</span>;
+  return <span className="flex flex-col leading-tight">{rows}</span>;
+}
+
 export function TenantUsersPage({ config }: { config: TenantConfig }) {
   const { apiUrl, tenantToken, role } = config;
   const isAdmin = role === 'admin';
 
+  const PAGE = 20;
   const [users, setUsers] = useState<TenantUser[]>([]);
+  const [total, setTotal] = useState(0);
+  const [offset, setOffset] = useState(0);
+  // Draft filters - staged in the toolbar. Nothing hits the server until Search: a
+  // dropdown choice, like the text box, is only applied on click / Enter.
+  const [roleFilter, setRoleFilter] = useState('');
+  const [statusFilter, setStatusFilter] = useState('');
+  const [search, setSearch] = useState('');
+  // Applied filters - what the current results reflect.
+  const EMPTY_APPLIED = { role: '', status: '', q: '' };
+  const [applied, setApplied] = useState(EMPTY_APPLIED);
+  const applySearch = () => { setApplied({ role: roleFilter, status: statusFilter, q: search.trim() }); setOffset(0); };
+  const filtersDirty = roleFilter !== applied.role || statusFilter !== applied.status || search.trim() !== applied.q;
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [modal, setModal] = useState<'create' | 'role' | 'creds' | null>(null);
@@ -51,11 +87,15 @@ export function TenantUsersPage({ config }: { config: TenantConfig }) {
 
   const load = useCallback(() => {
     setLoading(true);
-    listTenantUsers(apiUrl, tenantToken)
-      .then(r => setUsers(r.users))
+    const params: Record<string, string> = { limit: String(PAGE), offset: String(offset) };
+    if (applied.role) params.role = applied.role;
+    if (applied.status) params.status = applied.status;
+    if (applied.q) params.q = applied.q;
+    listTenantUsers(apiUrl, tenantToken, params)
+      .then(r => { setUsers(r.users); setTotal(r.total ?? r.users.length); })
       .catch(() => setError('Failed to load users'))
       .finally(() => setLoading(false));
-  }, [apiUrl, tenantToken]);
+  }, [apiUrl, tenantToken, applied, offset]);
 
   useEffect(() => { load(); }, [load]);
 
@@ -112,7 +152,7 @@ export function TenantUsersPage({ config }: { config: TenantConfig }) {
             </div>
           </div>
           <div className="flex items-center gap-3">
-            {!loading && users.length > 0 && (
+            {!loading && users.length > 0 && total <= PAGE && !applied.role && !applied.status && !applied.q && (
               <>
                 {adminCount > 0 && (
                   <span className="inline-flex items-center gap-1.5 bg-white/15 border border-white/20 text-violet-100 text-xs font-semibold px-3 py-1.5 rounded-lg">
@@ -149,6 +189,50 @@ export function TenantUsersPage({ config }: { config: TenantConfig }) {
         <div className="text-sm text-red-700 bg-red-50 border border-red-200 rounded-lg px-4 py-3 mb-4">{error}</div>
       )}
 
+      {/* Filters + search are staged and applied together, only on Search / Enter -
+          choosing a dropdown option doesn't re-query until you click Search. */}
+      <div className="flex flex-wrap items-center gap-2 mb-4">
+        <select
+          value={roleFilter}
+          onChange={e => setRoleFilter(e.target.value)}
+          className="border border-gray-300 rounded-lg px-3 py-1.5 text-sm bg-white shadow-sm focus:outline-none focus:ring-2 focus:ring-violet-500"
+        >
+          <option value="">All roles</option>
+          <option value="admin">Admins</option>
+          <option value="operator">Operators</option>
+          <option value="developer">Developers</option>
+        </select>
+        <select
+          value={statusFilter}
+          onChange={e => setStatusFilter(e.target.value)}
+          className="border border-gray-300 rounded-lg px-3 py-1.5 text-sm bg-white shadow-sm focus:outline-none focus:ring-2 focus:ring-violet-500"
+        >
+          <option value="">All statuses</option>
+          <option value="ACTIVE">Active</option>
+          <option value="REVOKED">Disabled</option>
+        </select>
+        <div className="flex items-center gap-2 ml-auto">
+          <input
+            value={search}
+            onChange={e => setSearch(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter') applySearch(); }}
+            placeholder="Search name or username…"
+            className="border border-gray-300 rounded-lg px-3 py-1.5 text-sm bg-white shadow-sm focus:outline-none focus:ring-2 focus:ring-violet-500"
+          />
+          <button
+            onClick={applySearch}
+            className={`text-sm text-white rounded-lg px-3 py-1.5 ${filtersDirty ? 'bg-indigo-600 hover:bg-indigo-500 ring-2 ring-indigo-300' : 'bg-slate-800 hover:bg-slate-700'}`}
+          >Search</button>
+          {(applied.role || applied.status || applied.q) && (
+            <button
+              onClick={() => { setRoleFilter(''); setStatusFilter(''); setSearch(''); setApplied(EMPTY_APPLIED); setOffset(0); }}
+              className="text-sm text-indigo-600 hover:text-indigo-800"
+              aria-label="Clear filters"
+            >✕</button>
+          )}
+        </div>
+      </div>
+
       {loading && users.length === 0 ? (
         <div className="flex justify-center py-20"><Spinner /></div>
       ) : (
@@ -178,14 +262,7 @@ export function TenantUsersPage({ config }: { config: TenantConfig }) {
                       >
                         {u.name || u.username}
                       </button>
-                      <div className="mt-0.5">
-                        {u.allowed_agent_ids == null
-                          ? <span className="text-[11px] text-gray-400 font-mono" title="all agents">* all agents</span>
-                          : u.allowed_agent_ids.length === 0
-                          ? <span className="text-[11px] font-semibold text-red-500">no agents</span>
-                          : <span className="text-[11px] font-semibold text-indigo-500">{u.allowed_agent_ids.length} agent{u.allowed_agent_ids.length !== 1 ? 's' : ''}</span>
-                        }
-                      </div>
+                      <div className="mt-0.5">{accessSummary(u)}</div>
                     </div>
                     {u.must_reset_password && (
                       u.last_login_at
@@ -240,6 +317,23 @@ export function TenantUsersPage({ config }: { config: TenantConfig }) {
               </tr>
             )}
           />
+          {total > PAGE && (
+            <div className="flex items-center justify-between px-4 py-3 border-t border-gray-100 bg-gray-50/60 text-sm text-gray-600">
+              <span>Showing {total === 0 ? 0 : offset + 1}–{Math.min(offset + PAGE, total)} of {total}</span>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => setOffset(Math.max(0, offset - PAGE))}
+                  disabled={offset === 0}
+                  className="px-3 py-1 rounded-md border border-gray-300 bg-white disabled:opacity-40 hover:bg-gray-50"
+                >Prev</button>
+                <button
+                  onClick={() => setOffset(offset + PAGE)}
+                  disabled={offset + PAGE >= total}
+                  className="px-3 py-1 rounded-md border border-gray-300 bg-white disabled:opacity-40 hover:bg-gray-50"
+                >Next</button>
+              </div>
+            </div>
+          )}
         </div>
       )}
 
@@ -335,29 +429,16 @@ function CreateUserModal({
   const [role, setRole] = useState<TenantRole>('developer');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
-
   const [agents, setAgents] = useState<Agent[]>([]);
-  const [restricted, setRestricted] = useState(false);
-  const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [agentSearch, setAgentSearch] = useState('');
+  const [fleets, setFleets] = useState<Fleet[]>([]);
+  const [scope, setScope] = useState<UserAccessScope>(EMPTY_SCOPE);
 
   useEffect(() => {
-    listTenantAgents(apiUrl, tenantToken)
-      .then(r => setAgents((r.agents ?? []).filter(a => a.status === 'ACTIVE')))
-      .catch(() => {/* non-fatal: agent picker stays empty */});
+    Promise.all([
+      listTenantAgents(apiUrl, tenantToken),
+      listFleets(apiUrl, tenantToken).catch(() => ({ fleets: [] as Fleet[] })),
+    ]).then(([a, f]) => { setAgents(a.agents ?? []); setFleets(f.fleets ?? []); }).catch(() => {});
   }, [apiUrl, tenantToken]);
-
-  const filteredAgents = agentSearch.trim()
-    ? agents.filter(a =>
-        (a.hostname ?? '').toLowerCase().includes(agentSearch.toLowerCase()) ||
-        a.agent_id.toLowerCase().includes(agentSearch.toLowerCase()))
-    : agents;
-
-  const toggleAgent = (id: string) => setSelected(prev => {
-    const next = new Set(prev);
-    next.has(id) ? next.delete(id) : next.add(id);
-    return next;
-  });
 
   const usernameFormatError = username && !/^[a-z0-9]*$/.test(username)
     ? 'Lowercase letters and numbers only - no spaces or special characters'
@@ -370,8 +451,9 @@ function CreateUserModal({
     if (usernameFormatError) { setError(usernameFormatError); return; }
     setLoading(true); setError('');
     try {
-      const allowed_agent_ids = restricted ? [...selected] : null;
-      const r = await createTenantUser(apiUrl, tenantToken, { username, name, role, allowed_agent_ids });
+      // Admins are tenant-wide (no scope sent); non-admins get the access chosen below.
+      const body = role === 'admin' ? { username, name, role } : { username, name, role, ...scope };
+      const r = await createTenantUser(apiUrl, tenantToken, body);
       onCreated({ username: r.username!, temp_password: r.temp_password! });
     } catch (e) { setError((e as Error).message); setLoading(false); }
   };
@@ -408,7 +490,7 @@ function CreateUserModal({
           <label className="block text-sm font-medium text-gray-700 mb-2">Role</label>
           <div className="grid grid-cols-3 gap-2">
             {ROLES.map(r => (
-              <button key={r} type="button" onClick={() => { setRole(r); if (r === 'admin') setRestricted(false); }}
+              <button key={r} type="button" onClick={() => setRole(r)}
                 className={`text-left px-3 py-2.5 rounded-md border transition-colors ${role === r ? 'bg-indigo-50 border-indigo-400 text-indigo-900' : 'border-gray-200 text-gray-700 hover:bg-gray-50'}`}>
                 <div className="mb-1"><span className={`text-xs font-semibold px-1.5 py-0.5 rounded ${ROLE_STYLE[r]}`}>{ROLE_LABEL[r]}</span></div>
                 <p className="text-[11px] text-gray-500 leading-tight">{ROLE_DESC[r]}</p>
@@ -417,88 +499,19 @@ function CreateUserModal({
           </div>
         </div>
 
-        {/* Agent access - admins are always tenant-wide, so the picker is hidden for them */}
+        {/* Agent/fleet access - admins are tenant-wide; others get what you grant here (or later). */}
         {role === 'admin' ? (
           <div className="flex items-start gap-2 rounded-lg border border-indigo-100 bg-indigo-50 px-3 py-2.5">
             <svg className="w-4 h-4 text-indigo-500 shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" d="M9 12.75 11.25 15 15 9.75M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z" />
             </svg>
-            <p className="text-xs text-indigo-800">Admins have <span className="font-semibold">tenant-wide access</span> to all agents and can't be restricted to specific ones.</p>
+            <p className="text-xs text-indigo-800">Admins have <span className="font-semibold">tenant-wide access</span> to every agent and fleet.</p>
           </div>
         ) : (
-        <div>
-          <div className="flex items-center gap-2 mb-2.5">
-            <span className="text-sm font-medium text-gray-700">Agent access</span>
-            {!restricted
-              ? <span className="text-xs bg-gray-100 text-gray-500 font-mono px-1.5 py-0.5 rounded">* all agents</span>
-              : selected.size === 0
-              ? <span className="text-xs bg-red-100 text-red-600 font-semibold px-1.5 py-0.5 rounded">no agents</span>
-              : <span className="text-xs bg-indigo-100 text-indigo-700 font-semibold px-1.5 py-0.5 rounded">{selected.size} selected</span>
-            }
+          <div className="space-y-3 border-t border-gray-100 pt-3">
+            <p className="text-sm font-medium text-gray-700">Access <span className="font-normal text-gray-400">(optional - grant now or later)</span></p>
+            <ScopeEditor agents={agents} fleets={fleets} initial={EMPTY_SCOPE} onChange={setScope} />
           </div>
-          <button
-            type="button"
-            onClick={() => setRestricted(v => !v)}
-            className="flex items-center gap-2.5 mb-3 group"
-          >
-            <div className={`relative w-9 h-5 rounded-full transition-colors ${restricted ? 'bg-indigo-600' : 'bg-gray-300 group-hover:bg-gray-400'}`}>
-              <div className={`absolute top-0.5 w-4 h-4 bg-white rounded-full shadow transition-all duration-150 ${restricted ? 'left-4' : 'left-0.5'}`} />
-            </div>
-            <span className="text-sm text-gray-600 group-hover:text-gray-800 select-none">Restrict to specific agents</span>
-          </button>
-          {restricted && (
-            <div className="border border-gray-200 rounded-lg overflow-hidden shadow-sm">
-              <div className="px-3 py-2 bg-white border-b border-gray-100 flex items-center gap-2">
-                <svg className="w-3.5 h-3.5 text-gray-400 shrink-0" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" d="m21 21-5.197-5.197m0 0A7.5 7.5 0 1 0 5.196 5.196a7.5 7.5 0 0 0 10.607 10.607Z" />
-                </svg>
-                <input
-                  type="text"
-                  placeholder="Search agents…"
-                  value={agentSearch}
-                  onChange={e => setAgentSearch(e.target.value)}
-                  className="flex-1 text-sm text-gray-800 placeholder-gray-400 focus:outline-none bg-transparent"
-                />
-                {agentSearch && (
-                  <button type="button" onClick={() => setAgentSearch('')} className="text-gray-400 hover:text-gray-600 leading-none">✕</button>
-                )}
-              </div>
-              <div className="flex items-center justify-between px-3 py-1.5 bg-gray-50 border-b border-gray-100">
-                <span className="text-[11px] text-gray-500">
-                  {selected.size} of {agents.length} selected
-                  {agentSearch && filteredAgents.length !== agents.length && ` · ${filteredAgents.length} shown`}
-                </span>
-                {selected.size > 0 && (
-                  <button type="button" onClick={() => setSelected(new Set())} className="text-[11px] text-gray-400 hover:text-red-500">clear all</button>
-                )}
-              </div>
-              <div className="max-h-44 overflow-y-auto">
-                {filteredAgents.length === 0 ? (
-                  <p className="text-sm text-gray-400 text-center py-5">{agentSearch ? 'No agents match' : 'No active agents in this tenant'}</p>
-                ) : filteredAgents.map(a => {
-                  const isSel = selected.has(a.agent_id);
-                  return (
-                    <label key={a.agent_id}
-                      className={`flex items-center gap-3 px-3 py-2.5 cursor-pointer border-b border-gray-50 last:border-0 transition-colors ${isSel ? 'bg-indigo-50 hover:bg-indigo-100/70' : 'hover:bg-gray-50'}`}>
-                      <input type="checkbox" checked={isSel} onChange={() => toggleAgent(a.agent_id)} className="sr-only" />
-                      <div className={`w-4 h-4 rounded border-2 flex items-center justify-center shrink-0 transition-colors ${isSel ? 'bg-indigo-600 border-indigo-600' : 'border-gray-300'}`}>
-                        {isSel && (
-                          <svg className="w-2.5 h-2.5 text-white" fill="none" viewBox="0 0 24 24" strokeWidth={3} stroke="currentColor">
-                            <path strokeLinecap="round" strokeLinejoin="round" d="m4.5 12.75 6 6 9-13.5" />
-                          </svg>
-                        )}
-                      </div>
-                      <div className="min-w-0 flex-1">
-                        <p className="text-sm font-medium text-gray-800 leading-tight">{a.hostname ?? '(unclaimed)'}</p>
-                        <p className="text-[10px] font-mono text-gray-400 leading-tight">{a.agent_id}</p>
-                      </div>
-                    </label>
-                  );
-                })}
-              </div>
-            </div>
-          )}
-        </div>
         )}
 
         {error && <p className="text-sm text-red-600">{error}</p>}
@@ -536,7 +549,7 @@ function ChangeRoleModal({
     setLoading(true); setError('');
     try {
       await setTenantUserRole(apiUrl, tenantToken, user.user_id, role);
-      onChanged(demotingAdmin ? { ...user, role, allowed_agent_ids: null } : undefined);
+      onChanged(demotingAdmin ? { ...user, role, readwrite_agent_ids: null } : undefined);
     } catch (e) { setError((e as Error).message); setLoading(false); }
   };
 
@@ -554,14 +567,14 @@ function ChangeRoleModal({
             </button>
           ))}
         </div>
-        {role === 'admin' && user.role !== 'admin' && user.allowed_agent_ids != null && (
+        {role === 'admin' && user.role !== 'admin' && user.readwrite_agent_ids != null && (
           <div className="flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2.5">
             <svg className="w-4 h-4 text-amber-500 shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m9-.75a9 9 0 1 1-18 0 9 9 0 0 1 18 0Zm-9 3.75h.008v.008H12v-.008Z" />
             </svg>
             <p className="text-xs text-amber-800">
               This user is currently restricted to{' '}
-              <span className="font-semibold">{user.allowed_agent_ids.length} agent{user.allowed_agent_ids.length !== 1 ? 's' : ''}</span>.
+              <span className="font-semibold">{user.readwrite_agent_ids.length} agent{user.readwrite_agent_ids.length !== 1 ? 's' : ''}</span>.
               Promoting to Admin grants <span className="font-semibold">tenant-wide access</span> - the restriction will be removed.
             </p>
           </div>
@@ -923,6 +936,133 @@ function DeleteUserModal({ user, onClose, onConfirm }: {
   );
 }
 
+// A capability granted per agent/fleet. There is no wildcard - "all" is every id.
+type Cap = 'none' | 'read' | 'write';
+type ScopeItem = { id: string; label: string; sub?: string; badge?: string };
+
+// One access section (agents or fleets): a per-item Read / Read-write picker, with
+// quick "All read" / "All read-write" / "Clear" actions that materialize every id
+// explicitly (no `*`). Maps directly to the (readwrite, readonly) id lists.
+function ScopeSection({ title, items, caps, setCaps }: {
+  title: string;
+  items: ScopeItem[];
+  caps: Map<string, Cap>;
+  setCaps: (m: Map<string, Cap>) => void;
+}) {
+  const [search, setSearch] = useState('');
+  const filtered = search.trim()
+    ? items.filter(i => i.label.toLowerCase().includes(search.toLowerCase()) || i.id.toLowerCase().includes(search.toLowerCase()))
+    : items;
+  const setCap = (id: string, c: Cap) => { const n = new Map(caps); c === 'none' ? n.delete(id) : n.set(id, c); setCaps(n); };
+  const setAll = (c: Cap) => {
+    const n = new Map(caps);
+    if (c === 'none') items.forEach(i => n.delete(i.id));
+    else items.forEach(i => n.set(i.id, c));   // materialize every id explicitly
+    setCaps(n);
+  };
+  const counts = { read: 0, write: 0 };
+  items.forEach(i => { const c = caps.get(i.id); if (c === 'read') counts.read++; else if (c === 'write') counts.write++; });
+
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-xs font-semibold text-gray-500 uppercase tracking-wider">{title}</span>
+        <div className="inline-flex rounded-lg border border-gray-200 overflow-hidden text-[11px]">
+          <button type="button" onClick={() => setAll('none')} className="px-2.5 py-1 font-medium bg-white text-gray-600 hover:bg-gray-50">Clear</button>
+          <button type="button" onClick={() => setAll('read')} className="px-2.5 py-1 font-medium bg-white text-sky-600 hover:bg-sky-50 border-l border-gray-200">All read</button>
+          <button type="button" onClick={() => setAll('write')} className="px-2.5 py-1 font-medium bg-white text-indigo-600 hover:bg-indigo-50 border-l border-gray-200">All read-write</button>
+        </div>
+      </div>
+
+      <div className="border border-gray-200 rounded-lg overflow-hidden shadow-sm">
+        <div className="px-3 py-2 bg-white border-b border-gray-100 flex items-center gap-2">
+          <input type="text" placeholder={`Search ${title.toLowerCase()}…`} value={search}
+            onChange={e => setSearch(e.target.value)}
+            className="flex-1 text-sm text-gray-800 placeholder-gray-400 focus:outline-none bg-transparent" />
+          {(counts.read > 0 || counts.write > 0) && (
+            <span className="text-[11px] text-gray-500">{counts.write} write · {counts.read} read</span>
+          )}
+        </div>
+        <div className="max-h-52 overflow-y-auto">
+          {filtered.length === 0 ? (
+            <p className="text-sm text-gray-400 text-center py-6">{search ? 'No matches' : `No ${title.toLowerCase()}`}</p>
+          ) : filtered.map(it => {
+            const c = caps.get(it.id) ?? 'none';
+            return (
+              <div key={it.id} className="flex items-center gap-3 px-3 py-2 border-b border-gray-50 last:border-0">
+                <div className="min-w-0 flex-1">
+                  <p className="text-sm font-medium text-gray-800 leading-tight truncate">{it.label}</p>
+                  {it.sub && <p className="text-[10px] font-mono text-gray-400 leading-tight truncate">{it.sub}</p>}
+                </div>
+                {it.badge && <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded-full shrink-0 bg-gray-100 text-gray-500">{it.badge}</span>}
+                <div className="inline-flex rounded-md border border-gray-200 overflow-hidden text-[11px] shrink-0">
+                  {(['none', 'read', 'write'] as Cap[]).map(opt => (
+                    <button key={opt} type="button" onClick={() => setCap(it.id, opt)}
+                      className={`px-2 py-1 font-medium transition-colors ${c === opt
+                        ? (opt === 'write' ? 'bg-indigo-600 text-white' : opt === 'read' ? 'bg-sky-500 text-white' : 'bg-gray-400 text-white')
+                        : 'bg-white text-gray-500 hover:bg-gray-50'}`}>
+                      {opt === 'none' ? '-' : opt === 'read' ? 'Read' : 'R/W'}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Parse (readwrite, readonly) id lists into per-item caps. No wildcard.
+function parseCaps(rw: string[] | null, ro: string[] | null): Map<string, Cap> {
+  const caps = new Map<string, Cap>();
+  (ro ?? []).forEach(id => caps.set(id, 'read'));
+  (rw ?? []).forEach(id => caps.set(id, 'write'));   // read-write wins if listed in both
+  return caps;
+}
+
+// Serialize per-item caps back into explicit (readwrite, readonly) id lists.
+function serializeCaps(caps: Map<string, Cap>): { rw: string[]; ro: string[] } {
+  const rw: string[] = [], ro: string[] = [];
+  caps.forEach((c, id) => { if (c === 'write') rw.push(id); else if (c === 'read') ro.push(id); });
+  return { rw, ro };
+}
+
+const EMPTY_SCOPE: UserAccessScope = {
+  readwrite_agent_ids: [], readonly_agent_ids: [], readwrite_fleet_ids: [], readonly_fleet_ids: [],
+};
+
+// The agents + fleets capability editor, shared by the Access modal and Create User.
+// Reports the current scope via onChange; `initial` is read once at mount.
+function ScopeEditor({ agents, fleets, initial, onChange }: {
+  agents: Agent[]; fleets: Fleet[]; initial: UserAccessScope; onChange: (s: UserAccessScope) => void;
+}) {
+  const [agentCaps, setAgentCaps] = useState<Map<string, Cap>>(() => parseCaps(initial.readwrite_agent_ids, initial.readonly_agent_ids));
+  const [fleetCaps, setFleetCaps] = useState<Map<string, Cap>>(() => parseCaps(initial.readwrite_fleet_ids, initial.readonly_fleet_ids));
+
+  useEffect(() => {
+    const a = serializeCaps(agentCaps);
+    const f = serializeCaps(fleetCaps);
+    onChange({ readwrite_agent_ids: a.rw, readonly_agent_ids: a.ro, readwrite_fleet_ids: f.rw, readonly_fleet_ids: f.ro });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agentCaps, fleetCaps]);
+
+  const noAccess = agentCaps.size === 0 && fleetCaps.size === 0;
+  return (
+    <>
+      <p className="text-xs text-gray-500">
+        Grant each agent/fleet <b>Read</b> (read commands + viewing) or <b>Read-write</b> (also write commands, still gated by the agent's mode). "All read / All read-write" grants every one explicitly. Fleet members are granted via the Fleets section, not by agent id.
+      </p>
+      <ScopeSection title="Agents" caps={agentCaps} setCaps={setAgentCaps}
+        items={agents.filter(a => !a.fleet_id).map(a => ({ id: a.agent_id, label: a.hostname ?? '(unclaimed)', sub: a.agent_id, badge: a.status.toLowerCase() }))} />
+      <ScopeSection title="Fleets" caps={fleetCaps} setCaps={setFleetCaps}
+        items={fleets.map(f => ({ id: f.fleet_id, label: f.name, sub: f.fleet_id }))} />
+      {noAccess && <p className="text-xs text-amber-600">This user will have <b>no agent access</b>.</p>}
+    </>
+  );
+}
+
 function AgentAccessModal({ apiUrl, tenantToken, user, onClose }: {
   apiUrl: string;
   tenantToken: string;
@@ -930,49 +1070,33 @@ function AgentAccessModal({ apiUrl, tenantToken, user, onClose }: {
   onClose: () => void;
 }) {
   const [agents, setAgents] = useState<Agent[]>([]);
-  const [restricted, setRestricted] = useState<boolean>(false);
-  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [fleets, setFleets] = useState<Fleet[]>([]);
+  const [initial, setInitial] = useState<UserAccessScope | null>(null);
+  const [scope, setScope] = useState<UserAccessScope>(EMPTY_SCOPE);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
-  const [search, setSearch] = useState('');
 
   useEffect(() => {
     Promise.all([
       listTenantAgents(apiUrl, tenantToken),
+      listFleets(apiUrl, tenantToken).catch(() => ({ fleets: [] as Fleet[] })),
       getUserAgentAccess(apiUrl, tenantToken, user.user_id),
-    ]).then(([agentsRes, accessRes]) => {
+    ]).then(([agentsRes, fleetsRes, access]) => {
       setAgents(agentsRes.agents ?? []);
-      const ids = accessRes.allowed_agent_ids;
-      if (ids !== null && ids !== undefined) {
-        setRestricted(true);
-        setSelected(new Set(ids));
-      } else {
-        setRestricted(false);
-        setSelected(new Set());
-      }
-    }).catch(() => setError('Failed to load agent access data'))
+      setFleets(fleetsRes.fleets ?? []);
+      setInitial({
+        readwrite_agent_ids: access.readwrite_agent_ids, readonly_agent_ids: access.readonly_agent_ids,
+        readwrite_fleet_ids: access.readwrite_fleet_ids, readonly_fleet_ids: access.readonly_fleet_ids,
+      });
+    }).catch(() => setError('Failed to load access data'))
       .finally(() => setLoading(false));
   }, [apiUrl, tenantToken, user.user_id]);
-
-  const filteredAgents = search.trim()
-    ? agents.filter(a =>
-        (a.hostname ?? '').toLowerCase().includes(search.toLowerCase()) ||
-        a.agent_id.toLowerCase().includes(search.toLowerCase()))
-    : agents;
-
-  const toggle = (agentId: string) => {
-    setSelected(prev => {
-      const next = new Set(prev);
-      next.has(agentId) ? next.delete(agentId) : next.add(agentId);
-      return next;
-    });
-  };
 
   const save = async () => {
     setSaving(true); setError('');
     try {
-      await setUserAgentAccess(apiUrl, tenantToken, user.user_id, restricted ? [...selected] : null);
+      await setUserAgentAccess(apiUrl, tenantToken, user.user_id, scope);
       onClose();
     } catch (e) {
       setError((e as Error).message);
@@ -982,89 +1106,12 @@ function AgentAccessModal({ apiUrl, tenantToken, user, onClose }: {
   };
 
   return (
-    <Modal title={`Agent access · @${user.username}`} onClose={onClose}>
+    <Modal title={`Access · @${user.username}`} onClose={onClose}>
       <div className="space-y-4">
-        {loading ? (
+        {loading || !initial ? (
           <div className="flex justify-center py-8"><Spinner /></div>
         ) : (
-          <>
-            <div className="flex items-center gap-2">
-              <button
-                type="button"
-                onClick={() => setRestricted(v => !v)}
-                className="flex items-center gap-2.5 group"
-              >
-                <div className={`relative w-9 h-5 rounded-full transition-colors ${restricted ? 'bg-indigo-600' : 'bg-gray-300 group-hover:bg-gray-400'}`}>
-                  <div className={`absolute top-0.5 w-4 h-4 bg-white rounded-full shadow transition-all duration-150 ${restricted ? 'left-4' : 'left-0.5'}`} />
-                </div>
-                <span className="text-sm text-gray-700 group-hover:text-gray-900 select-none">Restrict to specific agents</span>
-              </button>
-              <div className="ml-auto">
-                {!restricted
-                  ? <span className="text-xs bg-gray-100 text-gray-500 font-mono px-1.5 py-0.5 rounded">* all agents</span>
-                  : selected.size === 0
-                  ? <span className="text-xs bg-red-100 text-red-600 font-semibold px-1.5 py-0.5 rounded">no agents</span>
-                  : <span className="text-xs bg-indigo-100 text-indigo-700 font-semibold px-1.5 py-0.5 rounded">{selected.size} selected</span>
-                }
-              </div>
-            </div>
-
-            {restricted && (
-              <div className="border border-gray-200 rounded-lg overflow-hidden shadow-sm">
-                <div className="px-3 py-2 bg-white border-b border-gray-100 flex items-center gap-2">
-                  <svg className="w-3.5 h-3.5 text-gray-400 shrink-0" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
-                    <path strokeLinecap="round" strokeLinejoin="round" d="m21 21-5.197-5.197m0 0A7.5 7.5 0 1 0 5.196 5.196a7.5 7.5 0 0 0 10.607 10.607Z" />
-                  </svg>
-                  <input
-                    type="text"
-                    placeholder="Search agents…"
-                    value={search}
-                    onChange={e => setSearch(e.target.value)}
-                    className="flex-1 text-sm text-gray-800 placeholder-gray-400 focus:outline-none bg-transparent"
-                  />
-                  {search && (
-                    <button type="button" onClick={() => setSearch('')} className="text-gray-400 hover:text-gray-600 leading-none">✕</button>
-                  )}
-                </div>
-                <div className="flex items-center justify-between px-3 py-1.5 bg-gray-50 border-b border-gray-100">
-                  <span className="text-[11px] text-gray-500">
-                    {selected.size} of {agents.length} selected
-                    {search && filteredAgents.length !== agents.length && ` · ${filteredAgents.length} shown`}
-                  </span>
-                  {selected.size > 0 && (
-                    <button onClick={() => setSelected(new Set())} className="text-[11px] text-gray-400 hover:text-red-500">clear all</button>
-                  )}
-                </div>
-                <div className="max-h-56 overflow-y-auto">
-                  {filteredAgents.length === 0 ? (
-                    <p className="text-sm text-gray-400 text-center py-6">{search ? 'No agents match' : 'No agents in this tenant'}</p>
-                  ) : filteredAgents.map(a => {
-                    const isSel = selected.has(a.agent_id);
-                    return (
-                      <label key={a.agent_id}
-                        className={`flex items-center gap-3 px-3 py-2.5 cursor-pointer border-b border-gray-50 last:border-0 transition-colors ${isSel ? 'bg-indigo-50 hover:bg-indigo-100/70' : 'hover:bg-gray-50'}`}>
-                        <input type="checkbox" checked={isSel} onChange={() => toggle(a.agent_id)} className="sr-only" />
-                        <div className={`w-4 h-4 rounded border-2 flex items-center justify-center shrink-0 transition-colors ${isSel ? 'bg-indigo-600 border-indigo-600' : 'border-gray-300'}`}>
-                          {isSel && (
-                            <svg className="w-2.5 h-2.5 text-white" fill="none" viewBox="0 0 24 24" strokeWidth={3} stroke="currentColor">
-                              <path strokeLinecap="round" strokeLinejoin="round" d="m4.5 12.75 6 6 9-13.5" />
-                            </svg>
-                          )}
-                        </div>
-                        <div className="min-w-0 flex-1">
-                          <p className="text-sm font-medium text-gray-800 leading-tight">{a.hostname ?? '(unclaimed)'}</p>
-                          <p className="text-[10px] font-mono text-gray-400 leading-tight">{a.agent_id}</p>
-                        </div>
-                        <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full shrink-0 ${a.status === 'ACTIVE' ? 'bg-emerald-100 text-emerald-700' : 'bg-gray-100 text-gray-500'}`}>
-                          {a.status.toLowerCase()}
-                        </span>
-                      </label>
-                    );
-                  })}
-                </div>
-              </div>
-            )}
-          </>
+          <ScopeEditor agents={agents} fleets={fleets} initial={initial} onChange={setScope} />
         )}
 
         {error && <p className="text-sm text-red-600">{error}</p>}

@@ -1,14 +1,15 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import type { TenantConfig, Approval, Agent, K8sRule } from '../types';
+import type { TenantConfig, Approval, Agent, Fleet, K8sRule } from '../types';
 import {
   listAllTenantApprovals, listTenantApprovals, approveTenantApproval, denyTenantApproval,
-  deleteTenantApproval, tenantPreApprove, tenantPreApproveRule, listTenantAgents,
+  deleteTenantApproval, tenantPreApprove, tenantPreApproveFleet, tenantPreApproveRule,
+  listTenantAgents, listFleets,
 } from '../api';
 import { Modal } from '../components/Modal';
 import { Spinner } from '../components/Spinner';
 import { RefreshButton } from '../components/RefreshButton';
 import { CopyButton } from '../components/CopyButton';
-import { ApprovalTarget } from '../components/ApprovalTarget';
+import { ApprovalTarget, ApprovalScope } from '../components/ApprovalTarget';
 import { K8sRuleForm, EMPTY_RULE } from '../components/K8sRuleForm';
 
 
@@ -90,6 +91,27 @@ function StatusBadge({ status }: { status: string }) {
     <span className={`inline-flex px-2 py-0.5 rounded-full text-[11px] font-semibold capitalize ${STATUS_STYLE[status] ?? 'bg-gray-100 text-gray-500'}`}>
       {status}
     </span>
+  );
+}
+
+// An approval targets a standalone agent or a whole fleet. This picks which set
+// the page is looking at (the status tabs + filters below apply within it).
+type ApprovalScopeKind = 'agent' | 'fleet';
+function ScopeToggle({ value, onChange }: { value: ApprovalScopeKind; onChange: (v: ApprovalScopeKind) => void }) {
+  return (
+    <div className="inline-flex rounded-lg border border-gray-300 bg-white shadow-sm overflow-hidden">
+      {([['agent', 'Agents'], ['fleet', 'Fleets']] as const).map(([k, label]) => (
+        <button
+          key={k}
+          onClick={() => onChange(k)}
+          className={`px-3 py-1.5 text-sm font-medium transition-colors ${
+            value === k ? 'bg-indigo-600 text-white' : 'text-gray-600 hover:bg-gray-50'
+          }`}
+        >
+          {label}
+        </button>
+      ))}
+    </div>
   );
 }
 
@@ -232,7 +254,8 @@ function DeveloperApprovalsView({ config }: { config: TenantConfig }) {
             className="border border-gray-300 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent bg-white shadow-sm"
           >
             <option value="">All agents</option>
-            {agents.map(a => (
+            {/* Fleet members have no per-agent approvals - manage them under Fleets. */}
+            {agents.filter(a => !a.fleet_id).map(a => (
               <option key={a.agent_id} value={a.agent_id}>
                 {a.hostname ?? a.agent_id}{a.type ? ` (${a.type})` : ''}
               </option>
@@ -335,16 +358,7 @@ function DeveloperApprovalsView({ config }: { config: TenantConfig }) {
                       <ApprovalTarget approval={a} />
                     </td>
                     <td className="px-4 py-3.5">
-                      <div className="flex items-center gap-1.5">
-                        <div className="w-5 h-5 rounded bg-indigo-100 flex items-center justify-center shrink-0">
-                          <svg className="w-3 h-3 text-indigo-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                            <path strokeLinecap="round" strokeLinejoin="round" d="M5.25 14.25h13.5m-13.5 0a3 3 0 01-3-3m3 3a3 3 0 100 6h13.5a3 3 0 100-6m-16.5-3a3 3 0 013-3h13.5a3 3 0 013 3" />
-                          </svg>
-                        </div>
-                        <span className="text-sm text-gray-700 font-medium whitespace-nowrap">
-                          {a.agent_hostname ?? a.agent_id}
-                        </span>
-                      </div>
+                      <ApprovalScope approval={a} />
                     </td>
                     <td className="px-4 py-3.5 text-sm text-gray-500 whitespace-nowrap">
                       {fmtDate(a.created_at)}
@@ -389,8 +403,11 @@ function OperatorApprovalsView({ config }: { config: TenantConfig }) {
   );
 
   const [tab, setTab] = useState<StatusTab>('pending');
+  const [scopeKind, setScopeKind] = useState<ApprovalScopeKind>('agent');
   const [agents, setAgents] = useState<Agent[]>([]);
+  const [fleets, setFleets] = useState<Fleet[]>([]);
   const [agentFilter, setAgentFilter] = useState('');
+  const [fleetFilter, setFleetFilter] = useState('');
   const [kindFilter, setKindFilter] = useState<'k8s' | 'host'>('host');
   const [search, setSearch] = useState('');          // the input box
   const [appliedSearch, setAppliedSearch] = useState(''); // what was last submitted via Search
@@ -429,7 +446,13 @@ function OperatorApprovalsView({ config }: { config: TenantConfig }) {
     listTenantAgents(apiUrl, tenantToken)
       .then(r => setAgents(r.agents ?? []))
       .catch(() => {});
+    listFleets(apiUrl, tenantToken)
+      .then(r => setFleets(r.fleets ?? []))
+      .catch(() => {});
   }, [apiUrl, tenantToken]);
+
+  // Fleets are host-only, so in fleet scope the kind is always Host.
+  const effectiveKind = scopeKind === 'fleet' ? 'host' : kindFilter;
 
   const load = useCallback(() => {
     const seq = ++loadSeqRef.current;
@@ -437,11 +460,13 @@ function OperatorApprovalsView({ config }: { config: TenantConfig }) {
     setError('');
     const params: Record<string, string> = {
       status: tab,
-      type: kindFilter,
+      scope: scopeKind,
+      type: effectiveKind,
       limit: String(PAGE_SIZE),
       offset: String(page * PAGE_SIZE),
     };
-    if (agentFilter) params.agent_id = agentFilter;
+    if (scopeKind === 'agent' && agentFilter) params.agent_id = agentFilter;
+    if (scopeKind === 'fleet' && fleetFilter) params.fleet_id = fleetFilter;
     if (appliedSearch) params.q = appliedSearch;
 
     listAllTenantApprovals(apiUrl, tenantToken, params)
@@ -458,20 +483,20 @@ function OperatorApprovalsView({ config }: { config: TenantConfig }) {
         if (loadSeqRef.current !== seq) return;
         setLoading(false);
       });
-  }, [apiUrl, tenantToken, tab, agentFilter, kindFilter, appliedSearch, page]);
+  }, [apiUrl, tenantToken, tab, scopeKind, agentFilter, fleetFilter, effectiveKind, appliedSearch, page]);
 
   useEffect(() => { load(); }, [load]);
 
   useEffect(() => { setSelectedIds(new Set()); }, [tab]);
 
-  // Tab badges show the per-status total for the currently selected kind.
+  // Tab badges show the per-status total for the current scope + kind.
   useEffect(() => {
     (['pending', 'approved', 'expired'] as StatusTab[]).forEach(s => {
-      listAllTenantApprovals(apiUrl, tenantToken, { status: s, type: kindFilter, limit: '1' })
+      listAllTenantApprovals(apiUrl, tenantToken, { status: s, scope: scopeKind, type: effectiveKind, limit: '1' })
         .then(r => setTabCounts(prev => ({ ...prev, [s]: r.total ?? 0 })))
         .catch(() => {});
     });
-  }, [apiUrl, tenantToken, kindFilter]);
+  }, [apiUrl, tenantToken, scopeKind, effectiveKind]);
 
   const reload = useCallback(() => load(), [load]);
 
@@ -513,6 +538,13 @@ function OperatorApprovalsView({ config }: { config: TenantConfig }) {
   const doAddApproval = async (agentId: string, payload: { command?: string; rule?: K8sRule }, duration?: string) => {
     if (payload.rule) await tenantPreApproveRule(apiUrl, tenantToken, agentId, payload.rule, duration);
     else await tenantPreApprove(apiUrl, tenantToken, agentId, payload.command ?? '', duration);
+    setModal(null);
+    setTab('approved');
+    reload();
+  };
+
+  const doAddFleetApproval = async (fleetId: string, command: string, duration?: string) => {
+    await tenantPreApproveFleet(apiUrl, tenantToken, fleetId, command, duration);
     setModal(null);
     setTab('approved');
     reload();
@@ -620,25 +652,47 @@ function OperatorApprovalsView({ config }: { config: TenantConfig }) {
         </div>
 
         <div className="flex items-center gap-3 flex-wrap">
-          <select
-            value={agentFilter}
-            onChange={e => {
-              const id = e.target.value;
-              setAgentFilter(id);
-              // An agent is a single type, so selecting one locks the Host/Kubernetes
-              // toggle to that agent's type; "All agents" frees it again.
-              const a = agents.find(x => x.agent_id === id);
-              if (a?.type) { setKindFilter(a.type === 'k8s' ? 'k8s' : 'host'); setSelectedIds(new Set()); }
-            }}
-            className="border border-gray-300 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent bg-white shadow-sm"
-          >
-            <option value="">All agents</option>
-            {agents.map(a => (
-              <option key={a.agent_id} value={a.agent_id}>
-                {a.hostname ?? a.agent_id}{a.type ? ` (${a.type})` : ''}
-              </option>
-            ))}
-          </select>
+          <ScopeToggle value={scopeKind} onChange={k => {
+            if (k === scopeKind) return;
+            setScopeKind(k);
+            // Each scope has its own picker; reset the other and the page/selection.
+            setAgentFilter(''); setFleetFilter(''); setSelectedIds(new Set()); setPage(0);
+            if (k === 'fleet') setKindFilter('host');
+          }} />
+          {scopeKind === 'agent' ? (
+            <select
+              value={agentFilter}
+              onChange={e => {
+                const id = e.target.value;
+                setAgentFilter(id);
+                // An agent is a single type, so selecting one locks the Host/Kubernetes
+                // toggle to that agent's type; "All agents" frees it again.
+                const a = agents.find(x => x.agent_id === id);
+                if (a?.type) { setKindFilter(a.type === 'k8s' ? 'k8s' : 'host'); setSelectedIds(new Set()); }
+              }}
+              className="border border-gray-300 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent bg-white shadow-sm"
+            >
+              <option value="">All agents</option>
+              {/* Fleet members have no per-agent approvals - manage them under Fleets. */}
+              {agents.filter(a => !a.fleet_id).map(a => (
+                <option key={a.agent_id} value={a.agent_id}>
+                  {a.hostname ?? a.agent_id}{a.type ? ` (${a.type})` : ''}
+                </option>
+              ))}
+            </select>
+          ) : (
+            <select
+              value={fleetFilter}
+              onChange={e => { setFleetFilter(e.target.value); setSelectedIds(new Set()); }}
+              className="border border-gray-300 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent bg-white shadow-sm"
+            >
+              <option value="">All fleets</option>
+              {fleets.map(f => (
+                <option key={f.fleet_id} value={f.fleet_id}>{f.name ?? f.fleet_id}</option>
+              ))}
+            </select>
+          )}
+          {scopeKind === 'agent' && (
           <div className={`inline-flex rounded-lg border border-gray-300 bg-white shadow-sm overflow-hidden ${agentFilter ? 'opacity-60' : ''}`}>
             {(['k8s', 'host'] as const).map(k => (
               <button
@@ -654,6 +708,7 @@ function OperatorApprovalsView({ config }: { config: TenantConfig }) {
               </button>
             ))}
           </div>
+          )}
           <div className="relative">
             <svg className="w-4 h-4 text-gray-400 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
               <path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-5.197-5.197m0 0A7.5 7.5 0 105.196 5.196a7.5 7.5 0 0010.607 10.607z" />
@@ -662,7 +717,7 @@ function OperatorApprovalsView({ config }: { config: TenantConfig }) {
               value={search}
               onChange={e => setSearch(e.target.value)}
               onKeyDown={e => e.key === 'Enter' && applySearch()}
-              placeholder={kindFilter === 'k8s' ? 'Search verb, resource, namespace…' : 'Search command, agent…'}
+              placeholder={scopeKind === 'fleet' ? 'Search command, fleet…' : kindFilter === 'k8s' ? 'Search verb, resource, namespace…' : 'Search command, agent…'}
               className="w-64 border border-gray-300 rounded-lg pl-8 pr-7 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent shadow-sm"
             />
             {search && (
@@ -678,9 +733,14 @@ function OperatorApprovalsView({ config }: { config: TenantConfig }) {
           {appliedSearch && (
             <span className="text-xs text-gray-500">Filtered by “{appliedSearch}”</span>
           )}
-          {agentFilter && (
+          {scopeKind === 'agent' && agentFilter && (
             <button onClick={() => setAgentFilter('')} className="text-sm text-indigo-600 hover:text-indigo-800">
               Clear agent filter
+            </button>
+          )}
+          {scopeKind === 'fleet' && fleetFilter && (
+            <button onClick={() => setFleetFilter('')} className="text-sm text-indigo-600 hover:text-indigo-800">
+              Clear fleet filter
             </button>
           )}
           {tab === 'pending' && selectedIds.size > 0 && (
@@ -759,7 +819,7 @@ function OperatorApprovalsView({ config }: { config: TenantConfig }) {
                     </th>
                   )}
                   {opTh('Command / rule', 0)}
-                  {opTh('Agent', 1)}
+                  {opTh(scopeKind === 'fleet' ? 'Fleet' : 'Agent', 1)}
                   {opTh('Requested by', 2)}
                   {opTh('Created', 3)}
                   {tab === 'approved' ? (
@@ -786,9 +846,12 @@ function OperatorApprovalsView({ config }: { config: TenantConfig }) {
                           </svg>
                         </div>
                         <p className="text-sm font-medium text-gray-500">
-                          {appliedSearch
-                            ? `No ${kindFilter === 'k8s' ? 'Kubernetes' : 'host'} ${tab} approvals match “${appliedSearch}”`
-                            : `No ${kindFilter === 'k8s' ? 'Kubernetes' : 'host'} ${tab} approvals`}
+                          {(() => {
+                            const label = scopeKind === 'fleet' ? 'fleet' : (kindFilter === 'k8s' ? 'Kubernetes' : 'host');
+                            return appliedSearch
+                              ? `No ${label} ${tab} approvals match “${appliedSearch}”`
+                              : `No ${label} ${tab} approvals`;
+                          })()}
                         </p>
                         {tab === 'pending' && canAdd && !appliedSearch && (
                           <p className="text-xs text-gray-400 mt-1">
@@ -820,16 +883,7 @@ function OperatorApprovalsView({ config }: { config: TenantConfig }) {
                       <ApprovalTarget approval={a} />
                     </td>
                     <td className="px-4 py-3.5">
-                      <div className="flex items-center gap-1.5">
-                        <div className="w-5 h-5 rounded bg-indigo-100 flex items-center justify-center shrink-0">
-                          <svg className="w-3 h-3 text-indigo-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                            <path strokeLinecap="round" strokeLinejoin="round" d="M5.25 14.25h13.5m-13.5 0a3 3 0 01-3-3m3 3a3 3 0 100 6h13.5a3 3 0 100-6m-16.5-3a3 3 0 013-3h13.5a3 3 0 013 3" />
-                          </svg>
-                        </div>
-                        <span className="text-sm text-gray-700 font-medium whitespace-nowrap">
-                          {a.agent_hostname ?? a.agent_id}
-                        </span>
-                      </div>
+                      <ApprovalScope approval={a} />
                     </td>
                     <td className="px-4 py-3.5 text-sm text-gray-600">
                       {a.requester_name ?? a.requested_by ?? '-'}
@@ -967,9 +1021,12 @@ function OperatorApprovalsView({ config }: { config: TenantConfig }) {
 
       {modal?.type === 'add' && (
         <AddApprovalModal
+          scope={scopeKind}
           agents={agents}
+          fleets={fleets}
           onClose={() => setModal(null)}
           onSubmit={doAddApproval}
+          onSubmitFleet={doAddFleetApproval}
         />
       )}
     </div>
@@ -1043,7 +1100,9 @@ function RequestApprovalModal({
     catch (e) { setError((e as Error).message); setLoading(false); }
   };
 
-  const activeAgents = agents.filter(a => a.status === 'ACTIVE' || a.status === 'INACTIVE');
+  // Fleet members don't take per-agent approvals - those are managed on the fleet
+  // (Fleets page). Only standalone agents are selectable here.
+  const activeAgents = agents.filter(a => (a.status === 'ACTIVE' || a.status === 'INACTIVE') && !a.fleet_id);
 
   return (
     <Modal title="Request approval" onClose={onClose}>
@@ -1323,40 +1382,91 @@ function DeleteApprovalModal({ approval, onClose, onConfirm }: {
 }
 
 function AddApprovalModal({
-  agents, onClose, onSubmit,
+  scope, agents, fleets, onClose, onSubmit, onSubmitFleet,
 }: {
+  scope: ApprovalScopeKind;
   agents: Agent[];
+  fleets: Fleet[];
   onClose: () => void;
   onSubmit: (agentId: string, payload: { command?: string; rule?: K8sRule }, duration?: string) => Promise<void>;
+  onSubmitFleet: (fleetId: string, command: string, duration?: string) => Promise<void>;
 }) {
+  // The modal has its own Agent/Fleet chooser (defaulting to the current view),
+  // so you can add either kind regardless of what the list is filtered to.
+  const [target, setTarget] = useState<ApprovalScopeKind>(scope);
+  const isFleetScope = target === 'fleet';
   const [agentId, setAgentId] = useState('');
+  const [fleetId, setFleetId] = useState('');
   const [command, setCommand] = useState('');
   const [rule, setRule] = useState<K8sRule>(EMPTY_RULE);
   const [duration, setDuration] = useState<Duration>('permanent');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
-  const isK8s = agents.find(a => a.agent_id === agentId)?.type === 'k8s';
+  const isK8s = !isFleetScope && agents.find(a => a.agent_id === agentId)?.type === 'k8s';
 
   const submit = async () => {
-    if (!agentId) { setError('Select an agent.'); return; }
-    if (!isK8s && !command.trim()) { setError('Command is required.'); return; }
-    setLoading(true); setError('');
+    const dur = duration === 'permanent' ? undefined : duration;
+    setError('');
     try {
-      await onSubmit(agentId, isK8s ? { rule } : { command: command.trim() }, duration === 'permanent' ? undefined : duration);
+      if (isFleetScope) {
+        if (!fleetId) { setError('Select a fleet.'); return; }
+        if (!command.trim()) { setError('Command is required.'); return; }
+        setLoading(true);
+        await onSubmitFleet(fleetId, command.trim(), dur);
+      } else {
+        if (!agentId) { setError('Select an agent.'); return; }
+        if (!isK8s && !command.trim()) { setError('Command is required.'); return; }
+        setLoading(true);
+        await onSubmit(agentId, isK8s ? { rule } : { command: command.trim() }, dur);
+      }
     } catch (e) { setError((e as Error).message); setLoading(false); }
   };
 
-  const activeAgents = agents.filter(a => a.status === 'ACTIVE' || a.status === 'INACTIVE');
+  // Fleet members don't take per-agent approvals - those are managed on the fleet
+  // (Fleets page). Only standalone agents are selectable here.
+  const activeAgents = agents.filter(a => (a.status === 'ACTIVE' || a.status === 'INACTIVE') && !a.fleet_id);
 
   return (
     <Modal title="Add approval" onClose={onClose}>
       <div className="space-y-4">
+        <div>
+          <label className="block text-sm font-semibold text-gray-700 mb-1.5">Target</label>
+          <div className="inline-flex rounded-lg border border-gray-300 bg-white shadow-sm overflow-hidden">
+            {([['agent', 'Agent'], ['fleet', 'Fleet']] as const).map(([k, label]) => (
+              <button
+                key={k}
+                onClick={() => { setTarget(k); setError(''); }}
+                className={`px-4 py-1.5 text-sm font-medium transition-colors ${
+                  target === k ? 'bg-indigo-600 text-white' : 'text-gray-600 hover:bg-gray-50'
+                }`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        </div>
         <div className="bg-indigo-50 border border-indigo-200 rounded-lg px-3 py-2.5">
           <p className="text-xs text-indigo-700">
-            Creates an <strong>approved</strong> record directly - the agent can run it immediately without a pending request.
+            Creates an <strong>approved</strong> record directly - {isFleetScope ? 'every member of the fleet' : 'the agent'} can run it immediately without a pending request.
           </p>
         </div>
+        {isFleetScope ? (
+          <div>
+            <label className="block text-sm font-semibold text-gray-700 mb-1.5">Fleet</label>
+            <select
+              value={fleetId}
+              onChange={e => setFleetId(e.target.value)}
+              autoFocus
+              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent bg-white"
+            >
+              <option value="">Select fleet…</option>
+              {fleets.map(f => (
+                <option key={f.fleet_id} value={f.fleet_id}>{f.name ?? f.fleet_id}</option>
+              ))}
+            </select>
+          </div>
+        ) : (
         <div>
           <label className="block text-sm font-semibold text-gray-700 mb-1.5">Agent</label>
           <select
@@ -1373,6 +1483,7 @@ function AddApprovalModal({
             ))}
           </select>
         </div>
+        )}
         {isK8s ? (
           <div>
             <label className="block text-sm font-semibold text-gray-700 mb-1.5">Cluster rule</label>

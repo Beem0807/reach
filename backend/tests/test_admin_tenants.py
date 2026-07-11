@@ -96,6 +96,31 @@ class TestListTenants:
             r = handle_list_tenants(ADMIN)
         assert json.loads(r["body"])["tenants"] == []
 
+    def _roster(self, n):
+        return [{"tenant_id": f"t{i:02d}", "name": f"org-{i:02d}"} for i in range(n)]
+
+    def test_no_limit_returns_all_without_page_meta(self):
+        with patch("handlers.admin_tenants.tenants_repo") as tr:
+            tr.list_all.return_value = self._roster(30)
+            r = handle_list_tenants(ADMIN)
+        body = json.loads(r["body"])
+        assert len(body["tenants"]) == 30 and "total" not in body
+
+    def test_pagination_returns_page_and_total(self):
+        with patch("handlers.admin_tenants.tenants_repo") as tr:
+            tr.list_all.return_value = self._roster(30)
+            r = handle_list_tenants(ADMIN, limit=20, offset=20)
+        body = json.loads(r["body"])
+        assert body["total"] == 30 and len(body["tenants"]) == 10
+        assert body["tenants"][0]["name"] == "org-20"  # deterministic order
+
+    def test_q_filters_by_name(self):
+        with patch("handlers.admin_tenants.tenants_repo") as tr:
+            tr.list_all.return_value = [{"tenant_id": "t1", "name": "Acme"}, {"tenant_id": "t2", "name": "Globex"}]
+            r = handle_list_tenants(ADMIN, q="glob", limit=20)
+        body = json.loads(r["body"])
+        assert body["total"] == 1 and body["tenants"][0]["tenant_id"] == "t2"
+
 
 # ---------------------------------------------------------------------------
 # handle_delete_tenant

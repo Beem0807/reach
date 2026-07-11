@@ -146,8 +146,6 @@ docker run -d \
   -e SESSION_SIGNING_KEY="<your-session-key>" \
   -e ADMIN_PASSWORD="<your-admin-password>" \
   -e DATABASE_URL="postgresql://user:pass@host:5432/reach" \
-  -e APPROVAL_RETENTION_DAYS="7" \
-  -e JOB_RETENTION_DAYS="7" \
   nabeemdev/reach:latest
 ```
 
@@ -157,10 +155,17 @@ docker run -d \
 | `SESSION_SIGNING_KEY` | Yes | - | HMAC key for signing tenant session (login) tokens. **Safe to rotate** - only forces re-login. Use the same value across replicas if you run more than one backend instance. |
 | `ADMIN_PASSWORD` | Yes | - | Password for the platform admin console and admin API. Rotate by restarting with a new value. |
 | `DATABASE_URL` | Postgres only | - | PostgreSQL connection string. Required for the default Postgres backend; **not used** when `STORAGE_BACKEND=dynamo` (see [DynamoDB on AWS](#dynamodb-on-aws)). |
-| `APPROVAL_RETENTION_DAYS` | No | `7` | Days to retain terminal approval records (`denied`, `expired`) before deletion. |
-| `JOB_RETENTION_DAYS` | No | `7` | Days to retain terminal job records (`SUCCEEDED`, `FAILED`, `REJECTED`, `EXPIRED`) before deletion. |
-| `AUDIT_RETENTION_DAYS` | No | `90` | Days to retain audit log entries before deletion. |
-| `AGENT_HISTORY_RETENTION_DAYS` | No | `30` | Days to retain agent status history entries before deletion. |
+| `AUDIT_RETENTION_DAYS` | No | `90` | Days to retain **platform-level** audit entries (cross-tenant admin trail, `tenant_id IS NULL`) before deletion. Each tenant's own audit/approval/job/run/agent-history retention is a **tenant setting**, not an env var (see below). |
+| `FLEET_REAP_AFTER_SECONDS` | No | `1800` | Default inactivity window (seconds) after which a dead **fleet** member is reaped, when a fleet doesn't set its own `reap_after_seconds`. Applies to autoscaler hosts that scaled in without deregistering. |
+
+**Per-tenant settings.** Retention windows (approval, job, run, audit, agent-history)
+and the fan-out **blast-radius cap** are configured per tenant, not per deployment.
+A tenant admin edits them under **Settings** in the console (or the `GET`/`PUT
+/tenant/settings` API); the platform admin can override any tenant's values, beyond the
+tenant-admin bounds, via `PUT /admin/tenants/{id}/settings`. Unset values fall back to
+built-in defaults (7d approvals/jobs, 30d runs/agent-history, 90d audit, fan-out cap 25).
+The fan-out cap is a hard ceiling a caller can lower (`max_targets`) but not raise; a
+per-fleet `max_fanout` may lower it further.
 
 **Advanced (rarely changed).** These are baked into the image with working defaults - only override them if you self-host the agent binaries or pin a specific agent version:
 
@@ -219,7 +224,7 @@ docker run -d \
 - No `DATABASE_URL` is needed.
 - Provide AWS credentials the boto3 way - an ECS task role / EKS IRSA / EC2 instance profile is recommended over static keys. For local testing you can pass `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`.
 - On startup the container runs an idempotent bootstrap that creates the eight `reach-*` tables (on-demand billing) if they don't already exist - the DynamoDB equivalent of `alembic upgrade head`. Existing tables and their data are left untouched. You can also run it standalone with `python -m shared.dynamo_bootstrap`.
-- The retention env vars (`APPROVAL_RETENTION_DAYS`, etc.) work the same as the PostgreSQL path.
+- Per-tenant retention and the fan-out cap are tenant settings (not env vars), same as the PostgreSQL path; only the platform-level `AUDIT_RETENTION_DAYS` applies here.
 
 **2. IAM policy.** The container's role needs table and index access on the `reach-*` tables. To let the bootstrap create them, include the create/describe actions:
 
@@ -386,13 +391,18 @@ The only recovery is a full credential reset: reissue install tokens for every a
 
 ## Per-user agent access
 
-By default every user in a tenant sees all agents. From the **tenant console**, go to **Users → [user] → Agent Access** to restrict a user to specific machines.
+**Admins are tenant-wide.** Every other user starts with **no access by default** and is granted specific agents/fleets - **read-only or read-write** - from the **tenant console → Users → [user] → Access**.
 
-`allowed_agent_ids: ["*"]` means unrestricted access. A list of agent IDs means the user can only see and use those agents - every other agent returns 404 to them. An empty list locks them out of all agents without deleting their account.
+For each agent or fleet you pick a capability:
 
-When an agent is revoked, reach automatically removes it from every user's access list in that tenant - no manual cleanup needed.
+- **Read** - the user can run read commands and view the agent, but not write.
+- **Read-write** - the user can also run write commands (still gated by the agent's policy mode).
 
-For automation see `GET /tenant/users/{user_id}/agents` and `PUT /tenant/users/{user_id}/agents` in [API.md](API.md). The `PUT` replaces the whole access list - `{"agent_ids": ["*"]}` is unrestricted, `[]` locks the user out, and a list restricts them to those agents.
+The **All read** / **All read-write** buttons grant *every* listed agent explicitly (there is no wildcard - only admins are tenant-wide). So "read everything, write a few" = *All read* on agents, then bump the chosen few to *Read-write*. An out-of-scope agent returns `404`; a read-only user's write is rejected `403` in any mode. Because grants are explicit ids, a **newly created** agent isn't auto-included - grant it to users at creation, or re-grant.
+
+When an agent is revoked, reach automatically removes it from every user's access lists (read-write and read-only) - no manual cleanup needed.
+
+For automation see `GET`/`PUT /tenant/users/{user_id}/agents` in [API.md](API.md#users). The `PUT` sets the four scope lists (`readwrite_agent_ids`, `readonly_agent_ids`, `readwrite_fleet_ids`, `readonly_fleet_ids`); `[]` = none, no wildcard is allowed, and the read-write / read-only lists must be disjoint.
 
 ---
 
@@ -489,6 +499,29 @@ Removing an agent is a three-step sequence from the **tenant console** under **A
 
 ---
 
+## Managing fleets
+
+A **fleet** is a reusable join token for a group of interchangeable host agents - built for autoscaling groups of any flavour (AWS ASGs, GCP MIGs, Azure VMSS, or any autoscaler). Manage fleets from the **tenant console → Fleets** (operator role or higher; developers get a **read-only** view of the fleets they're granted). See [ARCHITECTURE → Fleets](ARCHITECTURE.md#fleets) for the model.
+
+**Create.** **Fleets → New fleet** sets the mode, tags, grants, and an optional reap window. You get a **join token** and a launch-template line **once** - bake it into your autoscaler's launch/instance template (user-data or startup script). Every instance that scales in claims with the token and auto-enrolls, inheriting the fleet's mode/tags/grants.
+
+**Operate as a group.** Editing a fleet's **mode** or **tags** propagates to every current member (and new members inherit it). Members can't have their mode/tags set individually or their install token reissued - those are managed through the fleet.
+
+**Editing grants.** Host grants (Docker / service-management) are baked into the host at install, so they can't be flipped on a running member remotely. Editing them in **Fleets → [fleet] → Edit** takes you straight to **rotate the join token** - the change is committed there, and the new install command carries the updated grants for *new* instances. Existing members then show a **grant mismatch** (member grants ≠ fleet grants); re-provision or replace those hosts, then **reconcile** them - **Reconcile all** from the fleet's banner, or **reconcile** a single host from its row. Reconcile is **verified against detection**: a host is only reconciled once it actually reports the granted capability, so hosts that weren't really re-provisioned are skipped (listed as blocked) rather than silently marked fixed. If a member is *deliberately* allowed to differ from the fleet, use **Accept as-is** instead - it keeps the member's real grants (nothing is falsified) but stops flagging it, and auto-re-flags if either the fleet grants or the member's own grants change to a new mismatch. (This is distinct from the k8s RBAC / capability **acknowledge**, which accepts observed reality.)
+
+**Rotate the join token.** **Fleets → [fleet] → Rotate** issues a new token while keeping the old one valid for a grace window (default 24h; pick the window in the dialog, or rotate immediately). Update the launch template before the grace window ends.
+
+**Scale-in cleanup happens automatically:**
+
+- On shutdown, a host that's actually terminating (not a `systemctl restart`) calls `POST /agent/deregister` and leaves the fleet at once.
+- Anything that misses that call is **reaped**: the per-minute scheduler deletes members whose last heartbeat is older than the fleet's `reap_after_seconds` (or `FLEET_REAP_AFTER_SECONDS`, default 30 min), writing an `agent.reaped` audit entry. Set a fleet's reap window to match your autoscaler's typical drain time.
+
+**Decommission.** **Revoke** a fleet to stop new enrollment - choose to **keep** members (detached into standalone agents) or **remove** them. A revoked fleet can then be **deleted**. To pull a single host out, **detach** it (Fleets → [fleet] → member → Remove from fleet); it becomes a standalone agent you manage individually.
+
+**From the CLI.** Fleets are *created* in the console, but you can drive them from the CLI: `reach fleets list` / `show <fleet>`, `reach fleets agents <fleet>` (members), `reach fleets exec <fleet> -- <cmd>` (fan out to every member, confirms first), `reach fleets jobs`/`runs`/`run` (fleet-wide job & run history), and `reach fleets approvals list`/`request`. Set a default fleet with `reach fleets use <fleet>`. See [cli/README.md](cli/README.md).
+
+---
+
 ## Policy management
 
 Set an agent's policy mode from the **tenant console** under **Agents → [agent] → Policy**. Choose `wild`, `readonly`, or `approved`.
@@ -505,20 +538,21 @@ Read commands always run. Only write commands need approval.
 
 **Host vs Kubernetes.** Host approvals are **command text** (prefix match). Kubernetes approvals are **structured rules** - `{verb, resource, namespace, name}`, any field wildcardable with `*` - so one rule (e.g. `delete pods` in `team-a`) covers every matching object without re-approving each one. The console shows the two kinds **separately** (a Host/Kubernetes toggle), defaults to the 10 most recent, and has a case-insensitive **Search**. See [POLICIES → Kubernetes approvals are structured rules](POLICIES.md#kubernetes-approvals-are-structured-rules).
 
-**Reviewing approvals**: admins and operators use the **tenant console → Approvals** to see pending requests and approve or deny them. You can approve permanently or with a time limit.
+**Reviewing approvals**: admins and operators review pending requests and approve/deny them in the **tenant console → Approvals**, or from the CLI with an operator/admin API token (`reach approvals approve <id>` / `deny <id>` - the id comes from `reach approvals list --pending`). You can approve permanently or with a time limit.
 
 **Pre-approving**: before first use, go to **Agents → [agent] → Approvals → Add** (or the **Approvals** page) to approve a command (host) or author a rule (k8s) without waiting for a block. Useful for provisioning a new agent.
 
 **Approval durations**: `permanent`, `1h`, `8h`, `24h`, `7d`, `30d`, `90d`, or custom `Nh`/`Nd`. Set `now` to instantly expire an approved record.
 
-**Users** check their own approval status via the CLI:
+**From the CLI:**
 
 ```bash
 reach approvals list                    # effective approved commands/rules for the default agent
-reach approvals list --pending          # my pending requests
-reach approvals list --denied           # my denied requests
-reach approvals list --expired          # my expired approvals
+reach approvals list --pending          # my pending requests (--denied / --expired too)
 reach approvals list --agent prod       # any of the above for a specific agent
+reach approvals request "<cmd>" --agent prod   # request approval (developer) / pre-approve (operator)
+reach approvals approve <approval-id>   # operator+: approve a pending request (agent or fleet, by id)
+reach approvals deny <approval-id>      # operator+: deny a pending request
 ```
 
 The output adapts to the agent type: **host** agents show the command, **Kubernetes** agents show the structured rule (`verb / resource / namespace / name`, `✱` = any).
@@ -540,7 +574,7 @@ The output adapts to the agent type: **host** agents show the command, **Kuberne
 
 **Hourly sweep** - the scheduler marks all `approved` records with `expires_at < now` as `expired` in bulk.
 
-**Daily cleanup** - at midnight UTC the scheduler deletes `denied` and `expired` approval records older than `APPROVAL_RETENTION_DAYS` (default 7), and terminal job records older than `JOB_RETENTION_DAYS` (default 7).
+**Daily cleanup** - at midnight UTC the scheduler sweeps each tenant, deleting `denied`/`expired` approval records, terminal job records, fan-out run records, tenant audit entries, and agent-history rows older than that tenant's own retention settings (defaults: 7d approvals/jobs, 30d runs/agent-history, 90d audit). The platform-level audit trail (`tenant_id IS NULL`) is swept separately using `AUDIT_RETENTION_DAYS`.
 
 Deleting an approved record immediately removes the command from the agent's allowed list on the next sync.
 
@@ -550,15 +584,16 @@ For automation see the approvals endpoints in [API.md](API.md).
 
 ## How tokens work
 
-Three token types - none stored raw, only `HMAC-SHA256(TOKEN_PEPPER, token)` hashes in the database:
+Four token types - none stored raw, only `HMAC-SHA256(TOKEN_PEPPER, token)` hashes in the database:
 
 | Token | Prefix | Used by | Purpose |
 |---|---|---|---|
 | `install_` | install token | Agent (once) | One-time claim to register the agent |
+| `fleet_` | fleet join token | Any host installer (reusable) | Reusable claim to auto-enroll autoscaler hosts into a fleet ([Managing fleets](#managing-fleets)) |
 | `agent_` | agent token | Agent (ongoing) | Poll for jobs, post results, heartbeat |
 | `tok_` | API token | CLI / MCP | Create jobs, read results, list agents |
 
-API tokens are named, per-user credentials created in the tenant console under **API Tokens → New token**. Each person gets their own, and revoking one doesn't affect anyone else. By default all users in a tenant see all agents, but access can be restricted per user - see [Per-user agent access](#per-user-agent-access).
+API tokens are named, per-user credentials created in the tenant console under **API Tokens → New token**. Each person gets their own, and revoking one doesn't affect anyone else. Admins are tenant-wide; every other user starts with no agent access and is granted agents/fleets (read-only or read-write) per user - see [Per-user agent access](#per-user-agent-access).
 
 Users authenticate to the tenant console with a username and password (separate from API tokens). API tokens are only for CLI and MCP server use.
 
@@ -788,7 +823,7 @@ These are agent-side limits enforced on the remote machine, independent of the b
 | `reach-agents` | `agent_id` | `tenant-index` (tenant_id) | Agent records, status, token hash, fingerprint, mode |
 | `reach-tenants` | `tenant_id` | - | Tenant records |
 | `reach-users` | `user_id` | `token-hash-index` (token_hash), `tenant-index` (tenant_id) | User records, token hashes, per-user agent access lists |
-| `reach-jobs` | `job_id` | `agent-status-index` (agent_id, status), `tenant-history-index` (tenant_id, created_at) | Job queue and results; terminal records deleted by the daily heartbeat sweep after `JOB_RETENTION_DAYS` (default 7) |
+| `reach-jobs` | `job_id` | `agent-status-index` (agent_id, status), `tenant-history-index` (tenant_id, created_at) | Job queue and results; terminal records deleted by the daily heartbeat sweep after the tenant's `job_retention_days` setting (default 7) |
 | `reach-approvals` | `approval_id` | `agent-approvals-index` (agent_id, created_at), `tenant-approvals-index` (tenant_id, created_at) | Approval records: `pending`, `approved` (with optional `expires_at`), `denied`, `expired` |
 
 All tables use `DeletionPolicy: Retain` - safe to redeploy the stack without losing data.

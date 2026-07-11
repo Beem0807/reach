@@ -2,7 +2,7 @@ import json
 import logging
 import secrets
 
-from shared.access import can_access_agent
+from shared.access import can_access_agent, can_write_agent
 from shared.auth import _bearer, _verify_tenant_token
 from shared.policy import (
     _is_blocked,
@@ -11,6 +11,7 @@ from shared.policy import (
     is_k8s_command_approved,
     is_k8s_write,
 )
+import shared.audit as audit
 from shared.response import _err, _iso, _now, _ok
 from shared.store import agents_repo, approvals_repo, jobs_repo, users_repo
 
@@ -18,7 +19,7 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 
-def handle_create_job(body: dict, raw_token: str) -> dict:
+def handle_create_job(body: dict, raw_token: str, ip: str = "") -> dict:
     agent_id = body.get("agent_id", "").strip()
     command = body.get("command", "").strip()
 
@@ -49,16 +50,42 @@ def handle_create_job(body: dict, raw_token: str) -> dict:
     is_k8s = (agent.get("type") or "host") == "k8s"
     is_write = is_k8s_write(command) if is_k8s else _is_readonly_blocked(command)
 
+    # Per-user read-only scope: a user granted read-only access to this agent may
+    # never write, in any mode. This only narrows - it never bypasses the mode
+    # checks below (a writable user is still gated by readonly/approved mode).
+    if is_write and not can_write_agent(tenant, agent):
+        return _err("you have read-only access to this agent", 403)
+
     if mode == "readonly" and is_write:
         return _err("command not permitted in readonly mode", 403)
 
     now = _now()
+
+    # dry_run: classify the command (after the same auth/access/mode gates) without
+    # creating a job, so a client can confirm before running a *write*. Mirrors the
+    # fan-out dry_run preview.
+    if body.get("dry_run"):
+        approval_required = False
+        if is_k8s and mode == "approved" and is_write:
+            rules = [a["k8s_rule"] for a in approvals_repo.list_by_agent(agent_id, status="approved") if a.get("k8s_rule")]
+            approval_required = not is_k8s_command_approved(command, rules)
+        # `type` lets a client convey how authoritative is_write is: for k8s it's an
+        # exact verb parse; for a host it's a best-effort regex and the agent's Landlock
+        # sandbox (readonly/approved) is the real gate - and wild mode is unsandboxed.
+        return _ok({"dry_run": True, "agent_id": agent_id, "hostname": agent.get("hostname"),
+                    "command": command, "mode": mode, "type": ("k8s" if is_k8s else "host"),
+                    "is_write": is_write, "approval_required": approval_required})
 
     # k8s + approved: a write that is not permitted by an approved rule is blocked
     # at submission - it never dispatches. We record a REJECTED job and raise a
     # pending approval (with the structured rule derived from the command) so the
     # operator can approve it and the user can re-run. Matching is rule-based
     # ({verb, resource, namespace, name}), not text prefix.
+    #
+    # This path is k8s-only, and fleets are host-only, so a fleet member never
+    # reaches it. A member's approvals are resolved at the fleet by the agent-facing
+    # paths instead: agent_sync draws its approved-command list from the fleet, and a
+    # blocked write raises a fleet-scoped pending request in agent_job_result.
     if is_k8s and mode == "approved" and is_write:
         rules = [a["k8s_rule"] for a in approvals_repo.list_by_agent(agent_id, status="approved") if a.get("k8s_rule")]
         if not is_k8s_command_approved(command, rules):
@@ -86,13 +113,24 @@ def handle_create_job(body: dict, raw_token: str) -> dict:
 
     agents_repo.set_active_until(agent_id, now + 120)
 
+    # Audit the single-agent execution (fan-outs get run.dispatched instead).
+    audit.write("job.dispatched", tenant_id=tenant["tenant_id"],
+                actor_id=tenant["user_id"], actor_name=tenant.get("username"),
+                actor_role=tenant.get("role"), resource_type="job", resource_id=job_id,
+                metadata={"agent_id": agent_id, "hostname": agent.get("hostname"),
+                          "command": command[:200], "is_write": is_write, "mode": mode},
+                ip_address=ip)
+
     return _ok({"job_id": job_id, "status": "PENDING"}, 201)
 
 
 def _reject_for_approval(tenant: dict, agent_id: str, command: str, mode: str, now: int, is_k8s: bool = False) -> dict:
     """Record a REJECTED job + a pending approval for a blocked k8s write. The
     pending approval carries the structured rule derived from the command so the
-    operator reviews (and can widen) verb/resource/namespace/name."""
+    operator reviews (and can widen) verb/resource/namespace/name.
+
+    k8s-only (fleets are host-only), so this is always agent-scoped - a fleet
+    member's approvals are raised at the fleet by agent_job_result instead."""
     k8s_rule = derive_k8s_rule(command) if is_k8s else None
     job_id = "job_" + secrets.token_urlsafe(16)
     jobs_repo.create({
@@ -141,4 +179,5 @@ def create_job_handler(event, context):
         body = json.loads(event.get("body") or "{}")
     except json.JSONDecodeError:
         return _err("invalid JSON body")
-    return handle_create_job(body, token)
+    ip = ((event.get("requestContext") or {}).get("http") or {}).get("sourceIp", "")
+    return handle_create_job(body, token, ip)

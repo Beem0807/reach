@@ -195,6 +195,20 @@ describe('tenant switching', () => {
 
     expect(await screen.findByText('Bob Jones')).toBeInTheDocument();
   });
+
+  it('pages the user list forward with Next', async () => {
+    vi.spyOn(api, 'listTenants').mockResolvedValue({ tenants: [TENANT_A] });
+    const spy = vi.spyOn(api, 'listUsers').mockImplementation((_u, _t, _tid, params = {}) =>
+      Promise.resolve({ users: [Number(params.offset) >= 20 ? USER_B : USER_A], total: 42 }));
+    render(<UsersPage config={CONFIG} />);
+    await screen.findByText('Alice Smith');
+    expect(screen.getByText(/Showing 1–20 of 42/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByText('Next'));
+    await waitFor(() => expect(spy).toHaveBeenCalledWith(
+      CONFIG.apiUrl, CONFIG.adminToken, TENANT_A.tenant_id, expect.objectContaining({ offset: '20' })));
+    await screen.findByText('Bob Jones');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -224,8 +238,7 @@ describe('Add user modal', () => {
     render(<UsersPage config={CONFIG} />);
     await screen.findByText('Alice Smith');
     fireEvent.click(screen.getByRole('button', { name: /add user/i }));
-    const inputs = screen.getAllByRole('textbox');
-    fireEvent.change(inputs[0], { target: { value: 'Alice' } });
+    fireEvent.change(screen.getByPlaceholderText('Alice Smith'), { target: { value: 'Alice' } });
     fireEvent.click(screen.getByRole('button', { name: /create user/i }));
     expect(await screen.findByText('Username is required')).toBeInTheDocument();
   });
@@ -238,9 +251,8 @@ describe('Add user modal', () => {
     render(<UsersPage config={CONFIG} />);
     await screen.findByText('Alice Smith');
     fireEvent.click(screen.getByRole('button', { name: /add user/i }));
-    const inputs = screen.getAllByRole('textbox');
-    fireEvent.change(inputs[0], { target: { value: 'Dave Jones' } });
-    fireEvent.change(inputs[1], { target: { value: 'dave' } });
+    fireEvent.change(screen.getByPlaceholderText('Alice Smith'), { target: { value: 'Dave Jones' } });
+    fireEvent.change(screen.getByPlaceholderText('alice123'), { target: { value: 'dave' } });
     fireEvent.click(screen.getByRole('button', { name: /create user/i }));
     await waitFor(() => expect(createUser).toHaveBeenCalled());
   });
@@ -253,9 +265,8 @@ describe('Add user modal', () => {
     render(<UsersPage config={CONFIG} />);
     await screen.findByText('Alice Smith');
     fireEvent.click(screen.getByRole('button', { name: /add user/i }));
-    const inputs = screen.getAllByRole('textbox');
-    fireEvent.change(inputs[0], { target: { value: 'Dave Jones' } });
-    fireEvent.change(inputs[1], { target: { value: 'dave' } });
+    fireEvent.change(screen.getByPlaceholderText('Alice Smith'), { target: { value: 'Dave Jones' } });
+    fireEvent.change(screen.getByPlaceholderText('alice123'), { target: { value: 'dave' } });
     fireEvent.click(screen.getByRole('button', { name: /create user/i }));
     expect(await screen.findByText('User created')).toBeInTheDocument();
     expect(screen.getByText('temp-pw-here')).toBeInTheDocument();

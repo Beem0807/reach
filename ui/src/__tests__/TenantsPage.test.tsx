@@ -21,6 +21,17 @@ function mockApis({ tenants = [ACME], users = 2, agents = 3 } = {}) {
   vi.spyOn(api, 'listAgentsAdmin').mockResolvedValue({ agents: Array(agents).fill({}) } as never);
 }
 
+const SETTINGS = {
+  settings: { approval_retention_days: 30, job_retention_days: 30, run_retention_days: 30,
+    audit_retention_days: 90, agent_history_retention_days: 30, fanout_cap: 50 },
+  overrides: {},
+  defaults: { approval_retention_days: 30, job_retention_days: 30, run_retention_days: 30,
+    audit_retention_days: 90, agent_history_retention_days: 30, fanout_cap: 50 },
+  bounds: { approval_retention_days: [1, 365], job_retention_days: [1, 365], run_retention_days: [1, 365],
+    audit_retention_days: [1, 3650], agent_history_retention_days: [1, 365], fanout_cap: [1, 100] },
+  wave_policy: {},
+} as never;
+
 beforeEach(() => { vi.restoreAllMocks(); });
 
 describe('TenantsPage', () => {
@@ -42,6 +53,36 @@ describe('TenantsPage', () => {
     vi.spyOn(api, 'listTenants').mockRejectedValue(new Error('down'));
     render(<TenantsPage config={CONFIG} />);
     expect(await screen.findByText('Failed to load tenants')).toBeInTheDocument();
+  });
+
+  it('pages the tenant grid forward with Next', async () => {
+    const other: Tenant = { ...ACME, tenant_id: 'tenant_glob', name: 'Globex' };
+    const spy = vi.spyOn(api, 'listTenants').mockImplementation((_u, _t, params = {}) =>
+      Promise.resolve({ tenants: [Number(params.offset) >= 20 ? other : ACME], total: 42 }));
+    vi.spyOn(api, 'listUsers').mockResolvedValue({ users: [] } as never);
+    vi.spyOn(api, 'listAgentsAdmin').mockResolvedValue({ agents: [] } as never);
+    render(<TenantsPage config={CONFIG} />);
+    await screen.findByText('Acme Corp');
+    expect(screen.getByText(/Showing 1–20 of 42/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByText('Next'));
+    await waitFor(() => expect(spy).toHaveBeenCalledWith(
+      CONFIG.apiUrl, CONFIG.adminToken, expect.objectContaining({ offset: '20' })));
+    await screen.findByText('Globex');
+  });
+
+  it('searches tenants only when Search is clicked', async () => {
+    const spy = vi.spyOn(api, 'listTenants').mockResolvedValue({ tenants: [ACME] });
+    vi.spyOn(api, 'listUsers').mockResolvedValue({ users: [] } as never);
+    vi.spyOn(api, 'listAgentsAdmin').mockResolvedValue({ agents: [] } as never);
+    render(<TenantsPage config={CONFIG} />);
+    await screen.findByText('Acme Corp');
+
+    fireEvent.change(screen.getByPlaceholderText('Search tenants by name or ID…'), { target: { value: 'acme' } });
+    expect(spy).not.toHaveBeenCalledWith(CONFIG.apiUrl, CONFIG.adminToken, expect.objectContaining({ q: 'acme' }));
+    fireEvent.click(screen.getByText('Search'));
+    await waitFor(() => expect(spy).toHaveBeenCalledWith(
+      CONFIG.apiUrl, CONFIG.adminToken, expect.objectContaining({ q: 'acme' })));
   });
 
   it('creates a tenant and reloads', async () => {
@@ -90,5 +131,26 @@ describe('TenantsPage', () => {
     await waitFor(() =>
       expect(enableSpy).toHaveBeenCalledWith(CONFIG.apiUrl, CONFIG.adminToken, 'tenant_old'),
     );
+  });
+
+  it('opens the settings override modal from a tenant card and saves an override', async () => {
+    mockApis({ tenants: [ACME] });
+    const getSpy = vi.spyOn(api, 'adminGetTenantSettings').mockResolvedValue(SETTINGS);
+    const putSpy = vi.spyOn(api, 'adminUpdateTenantSettings').mockResolvedValue(SETTINGS);
+    render(<TenantsPage config={CONFIG} />);
+    await screen.findByText('Acme Corp');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }));
+    await waitFor(() =>
+      expect(getSpy).toHaveBeenCalledWith(CONFIG.apiUrl, CONFIG.adminToken, 'tenant_acme'));
+
+    // Raise the fan-out cap above the tenant bound (100) - the override bypasses bounds.
+    const capInput = await screen.findByLabelText('Fan-out cap');
+    fireEvent.change(capInput, { target: { value: '200' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save override' }));
+
+    await waitFor(() =>
+      expect(putSpy).toHaveBeenCalledWith(CONFIG.apiUrl, CONFIG.adminToken, 'tenant_acme',
+        { fanout_cap: 200 }));
   });
 });

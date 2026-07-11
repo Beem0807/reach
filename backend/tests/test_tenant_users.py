@@ -58,6 +58,61 @@ class TestListTenantUsers:
         r = handle_list_tenant_users(USER_TOKEN)
         assert r["statusCode"] == 403
 
+    def _roster(self):
+        return [
+            {**EXISTING_USER, "user_id": "u_admin", "username": "adminone", "name": "Admin One", "role": "admin"},
+            {**EXISTING_USER, "user_id": "u_op", "username": "opsguy", "name": "Ops Guy", "role": "operator"},
+            {**EXISTING_USER, "user_id": "u_dev1", "username": "devann", "name": "Dev Ann", "role": "developer"},
+            {**EXISTING_USER, "user_id": "u_dev2", "username": "devbob", "name": "Dev Bob",
+             "role": "developer", "status": "REVOKED"},
+        ]
+
+    def test_filters_by_role(self):
+        with patch("handlers.tenant_users.users_repo") as ur:
+            ur.list_by_tenant.return_value = self._roster()
+            r = handle_list_tenant_users(ADMIN_TOKEN, role="developer")
+        users = json.loads(r["body"])["users"]
+        assert {u["user_id"] for u in users} == {"u_dev1", "u_dev2"}
+
+    def test_filters_by_status(self):
+        with patch("handlers.tenant_users.users_repo") as ur:
+            ur.list_by_tenant.return_value = self._roster()
+            r = handle_list_tenant_users(ADMIN_TOKEN, status="revoked")  # case-insensitive
+        users = json.loads(r["body"])["users"]
+        assert {u["user_id"] for u in users} == {"u_dev2"}
+
+    def test_search_matches_username_and_name(self):
+        with patch("handlers.tenant_users.users_repo") as ur:
+            ur.list_by_tenant.return_value = self._roster()
+            r = handle_list_tenant_users(ADMIN_TOKEN, q="dev")
+        users = json.loads(r["body"])["users"]
+        assert {u["user_id"] for u in users} == {"u_dev1", "u_dev2"}
+
+    def test_no_limit_returns_all_without_page_meta(self):
+        with patch("handlers.tenant_users.users_repo") as ur:
+            ur.list_by_tenant.return_value = self._roster()
+            r = handle_list_tenant_users(ADMIN_TOKEN)
+        body = json.loads(r["body"])
+        assert len(body["users"]) == 4
+        assert "total" not in body
+
+    def test_pagination_returns_page_and_total(self):
+        with patch("handlers.tenant_users.users_repo") as ur:
+            ur.list_by_tenant.return_value = self._roster()
+            r = handle_list_tenant_users(ADMIN_TOKEN, limit=2, offset=2)
+        body = json.loads(r["body"])
+        assert body["total"] == 4
+        assert body["limit"] == 2 and body["offset"] == 2
+        assert len(body["users"]) == 2
+
+    def test_filter_then_paginate_total_reflects_filter(self):
+        with patch("handlers.tenant_users.users_repo") as ur:
+            ur.list_by_tenant.return_value = self._roster()
+            r = handle_list_tenant_users(ADMIN_TOKEN, role="developer", limit=1, offset=0)
+        body = json.loads(r["body"])
+        assert body["total"] == 2  # not 4 - total is over the filtered set
+        assert len(body["users"]) == 1
+
 
 # ---------------------------------------------------------------------------
 # Create user
@@ -70,7 +125,7 @@ class TestCreateTenantUser:
             ur.create.return_value = None
             # The acting admin's own record (unrestricted by default).
             ur.get.return_value = {"user_id": token["sub"], "tenant_id": token["tenant_id"],
-                                   "role": "admin", "allowed_agent_ids": None}
+                                   "role": "admin", "readwrite_agent_ids": None}
             return handle_create_tenant_user(body, token), ur
 
     def test_admin_creates_user(self):
@@ -98,7 +153,7 @@ class TestCreateTenantUser:
     def test_restricted_admin_cannot_grant_agent_outside_scope(self):
         # Admin scoped to agent_a tries to grant a new user agent_b → 403.
         restricted_admin = {"user_id": "user_admin", "tenant_id": "tenant_acme",
-                            "role": "admin", "allowed_agent_ids": ["agent_a"]}
+                            "role": "admin", "readwrite_agent_ids": ["agent_a"]}
         with patch("handlers.tenant_users.users_repo") as ur, \
              patch("handlers.tenant_users.agents_repo") as agr, \
              patch("handlers.tenant_users.audit"):
@@ -109,37 +164,38 @@ class TestCreateTenantUser:
                 {"agent_id": "agent_b", "tenant_id": "tenant_acme"},
             ]
             r = handle_create_tenant_user(
-                {"username": "carol", "allowed_agent_ids": ["agent_b"]}, ADMIN_TOKEN)
+                {"username": "carol", "readwrite_agent_ids": ["agent_b"]}, ADMIN_TOKEN)
         assert r["statusCode"] == 403
         ur.create.assert_not_called()
 
-    def test_restricted_admin_cannot_grant_all_agents(self):
-        # Granting null (tenant-wide) while restricted is an escalation → 403.
+    def test_restricted_admin_cannot_grant_agents_outside_scope(self):
+        # Granting an agent the acting admin can't reach is an escalation → 403.
         restricted_admin = {"user_id": "user_admin", "tenant_id": "tenant_acme",
-                            "role": "admin", "allowed_agent_ids": ["agent_a"]}
+                            "role": "admin", "readwrite_agent_ids": ["agent_a"]}
         with patch("handlers.tenant_users.users_repo") as ur, \
              patch("handlers.tenant_users.agents_repo") as agr, \
              patch("handlers.tenant_users.audit"):
             ur.get_by_username.return_value = None
             ur.get.return_value = restricted_admin
-            agr.list_by_tenant.return_value = [{"agent_id": "agent_a", "tenant_id": "tenant_acme"}]
-            r = handle_create_tenant_user({"username": "carol"}, ADMIN_TOKEN)  # no allowed_agent_ids = null
+            agr.list_by_tenant.return_value = [{"agent_id": "agent_a", "tenant_id": "tenant_acme"},
+                                               {"agent_id": "agent_other", "tenant_id": "tenant_acme"}]
+            r = handle_create_tenant_user({"username": "carol", "readwrite_agent_ids": ["agent_other"]}, ADMIN_TOKEN)
         assert r["statusCode"] == 403
 
     def test_cannot_create_scoped_admin(self):
         # Admins are always tenant-wide - a scoped admin is rejected.
-        r, ur = self._call({"username": "adminx", "role": "admin", "allowed_agent_ids": ["agent_a"]})
+        r, ur = self._call({"username": "adminx", "role": "admin", "readwrite_agent_ids": ["agent_a"]})
         assert r["statusCode"] == 400
         ur.create.assert_not_called()
 
     def test_can_create_unscoped_admin(self):
         r, ur = self._call({"username": "adminy", "role": "admin"})
         assert r["statusCode"] == 201
-        assert ur.create.call_args[0][0]["allowed_agent_ids"] is None
+        assert ur.create.call_args[0][0]["readwrite_agent_ids"] is None
 
     def test_restricted_admin_can_grant_within_scope(self):
         restricted_admin = {"user_id": "user_admin", "tenant_id": "tenant_acme",
-                            "role": "admin", "allowed_agent_ids": ["agent_a", "agent_b"]}
+                            "role": "admin", "readwrite_agent_ids": ["agent_a", "agent_b"]}
         with patch("handlers.tenant_users.users_repo") as ur, \
              patch("handlers.tenant_users.agents_repo") as agr, \
              patch("handlers.tenant_users.audit"):
@@ -151,7 +207,7 @@ class TestCreateTenantUser:
                 {"agent_id": "agent_b", "tenant_id": "tenant_acme"},
             ]
             r = handle_create_tenant_user(
-                {"username": "carol", "allowed_agent_ids": ["agent_a"]}, ADMIN_TOKEN)
+                {"username": "carol", "readwrite_agent_ids": ["agent_a"]}, ADMIN_TOKEN)
         assert r["statusCode"] == 201
         ur.create.assert_called_once()
 
@@ -189,57 +245,60 @@ class TestCreateTenantUser:
         with patch("handlers.tenant_users.users_repo") as ur, \
              patch("handlers.tenant_users.audit"):
             ur.get_by_username.return_value = EXISTING_USER
-            ur.get.return_value = {"user_id": "user_admin", "role": "admin", "allowed_agent_ids": None}
+            ur.get.return_value = {"user_id": "user_admin", "role": "admin", "readwrite_agent_ids": None}
             r = handle_create_tenant_user({"username": "bob"}, ADMIN_TOKEN)
         assert r["statusCode"] == 409
 
-    def test_default_allowed_agent_ids_is_none(self):
+    def test_default_readwrite_agent_ids_is_empty(self):
+        # No access by default: a new developer starts with no agent grants.
         _, ur = self._call({"username": "carol"})
         stored = ur.create.call_args[0][0]
-        assert stored["allowed_agent_ids"] is None
+        assert stored["readwrite_agent_ids"] == []
+        assert stored["readonly_agent_ids"] == []
 
-    def test_allowed_agent_ids_list_stored_on_create(self):
-        _, ur = self._call({"username": "carol", "allowed_agent_ids": ["agent_x", "agent_y"]})
+    def test_readwrite_agent_ids_list_stored_on_create(self):
+        _, ur = self._call({"username": "carol", "readwrite_agent_ids": ["agent_x", "agent_y"]})
         stored = ur.create.call_args[0][0]
-        assert stored["allowed_agent_ids"] == ["agent_x", "agent_y"]
+        assert stored["readwrite_agent_ids"] == ["agent_x", "agent_y"]
 
-    def test_allowed_agent_ids_empty_list_stored(self):
-        _, ur = self._call({"username": "carol", "allowed_agent_ids": []})
+    def test_readwrite_agent_ids_empty_list_stored(self):
+        _, ur = self._call({"username": "carol", "readwrite_agent_ids": []})
         stored = ur.create.call_args[0][0]
-        assert stored["allowed_agent_ids"] == []
+        assert stored["readwrite_agent_ids"] == []
 
-    def test_allowed_agent_ids_null_stored(self):
-        _, ur = self._call({"username": "carol", "allowed_agent_ids": None})
+    def test_readwrite_agent_ids_null_defaults_to_empty_for_non_admin(self):
+        # A non-admin can't be tenant-wide via null - it means no access.
+        _, ur = self._call({"username": "carol", "readwrite_agent_ids": None})
         stored = ur.create.call_args[0][0]
-        assert stored["allowed_agent_ids"] is None
+        assert stored["readwrite_agent_ids"] == []
 
-    def test_allowed_agent_ids_non_list_returns_400(self):
-        r, _ = self._call({"username": "carol", "allowed_agent_ids": "agent_x"})
+    def test_readwrite_agent_ids_non_list_returns_400(self):
+        r, _ = self._call({"username": "carol", "readwrite_agent_ids": "agent_x"})
         assert r["statusCode"] == 400
 
-    def test_allowed_agent_ids_non_string_items_returns_400(self):
-        r, _ = self._call({"username": "carol", "allowed_agent_ids": [1, 2, 3]})
+    def test_readwrite_agent_ids_non_string_items_returns_400(self):
+        r, _ = self._call({"username": "carol", "readwrite_agent_ids": [1, 2, 3]})
         assert r["statusCode"] == 400
 
-    def test_allowed_agent_ids_in_audit_metadata(self):
+    def test_readwrite_agent_ids_in_audit_metadata(self):
         with patch("handlers.tenant_users.users_repo") as ur, \
              patch("handlers.tenant_users.audit") as mock_audit:
             ur.get_by_username.return_value = None
             ur.create.return_value = None
-            ur.get.return_value = {"user_id": "user_admin", "role": "admin", "allowed_agent_ids": None}
-            handle_create_tenant_user({"username": "carol", "allowed_agent_ids": ["agent_x"]}, ADMIN_TOKEN)
+            ur.get.return_value = {"user_id": "user_admin", "role": "admin", "readwrite_agent_ids": None}
+            handle_create_tenant_user({"username": "carol", "readwrite_agent_ids": ["agent_x"]}, ADMIN_TOKEN)
         meta = mock_audit.write.call_args[1]["metadata"]
-        assert meta["allowed_agent_ids"] == ["agent_x"]
+        assert meta["readwrite_agent_ids"] == ["agent_x"]
 
-    def test_null_allowed_agent_ids_in_audit_metadata(self):
+    def test_default_readwrite_agent_ids_in_audit_metadata(self):
         with patch("handlers.tenant_users.users_repo") as ur, \
              patch("handlers.tenant_users.audit") as mock_audit:
             ur.get_by_username.return_value = None
             ur.create.return_value = None
-            ur.get.return_value = {"user_id": "user_admin", "role": "admin", "allowed_agent_ids": None}
+            ur.get.return_value = {"user_id": "user_admin", "role": "admin", "readwrite_agent_ids": None}
             handle_create_tenant_user({"username": "carol"}, ADMIN_TOKEN)
         meta = mock_audit.write.call_args[1]["metadata"]
-        assert meta["allowed_agent_ids"] is None
+        assert meta["readwrite_agent_ids"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -409,14 +468,14 @@ class TestSetUserRole:
         assert json.loads(r["body"])["role"] == "admin"
 
     def test_promote_to_admin_clears_agent_scope(self):
-        scoped = {**EXISTING_USER, "role": "operator", "allowed_agent_ids": ["agent_a"]}
+        scoped = {**EXISTING_USER, "role": "operator", "readwrite_agent_ids": ["agent_a"]}
         with patch("handlers.tenant_users.users_repo") as ur, \
              patch("handlers.tenant_users.audit"):
             ur.get.return_value = scoped
             ur.set_role.return_value = None
             r = handle_set_user_role("user_bob", {"role": "admin"}, ADMIN_TOKEN)
         assert r["statusCode"] == 200
-        ur.set_allowed_agents.assert_called_once_with("user_bob", None)
+        ur.set_agent_access.assert_called_once_with("user_bob", None, None, None, None)
 
     def test_demote_to_user(self):
         admin_user = {**EXISTING_USER, "role": "admin"}
@@ -486,13 +545,13 @@ class TestResetUserPassword:
 # ---------------------------------------------------------------------------
 class TestGetUserAgents:
     def test_admin_gets_allowed_agents(self):
-        user = {**EXISTING_USER, "allowed_agent_ids": ["agent_1", "agent_2"]}
+        user = {**EXISTING_USER, "readwrite_agent_ids": ["agent_1", "agent_2"]}
         with patch("handlers.tenant_users.users_repo") as ur:
             ur.get.return_value = user
             r = handle_get_user_agents("user_bob", ADMIN_TOKEN)
         assert r["statusCode"] == 200
         body = json.loads(r["body"])
-        assert body["allowed_agent_ids"] == ["agent_1", "agent_2"]
+        assert body["readwrite_agent_ids"] == ["agent_1", "agent_2"]
 
     def test_non_admin_forbidden(self):
         r = handle_get_user_agents("user_bob", USER_TOKEN)
@@ -511,13 +570,13 @@ class TestGetUserAgents:
             r = handle_get_user_agents("user_bob", ADMIN_TOKEN)
         assert r["statusCode"] == 404
 
-    def test_null_allowed_agent_ids_means_all(self):
-        user = {**EXISTING_USER, "allowed_agent_ids": None}
+    def test_null_readwrite_agent_ids_means_all(self):
+        user = {**EXISTING_USER, "readwrite_agent_ids": None}
         with patch("handlers.tenant_users.users_repo") as ur:
             ur.get.return_value = user
             r = handle_get_user_agents("user_bob", ADMIN_TOKEN)
         assert r["statusCode"] == 200
-        assert json.loads(r["body"])["allowed_agent_ids"] is None
+        assert json.loads(r["body"])["readwrite_agent_ids"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -527,11 +586,11 @@ class TestSetUserAgents:
     def test_admin_sets_allowed_agents(self):
         with patch("handlers.tenant_users.users_repo") as ur:
             ur.get.return_value = EXISTING_USER
-            ur.set_allowed_agents.return_value = None
-            r = handle_set_user_agents("user_bob", {"allowed_agent_ids": ["agent_x"]}, ADMIN_TOKEN)
+            ur.set_agent_access.return_value = None
+            r = handle_set_user_agents("user_bob", {"readwrite_agent_ids": ["agent_x"]}, ADMIN_TOKEN)
         assert r["statusCode"] == 200
-        assert json.loads(r["body"])["allowed_agent_ids"] == ["agent_x"]
-        ur.set_allowed_agents.assert_called_once_with("user_bob", ["agent_x"])
+        assert json.loads(r["body"])["readwrite_agent_ids"] == ["agent_x"]
+        ur.set_agent_access.assert_called_once_with("user_bob", ["agent_x"], None, None, None)
 
     def test_non_admin_forbidden(self):
         r = handle_set_user_agents("user_bob", {}, USER_TOKEN)
@@ -540,16 +599,78 @@ class TestSetUserAgents:
     def test_user_not_found_returns_404(self):
         with patch("handlers.tenant_users.users_repo") as ur:
             ur.get.return_value = None
-            r = handle_set_user_agents("user_missing", {"allowed_agent_ids": []}, ADMIN_TOKEN)
+            r = handle_set_user_agents("user_missing", {"readwrite_agent_ids": []}, ADMIN_TOKEN)
         assert r["statusCode"] == 404
 
     def test_null_agent_ids_allows_all(self):
         with patch("handlers.tenant_users.users_repo") as ur:
             ur.get.return_value = EXISTING_USER
-            ur.set_allowed_agents.return_value = None
-            r = handle_set_user_agents("user_bob", {"allowed_agent_ids": None}, ADMIN_TOKEN)
+            ur.set_agent_access.return_value = None
+            r = handle_set_user_agents("user_bob", {"readwrite_agent_ids": None}, ADMIN_TOKEN)
         assert r["statusCode"] == 200
-        ur.set_allowed_agents.assert_called_once_with("user_bob", None)
+        ur.set_agent_access.assert_called_once_with("user_bob", None, None, None, None)
+
+    def test_sets_readwrite_and_readonly_partition(self):
+        with patch("handlers.tenant_users.users_repo") as ur:
+            ur.get.return_value = EXISTING_USER
+            ur.set_agent_access.return_value = None
+            r = handle_set_user_agents(
+                "user_bob",
+                {"readwrite_agent_ids": ["agent_x"], "readonly_agent_ids": ["agent_y"]},
+                ADMIN_TOKEN,
+            )
+        assert r["statusCode"] == 200
+        body = json.loads(r["body"])
+        assert body["readwrite_agent_ids"] == ["agent_x"]
+        assert body["readonly_agent_ids"] == ["agent_y"]
+        ur.set_agent_access.assert_called_once_with("user_bob", ["agent_x"], ["agent_y"], None, None)
+
+    def test_rejects_fleet_member_by_agent_id(self):
+        with patch("handlers.tenant_users.users_repo") as ur, \
+             patch("handlers.tenant_users.agents_repo") as agr:
+            ur.get.return_value = EXISTING_USER
+            agr.list_by_tenant.return_value = [{"agent_id": "agent_fleet", "fleet_id": "fleet_1"}]
+            r = handle_set_user_agents("user_bob", {"readwrite_agent_ids": ["agent_fleet"]}, ADMIN_TOKEN)
+        assert r["statusCode"] == 400
+        assert "fleet member" in json.loads(r["body"])["error"]
+        ur.set_agent_access.assert_not_called()
+
+    def test_allows_standalone_agent_when_fleet_members_exist(self):
+        with patch("handlers.tenant_users.users_repo") as ur, \
+             patch("handlers.tenant_users.agents_repo") as agr:
+            ur.get.return_value = EXISTING_USER
+            agr.list_by_tenant.return_value = [
+                {"agent_id": "agent_fleet", "fleet_id": "fleet_1"},
+                {"agent_id": "agent_solo", "fleet_id": None},
+            ]
+            r = handle_set_user_agents("user_bob", {"readwrite_agent_ids": ["agent_solo"]}, ADMIN_TOKEN)
+        assert r["statusCode"] == 200
+
+    def test_wildcard_is_rejected(self):
+        with patch("handlers.tenant_users.users_repo") as ur:
+            ur.get.return_value = EXISTING_USER
+            r = handle_set_user_agents("user_bob", {"readwrite_agent_ids": ["*"]}, ADMIN_TOKEN)
+        assert r["statusCode"] == 400
+        assert "wildcard" in json.loads(r["body"])["error"]
+        ur.set_agent_access.assert_not_called()
+
+    def test_overlapping_lists_rejected(self):
+        with patch("handlers.tenant_users.users_repo") as ur:
+            ur.get.return_value = EXISTING_USER
+            r = handle_set_user_agents(
+                "user_bob",
+                {"readwrite_agent_ids": ["agent_x"], "readonly_agent_ids": ["agent_x"]},
+                ADMIN_TOKEN,
+            )
+        assert r["statusCode"] == 400
+        assert "disjoint" in json.loads(r["body"])["error"]
+        ur.set_agent_access.assert_not_called()
+
+    def test_readonly_ids_must_be_list(self):
+        with patch("handlers.tenant_users.users_repo") as ur:
+            ur.get.return_value = EXISTING_USER
+            r = handle_set_user_agents("user_bob", {"readonly_agent_ids": "nope"}, ADMIN_TOKEN)
+        assert r["statusCode"] == 400
 
 
 # ---------------------------------------------------------------------------
@@ -558,24 +679,24 @@ class TestSetUserAgents:
 
 def _set_agents(prev_ids, new_ids, user=None):
     """Helper: call handle_set_user_agents with audit mocked, return (response, audit_mock)."""
-    target = {**EXISTING_USER, "allowed_agent_ids": prev_ids}
+    target = {**EXISTING_USER, "readwrite_agent_ids": prev_ids}
     if user is None:
         user = target
-    admin_actor = {"user_id": "user_admin", "tenant_id": "tenant_acme", "role": "admin", "allowed_agent_ids": None}
+    admin_actor = {"user_id": "user_admin", "tenant_id": "tenant_acme", "role": "admin", "readwrite_agent_ids": None}
     with patch("handlers.tenant_users.users_repo") as ur, \
          patch("handlers.tenant_users.audit") as mock_audit:
         # The actor (ADMIN_TOKEN.sub) is a distinct unrestricted admin; user_bob is the target.
         ur.get.side_effect = lambda uid: admin_actor if uid == "user_admin" else target
         ur.set_allowed_agents.return_value = None
-        r = handle_set_user_agents("user_bob", {"allowed_agent_ids": new_ids}, ADMIN_TOKEN)
+        r = handle_set_user_agents("user_bob", {"readwrite_agent_ids": new_ids}, ADMIN_TOKEN)
     return r, mock_audit
 
 
 class TestSetUserAgentsScope:
     def test_restricted_admin_cannot_widen_target_beyond_own_scope(self):
         restricted_admin = {"user_id": "user_admin", "tenant_id": "tenant_acme",
-                            "role": "admin", "allowed_agent_ids": ["agent_a"]}
-        target = {**EXISTING_USER, "allowed_agent_ids": ["agent_a"]}
+                            "role": "admin", "readwrite_agent_ids": ["agent_a"]}
+        target = {**EXISTING_USER, "readwrite_agent_ids": ["agent_a"]}
         with patch("handlers.tenant_users.users_repo") as ur, \
              patch("handlers.tenant_users.agents_repo") as agr, \
              patch("handlers.tenant_users.audit"):
@@ -584,20 +705,20 @@ class TestSetUserAgentsScope:
                 {"agent_id": "agent_a", "tenant_id": "tenant_acme"},
                 {"agent_id": "agent_b", "tenant_id": "tenant_acme"},
             ]
-            r = handle_set_user_agents("user_bob", {"allowed_agent_ids": ["agent_a", "agent_b"]}, ADMIN_TOKEN)
+            r = handle_set_user_agents("user_bob", {"readwrite_agent_ids": ["agent_a", "agent_b"]}, ADMIN_TOKEN)
         assert r["statusCode"] == 403
         ur.set_allowed_agents.assert_not_called()
 
     def test_restricted_admin_cannot_widen_self(self):
         # Actor == target: a restricted admin cannot grant themselves all agents (null).
         restricted_admin = {"user_id": "user_admin", "tenant_id": "tenant_acme",
-                            "role": "admin", "allowed_agent_ids": ["agent_a"]}
+                            "role": "admin", "readwrite_agent_ids": ["agent_a"]}
         with patch("handlers.tenant_users.users_repo") as ur, \
              patch("handlers.tenant_users.agents_repo") as agr, \
              patch("handlers.tenant_users.audit"):
             ur.get.return_value = restricted_admin
             agr.list_by_tenant.return_value = [{"agent_id": "agent_a", "tenant_id": "tenant_acme"}]
-            r = handle_set_user_agents("user_admin", {"allowed_agent_ids": None}, ADMIN_TOKEN)
+            r = handle_set_user_agents("user_admin", {"readwrite_agent_ids": None}, ADMIN_TOKEN)
         assert r["statusCode"] == 403
         ur.set_allowed_agents.assert_not_called()
 
@@ -605,16 +726,16 @@ class TestSetUserAgentsScope:
         with patch("handlers.tenant_users.users_repo") as ur, \
              patch("handlers.tenant_users.audit"):
             ur.get.return_value = {**EXISTING_USER}
-            r = handle_set_user_agents("user_bob", {"allowed_agent_ids": "nope"}, ADMIN_TOKEN)
+            r = handle_set_user_agents("user_bob", {"readwrite_agent_ids": "nope"}, ADMIN_TOKEN)
         assert r["statusCode"] == 400
 
     def test_cannot_scope_an_admin_target(self):
-        admin_target = {**EXISTING_USER, "user_id": "user_target", "role": "admin", "allowed_agent_ids": None}
-        actor = {"user_id": "user_admin", "tenant_id": "tenant_acme", "role": "admin", "allowed_agent_ids": None}
+        admin_target = {**EXISTING_USER, "user_id": "user_target", "role": "admin", "readwrite_agent_ids": None}
+        actor = {"user_id": "user_admin", "tenant_id": "tenant_acme", "role": "admin", "readwrite_agent_ids": None}
         with patch("handlers.tenant_users.users_repo") as ur, \
              patch("handlers.tenant_users.audit"):
             ur.get.side_effect = lambda uid: actor if uid == "user_admin" else admin_target
-            r = handle_set_user_agents("user_target", {"allowed_agent_ids": ["agent_a"]}, ADMIN_TOKEN)
+            r = handle_set_user_agents("user_target", {"readwrite_agent_ids": ["agent_a"]}, ADMIN_TOKEN)
         assert r["statusCode"] == 400
         ur.set_allowed_agents.assert_not_called()
 
@@ -733,7 +854,7 @@ class TestListUsersHandler:
         with patch("handlers.tenant_users._verify_tenant_payload", return_value=ADMIN_TOKEN), \
              patch("handlers.tenant_users.handle_list_tenant_users", return_value=_OK) as h:
             list_users_handler(_evt(), None)
-        h.assert_called_once_with(ADMIN_TOKEN)
+        h.assert_called_once_with(ADMIN_TOKEN, role=None, status=None, q=None, limit=None, offset=0)
 
 
 class TestCreateUserHandler:
@@ -845,7 +966,7 @@ class TestSetUserAgentsHandler:
         assert r["statusCode"] == 400
 
     def test_delegates_with_user_id_body_and_payload(self):
-        body = {"allowed_agent_ids": ["agent_x", "agent_y"]}
+        body = {"readwrite_agent_ids": ["agent_x", "agent_y"]}
         with patch("handlers.tenant_users._verify_tenant_payload", return_value=ADMIN_TOKEN), \
              patch("handlers.tenant_users.handle_set_user_agents", return_value=_OK) as h:
             r = set_user_agents_handler(_evt(path={"user_id": "user_bob"}, body=json.dumps(body)), None)

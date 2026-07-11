@@ -120,3 +120,108 @@ def test_empty_agent_ids_matches_nothing(repo):
     _mk(repo, 0, command="docker ps", agent_id="agent_1")
     items, total = repo.search_by_tenant("t1", agent_ids=[], limit=100)
     assert total == 0 and items == []
+
+
+def _mk_fleet(repo, i, *, command, fleet_id="fleet_1", status="pending"):
+    repo.create({
+        "approval_id": f"fappr_{i}",
+        "tenant_id": "t1",
+        "agent_id": None,
+        "fleet_id": fleet_id,
+        "command": command,
+        "k8s_rule": None,
+        "requested_by": "u1",
+        "requester_name": "alice",
+        "job_id": None,
+        "status": status,
+        "expires_at": None,
+        "created_at": f"2026-06-02T{i:02d}:00:00Z",
+        "reviewed_at": None,
+        "reviewed_by": None,
+    })
+
+
+def test_list_by_fleet_scopes_to_fleet(repo):
+    _mk_fleet(repo, 0, command="docker ps", fleet_id="fleet_1")
+    _mk_fleet(repo, 1, command="docker ps", fleet_id="fleet_2")
+    items = repo.list_by_fleet("fleet_1")
+    assert [a["approval_id"] for a in items] == ["fappr_0"]
+
+
+def test_list_by_fleet_status_filter(repo):
+    _mk_fleet(repo, 0, command="a", status="approved")
+    _mk_fleet(repo, 1, command="b", status="pending")
+    assert [a["command"] for a in repo.list_by_fleet("fleet_1", status="approved")] == ["a"]
+
+
+def test_exists_pending_fleet(repo):
+    _mk_fleet(repo, 0, command="docker restart web", status="pending")
+    assert repo.exists_pending_fleet("fleet_1", "docker restart web") is True
+    assert repo.exists_pending_fleet("fleet_1", "docker restart db") is False
+    assert repo.exists_pending_fleet("fleet_2", "docker restart web") is False
+
+
+def test_search_fleet_id_scopes_results(repo):
+    _mk_fleet(repo, 0, command="docker ps", fleet_id="fleet_1")
+    _mk_fleet(repo, 1, command="docker ps", fleet_id="fleet_2")
+    _mk(repo, 5, command="docker ps", agent_id="agent_1")
+    items, total = repo.search_by_tenant("t1", fleet_id="fleet_1", limit=100)
+    assert total == 1 and items[0]["fleet_id"] == "fleet_1"
+
+
+def test_search_fleet_ids_and_agent_ids_union(repo):
+    _mk_fleet(repo, 0, command="x", fleet_id="fleet_1")
+    _mk(repo, 5, command="y", agent_id="agent_1")
+    _mk(repo, 6, command="z", agent_id="agent_9")  # excluded
+    items, total = repo.search_by_tenant("t1", agent_ids=["agent_1"], fleet_ids=["fleet_1"], limit=100)
+    assert total == 2
+    assert {a["approval_id"] for a in items} == {"fappr_0", "appr_5"}
+
+
+def test_search_scope_agent_excludes_fleet(repo):
+    _mk(repo, 0, command="a", agent_id="agent_1")
+    _mk_fleet(repo, 1, command="b", fleet_id="fleet_1")
+    items, total = repo.search_by_tenant("t1", scope="agent", limit=100)
+    assert total == 1 and items[0]["agent_id"] == "agent_1"
+
+
+def test_search_scope_fleet_excludes_agents(repo):
+    _mk(repo, 0, command="a", agent_id="agent_1")
+    _mk_fleet(repo, 1, command="b", fleet_id="fleet_1")
+    items, total = repo.search_by_tenant("t1", scope="fleet", limit=100)
+    assert total == 1 and items[0]["fleet_id"] == "fleet_1"
+
+
+def _mk_full(repo, i, *, agent_id=None, fleet_id=None):
+    repo.create({
+        "approval_id": f"appr_{i}", "tenant_id": "t1", "agent_id": agent_id, "fleet_id": fleet_id,
+        "command": "uptime", "k8s_rule": None, "requested_by": "u1", "requester_name": "alice",
+        "job_id": None, "status": "approved", "expires_at": None,
+        "created_at": f"2026-06-01T{i:02d}:00:00Z", "reviewed_at": None, "reviewed_by": None,
+    })
+
+
+def test_delete_by_agent_removes_only_that_agents_approvals(repo):
+    _mk_full(repo, 1, agent_id="agent_1")
+    _mk_full(repo, 2, agent_id="agent_1")
+    _mk_full(repo, 3, agent_id="agent_2")
+    n = repo.delete_by_agent("agent_1")
+    assert n == 2
+    remaining = repo.list_by_agent("agent_2")
+    assert {a["approval_id"] for a in remaining} == {"appr_3"}
+    assert repo.list_by_agent("agent_1") == []
+
+
+def test_delete_by_fleet_removes_only_that_fleets_approvals(repo):
+    _mk_full(repo, 1, fleet_id="fleet_1")
+    _mk_full(repo, 2, fleet_id="fleet_1", agent_id="agent_9")
+    _mk_full(repo, 3, fleet_id="fleet_2")
+    n = repo.delete_by_fleet("fleet_1")
+    assert n == 2
+    assert {a["approval_id"] for a in repo.list_by_fleet("fleet_2")} == {"appr_3"}
+    assert repo.list_by_fleet("fleet_1") == []
+
+
+def test_delete_by_agent_no_match_returns_zero(repo):
+    _mk_full(repo, 1, agent_id="agent_1")
+    assert repo.delete_by_agent("ghost") == 0

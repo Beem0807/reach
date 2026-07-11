@@ -351,41 +351,16 @@ if [[ "${1:-}" == "--update" ]]; then
   fi
 
   echo ""
-  echo "  How long to keep each record type before auto-deleting (leave blank to keep existing):"
-  read -rp "  Approval retention days  (command allow/deny records) [keep existing]: " _apr < /dev/tty
-  if [[ -n "$_apr" ]]; then
-    APPROVAL_RETENTION_PARAM="ParameterKey=ApprovalRetentionDays,ParameterValue=$_apr"
-    ok "Approval retention → $_apr days"
-  else
-    APPROVAL_RETENTION_PARAM="ParameterKey=ApprovalRetentionDays,UsePreviousValue=true"
-    info "Approval retention unchanged"
-  fi
-
-  read -rp "  Job retention days       (stdout, stderr, exit codes) [keep existing]: " _jrd < /dev/tty
-  if [[ -n "$_jrd" ]]; then
-    JOB_RETENTION_PARAM="ParameterKey=JobRetentionDays,ParameterValue=$_jrd"
-    ok "Job retention → $_jrd days"
-  else
-    JOB_RETENTION_PARAM="ParameterKey=JobRetentionDays,UsePreviousValue=true"
-    info "Job retention unchanged"
-  fi
-
-  read -rp "  Audit retention days     (who did what and when) [keep existing]: " _ard < /dev/tty
+  echo "  Per-tenant retention (approval/job/run/audit/agent-history) and the fan-out cap"
+  echo "  are now tenant settings, managed in the console. Only the platform-level audit"
+  echo "  trail (cross-tenant, tenant_id IS NULL) is set here:"
+  read -rp "  Platform audit retention days [keep existing]: " _ard < /dev/tty
   if [[ -n "$_ard" ]]; then
     AUDIT_RETENTION_PARAM="ParameterKey=AuditRetentionDays,ParameterValue=$_ard"
-    ok "Audit retention → $_ard days"
+    ok "Platform audit retention → $_ard days"
   else
     AUDIT_RETENTION_PARAM="ParameterKey=AuditRetentionDays,UsePreviousValue=true"
-    info "Audit retention unchanged"
-  fi
-
-  read -rp "  Agent history days       (heartbeat and status snapshots) [keep existing]: " _ahd < /dev/tty
-  if [[ -n "$_ahd" ]]; then
-    AGENT_HISTORY_RETENTION_PARAM="ParameterKey=AgentHistoryRetentionDays,ParameterValue=$_ahd"
-    ok "Agent history retention → $_ahd days"
-  else
-    AGENT_HISTORY_RETENTION_PARAM="ParameterKey=AgentHistoryRetentionDays,UsePreviousValue=true"
-    info "Agent history retention unchanged"
+    info "Platform audit retention unchanged"
   fi
 
   # Agent / chart version pins. UsePreviousValue only works once a parameter is
@@ -414,10 +389,7 @@ if [[ "${1:-}" == "--update" ]]; then
       ParameterKey=ReleasesS3Base,UsePreviousValue=true \
       "$SESSION_SIGNING_PARAM" \
       "$ADMIN_PASSWORD_PARAM" \
-      "$APPROVAL_RETENTION_PARAM" \
-      "$JOB_RETENTION_PARAM" \
       "$AUDIT_RETENTION_PARAM" \
-      "$AGENT_HISTORY_RETENTION_PARAM" \
       "$RELEASES_CHART_REPO_PARAM" \
     --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND \
     --region "$AWS_REGION"
@@ -570,21 +542,16 @@ if [[ "$CREATE_AGENT" == "true" ]]; then
   fi
 fi
 
-# Retention (advanced)
+# Platform audit retention (advanced). Per-tenant retention (approval/job/run/audit/
+# agent-history) and the fan-out cap are tenant settings, managed in the console; only
+# the platform-level audit trail (cross-tenant, tenant_id IS NULL) is set at deploy time.
 echo ""
-ADVANCED=$(prompt_yes_no "Configure data retention? (default: 7/7/90/30 days)" "N")
+ADVANCED=$(prompt_yes_no "Configure platform audit retention? (default: 90 days)" "N")
 if [[ "$ADVANCED" == "true" ]]; then
   echo ""
-  echo "  How long to keep each record type before auto-deleting:"
-  APPROVAL_RETENTION_DAYS=$(prompt "Approval retention days  (command allow/deny records)" "7")
-  JOB_RETENTION_DAYS=$(prompt "Job retention days       (stdout, stderr, exit codes)" "7")
-  AUDIT_RETENTION_DAYS=$(prompt "Audit retention days     (who did what and when)" "90")
-  AGENT_HISTORY_RETENTION_DAYS=$(prompt "Agent history days       (heartbeat and status snapshots)" "30")
+  AUDIT_RETENTION_DAYS=$(prompt "Platform audit retention days (cross-tenant admin trail)" "90")
 else
-  APPROVAL_RETENTION_DAYS=7
-  JOB_RETENTION_DAYS=7
   AUDIT_RETENTION_DAYS=90
-  AGENT_HISTORY_RETENTION_DAYS=30
 fi
 
 # Chart repo defaults to <ReleasesS3Base>/charts/reach-agent. Self-hosting the
@@ -635,7 +602,7 @@ if [[ "$CREATE_AGENT" == "true" ]]; then
 else
   echo "  Agent:     none"
 fi
-echo "  Retention: ${APPROVAL_RETENTION_DAYS}d approvals / ${JOB_RETENTION_DAYS}d jobs / ${AUDIT_RETENTION_DAYS}d audit / ${AGENT_HISTORY_RETENTION_DAYS}d history"
+echo "  Retention: ${AUDIT_RETENTION_DAYS}d platform audit (per-tenant retention set in the console)"
 echo "  ────────────────────────────────────────────"
 echo ""
 read -rp "  Start deployment? [Y/n]: " _confirm < /dev/tty
@@ -653,10 +620,7 @@ aws cloudformation create-stack \
     ParameterKey=TokenPepper,ParameterValue="$TOKEN_PEPPER" \
     ParameterKey=SessionSigningKey,ParameterValue="$SESSION_SIGNING_KEY" \
     ParameterKey=AdminPassword,ParameterValue="$ADMIN_PASSWORD" \
-    ParameterKey=ApprovalRetentionDays,ParameterValue="$APPROVAL_RETENTION_DAYS" \
-    ParameterKey=JobRetentionDays,ParameterValue="$JOB_RETENTION_DAYS" \
     ParameterKey=AuditRetentionDays,ParameterValue="$AUDIT_RETENTION_DAYS" \
-    ParameterKey=AgentHistoryRetentionDays,ParameterValue="$AGENT_HISTORY_RETENTION_DAYS" \
     ParameterKey=ReleasesChartRepo,ParameterValue="${RELEASES_CHART_REPO:-}" \
   --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND \
   --region "$AWS_REGION"

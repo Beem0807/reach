@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import type { AuditLog } from '../types';
-import { listPlatformAuditLogs, listTenantAuditLogs } from '../api';
+import type { AuditLog, Tenant } from '../types';
+import { listPlatformAuditLogs, listTenantAuditLogs, listTenants } from '../api';
 import { Spinner } from '../components/Spinner';
 import { DataTable } from '../components/DataTable';
 import { RefreshButton } from '../components/RefreshButton';
@@ -17,6 +17,13 @@ const ACTION_COLOR: Record<string, string> = {
   'tenant.created': 'bg-emerald-50 text-emerald-700',
   'tenant.disabled': 'bg-red-50 text-red-700',
   'tenant.enabled': 'bg-emerald-50 text-emerald-700',
+  'tenant.settings_updated': 'bg-purple-50 text-purple-700',
+  'tenant.settings_overridden': 'bg-amber-50 text-amber-700',
+  'run.dispatched': 'bg-blue-50 text-blue-700',
+  'job.dispatched': 'bg-blue-50 text-blue-700',
+  'run.paused': 'bg-amber-50 text-amber-700',
+  'run.resumed': 'bg-emerald-50 text-emerald-700',
+  'run.canceled': 'bg-red-50 text-red-700',
   'user.created': 'bg-indigo-50 text-indigo-700',
   'user.disabled': 'bg-red-50 text-red-700',
   'user.deleted': 'bg-red-50 text-red-700',
@@ -28,11 +35,22 @@ const ACTION_COLOR: Record<string, string> = {
   'api_token.created': 'bg-indigo-50 text-indigo-700',
   'api_token.renamed': 'bg-purple-50 text-purple-700',
   'api_token.revoked': 'bg-red-50 text-red-700',
+  'api_token.deleted': 'bg-red-50 text-red-700',
+  'fleet.created': 'bg-emerald-50 text-emerald-700',
+  'fleet.updated': 'bg-purple-50 text-purple-700',
+  'fleet.token_rotated': 'bg-amber-50 text-amber-700',
+  'fleet.member_detached': 'bg-gray-100 text-gray-700',
+  'fleet.grants_reconciled': 'bg-amber-50 text-amber-700',
+  'fleet.grant_mismatch_accepted': 'bg-amber-50 text-amber-700',
+  'fleet.revoked': 'bg-red-50 text-red-700',
+  'fleet.deleted': 'bg-red-50 text-red-700',
   'agent.created': 'bg-indigo-50 text-indigo-700',
   'agent.revoked': 'bg-red-50 text-red-700',
   'agent.deleted': 'bg-red-50 text-red-700',
   'agent.removed': 'bg-gray-100 text-gray-700',
   'agent.unreachable': 'bg-amber-50 text-amber-700',
+  'agent.reaped': 'bg-red-50 text-red-700',
+  'agent.deregistered': 'bg-gray-100 text-gray-700',
   'agent.recovered': 'bg-emerald-50 text-emerald-700',
   'agent.install_token_reissued': 'bg-amber-50 text-amber-700',
   'agent.tags_changed': 'bg-purple-50 text-purple-700',
@@ -159,6 +177,60 @@ function ApprovalDetail({ action, meta }: { action: string; meta: Record<string,
   );
 }
 
+function RunDispatchDetail({ meta }: { meta: Record<string, unknown> }) {
+  const command = String(meta.command ?? '');
+  const scope = String(meta.scope ?? '');
+  const target = scope === 'fleet' ? String(meta.fleet_name ?? meta.fleet_id ?? '') : String(meta.tag ?? '');
+  const dispatched = typeof meta.dispatched === 'number' ? meta.dispatched : undefined;
+  const waves = typeof meta.wave_total === 'number' ? meta.wave_total : undefined;
+  const isWrite = meta.is_write === true;
+  return (
+    <span className="text-xs text-gray-600">
+      {command && <span className="font-mono bg-gray-100 px-1 py-0.5 rounded text-gray-700 break-all">{command}</span>}
+      {target && <span className="text-gray-400 ml-1">on {scope === 'fleet' ? 'fleet' : 'tag'} <span className="font-medium text-gray-700">{target}</span></span>}
+      {dispatched !== undefined && <span className="text-gray-400 ml-1">· {dispatched} agent{dispatched !== 1 ? 's' : ''}</span>}
+      {waves !== undefined && waves > 1 && <span className="text-gray-400 ml-1">· {waves} waves</span>}
+      {isWrite && <span className="ml-1 text-amber-600 font-medium">write</span>}
+    </span>
+  );
+}
+
+function JobDispatchDetail({ meta }: { meta: Record<string, unknown> }) {
+  const command = String(meta.command ?? '');
+  const target = String(meta.hostname ?? meta.agent_id ?? '');
+  const isWrite = meta.is_write === true;
+  return (
+    <span className="text-xs text-gray-600">
+      {command && <span className="font-mono bg-gray-100 px-1 py-0.5 rounded text-gray-700 break-all">{command}</span>}
+      {target && <span className="text-gray-400 ml-1">on <span className="font-medium text-gray-700">{target}</span></span>}
+      {isWrite && <span className="ml-1 text-amber-600 font-medium">write</span>}
+    </span>
+  );
+}
+
+// Fallback detail renderer: any action that carries metadata but has no bespoke
+// renderer above still shows a compact key: value summary instead of a bare "-".
+function GenericDetail({ meta }: { meta: Record<string, unknown> }) {
+  const fmt = (v: unknown): string => {
+    if (v === null || v === undefined) return '∅';
+    if (Array.isArray(v)) return v.length ? v.join(', ') : '(none)';
+    if (typeof v === 'object') return JSON.stringify(v);
+    return String(v);
+  };
+  const entries = Object.entries(meta).filter(([, v]) => v !== '' && v !== undefined);
+  if (entries.length === 0) return <span className="text-xs text-gray-400">-</span>;
+  return (
+    <span className="text-xs text-gray-600 space-x-2">
+      {entries.slice(0, 4).map(([k, v]) => (
+        <span key={k} className="whitespace-nowrap">
+          <span className="text-gray-400">{k}:</span>{' '}
+          <span className="font-medium text-gray-700 break-all">{fmt(v)}</span>
+        </span>
+      ))}
+    </span>
+  );
+}
+
 interface Props {
   mode: 'platform' | 'tenant';
   apiUrl: string;
@@ -177,11 +249,14 @@ export function AuditLogsPage({ mode, apiUrl, token }: Props) {
   const [filterActor, setFilterActor] = useState('');
   const [filterResource, setFilterResource] = useState('');
   const [filterIp, setFilterIp] = useState('');
+  const [filterTenant, setFilterTenant] = useState('');
+  // Platform mode only: the tenant list backs the tenant filter dropdown.
+  const [tenants, setTenants] = useState<Tenant[]>([]);
   const [filterSince, setFilterSince] = useState('');
   const [filterUntil, setFilterUntil] = useState('');
-  const filterRefs = useRef({ action: '', actor: '', resource: '', ip: '', since: '', until: '' });
+  const filterRefs = useRef({ action: '', actor: '', resource: '', ip: '', tenant: '', since: '', until: '' });
 
-  const activeFilters = [filterAction, filterActor, filterResource, filterIp, filterSince, filterUntil].filter(Boolean).length;
+  const activeFilters = [filterAction, filterActor, filterResource, filterIp, filterTenant, filterSince, filterUntil].filter(Boolean).length;
 
   const load = useCallback((reset = true) => {
     const seq = ++seqRef.current;
@@ -199,6 +274,7 @@ export function AuditLogsPage({ mode, apiUrl, token }: Props) {
     if (f.actor) params.actor = f.actor;
     if (f.resource) params.resource = f.resource;
     if (f.ip) params.ip = f.ip;
+    if (f.tenant) params.tenant = f.tenant;
     const fn = mode === 'platform'
       ? listPlatformAuditLogs(apiUrl, token, params)
       : listTenantAuditLogs(apiUrl, token, params);
@@ -215,20 +291,29 @@ export function AuditLogsPage({ mode, apiUrl, token }: Props) {
 
   useEffect(() => { load(true); }, [load]);
 
+  // Populate the tenant filter dropdown (platform mode). One shot; a high limit pulls
+  // the full list so every tenant with audit activity is selectable.
+  useEffect(() => {
+    if (mode !== 'platform') return;
+    listTenants(apiUrl, token, { limit: '1000' })
+      .then(r => setTenants(r.tenants))
+      .catch(() => setTenants([]));
+  }, [mode, apiUrl, token]);
+
   // Filters are staged in input state and only sent when the user hits Search
   // (the default view is the recent page). Enter in any text box also searches.
   function applyFilters() {
     filterRefs.current = {
       action: filterAction, actor: filterActor, resource: filterResource,
-      ip: filterIp, since: filterSince, until: filterUntil,
+      ip: filterIp, tenant: filterTenant, since: filterSince, until: filterUntil,
     };
     load(true);
   }
 
   function clearFilters() {
     setFilterAction(''); setFilterActor(''); setFilterResource(''); setFilterIp('');
-    setFilterSince(''); setFilterUntil('');
-    filterRefs.current = { action: '', actor: '', resource: '', ip: '', since: '', until: '' };
+    setFilterTenant(''); setFilterSince(''); setFilterUntil('');
+    filterRefs.current = { action: '', actor: '', resource: '', ip: '', tenant: '', since: '', until: '' };
     load(true);
   }
 
@@ -261,7 +346,21 @@ export function AuditLogsPage({ mode, apiUrl, token }: Props) {
 
       {/* Filter toolbar */}
       <div className="flex flex-wrap items-center gap-2 mb-4">
+        {mode === 'platform' && (
+          <select
+            aria-label="Filter by tenant"
+            value={filterTenant}
+            onChange={e => setFilterTenant(e.target.value)}
+            className="text-sm border border-gray-300 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-orange-400 bg-white w-48"
+          >
+            <option value="">All tenants</option>
+            {tenants.map(t => (
+              <option key={t.tenant_id} value={t.tenant_id}>{t.name}</option>
+            ))}
+          </select>
+        )}
         <select
+          aria-label="Filter by action"
           value={filterAction}
           onChange={e => setFilterAction(e.target.value)}
           className="text-sm border border-gray-300 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-orange-400 bg-white w-52"
@@ -335,6 +434,9 @@ export function AuditLogsPage({ mode, apiUrl, token }: Props) {
               tableId="audit-logs"
               columns={[
                 { label: 'Time',     sortValue: l => l.created_at, required: true },
+                ...(mode === 'platform'
+                  ? [{ label: 'Tenant', sortValue: (l: AuditLog) => l.tenant_id ?? '' }]
+                  : []),
                 { label: 'Action',   sortValue: l => l.action, required: true },
                 { label: 'Details',  sortValue: l => String((l.metadata as Record<string, unknown>)?.label ?? '') },
                 { label: 'Actor',    sortValue: l => l.actor_name ?? l.actor_id ?? '' },
@@ -346,6 +448,13 @@ export function AuditLogsPage({ mode, apiUrl, token }: Props) {
               renderRow={l => (
                 <tr key={l.log_id} className="hover:bg-gray-50/70">
                   <td className="px-4 py-3 text-xs text-gray-500 whitespace-nowrap">{fmtDate(l.created_at)}</td>
+                  {mode === 'platform' && (
+                    <td className="px-4 py-3 text-xs font-mono text-gray-500 whitespace-nowrap">
+                      {l.tenant_id
+                        ? <span className="break-all">{l.tenant_id}</span>
+                        : <span className="text-gray-400 italic">platform</span>}
+                    </td>
+                  )}
                   <td className="px-4 py-3">
                     <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${ACTION_COLOR[l.action] || 'bg-gray-100 text-gray-600'}`}>
                       {l.action}
@@ -362,6 +471,12 @@ export function AuditLogsPage({ mode, apiUrl, token }: Props) {
                       ? <AgentsChangedDetail meta={l.metadata as Record<string, unknown>} />
                       : l.action.startsWith('approval.') && l.metadata
                       ? <ApprovalDetail action={l.action} meta={l.metadata as Record<string, unknown>} />
+                      : l.action === 'run.dispatched' && l.metadata
+                      ? <RunDispatchDetail meta={l.metadata as Record<string, unknown>} />
+                      : l.action === 'job.dispatched' && l.metadata
+                      ? <JobDispatchDetail meta={l.metadata as Record<string, unknown>} />
+                      : l.metadata && Object.keys(l.metadata).length > 0
+                      ? <GenericDetail meta={l.metadata as Record<string, unknown>} />
                       : <span className="text-xs text-gray-400">-</span>}
                   </td>
                   <td className="px-4 py-3 text-xs text-gray-700">

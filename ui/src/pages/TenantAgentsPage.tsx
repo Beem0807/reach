@@ -1,9 +1,11 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { createPortal } from 'react-dom';
-import type { TenantConfig, Agent, AgentHistory, TenantUser } from '../types';
+import type { TenantConfig, Agent, AgentHistory, TenantUser, Fleet } from '../types';
 import {
   listTenantAgents,
   listTenantUsers,
+  listFleets,
+  removeFleetMember,
   listAgentVersions,
   createTenantAgent,
   reissueTenantInstallToken,
@@ -17,13 +19,14 @@ import {
   listAgentHistory,
 } from '../api';
 import { Modal } from '../components/Modal';
+import { RunCommandModal } from '../components/RunCommandModal';
 import { RefreshButton } from '../components/RefreshButton';
 import { Badge } from '../components/Badge';
 import { K8sPermissionsView } from '../components/K8sPermissionsView';
 import { Spinner } from '../components/Spinner';
 import { CopyButton, TokenBox } from '../components/CopyButton';
 import { DataTable } from '../components/DataTable';
-import { relTime } from '../utils';
+import { relTime, memberMismatchAccepted } from '../utils';
 
 const MODES = ['wild', 'readonly', 'approved'] as const;
 type Mode = typeof MODES[number];
@@ -41,7 +44,12 @@ const MODE_DESC: Record<string, string> = {
 };
 
 
-function CapabilityCell({ granted, detected, onAcknowledge }: { granted?: boolean; detected?: boolean; onAcknowledge?: () => void }) {
+function CapabilityCell({ granted, detected, onAcknowledge, fleetDrift, fleetWants }: {
+  granted?: boolean; detected?: boolean; onAcknowledge?: () => void;
+  // Set for fleet members whose grant differs from the fleet's desired grant - the
+  // the same "grant mismatch" the Fleets screen flags, surfaced here for consistency.
+  fleetDrift?: boolean; fleetWants?: boolean;
+}) {
   const outOfBand   = detected && !granted;
   const active      = detected && granted;
   const grantedOnly = granted && !detected;
@@ -87,8 +95,14 @@ function CapabilityCell({ granted, detected, onAcknowledge }: { granted?: boolea
   );
 
   return (
-    <div className="relative group/cap inline-flex flex-col items-start">
+    <div className="relative group/cap inline-flex flex-col items-start gap-0.5">
       {badge}
+      {fleetDrift && (
+        <span className="inline-flex items-center gap-0.5 text-[10px] font-semibold text-amber-700 bg-amber-50 border border-amber-200 px-1 py-0.5 rounded"
+          title={`Fleet grant mismatch: this member has it ${granted ? 'on' : 'off'}, but the fleet now wants it ${fleetWants ? 'on' : 'off'}. Reconcile it from the Fleets screen (verified against detection).`}>
+          ⚠ grant mismatch
+        </span>
+      )}
       <div className="pointer-events-none absolute bottom-full left-0 mb-1.5 z-20 w-56 bg-gray-900 text-white text-[11px] leading-snug rounded-lg px-2.5 py-2 opacity-0 group-hover/cap:opacity-100 transition-opacity shadow-xl whitespace-normal">
         {tooltip}
         <div className="absolute top-full left-4 -mt-px border-4 border-transparent border-t-gray-900" />
@@ -163,38 +177,101 @@ type ModalState =
   | { type: 'reissue'; agent: Agent }
   | { type: 'set-mode'; agent: Agent }
   | { type: 'set-tags'; agent: Agent }
-  | { type: 'detail'; agent: Agent }
+  | { type: 'detail'; agent: Agent; backFleetId?: string | null }
   | { type: 'confirm-revoke'; agent: Agent }
   | { type: 'confirm-delete'; agent: Agent }
   | { type: 'confirm-remove'; agent: Agent }
   | { type: 'rotate'; agent: Agent }
+  | { type: 'detach-fleet'; agent: Agent }
+  | { type: 'run-agent'; agent: Agent }
   | null;
 
-export function TenantAgentsPage({ config }: { config: TenantConfig }) {
+export function TenantAgentsPage({ config, focusAgentId, backFleetId, onBackToFleet, onFocusConsumed }: {
+  config: TenantConfig;
+  focusAgentId?: string | null;
+  backFleetId?: string | null;
+  onBackToFleet?: (fleetId: string) => void;
+  onFocusConsumed?: () => void;
+}) {
   const { apiUrl, tenantToken, role } = config;
   const isOperator = role === 'admin' || role === 'operator';
 
+  const PAGE = 20;
   const [agents, setAgents] = useState<Agent[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState('');
-  const [modal, setModal] = useState<ModalState>(null);
+  const [total, setTotal] = useState(0);
+  const [offset, setOffset] = useState(0);
+  // Draft (form) filters - what the toolbar shows. Nothing hits the server until the
+  // user clicks Search, so choosing a dropdown option just stages it.
+  const [search, setSearch] = useState('');
   const [tagFilters, setTagFilters] = useState<Set<string>>(new Set());
   const [modeFilter, setModeFilter] = useState('');
   const [accessFilter, setAccessFilter] = useState('');
   const [typeFilter, setTypeFilter] = useState('');
+  const [fleetFilter, setFleetFilter] = useState('');
+  // Applied filters - the set the current server results reflect. Search copies the
+  // draft here (all at once) and the load runs against these.
+  const EMPTY_APPLIED = { tags: '', mode: '', access: '', type: '', fleet: '', q: '' };
+  const [applied, setApplied] = useState(EMPTY_APPLIED);
+  // Full tag universe for the filter dropdown, from the server facet (every accessible
+  // agent, not just the current page).
+  const [allTags, setAllTags] = useState<string[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [modal, setModal] = useState<ModalState>(null);
+  const [fleets, setFleets] = useState<Fleet[]>([]);
   const [tagPickerOpen, setTagPickerOpen] = useState(false);
   const tagPickerRef = useRef<HTMLDivElement>(null);
+
+  // Search applies the whole filter form at once (button / Enter) - like the Approvals
+  // & Audit pages, the API call fires only on submit, never on a keystroke or a
+  // dropdown change. This re-queries the server so filters span every page, not just
+  // the loaded one.
+  const applyFilters = () => {
+    setApplied({
+      tags: [...tagFilters].sort().join(','),
+      mode: modeFilter, access: accessFilter, type: typeFilter, fleet: fleetFilter,
+      q: search.trim(),
+    });
+    setOffset(0);
+  };
 
   const load = useCallback(() => {
     setLoading(true);
     setError('');
-    listTenantAgents(apiUrl, tenantToken)
-      .then(r => setAgents(r.agents ?? []))
+    // Server-side filter + search + pagination: one page (PAGE) of the matched agents,
+    // so the console never loads every agent in a large tenant.
+    const params: Record<string, string> = { limit: String(PAGE), offset: String(offset) };
+    if (applied.q) params.q = applied.q;
+    if (applied.tags) params.tag = applied.tags;
+    if (applied.mode) params.mode = applied.mode;
+    if (applied.access) params.access = applied.access;
+    if (applied.type) params.type = applied.type;
+    if (applied.fleet) params.fleet = applied.fleet;
+    listTenantAgents(apiUrl, tenantToken, params)
+      .then(r => {
+        setAgents(r.agents ?? []);
+        setTotal(r.total ?? (r.agents?.length ?? 0));
+        setAllTags(r.all_tags ?? []);
+      })
       .catch(e => setError(e.message))
       .finally(() => setLoading(false));
-  }, [apiUrl, tenantToken]);
+    // Fleets are only needed to label/filter by fleet name; failure is non-fatal
+    // (developers can't list fleets - the column just falls back to the id).
+    listFleets(apiUrl, tenantToken).then(r => setFleets(r.fleets)).catch(() => {});
+  }, [apiUrl, tenantToken, applied, offset]);
 
   useEffect(() => { load(); }, [load]);
+
+  // Deep-link from the Fleets page: open a specific agent's detail once loaded,
+  // carrying the originating fleet so the modal can offer a "Back to fleet" link.
+  useEffect(() => {
+    if (!focusAgentId) return;
+    const target = agents.find(a => a.agent_id === focusAgentId);
+    if (target) {
+      setModal({ type: 'detail', agent: target, backFleetId });
+      onFocusConsumed?.();
+    }
+  }, [focusAgentId, backFleetId, agents, onFocusConsumed]);
 
   const closeAndReload = () => { setModal(null); load(); };
 
@@ -208,23 +285,23 @@ export function TenantAgentsPage({ config }: { config: TenantConfig }) {
     }
   };
 
-  const allTags = useMemo(() => {
-    const s = new Set<string>();
-    agents.forEach(a => (a.tags ?? []).forEach(t => s.add(t)));
-    return [...s].sort();
-  }, [agents]);
+  const fleetById = useMemo(() => new Map(fleets.map(f => [f.fleet_id, f])), [fleets]);
+  const fleetLabel = (id?: string | null) => id ? (fleetById.get(id)?.name ?? id) : '';
 
-  const filteredAgents = agents.filter(a => {
-    if (tagFilters.size > 0 && !(a.tags ?? []).some(t => tagFilters.has(t))) return false;
-    if (modeFilter && a.mode !== modeFilter) return false;
-    if (accessFilter && a.access_level !== accessFilter) return false;
-    if (typeFilter && (a.type ?? 'host') !== typeFilter) return false;
-    return true;
-  });
+  // Filtering happens on the server now (over the full tenant set), so the table just
+  // renders the page it was handed.
+  const draftFilterCount = tagFilters.size + (modeFilter ? 1 : 0) + (accessFilter ? 1 : 0) + (typeFilter ? 1 : 0) + (fleetFilter ? 1 : 0);
+  const anyApplied = !!(applied.q || applied.tags || applied.mode || applied.access || applied.type || applied.fleet);
+  // The draft has un-applied changes - the Search button is highlighted until submitted.
+  const filtersDirty = [...tagFilters].sort().join(',') !== applied.tags
+    || modeFilter !== applied.mode || accessFilter !== applied.access
+    || typeFilter !== applied.type || fleetFilter !== applied.fleet
+    || search.trim() !== applied.q;
 
-  const activeFilterCount = tagFilters.size + (modeFilter ? 1 : 0) + (accessFilter ? 1 : 0) + (typeFilter ? 1 : 0);
-
-  const clearFilters = () => { setTagFilters(new Set()); setModeFilter(''); setAccessFilter(''); setTypeFilter(''); };
+  const clearFilters = () => {
+    setTagFilters(new Set()); setModeFilter(''); setAccessFilter(''); setTypeFilter(''); setFleetFilter(''); setSearch('');
+    setApplied(EMPTY_APPLIED); setOffset(0);
+  };
 
   const activeCount   = agents.filter(a => a.status === 'ACTIVE').length;
   const inactiveCount = agents.filter(a => a.status === 'INACTIVE').length;
@@ -303,6 +380,36 @@ export function TenantAgentsPage({ config }: { config: TenantConfig }) {
         {error && (
           <div className="text-sm text-red-700 bg-red-50 border border-red-200 rounded-lg px-4 py-3 mb-4">{error}</div>
         )}
+
+        {/* Search + filters are applied together, server-side, only on click / Enter -
+            so every filter spans all pages, not just the loaded one. */}
+        <div className="flex items-center gap-3 mb-4">
+          <div className="relative flex-1 max-w-md">
+            <svg className="w-4 h-4 text-gray-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-4.35-4.35m0 0A7.5 7.5 0 105.6 5.6a7.5 7.5 0 0011.05 11.05z" />
+            </svg>
+            <input
+              value={search}
+              onChange={e => setSearch(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && applyFilters()}
+              placeholder="Search agents by hostname, ID, or tag…"
+              className="w-full border border-gray-300 rounded-lg pl-9 pr-8 py-2 text-sm bg-white shadow-sm focus:outline-none focus:ring-2 focus:ring-slate-500"
+            />
+            {search && (
+              <button onClick={() => { setSearch(''); if (applied.q) { setApplied(a => ({ ...a, q: '' })); setOffset(0); } }} className="absolute right-2.5 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-700" aria-label="Clear search">✕</button>
+            )}
+          </div>
+          <button onClick={applyFilters}
+            className={`text-sm font-semibold px-3.5 py-2 rounded-lg text-white transition-colors shadow-sm ${filtersDirty ? 'bg-indigo-600 hover:bg-indigo-500 ring-2 ring-indigo-300' : 'bg-slate-800 hover:bg-slate-700'}`}>
+            Search
+          </button>
+          {filtersDirty && <span className="text-xs text-indigo-600 whitespace-nowrap">Filters changed - click Search</span>}
+          {!loading && (
+            <span className="text-xs text-gray-500 whitespace-nowrap ml-auto">
+              {total} agent{total !== 1 ? 's' : ''}{anyApplied ? ' matching' : ''}
+            </span>
+          )}
+        </div>
 
         {/* Filter toolbar */}
         {!loading && (
@@ -408,12 +515,24 @@ export function TenantAgentsPage({ config }: { config: TenantConfig }) {
               <option value="restricted">Restricted</option>
             </select>
 
+            {/* Fleet filter */}
+            {fleets.length > 0 && (
+              <select
+                value={fleetFilter}
+                onChange={e => setFleetFilter(e.target.value)}
+                className={`text-sm px-3 py-1.5 rounded-lg border transition-all focus:outline-none focus:ring-2 focus:ring-slate-400 ${
+                  fleetFilter ? 'bg-slate-800 text-white border-slate-800' : 'bg-white text-gray-700 border-gray-300 hover:border-gray-400'
+                }`}
+              >
+                <option value="">All fleets</option>
+                <option value="__none__">No fleet</option>
+                {fleets.map(f => <option key={f.fleet_id} value={f.fleet_id}>{f.name}</option>)}
+              </select>
+            )}
+
             {/* Active filters summary */}
-            {activeFilterCount > 0 && (
-              <>
-                <span className="text-xs text-gray-400">{filteredAgents.length} of {agents.length} agents</span>
-                <button onClick={clearFilters} className="text-xs text-red-500 hover:text-red-700 font-medium ml-1">Clear all</button>
-              </>
+            {(draftFilterCount > 0 || anyApplied) && (
+              <button onClick={clearFilters} className="text-xs text-red-500 hover:text-red-700 font-medium ml-1">Clear all</button>
             )}
           </div>
         )}
@@ -427,6 +546,7 @@ export function TenantAgentsPage({ config }: { config: TenantConfig }) {
               columns={[
                 { label: 'Hostname',     sortValue: a => a.hostname ?? a.agent_id, required: true },
                 { label: 'Type',         sortValue: a => a.type ?? '' },
+                { label: 'Fleet',        sortValue: a => fleetLabel(a.fleet_id) },
                 { label: 'Status',       sortValue: a => a.status },
                 { label: 'Mode',         sortValue: a => a.mode },
                 { label: 'Access',       sortValue: a => a.access_level },
@@ -440,11 +560,11 @@ export function TenantAgentsPage({ config }: { config: TenantConfig }) {
                 { label: 'Created',      sortValue: a => a.created_at ?? '', defaultHidden: true },
                 ...(isOperator ? [{ label: '' }] : []),
               ]}
-              rows={filteredAgents}
+              rows={agents}
               fallback={
                 <>
-                  {tagFilters.size > 0 ? 'No agents match the selected tags' : 'No agents registered'}
-                  {isOperator && tagFilters.size === 0 && (
+                  {anyApplied ? 'No agents match the current filters' : 'No agents registered'}
+                  {isOperator && !anyApplied && (
                     <span> - <button onClick={() => setModal({ type: 'create' })} className="text-indigo-600 hover:underline">create one</button></span>
                   )}
                 </>
@@ -468,30 +588,47 @@ export function TenantAgentsPage({ config }: { config: TenantConfig }) {
                   <td className="px-4 py-3">
                     {a.type ? <Badge value={a.type} /> : <span className="text-gray-400">-</span>}
                   </td>
+                  <td className="px-4 py-3 text-sm text-gray-600">
+                    {a.fleet_id
+                      ? <span className="inline-flex items-center gap-1 text-xs font-medium text-violet-700 bg-violet-50 border border-violet-200 px-2 py-0.5 rounded-full">{fleetLabel(a.fleet_id)}</span>
+                      : <span className="text-gray-400">-</span>}
+                  </td>
                   <td className="px-4 py-3"><Badge value={a.status} /></td>
                   <td className="px-4 py-3"><Badge value={a.mode} /></td>
                   <td className="px-4 py-3"><Badge value={a.access_level} /></td>
                   <td className="px-4 py-3">
                     {a.type === 'k8s' ? (
                       <span className="text-gray-300 text-xs">n/a</span>
-                    ) : (
-                      <CapabilityCell
-                        granted={a.grant_docker}
-                        detected={a.docker_detected}
-                        onAcknowledge={isOperator ? () => handleAcknowledge(a, 'docker') : undefined}
-                      />
-                    )}
+                    ) : (() => {
+                      const fleet = a.fleet_id ? fleetById.get(a.fleet_id) : undefined;
+                      const drift = a.status !== 'REVOKED' && fleet && !!a.grant_docker !== !!fleet.grant_docker && !memberMismatchAccepted(a, fleet);
+                      return (
+                        <CapabilityCell
+                          granted={a.grant_docker}
+                          detected={a.docker_detected}
+                          onAcknowledge={isOperator ? () => handleAcknowledge(a, 'docker') : undefined}
+                          fleetDrift={!!drift}
+                          fleetWants={!!fleet?.grant_docker}
+                        />
+                      );
+                    })()}
                   </td>
                   <td className="px-4 py-3">
                     {a.type === 'k8s' ? (
                       <span className="text-gray-300 text-xs">n/a</span>
-                    ) : (
-                      <CapabilityCell
-                        granted={a.grant_service_mgmt}
-                        detected={a.service_mgmt_detected}
-                        onAcknowledge={isOperator ? () => handleAcknowledge(a, 'service_mgmt') : undefined}
-                      />
-                    )}
+                    ) : (() => {
+                      const fleet = a.fleet_id ? fleetById.get(a.fleet_id) : undefined;
+                      const drift = a.status !== 'REVOKED' && fleet && !!a.grant_service_mgmt !== !!fleet.grant_service_mgmt && !memberMismatchAccepted(a, fleet);
+                      return (
+                        <CapabilityCell
+                          granted={a.grant_service_mgmt}
+                          detected={a.service_mgmt_detected}
+                          onAcknowledge={isOperator ? () => handleAcknowledge(a, 'service_mgmt') : undefined}
+                          fleetDrift={!!drift}
+                          fleetWants={!!fleet?.grant_service_mgmt}
+                        />
+                      );
+                    })()}
                   </td>
                   <td className="px-4 py-3">
                     {a.type === 'k8s' ? (
@@ -532,6 +669,19 @@ export function TenantAgentsPage({ config }: { config: TenantConfig }) {
                 );
               }}
             />
+            {total > PAGE && (
+              <div className="flex items-center justify-between px-4 py-3 border-t border-gray-100 bg-gray-50/60 text-xs text-gray-600">
+                <span>Showing {total === 0 ? 0 : offset + 1}–{Math.min(offset + agents.length, total)} of {total}</span>
+                <div className="flex items-center gap-2">
+                  <button disabled={offset === 0}
+                    onClick={() => setOffset(o => Math.max(0, o - PAGE))}
+                    className="px-2.5 py-1 rounded-md border border-gray-300 bg-white disabled:opacity-40 hover:bg-gray-50">Prev</button>
+                  <button disabled={offset + agents.length >= total}
+                    onClick={() => setOffset(o => o + PAGE)}
+                    className="px-2.5 py-1 rounded-md border border-gray-300 bg-white disabled:opacity-40 hover:bg-gray-50">Next</button>
+                </div>
+              </div>
+            )}
           </div>
         )}
 
@@ -542,6 +692,9 @@ export function TenantAgentsPage({ config }: { config: TenantConfig }) {
             token={tenantToken}
             agent={modal.agent}
             isOperator={isOperator}
+            backToFleet={modal.backFleetId && onBackToFleet
+              ? { label: fleetLabel(modal.backFleetId), onBack: () => onBackToFleet(modal.backFleetId!) }
+              : undefined}
             onClose={() => setModal(null)}
             onAction={setModal}
             onAcknowledge={isOperator ? cap => handleAcknowledge(modal.agent, cap) : undefined}
@@ -591,6 +744,14 @@ export function TenantAgentsPage({ config }: { config: TenantConfig }) {
             agent={modal.agent}
             onClose={() => setModal(null)}
             onDone={closeAndReload}
+          />
+        )}
+
+        {modal?.type === 'run-agent' && (
+          <RunCommandModal
+            config={config}
+            target={{ kind: 'agent', agent: modal.agent }}
+            onClose={() => setModal(null)}
           />
         )}
 
@@ -647,6 +808,19 @@ export function TenantAgentsPage({ config }: { config: TenantConfig }) {
             }}
           />
         )}
+
+        {modal?.type === 'detach-fleet' && (
+          <ConfirmModal
+            title="Remove from fleet"
+            message={`Remove "${modal.agent.hostname ?? modal.agent.agent_id}" from its fleet? It becomes a standalone individual agent - it keeps running and regains individual controls (mode, tags, install token).`}
+            confirmLabel="Remove from fleet"
+            onClose={() => setModal(null)}
+            onConfirm={async () => {
+              if (modal.agent.fleet_id) await removeFleetMember(apiUrl, tenantToken, modal.agent.fleet_id, modal.agent.agent_id);
+              closeAndReload();
+            }}
+          />
+        )}
       </div>
     </div>
   );
@@ -657,12 +831,13 @@ export function TenantAgentsPage({ config }: { config: TenantConfig }) {
 // ---------------------------------------------------------------------------
 
 function AgentDetailModal({
-  apiUrl, token, agent, isOperator, onClose, onAction, onAcknowledge,
+  apiUrl, token, agent, isOperator, backToFleet, onClose, onAction, onAcknowledge,
 }: {
   apiUrl: string;
   token: string;
   agent: Agent;
   isOperator: boolean;
+  backToFleet?: { label: string; onBack: () => void };
   onClose: () => void;
   onAction: (s: ModalState) => void;
   onAcknowledge?: (capability: 'docker' | 'service_mgmt' | 'k8s_permissions') => void;
@@ -715,6 +890,15 @@ function AgentDetailModal({
       onClose={onClose}
     >
       <div className="space-y-4">
+        {backToFleet && (
+          <button onClick={backToFleet.onBack}
+            className="inline-flex items-center gap-1 text-xs font-medium text-violet-700 hover:text-violet-900 -mt-1">
+            <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M10.5 19.5L3 12m0 0l7.5-7.5M3 12h18" />
+            </svg>
+            Back to fleet {backToFleet.label}
+          </button>
+        )}
         {/* Tabs */}
         <div className="flex gap-1 border-b border-gray-200 -mt-1">
           {(['info', 'history'] as const).map(t => (
@@ -839,24 +1023,38 @@ function AgentDetailModal({
         {/* Actions */}
         {isOperator && (
           <div className="flex flex-wrap gap-2 pt-3 border-t border-gray-100">
-            <button
-              onClick={() => open({ type: 'set-tags', agent })}
-              className="text-xs font-semibold text-gray-700 bg-gray-100 hover:bg-gray-200 px-3 py-1.5 rounded-lg transition-colors"
-            >
-              Edit tags
-            </button>
-            <button
-              onClick={() => open({ type: 'set-mode', agent })}
-              className="text-xs font-semibold text-gray-700 bg-gray-100 hover:bg-gray-200 px-3 py-1.5 rounded-lg transition-colors"
-            >
-              Set mode
-            </button>
-            <button
-              onClick={() => open({ type: 'reissue', agent })}
-              className="text-xs font-semibold text-gray-700 bg-gray-100 hover:bg-gray-200 px-3 py-1.5 rounded-lg transition-colors"
-            >
-              Reissue token
-            </button>
+            {/* Fleet agents inherit mode/tags from the fleet and enroll via the
+                fleet join token, so those individual controls are hidden. */}
+            {!agent.fleet_id && (
+              <>
+                <button
+                  onClick={() => open({ type: 'set-tags', agent })}
+                  className="text-xs font-semibold text-gray-700 bg-gray-100 hover:bg-gray-200 px-3 py-1.5 rounded-lg transition-colors"
+                >
+                  Edit tags
+                </button>
+                <button
+                  onClick={() => open({ type: 'set-mode', agent })}
+                  className="text-xs font-semibold text-gray-700 bg-gray-100 hover:bg-gray-200 px-3 py-1.5 rounded-lg transition-colors"
+                >
+                  Set mode
+                </button>
+                <button
+                  onClick={() => open({ type: 'reissue', agent })}
+                  className="text-xs font-semibold text-gray-700 bg-gray-100 hover:bg-gray-200 px-3 py-1.5 rounded-lg transition-colors"
+                >
+                  Reissue token
+                </button>
+              </>
+            )}
+            {agent.fleet_id && (
+              <button
+                onClick={() => open({ type: 'detach-fleet', agent })}
+                className="text-xs font-semibold text-amber-700 bg-amber-50 hover:bg-amber-100 border border-amber-200 px-3 py-1.5 rounded-lg transition-colors"
+              >
+                Remove from fleet
+              </button>
+            )}
             <button
               onClick={status === 'ACTIVE' ? handleRequestRotation : undefined}
               disabled={status !== 'ACTIVE' || rotateLoading || rotateDone}
@@ -908,14 +1106,20 @@ function AgentMenu({
   onAction: (s: ModalState) => void;
 }) {
   const [open, setOpen] = useState(false);
-  const [pos, setPos] = useState({ top: 0, right: 0 });
+  const [pos, setPos] = useState<{ top?: number; bottom?: number; right: number }>({ right: 0 });
   const btnRef = useRef<HTMLButtonElement>(null);
   const status = agent.status;
 
   const toggle = () => {
     if (!open && btnRef.current) {
       const r = btnRef.current.getBoundingClientRect();
-      setPos({ top: r.bottom + 4, right: window.innerWidth - r.right });
+      const spaceBelow = window.innerHeight - r.bottom;
+      // Open upward when the last rows don't have room below (and there's more
+      // room above), so the menu isn't clipped off the bottom of the viewport.
+      const openUp = spaceBelow < 300 && r.top > spaceBelow;
+      setPos(openUp
+        ? { bottom: window.innerHeight - r.top + 4, right: window.innerWidth - r.right }
+        : { top: r.bottom + 4, right: window.innerWidth - r.right });
     }
     setOpen(v => !v);
   };
@@ -935,29 +1139,47 @@ function AgentMenu({
         <>
           <div className="fixed inset-0 z-40" onClick={() => setOpen(false)} />
           <div
-            className="fixed z-50 bg-white border border-gray-200 rounded-lg shadow-lg py-1 min-w-[170px] text-sm"
-            style={{ top: pos.top, right: pos.right }}
+            className="fixed z-50 bg-white border border-gray-200 rounded-lg shadow-lg py-1 min-w-[170px] text-sm max-h-[80vh] overflow-y-auto"
+            style={{ top: pos.top, bottom: pos.bottom, right: pos.right }}
           >
             <MenuItem onClick={() => { setOpen(false); onAction({ type: 'detail', agent }); }}>
               View details
             </MenuItem>
+            {/* Run a command: only where the user has write access to this agent, and
+                only when it's ACTIVE (a job can't dispatch otherwise). */}
+            {agent.writable && status === 'ACTIVE' && (
+              <MenuItem onClick={() => { setOpen(false); onAction({ type: 'run-agent', agent }); }}>
+                Run command
+              </MenuItem>
+            )}
             {isOperator && (
               <>
-                <MenuItem onClick={() => { setOpen(false); onAction({ type: 'set-tags', agent }); }}>
-                  Edit tags
-                </MenuItem>
-                <MenuItem onClick={() => { setOpen(false); onAction({ type: 'set-mode', agent }); }}>
-                  Set mode
-                </MenuItem>
-                <MenuItem onClick={() => { setOpen(false); onAction({ type: 'reissue', agent }); }}>
-                  Reissue install token
-                </MenuItem>
+                {/* Fleet agents inherit mode/tags from the fleet and enroll via the
+                    fleet join token, so those individual controls don't apply. */}
+                {!agent.fleet_id && (
+                  <>
+                    <MenuItem onClick={() => { setOpen(false); onAction({ type: 'set-tags', agent }); }}>
+                      Edit tags
+                    </MenuItem>
+                    <MenuItem onClick={() => { setOpen(false); onAction({ type: 'set-mode', agent }); }}>
+                      Set mode
+                    </MenuItem>
+                    <MenuItem onClick={() => { setOpen(false); onAction({ type: 'reissue', agent }); }}>
+                      Reissue install token
+                    </MenuItem>
+                  </>
+                )}
                 <MenuItem
                   disabled={status !== 'ACTIVE'}
                   onClick={() => { setOpen(false); onAction({ type: 'rotate', agent }); }}
                 >
                   Rotate auth token
                 </MenuItem>
+                {agent.fleet_id && (
+                  <MenuItem onClick={() => { setOpen(false); onAction({ type: 'detach-fleet', agent }); }}>
+                    Remove from fleet
+                  </MenuItem>
+                )}
                 <div className="border-t border-gray-100 my-1" />
                 {status !== 'REVOKED' && status !== 'DELETED' && (
                   <MenuItem danger onClick={() => { setOpen(false); onAction({ type: 'confirm-revoke', agent }); }}>
@@ -1029,15 +1251,25 @@ function CreateAgentModal({
   // Unrestricted users already have access, so they're excluded. Listing users is
   // admin-only; for non-admins the fetch fails and the section stays hidden.
   const [restrictedUsers, setRestrictedUsers] = useState<TenantUser[]>([]);
-  const [grantIds, setGrantIds] = useState<Set<string>>(new Set());
+  // per-user grant level for the new agent: 'read' | 'write' (absent = no grant)
+  const [grantCaps, setGrantCaps] = useState<Map<string, 'read' | 'write'>>(new Map());
   useEffect(() => {
+    // Grantable = non-admin, non-revoked users who aren't already tenant-wide (so they
+    // wouldn't otherwise see the new agent). Admins and unrestricted users are skipped.
+    const needsGrant = (u: TenantUser) => {
+      if (u.role === 'admin' || u.status === 'REVOKED') return false;
+      if ((u.readwrite_agent_ids ?? []).includes('*')) return false;  // already read-write all
+      const unrestricted = u.readwrite_agent_ids == null && u.readonly_agent_ids == null
+        && u.readwrite_fleet_ids == null && u.readonly_fleet_ids == null;
+      return !unrestricted;
+    };
     listTenantUsers(apiUrl, token)
-      .then(r => setRestrictedUsers((r.users ?? []).filter(u => u.allowed_agent_ids != null && u.status !== 'REVOKED')))
+      .then(r => setRestrictedUsers((r.users ?? []).filter(needsGrant)))
       .catch(() => {/* non-admin or fetch failed: section stays hidden */});
   }, [apiUrl, token]);
-  const toggleGrant = (id: string) => setGrantIds(prev => {
-    const next = new Set(prev);
-    next.has(id) ? next.delete(id) : next.add(id);
+  const setGrantCap = (id: string, cap: 'none' | 'read' | 'write') => setGrantCaps(prev => {
+    const next = new Map(prev);
+    cap === 'none' ? next.delete(id) : next.set(id, cap);
     return next;
   });
 
@@ -1052,13 +1284,16 @@ function CreateAgentModal({
       const isK8s = agentType === 'k8s';
       // Docker / service-mgmt grants are host-only; the backend ignores them for
       // k8s, but we omit them here too so intent is clear.
+      const grantWrite = [...grantCaps].filter(([, c]) => c === 'write').map(([id]) => id);
+      const grantRead = [...grantCaps].filter(([, c]) => c === 'read').map(([id]) => id);
       const result = await createTenantAgent(
         apiUrl, token, mode,
         isK8s ? undefined : grantSvc,
         isK8s ? undefined : grantDocker,
         agentType,
-        [...grantIds],
+        grantWrite,
         version || undefined,
+        grantRead,
       );
       const tags = serializePairs(tagPairs);
       if (tags.length > 0) {
@@ -1252,30 +1487,39 @@ function CreateAgentModal({
               Grant access <span className="font-normal normal-case text-gray-400">(optional)</span>
             </p>
             <p className="text-[11px] text-gray-500 mb-2.5">
-              These users are restricted to specific agents and won't see this one unless you grant it.
-              Unrestricted users already have access.
+              Every non-admin user is scoped and won't see this agent unless you grant it -
+              as <span className="text-sky-600 font-medium">Read</span> or <span className="text-indigo-600 font-medium">R/W</span> (read-write). Admins are tenant-wide and already have access.
             </p>
             <div className="border border-gray-200 rounded-xl overflow-hidden divide-y divide-gray-100 max-h-56 overflow-y-auto">
               {restrictedUsers.map(u => {
-                const sel = grantIds.has(u.user_id);
+                const cap = grantCaps.get(u.user_id) ?? 'none';
                 return (
-                  <label key={u.user_id}
-                    className={`flex items-center gap-3 px-3 py-2.5 cursor-pointer transition-colors ${sel ? 'bg-indigo-50 hover:bg-indigo-100/70' : 'hover:bg-gray-50'}`}>
-                    <input type="checkbox" checked={sel} onChange={() => toggleGrant(u.user_id)} className="w-4 h-4" />
-                    <div className="min-w-0">
+                  <div key={u.user_id}
+                    className={`flex items-center gap-3 px-3 py-2.5 transition-colors ${cap !== 'none' ? 'bg-indigo-50/60' : 'hover:bg-gray-50'}`}>
+                    <div className="min-w-0 flex-1">
                       <p className="text-sm font-medium text-gray-800 leading-tight truncate">
                         {u.name || u.username} <span className="text-gray-400 font-mono text-xs">@{u.username}</span>
                       </p>
                       <p className="text-[11px] text-gray-500 leading-tight">
-                        {u.role} · currently {u.allowed_agent_ids?.length ?? 0} agent{(u.allowed_agent_ids?.length ?? 0) !== 1 ? 's' : ''}
+                        {u.role} · currently {u.readwrite_agent_ids?.length ?? 0} agent{(u.readwrite_agent_ids?.length ?? 0) !== 1 ? 's' : ''}
                       </p>
                     </div>
-                  </label>
+                    <div className="inline-flex rounded-md border border-gray-200 overflow-hidden text-[11px] shrink-0">
+                      {(['none', 'read', 'write'] as const).map(opt => (
+                        <button key={opt} type="button" onClick={() => setGrantCap(u.user_id, opt)}
+                          className={`px-2 py-1 font-medium transition-colors ${cap === opt
+                            ? (opt === 'write' ? 'bg-indigo-600 text-white' : opt === 'read' ? 'bg-sky-500 text-white' : 'bg-gray-400 text-white')
+                            : 'bg-white text-gray-500 hover:bg-gray-50'}`}>
+                          {opt === 'none' ? '-' : opt === 'read' ? 'Read' : 'R/W'}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
                 );
               })}
             </div>
-            {grantIds.size > 0 && (
-              <p className="text-[11px] text-indigo-600 mt-1.5">{grantIds.size} user{grantIds.size !== 1 ? 's' : ''} will be granted access to this agent.</p>
+            {grantCaps.size > 0 && (
+              <p className="text-[11px] text-indigo-600 mt-1.5">{grantCaps.size} user{grantCaps.size !== 1 ? 's' : ''} will be granted access to this agent.</p>
             )}
           </div>
         )}

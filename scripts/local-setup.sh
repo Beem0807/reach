@@ -289,10 +289,7 @@ load_env_file() {
   : "${IMAGE:?IMAGE missing from env file}"
   : "${TOKEN_PEPPER:?TOKEN_PEPPER missing from env file}"
   : "${ADMIN_PASSWORD:?ADMIN_PASSWORD missing from env file}"
-  : "${APPROVAL_RETENTION_DAYS:?APPROVAL_RETENTION_DAYS missing from env file}"
-  : "${JOB_RETENTION_DAYS:?JOB_RETENTION_DAYS missing from env file}"
   : "${AUDIT_RETENTION_DAYS:?AUDIT_RETENTION_DAYS missing from env file}"
-  : "${AGENT_HISTORY_RETENTION_DAYS:?AGENT_HISTORY_RETENTION_DAYS missing from env file}"
 
   # Defaults for older env files so downstream refs are safe.
   RELEASES_CHART_REPO="${RELEASES_CHART_REPO:-}"
@@ -361,10 +358,7 @@ services:
       ADMIN_PASSWORD: "$ADMIN_PASSWORD"
       DATABASE_URL: postgresql://reach:reach@db:5432/reach
       STORAGE_BACKEND: postgres
-      APPROVAL_RETENTION_DAYS: "$APPROVAL_RETENTION_DAYS"
-      JOB_RETENTION_DAYS: "$JOB_RETENTION_DAYS"
-      AUDIT_RETENTION_DAYS: "$AUDIT_RETENTION_DAYS"
-      AGENT_HISTORY_RETENTION_DAYS: "$AGENT_HISTORY_RETENTION_DAYS"${chart_repo_env}
+      AUDIT_RETENTION_DAYS: "$AUDIT_RETENTION_DAYS"${chart_repo_env}
     depends_on:
       db:
         condition: service_healthy
@@ -392,10 +386,7 @@ IMAGE=${IMAGE}
 TOKEN_PEPPER=${TOKEN_PEPPER}
 SESSION_SIGNING_KEY=${SESSION_SIGNING_KEY}
 ADMIN_PASSWORD=${ADMIN_PASSWORD}
-APPROVAL_RETENTION_DAYS=${APPROVAL_RETENTION_DAYS}
-JOB_RETENTION_DAYS=${JOB_RETENTION_DAYS}
 AUDIT_RETENTION_DAYS=${AUDIT_RETENTION_DAYS}
-AGENT_HISTORY_RETENTION_DAYS=${AGENT_HISTORY_RETENTION_DAYS}
 RELEASES_CHART_REPO=${RELEASES_CHART_REPO:-}
 TENANT_ID=${TENANT_ID:-}
 TENANT_NAME=${SETUP_TENANT:-${TENANT_NAME:-}}
@@ -1257,21 +1248,16 @@ if [[ "$TUNNEL_CMD" == "ngrok" ]]; then
   fi
 fi
 
-# Retention (advanced - most users skip)
+# Platform audit retention (advanced - most users skip). Per-tenant retention
+# (approval/job/run/audit/agent-history) and the fan-out cap are tenant settings,
+# managed in the console; only the cross-tenant audit trail is set at deploy time.
 echo ""
-ADVANCED=$(prompt_yes_no "Configure data retention? (default: 7/7/90/30 days)" "N")
+ADVANCED=$(prompt_yes_no "Configure platform audit retention? (default: 90 days)" "N")
 if [[ "$ADVANCED" == "true" ]]; then
   echo ""
-  echo "  How long to keep each record type before auto-deleting:"
-  APPROVAL_RETENTION_DAYS=$(prompt "Approval retention days  (command allow/deny records)" "7")
-  JOB_RETENTION_DAYS=$(prompt "Job retention days       (stdout, stderr, exit codes)" "7")
-  AUDIT_RETENTION_DAYS=$(prompt "Audit retention days     (who did what and when)" "90")
-  AGENT_HISTORY_RETENTION_DAYS=$(prompt "Agent history days       (heartbeat and status snapshots)" "30")
+  AUDIT_RETENTION_DAYS=$(prompt "Platform audit retention days (cross-tenant admin trail)" "90")
 else
-  APPROVAL_RETENTION_DAYS=7
-  JOB_RETENTION_DAYS=7
   AUDIT_RETENTION_DAYS=90
-  AGENT_HISTORY_RETENTION_DAYS=30
 fi
 
 # Chart repo defaults to <RELEASES_S3_BASE>/charts/reach-agent. Self-hosting the
