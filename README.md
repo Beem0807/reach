@@ -94,90 +94,34 @@ The local and Lambda setup scripts do 1-3 for you. See [ARCHITECTURE.md](ARCHITE
 
 ## Getting started
 
-Reach is self-hosted - you deploy your own backend. The fastest path is the **interactive setup script**: one command bootstraps everything end to end - it deploys the backend, provisions your tenant, tenant admin user, API token, and first agent, then installs the CLI and logs you in.
+Reach is self-hosted: you deploy your own backend, then enroll machines as agents. The **interactive setup script** does the whole first run end to end - deploy the backend, provision your tenant, admin user, API token, and first agent, install the CLI, and log you in:
 
-**Local machine** (no cloud account needed):
-```bash
-curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh | bash
-```
+| Backend | Setup |
+|---|---|
+| **Local** (no cloud account) | `curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh \| bash` |
+| **AWS Lambda + DynamoDB** | `curl -fsSL https://reach-releases.s3.amazonaws.com/lambda-setup.sh \| bash` |
+| **Docker + PostgreSQL** (any cloud) | `docker run … nabeemdev/reach:0.1.0`, then finish in the console at `/ui` |
 
-**AWS Lambda + DynamoDB** (low cost, AWS-native):
-```bash
-curl -fsSL https://reach-releases.s3.amazonaws.com/lambda-setup.sh | bash
-```
+The Local and Lambda scripts are interactive, safe to re-run, and double as management tools (`--update`, `--down`, …). Full setup for all three - including the Docker environment variables - is in **[SELF_HOSTING.md](SELF_HOSTING.md)**.
 
-Both scripts are interactive, safe to re-run, and double as management tools (`--update`, `--down`, …).
-
-**Docker + PostgreSQL** (any cloud) - a plain container; finish setup in the console at `http://localhost:8000/ui` (or `http://<host>:8000/ui` on a remote box):
-```bash
-docker run -d -p 8000:8000 \
-  -e TOKEN_PEPPER="<your-pepper>" \
-  -e SESSION_SIGNING_KEY="<your-session-key>" \
-  -e ADMIN_PASSWORD="<your-admin-password>" \
-  -e DATABASE_URL="postgresql://user:pass@host:5432/reach" \
-  nabeemdev/reach:0.1.0
-```
-
-Full setup guide for all three: [SELF_HOSTING.md](SELF_HOSTING.md).
-
-## Install the CLI
-
-The setup script installs it for you. To install it yourself:
+**Install the CLI** (the setup script already does this):
 
 ```bash
 uv tool install https://reach-releases.s3.amazonaws.com/cli/v0.1.0/reach-0.1.0-py3-none-any.whl
 reach login --api-url "<your-api-url>" --api-key "<your-api-token>"   # token from the tenant console → API Tokens
 ```
 
-Full command reference, profiles, aliases, and MCP setup: **[cli/README.md](cli/README.md)**.
+Commands, profiles, aliases, and MCP setup: **[cli/README.md](cli/README.md)**.
 
----
+### Add a machine
 
-## Add a machine
+In the tenant console → **Agents → New agent**, pick the **type** (Host or Kubernetes) and a policy mode; the console prints the exact install command. For a whole autoscaling group of identical hosts, create a **Fleet** instead.
 
-In the tenant console, go to **Agents → New agent**, choose the agent **type** (Host or Kubernetes) and a policy mode, and click Create. The console shows the install command for that type. For a whole autoscaling group of identical hosts, create a **Fleet** instead (see below).
+- **Host** - run the generated `curl … install.sh …` (auto-detects OS/arch: Linux → systemd service, macOS → foreground or LaunchDaemon). Optional `systemctl`/`docker` grants are set at install time.
+- **Kubernetes** - run the generated `helm install …`; deploys **one logical agent per cluster** (a `Lease` elects the leader), bounded by cluster **RBAC** (default read-only `view`) which you acknowledge in the console - later changes surface as **drift**.
+- **Fleet** - host-only (a cluster is already one agent). A **reusable join token** baked into your autoscaler's launch template: instances auto-enroll on scale-out, deregister on scale-in, and inherit the fleet's mode, tags, and grants.
 
-### Host
-
-Run the generated `curl … install.sh …` command on the machine. It auto-detects OS/architecture (Linux → systemd service; macOS → foreground or, with `--background`, a LaunchDaemon). The generated command already includes `--yes --force` and your API URL + install token. Optional grants:
-
-| Flag | What it does | Default with `--yes` |
-|---|---|---|
-| `--grant-service-mgmt` / `--no-grant-service-mgmt` | `systemctl`/`launchctl` start/stop/restart via sudoers | ✅ on |
-| `--grant-docker` / `--no-grant-docker` | Add `reach-agent` to the `docker` group | ❌ off |
-| `--background` | macOS only - install as a LaunchDaemon | - |
-
-Uninstall: `curl -fsSL …/agent/latest/install.sh | sudo bash -s -- --uninstall`.
-
-### Kubernetes
-
-Run the generated `helm install …` command (it fills in `reach.apiUrl` and a one-time `reach.installToken`; it also adds `--version` when you pick a specific version at create time, otherwise it installs the latest chart):
-
-```bash
-helm repo add reach https://reach-releases.s3.amazonaws.com/charts/reach-agent --force-update
-helm install reach-agent reach/reach-agent \
-  --namespace reach --create-namespace \
-  --set reach.apiUrl=https://reach.example.com \
-  --set reach.installToken=install_xxx
-```
-
-Deploys the agent as a **Deployment** - **one logical agent per cluster** (replicas share a cluster-derived identity; a `Lease` elects one leader), so scaling replicas doesn't create more agents. What it can do is bounded by **Kubernetes RBAC** (the chart's `clusterAccess`, default read-only `view`), which the agent self-reports for you to **acknowledge** in the console (later changes surface as **drift**). Uninstall: `helm uninstall reach-agent -n reach`.
-
-Full chart values, RBAC, and execution model: [deploy/helm/reach-agent](deploy/helm/reach-agent) and [agent/README.md](agent/README.md).
-
-### Fleet (autoscaling groups)
-
-For a fleet of interchangeable hosts (an **autoscaling group** - AWS ASG, GCP MIG, Azure VMSS, or any "cattle, not pets" set), create a **Fleet** in the console → **Fleets → New fleet**. A fleet is a **reusable join token**: bake the generated install line into your autoscaler's launch/instance template (user-data or startup script), and every instance that scales in auto-enrolls as a host agent, inheriting the fleet's mode, tags, and grants.
-
-- **Idempotent** - a rebooting instance re-uses its record (keyed on the machine fingerprint) rather than duplicating.
-- **Self-cleaning** - an instance that scales in deregisters on shutdown, and any it misses are reaped after the fleet's inactivity window.
-- **Managed as a group** - change the fleet's mode or tags and it propagates to every member; rotate the join token with a grace window so you can update the launch template first.
-
-Fleets are host-only (Kubernetes already gives you one-agent-per-cluster). Detach a member to make it a standalone agent, or revoke the whole fleet from the console → **Fleets**.
-
-### After install
-
-Set an agent as your CLI default: `reach agents use <id|alias>`. Decommission any agent from the tenant console → **Agents**.
+Grant flags, full Helm values, RBAC, and fleet mechanics: **[SELF_HOSTING.md](SELF_HOSTING.md)** and **[agent/README.md](agent/README.md)**. Set an agent as your CLI default with `reach agents use <id|alias>`; decommission any from the console → **Agents**.
 
 ---
 
@@ -228,7 +172,7 @@ Each agent runs in one of three modes (set in the tenant console or via the API)
 - **`readonly`** - only reads run; any write/delete/restart/install is blocked.
 - **`approved`** - reads run; writes run only if pre-approved for that agent (blocked and queued otherwise).
 
-Host and Kubernetes agents share these modes but enforce them differently - agent-side Landlock vs backend-side `kubectl`-verb gating - and k8s approvals are structured `verb/resource/namespace/name` rules. Full detail (enforcement model, structured rules, `access_level`): **[POLICIES.md](POLICIES.md)**.
+Host and Kubernetes agents share these modes but enforce them differently - agent-side Landlock vs backend-side `kubectl`-verb gating. Approvals are structured rules on both: host `{bin, args[]}`, k8s `{verb, resource, namespace, name}`. Full detail (enforcement model, structured rules, `access_level`): **[POLICIES.md](POLICIES.md)**.
 
 ## Safety
 
@@ -256,7 +200,7 @@ Use **`approved`** mode on production machines (set it when creating the agent, 
 | Doc | What's in it |
 |---|---|
 | [cli/README.md](cli/README.md) | The `reach` CLI and `reach-mcp` server - install, commands, profiles, aliases, MCP setup |
-| [POLICIES.md](POLICIES.md) | Policy modes (wild/readonly/approved), approvals, host vs Kubernetes enforcement, structured k8s rules, `access_level` |
+| [POLICIES.md](POLICIES.md) | Policy modes (wild/readonly/approved), approvals, host vs Kubernetes enforcement, structured host & k8s rules, `access_level` |
 | [agent/README.md](agent/README.md) | How the agent works - host vs Kubernetes, credential-only identity, the poll loop, execution models, leader election, RBAC self-review, metrics |
 | [deploy/helm/reach-agent](deploy/helm/reach-agent) | Kubernetes agent Helm chart - install, RBAC (`clusterAccess`), execution allowlist, and all values |
 | [SELF_HOSTING.md](SELF_HOSTING.md) | Deploy and operate your own backend (Local, AWS Lambda, Docker), setup, agent lifecycle, grants, blocked-command reference |

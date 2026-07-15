@@ -536,7 +536,7 @@ When an agent runs in `approved` mode and a write command is not yet approved, t
 
 Read commands always run. Only write commands need approval.
 
-**Host vs Kubernetes.** Host approvals are **command text** (prefix match). Kubernetes approvals are **structured rules** - `{verb, resource, namespace, name}`, any field wildcardable with `*` - so one rule (e.g. `delete pods` in `team-a`) covers every matching object without re-approving each one. The console shows the two kinds **separately** (a Host/Kubernetes toggle), defaults to the 10 most recent, and has a case-insensitive **Search**. See [POLICIES → Kubernetes approvals are structured rules](POLICIES.md#kubernetes-approvals-are-structured-rules).
+**Host vs Kubernetes.** Both are **structured rules**. Host approvals are `{bin, args[]}` - each arg a literal or `*`, matched positionally against the write's `argv` (e.g. `{bin: systemctl, args: [restart, *]}`). Kubernetes approvals are `{verb, resource, namespace, name}`, any field wildcardable with `*` - so one rule (e.g. `delete pods` in `team-a`) covers every matching object without re-approving each one. The console shows the two kinds **separately** (a Host/Kubernetes toggle), defaults to the 10 most recent, and has a case-insensitive **Search**. See [POLICIES → Approvals are structured rules](POLICIES.md#approvals-are-structured-rules).
 
 **Reviewing approvals**: admins and operators review pending requests and approve/deny them in the **tenant console → Approvals**, or from the CLI with an operator/admin API token (`reach approvals approve <id>` / `deny <id>` - the id comes from `reach approvals list --pending`). You can approve permanently or with a time limit.
 
@@ -555,7 +555,7 @@ reach approvals approve <approval-id>   # operator+: approve a pending request (
 reach approvals deny <approval-id>      # operator+: deny a pending request
 ```
 
-The output adapts to the agent type: **host** agents show the command, **Kubernetes** agents show the structured rule (`verb / resource / namespace / name`, `✱` = any).
+The output adapts to the agent type: **host** agents show the structured rule (`bin / args`), **Kubernetes** agents show it as `verb / resource / namespace / name` (`✱` = any).
 
 ### Approval lifecycle
 
@@ -792,7 +792,7 @@ The agent reads a few optional environment variables. The installer sets the tim
 | Variable | Default | Description |
 |---|---|---|
 | `REACH_COMMAND_TIMEOUT_SECONDS` | `60` | Max wall-clock time for a single command before the agent kills it and returns a timeout result. |
-| `REACH_MAX_OUTPUT_BYTES` | `50000` | Max bytes of `stdout`/`stderr` captured per command. Output beyond this is truncated. |
+| `REACH_MAX_OUTPUT_BYTES` | `50000` | Max bytes of `stdout`/`stderr` **retained** per stream, per command. Capture is bounded as it streams (not buffered then cut), so a runaway producer - `yes`, `find /`, an unfiltered `journalctl`/`docker logs` - cannot balloon agent memory; excess bytes are dropped and the result is flagged truncated. |
 | `REACH_CONFIG_PATH` | `/etc/reach-agent/config.json` | Path to the agent config file. Mainly for local development; the installer manages this path for you. |
 | `REACH_METRICS_ADDR` | _(unset)_ | Opt-in: serve Prometheus `/metrics` on this address. **Unset by default** - the agent otherwise opens no inbound port. On a host there is no NetworkPolicy to contain it, so bind to loopback (`127.0.0.1:9090`) and scrape with a co-located collector. On Kubernetes the Helm chart wires this for you (`metrics.enabled=true`) with a Service, ServiceMonitor, and NetworkPolicy. See [SECURITY.md → Optional metrics endpoint](SECURITY.md#optional-metrics-endpoint). |
 
@@ -811,6 +811,15 @@ sudo launchctl load /Library/LaunchDaemons/com.reach-agent.plist
 ```
 
 These are agent-side limits enforced on the remote machine, independent of the backend.
+
+### Output limits & truncation
+
+Command output is bounded at two independent points, so a job result is always small and storage-safe:
+
+1. **Agent** - each of `stdout`/`stderr` is capped to `REACH_MAX_OUTPUT_BYTES` (default 50 KB) **as it streams**. Capture stops retaining once the cap is hit but the command runs to completion (or the timeout), so agent memory stays bounded regardless of how much the command emits.
+2. **Backend (on ingest)** - re-caps each stream to **50 KB** as defence-in-depth and to stay well under the DynamoDB 400 KB item ceiling, then applies [secret redaction](SECURITY.md).
+
+When either side drops bytes, the result carries **two signals**: the inline `\n[TRUNCATED]` marker at the end of the output, and structured booleans **`stdout_truncated` / `stderr_truncated`** on the job (see [API.md](API.md#jobs)). The CLI (`reach exec`, `reach job <id>`), the tenant console Jobs view, and the MCP `exec_command`/`get_job` tools all surface the flag, so an operator or AI agent knows the output is partial rather than silently reasoning on a cut-off result. There is **no streaming** channel - results are delivered whole (and bounded) when the job reaches a terminal state.
 
 ---
 
@@ -906,14 +915,14 @@ In addition to the always-blocked list, readonly mode also blocks:
 
 Read commands always run - approved mode only gates write and destructive operations (anything that would be blocked in readonly mode).
 
-Write commands are checked against the agent's approved list. If the command matches (exact match or starts-with prefix), it runs normally. If not:
+A host write is parsed into an `argv` and run with `execve` (**no shell**) and checked against the agent's approved **host rules** `{bin, args[]}`. If the argv matches a rule, it runs. If not:
 
 - **Linux** - runs under Landlock sandbox. If the kernel blocks the write, the agent returns `blocked=true`.
 - **macOS** - uses the server-supplied `is_write` flag. If the command is a write and not approved, the agent refuses it immediately without running it.
 
-In both cases the backend creates a pending approval record. Admins and operators review it in the **tenant console → Approvals**, then approve or deny. Once approved, the command prefix is included in the approved list on the next sync and runs without restriction. See [Approvals](#approvals).
+In both cases the backend creates a pending approval record. Admins and operators review it in the **tenant console → Approvals**, then approve or deny. Once approved, the rule feeds the agent's allowlist on the next sync and the write runs. A write that uses **shell operators** can't be structured and is rejected in approved mode (run it in `wild`, or approve a rule for the underlying command). See [Approvals](#approvals).
 
-The match is prefix-based with a word boundary: approving `docker logs` permits `docker logs myapp --tail 100` but not `docker rm myapp`.
+A host rule matches positionally - bin equal, arity equal, each arg equal or `*`: approving `{bin: docker, args: [logs, *]}` permits `docker logs myapp` but not `docker rm myapp`.
 
 > **Kubernetes agents work differently.** The blocklist tables above are the regex classifier used for **host** agents. A `type=k8s` agent has no shell, so write-ness is classified from the `kubectl` **verb** (default-deny: anything that isn't a known read verb - including `exec`/`cp`/`port-forward` and unknown verbs - is a write), and the policy decision is made **at the backend on submission**, not on the agent. "Double verbs" whose sub-subcommand changes read/write are classified on the pair - e.g. `rollout status`/`history` and `auth can-i` are reads, while `rollout restart`/`undo` and `auth reconcile` are writes - and cluster-inert utilities (`kustomize`, `options`, `plugin`, `config`, …) count as reads. In approved mode an unapproved k8s write never dispatches: it is recorded as a `REJECTED` job and a pending approval is raised. There is no Landlock or `is_write`-flag step on a k8s agent. See [ARCHITECTURE.md → How `kubectl` commands are classified](ARCHITECTURE.md#kubernetes-agents) for the full model.
 

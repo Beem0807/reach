@@ -662,6 +662,39 @@ class TestHandleTenantCreateApproval:
         assert json.loads(r["body"])["status"] == "pending"
         ar.create.assert_called_once()
 
+    def test_developer_request_with_shell_operators_rejected(self):
+        r, ar = self._call(user=_DEV, body={"agent_id": AGENT_ID, "command": "docker restart nginx | tee /etc/x"})
+        assert r["statusCode"] == 400
+        assert "shell operators" in json.loads(r["body"])["error"]
+        ar.create.assert_not_called()
+
+    def test_operator_preapprove_with_shell_operators_rejected(self):
+        r, ar = self._call(user=_OPERATOR, body={"agent_id": AGENT_ID, "command": "systemctl restart nginx && rm -rf /"})
+        assert r["statusCode"] == 400
+        ar.create.assert_not_called()
+
+    def test_developer_creates_pending_with_host_rule(self):
+        r, ar = self._call(user=_DEV, body={"agent_id": AGENT_ID,
+                                            "host_rule": {"bin": "systemctl", "args": ["restart", "*"]}})
+        assert r["statusCode"] == 201
+        rec = ar.create.call_args[0][0]
+        assert rec["host_rule"] == {"bin": "systemctl", "args": ["restart", "*"]}
+        assert rec["command"] == "systemctl restart *"    # display form
+        assert rec["k8s_rule"] is None
+
+    def test_developer_invalid_host_rule_rejected(self):
+        r, ar = self._call(user=_DEV, body={"agent_id": AGENT_ID, "host_rule": {"args": ["x"]}})
+        assert r["statusCode"] == 400
+        ar.create.assert_not_called()
+
+    def test_operator_preapprove_host_rule(self):
+        r, ar = self._call(user=_OPERATOR, body={"agent_id": AGENT_ID,
+                                                 "host_rule": {"bin": "df", "args": ["-h"]}})
+        assert r["statusCode"] == 200   # operator pre-approve returns 200
+        rec = ar.create.call_args[0][0]
+        assert rec["host_rule"] == {"bin": "df", "args": ["-h"]}
+        assert rec["command"] == "df -h"
+
     def test_developer_already_approved_command_returns_409(self):
         existing = {**_APPROVED, "command": "ls"}
         r, _ = self._call(user=_DEV, body={"agent_id": AGENT_ID, "command": "ls"}, active_approvals=[existing])
@@ -966,6 +999,16 @@ class TestFleetScopedCreate:
         created = ar.create.mock_calls[0].args[0]
         assert created["fleet_id"] == FLEET_ID and created["agent_id"] is None
         assert created["status"] == "approved"
+
+    def test_operator_preapproves_fleet_host_rule(self):
+        # Fleet approvals can be structured JSON rules (fleets are host-only).
+        r, ar = self._call(user=_FLEET_OPERATOR,
+                           body={"fleet_id": FLEET_ID, "host_rule": {"bin": "systemctl", "args": ["restart", "*"]}})
+        assert r["statusCode"] == 200
+        created = ar.create.mock_calls[0].args[0]
+        assert created["fleet_id"] == FLEET_ID
+        assert created["host_rule"] == {"bin": "systemctl", "args": ["restart", "*"]}
+        assert created["command"] == "systemctl restart *"
 
     def test_developer_creates_pending_fleet_approval(self):
         dev = {**_DEV, "readwrite_fleet_ids": [FLEET_ID], "readonly_fleet_ids": []}

@@ -145,6 +145,51 @@ class TestTagFanout:
         with patch("handlers.jobs_fanout._verify_tenant_token", return_value=None):
             assert handle_fanout_by_tag({"tag": "x", "command": "y"}, "bad")["statusCode"] == 401
 
+    # --- Structured host writes (parity with POST /jobs and fleet fan-out) ---
+
+    def _created_jobs(self, body, agents):
+        """Run a fan-out and return the job payloads passed to jobs_repo.create."""
+        with patch("handlers.jobs_fanout._verify_tenant_token", return_value=USER), \
+             patch("handlers.jobs_fanout.agents_repo") as ar, \
+             patch("handlers.jobs_fanout.approvals_repo") as apr, \
+             patch("handlers.jobs_fanout.jobs_repo") as jr:
+            ar.list_by_tenant.return_value = agents
+            apr.list_by_agent.return_value = []
+            r = handle_fanout_by_tag(body, TOKEN)
+            created = [c.args[0] for c in jr.create.call_args_list]
+        return r, created
+
+    def test_host_write_carries_structured_argv(self):
+        _, created = self._created_jobs(
+            {"tag": "env:prod", "command": "systemctl restart nginx"}, [_host("a1")])
+        assert len(created) == 1
+        assert created[0]["argv"] == ["systemctl", "restart", "nginx"]
+        assert created[0]["is_write"] is True
+
+    def test_read_has_no_argv(self):
+        _, created = self._created_jobs({"tag": "env:prod", "command": "uptime"}, [_host("a1")])
+        assert created[0]["argv"] is None
+
+    def test_shell_operator_write_runs_freeform_in_wild(self):
+        # A write with a pipe can't be structured; in wild it still dispatches (argv None).
+        _, created = self._created_jobs(
+            {"tag": "env:prod", "command": "systemctl restart nginx | tee /tmp/x"}, [_host("a1")])
+        assert len(created) == 1 and created[0]["argv"] is None
+
+    def test_shell_operator_write_skipped_in_approved_mode(self):
+        # Unstructurable (and so unapprovable) -> skipped for an approved-mode host.
+        r = _call({"tag": "env:prod", "command": "systemctl restart nginx | tee /tmp/x"},
+                  [_host("a1", mode="approved")])
+        body = json.loads(r["body"])
+        assert body["dispatched"] == 0
+        assert body["skipped"][0]["reason"] == "shell operators can't be structured (approved mode)"
+
+    def test_structured_write_dispatches_in_approved_mode(self):
+        # A structurable write dispatches; the agent enforces its host rules (like fleets).
+        _, created = self._created_jobs(
+            {"tag": "env:prod", "command": "systemctl restart nginx"}, [_host("a1", mode="approved")])
+        assert len(created) == 1 and created[0]["argv"] == ["systemctl", "restart", "nginx"]
+
 
 # --- Tag runs (standalone fan-out batches) -----------------------------------
 from handlers.jobs_fanout import handle_list_tag_runs

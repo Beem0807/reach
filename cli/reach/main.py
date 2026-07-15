@@ -2092,12 +2092,16 @@ def _print_job_result(result: dict) -> None:
         console.print(stdout, highlight=False, end="")
         if not stdout.endswith("\n"):
             console.print()
+        if result.get("stdout_truncated"):
+            console.print("[yellow]⚠ stdout truncated - output exceeded the size limit[/yellow]")
 
     if stderr:
         console.print("\n[bold red]stderr:[/bold red]")
         console.print(stderr, highlight=False, end="")
         if not stderr.endswith("\n"):
             console.print()
+        if result.get("stderr_truncated"):
+            console.print("[yellow]⚠ stderr truncated - output exceeded the size limit[/yellow]")
 
 
 # ---------------------------------------------------------------------------

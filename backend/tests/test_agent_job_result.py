@@ -120,6 +120,48 @@ class TestAgentJobResult:
         assert "[TRUNCATED]" in stored
         assert len(stored.encode()) <= 50_100
 
+    def test_backend_cap_sets_truncated_flag(self):
+        # Agent under-reports (no flag), but server has to cut -> flag forced True.
+        large = "x" * 60_000
+        with patch("handlers.agent_job_result._verify_agent_token", return_value=_AGENT), \
+             patch("handlers.agent_job_result.jobs_repo") as jr, \
+             patch("handlers.agent_job_result.approvals_repo"), \
+             patch("handlers.agent_job_result.users_repo") as ur:
+            jr.get.return_value = _JOB_RUNNING
+            ur.get.return_value = None
+            handle_agent_job_result(JOB_ID, {**_VALID_BODY, "stdout": large}, "tok")
+        stored = jr.set_result.call_args[0][1]
+        assert stored["stdout_truncated"] is True
+        assert stored["stderr_truncated"] is False
+
+    def test_agent_reported_truncation_persisted(self):
+        # Agent already capped (output fits under 50KB) and reports the flag -> preserved.
+        with patch("handlers.agent_job_result._verify_agent_token", return_value=_AGENT), \
+             patch("handlers.agent_job_result.jobs_repo") as jr, \
+             patch("handlers.agent_job_result.approvals_repo"), \
+             patch("handlers.agent_job_result.users_repo") as ur:
+            jr.get.return_value = _JOB_RUNNING
+            ur.get.return_value = None
+            handle_agent_job_result(
+                JOB_ID,
+                {**_VALID_BODY, "stdout": "capped\n[TRUNCATED]", "stdout_truncated": True},
+                "tok",
+            )
+        stored = jr.set_result.call_args[0][1]
+        assert stored["stdout_truncated"] is True
+
+    def test_no_truncation_flag_false(self):
+        with patch("handlers.agent_job_result._verify_agent_token", return_value=_AGENT), \
+             patch("handlers.agent_job_result.jobs_repo") as jr, \
+             patch("handlers.agent_job_result.approvals_repo"), \
+             patch("handlers.agent_job_result.users_repo") as ur:
+            jr.get.return_value = _JOB_RUNNING
+            ur.get.return_value = None
+            handle_agent_job_result(JOB_ID, {**_VALID_BODY, "stdout": "hi\n"}, "tok")
+        stored = jr.set_result.call_args[0][1]
+        assert stored["stdout_truncated"] is False
+        assert stored["stderr_truncated"] is False
+
     def test_rejected_status_accepted(self):
         r = self._call({**_VALID_BODY, "status": "REJECTED"})
         assert r["statusCode"] == 200

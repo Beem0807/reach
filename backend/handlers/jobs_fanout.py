@@ -20,7 +20,7 @@ from shared.auth import _bearer, _verify_tenant_token
 from shared.fanout import deterministic_run_id, new_run_row, order_and_limit, parse_max_targets, run_summary_view
 from shared.settings import effective_settings
 from shared.waves import assign_waves, plan_waves, resolve_policy
-from shared.policy import _is_blocked, _is_readonly_blocked, is_k8s_command_approved, is_k8s_write
+from shared.policy import _is_blocked, _is_readonly_blocked, is_k8s_command_approved, is_k8s_write, needs_shell, to_argv
 from shared.response import _err, _iso, _now, _ok
 from shared.store import agents_repo, approvals_repo, jobs_repo, runs_repo, tenants_repo
 
@@ -88,6 +88,12 @@ def handle_fanout_by_tag(body: dict, raw_token: str, ip: str = "") -> dict:
     now = _now()
     is_k8s = want_type == "k8s"
     is_write = is_k8s_write(command) if is_k8s else _is_readonly_blocked(command)
+    # Host writes are structured: a plain write becomes an argv (run with execve, no
+    # shell) so the agent can match it against host rules; a write with shell operators
+    # can't be structured (argv is None) - it runs freeform in `wild` but is unapprovable,
+    # so approved-mode host agents skip it below. Reads and k8s carry no argv.
+    write_needs_shell = is_write and not is_k8s and needs_shell(command)
+    argv = to_argv(command) if (is_write and not is_k8s) else None
     # First pass: who is eligible (active, writable, mode/approval allows it). Second
     # pass caps the blast radius, then we dispatch.
     eligible: list = []
@@ -112,6 +118,13 @@ def handle_fanout_by_tag(body: dict, raw_token: str, ip: str = "") -> dict:
             if not is_k8s_command_approved(command, rules):
                 skipped.append({**entry, "reason": "not pre-approved (k8s rule)"})
                 continue
+        # Host writes with shell operators can't be structured into a rule, so they can
+        # never be approved - skip them for approved-mode host agents (they'd run freeform
+        # in wild, but here the mode forbids it). Structured host writes dispatch and the
+        # agent enforces its host rules (like fleet fan-out).
+        if not is_k8s and mode == "approved" and write_needs_shell:
+            skipped.append({**entry, "reason": "shell operators can't be structured (approved mode)"})
+            continue
         eligible.append(a)
 
     # Tag fan-outs have no fleet, so the wave size = the tenant's fanout_cap (a policy
@@ -162,6 +175,7 @@ def handle_fanout_by_tag(body: dict, raw_token: str, ip: str = "") -> dict:
             "wave": wave,
             "created_by": user["user_id"],
             "command": command,
+            "argv": argv,
             "status": status,
             "stdout": None,
             "stderr": None,

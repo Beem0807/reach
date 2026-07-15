@@ -37,6 +37,8 @@ def handle_get_job(job_id: str, raw_token: str) -> dict:
         "exit_code": job.get("exit_code"),
         "stdout": job.get("stdout"),
         "stderr": job.get("stderr"),
+        "stdout_truncated": bool(job.get("stdout_truncated")),
+        "stderr_truncated": bool(job.get("stderr_truncated")),
         "duration_ms": job.get("duration_ms"),
         "created_at": job.get("created_at"),
         "started_at": job.get("started_at"),

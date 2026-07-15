@@ -669,6 +669,7 @@ def make_jobs(
             "tenant_id":    tenant_id,
             "agent_id":     ag1,
             "command":      "systemctl restart nginx",
+            "argv":         ["systemctl", "restart", "nginx"],   # structured (host write, no shell)
             "status":       "PENDING",
             "mode":         "approved",
             "is_write":     True,
@@ -1047,7 +1048,8 @@ def make_approvals(
             "approval_id":   "appr_" + secrets.token_hex(8),
             "tenant_id":     tenant_id,
             "agent_id":      ag1,
-            "command":       "systemctl restart nginx",
+            "command":       "systemctl restart nginx",   # host_rule_to_command(host_rule)
+            "host_rule":     {"bin": "systemctl", "args": ["restart", "nginx"]},
             "requested_by":  uid1,
             "requester_name": "Alice",
             "job_id":        pending_job_id,
@@ -1063,6 +1065,7 @@ def make_approvals(
             "tenant_id":     tenant_id,
             "agent_id":      ag2,
             "command":       "apt-get upgrade -y",
+            "host_rule":     {"bin": "apt-get", "args": ["upgrade", "-y"]},
             "requested_by":  uid2,
             "requester_name": "Bob",
             "job_id":        running_job_id,
@@ -1077,7 +1080,8 @@ def make_approvals(
             "approval_id":   "appr_" + secrets.token_hex(8),
             "tenant_id":     tenant_id,
             "agent_id":      ag1,
-            "command":       "docker ps",
+            "command":       "docker restart api",
+            "host_rule":     {"bin": "docker", "args": ["restart", "api"]},
             "requested_by":  uid1,
             "requester_name": "Alice",
             "job_id":        None,
@@ -1092,7 +1096,8 @@ def make_approvals(
             "approval_id":   "appr_" + secrets.token_hex(8),
             "tenant_id":     tenant_id,
             "agent_id":      ag2,
-            "command":       "uptime",
+            "command":       "nginx -s reload",
+            "host_rule":     {"bin": "nginx", "args": ["-s", "reload"]},
             "requested_by":  uid2,
             "requester_name": "Bob",
             "job_id":        None,
@@ -1107,7 +1112,8 @@ def make_approvals(
             "approval_id":   "appr_" + secrets.token_hex(8),
             "tenant_id":     tenant_id,
             "agent_id":      ag2,
-            "command":       "rm -rf /var/log/app/*.log",
+            "command":       "rm -rf /var/log/app",
+            "host_rule":     {"bin": "rm", "args": ["-rf", "/var/log/app"]},
             "requested_by":  uid1,
             "requester_name": "Alice",
             "job_id":        None,
@@ -1123,6 +1129,7 @@ def make_approvals(
             "tenant_id":     tenant_id,
             "agent_id":      ag1,
             "command":       "apt upgrade -y",
+            "host_rule":     {"bin": "apt", "args": ["upgrade", "-y"]},
             "requested_by":  uid1,
             "requester_name": "Alice",
             "job_id":        None,
@@ -1172,6 +1179,7 @@ def make_approvals(
             "agent_id":      None,
             "fleet_id":      prod_fleet,
             "command":       "docker restart web",
+            "host_rule":     {"bin": "docker", "args": ["restart", "web"]},
             "requested_by":  uid1,
             "requester_name": "Alice",
             "job_id":        None,
@@ -1188,6 +1196,7 @@ def make_approvals(
             "agent_id":      None,
             "fleet_id":      prod_fleet,
             "command":       "systemctl restart app",
+            "host_rule":     {"bin": "systemctl", "args": ["restart", "app"]},
             "requested_by":  uid2,
             "requester_name": "Bob",
             "job_id":        None,
@@ -1205,6 +1214,7 @@ def make_approvals(
             "agent_id":      None,
             "fleet_id":      staging_fleet,
             "command":       "docker compose pull",
+            "host_rule":     {"bin": "docker", "args": ["compose", "pull"]},
             "requested_by":  uid2,
             "requester_name": "Bob",
             "job_id":        None,
@@ -1220,7 +1230,8 @@ def make_approvals(
             "tenant_id":     tenant_id,
             "agent_id":      None,
             "fleet_id":      staging_fleet,
-            "command":       "rm -rf /var/lib/app/cache/*",
+            "command":       "rm -rf /var/lib/app/cache",
+            "host_rule":     {"bin": "rm", "args": ["-rf", "/var/lib/app/cache"]},
             "requested_by":  uid1,
             "requester_name": "Alice",
             "job_id":        None,
@@ -1228,6 +1239,56 @@ def make_approvals(
             "expires_at":    None,
             "created_at":    _iso(4),
             "reviewed_at":   _iso(3.9),
+            "reviewed_by":   "admin",
+        },
+        # 13. HOST STRUCTURED APPROVED - a JSON host rule {bin, args[]} with a "*" wildcard
+        #     (the structured model: host writes are argv-based and rule-approved, no strings).
+        {
+            "approval_id":   "appr_" + secrets.token_hex(8),
+            "tenant_id":     tenant_id,
+            "agent_id":      ag1,
+            "command":       "systemctl restart *",   # host_rule_to_command(host_rule)
+            "host_rule":     {"bin": "systemctl", "args": ["restart", "*"]},
+            "requested_by":  uid1,
+            "requester_name": "Alice",
+            "job_id":        None,
+            "status":        "approved",
+            "expires_at":    None,                    # permanent
+            "created_at":    _iso(2),
+            "reviewed_at":   _iso(1.9),
+            "reviewed_by":   "admin",
+        },
+        # 14. HOST STRUCTURED PENDING - a structured rule awaiting review.
+        {
+            "approval_id":   "appr_" + secrets.token_hex(8),
+            "tenant_id":     tenant_id,
+            "agent_id":      ag2,
+            "command":       "docker restart *",
+            "host_rule":     {"bin": "docker", "args": ["restart", "*"]},
+            "requested_by":  uid2,
+            "requester_name": "Bob",
+            "job_id":        None,
+            "status":        "pending",
+            "expires_at":    None,
+            "created_at":    _iso(0.05),
+            "reviewed_at":   None,
+            "reviewed_by":   None,
+        },
+        # 15. FLEET HOST RULE APPROVED - a structured rule for the whole prod fleet.
+        {
+            "approval_id":   "appr_" + secrets.token_hex(8),
+            "tenant_id":     tenant_id,
+            "agent_id":      None,
+            "fleet_id":      prod_fleet,
+            "command":       "systemctl restart *",
+            "host_rule":     {"bin": "systemctl", "args": ["restart", "*"]},
+            "requested_by":  uid1,
+            "requester_name": "Alice",
+            "job_id":        None,
+            "status":        "approved",
+            "expires_at":    None,
+            "created_at":    _iso(3),
+            "reviewed_at":   _iso(2.9),
             "reviewed_by":   "admin",
         },
     ]
@@ -1362,7 +1423,7 @@ def make_audit_logs(tenant_id: str, tenant_slug: str, agent_ids: list[str]) -> l
         ("user.password_reset",admin_id, "Admin",    "admin",    "user",    dev_id,    None,       _iso(1)),
         ("agent.revoked",      admin_id, "Admin",    "admin",    "agent",   ag,        None,       _iso(2)),
         ("approval.approved",  ops_id,   "Operator", "operator", "approval","appr_xxx",{"command":"docker restart api","duration":"24h"}, _iso(0.5)),
-        ("approval.pre_approved",ops_id, "Operator", "operator", "approval","appr_yyy",{"command":"docker ps"},              _iso(0.8)),
+        ("approval.pre_approved",ops_id, "Operator", "operator", "approval","appr_yyy",{"command":"docker restart *"},        _iso(0.8)),
         ("user.role_changed",  admin_id, "Admin",    "admin",    "user",    ops_id,    {"from":"developer","to":"operator"},  _iso(3)),
         ("api_token.revoked",  admin_id, "Admin",    "admin",    "api_token","apitok_x",None,      _iso(3)),
         ("user.login",         dev_id,   "Developer","developer","user",    dev_id,    None,       _iso(4)),
@@ -1819,7 +1880,7 @@ def seed():
           f"2 fleets/tenant (web-prod, worker-staging) + ~7 enrolled members (incl. a grant-drift host) · "
           f"10 standalone agents/tenant (host + k8s, incl. DELETED and RBAC-drift) · 6 users/tenant · "
           f"12 jobs + fan-out runs (3 live fleet + 1 reaped-member fleet + 1 tag, batched) · "
-          f"12 approvals/tenant (8 agent + 4 fleet-scoped) · "
+          f"15 approvals/tenant (10 agent + 5 fleet-scoped, incl. structured host rules) · "
           f"3 api tokens · 15 audit logs · agent history")
     print()
     print("  Pagination check - the 'scale' tenant is loaded past the 20-per-page line:")

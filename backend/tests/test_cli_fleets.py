@@ -213,6 +213,38 @@ class TestFleetFanout:
         assert {s["agent_id"] for s in body["skipped"]} == {"agent_m2"}  # INACTIVE skipped
         assert jr.create.call_count == 1
 
+    def test_write_is_structured_into_argv(self, _runs_repo):
+        fleet = {**_FLEET, "mode": "wild"}
+        pa, pf, par, pj, agents, _ = _patch(agents=[_M1], fleet=fleet)
+        with pa, pf as fr, par as ar, pj as jr, patch("handlers.cli_fleets.tenants_repo") as tr:
+            fr.get.return_value = fleet
+            tr.get.return_value = {"tenant_id": TENANT_ID, "settings": {}}
+            ar.list_by_fleet.return_value = [_M1]
+            jr.create.return_value = None
+            handle_cli_fleet_fanout(FLEET_ID, {"command": "systemctl restart nginx"}, TOKEN)
+        assert jr.create.call_args[0][0]["argv"] == ["systemctl", "restart", "nginx"]
+
+    def test_wild_fleet_shell_write_runs_freeform(self, _runs_repo):
+        fleet = {**_FLEET, "mode": "wild"}
+        pa, pf, par, pj, agents, _ = _patch(agents=[_M1], fleet=fleet)
+        with pa, pf as fr, par as ar, pj as jr, patch("handlers.cli_fleets.tenants_repo") as tr:
+            fr.get.return_value = fleet
+            tr.get.return_value = {"tenant_id": TENANT_ID, "settings": {}}
+            ar.list_by_fleet.return_value = [_M1]
+            jr.create.return_value = None
+            r = handle_cli_fleet_fanout(FLEET_ID, {"command": "cat x | tee /var/log/y"}, TOKEN)
+        assert r["statusCode"] == 201
+        assert jr.create.call_args[0][0]["argv"] is None   # freeform in a wild fleet
+
+    def test_approved_fleet_shell_write_rejected(self):
+        fleet = {**_FLEET, "mode": "approved"}
+        pa, pf, par, pj, agents, _ = _patch(agents=[_M1], fleet=fleet)
+        with pa, pf as fr, par, pj:
+            fr.get.return_value = fleet
+            r = handle_cli_fleet_fanout(FLEET_ID, {"command": "cat x | tee /etc/passwd"}, TOKEN)
+        assert r["statusCode"] == 400
+        assert "shell operators" in json.loads(r["body"])["error"]
+
     def test_run_row_records_skip_detail(self, _runs_repo):
         # The run persists who/why was skipped, so it's clear later why a host didn't run.
         pa, pf, par, pj, agents, fleet = _patch()

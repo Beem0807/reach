@@ -115,6 +115,82 @@ class TestCreateJob:
         body = json.loads(r["body"])
         assert body["dry_run"] is True and body["is_write"] is False
 
+    def test_plain_command_auto_structured(self):
+        # A plain command is transparently structured into an argv (no flag needed).
+        with patch("handlers.create_job._verify_tenant_token", return_value=USER), \
+             patch("handlers.create_job.agents_repo") as ar, \
+             patch("handlers.create_job.audit"), \
+             patch("handlers.create_job.jobs_repo") as jr:
+            ar.get.return_value = _AGENT_ACTIVE
+            handle_create_job({"agent_id": AGENT_ID, "command": "systemctl restart nginx"}, "tok")
+        assert jr.create.call_args[0][0]["argv"] == ["systemctl", "restart", "nginx"]
+
+    def test_shell_command_stays_freeform(self):
+        # A READ with shell features keeps the freeform (shell) path - argv is None.
+        with patch("handlers.create_job._verify_tenant_token", return_value=USER), \
+             patch("handlers.create_job.agents_repo") as ar, \
+             patch("handlers.create_job.audit"), \
+             patch("handlers.create_job.jobs_repo") as jr:
+            ar.get.return_value = _AGENT_ACTIVE
+            handle_create_job({"agent_id": AGENT_ID, "command": "ps aux | grep nginx"}, "tok")
+        assert jr.create.call_args[0][0]["argv"] is None
+
+    def test_plain_read_stays_freeform(self):
+        # Reads run as-is (freeform); only writes are structured.
+        with patch("handlers.create_job._verify_tenant_token", return_value=USER), \
+             patch("handlers.create_job.agents_repo") as ar, \
+             patch("handlers.create_job.audit"), \
+             patch("handlers.create_job.jobs_repo") as jr:
+            ar.get.return_value = _AGENT_ACTIVE
+            handle_create_job({"agent_id": AGENT_ID, "command": "uptime"}, "tok")
+        assert jr.create.call_args[0][0]["argv"] is None
+
+    def test_piped_write_rejected_in_approved_mode(self):
+        # In approved mode a shell/pipe write can't be a structured rule -> rejected.
+        approved = {**_AGENT_ACTIVE, "mode": "approved"}
+        r = self._call({"agent_id": AGENT_ID, "command": "cat x | tee /etc/passwd"}, agent=approved)
+        assert r["statusCode"] == 400
+        assert "shell operators" in json.loads(r["body"])["error"]
+
+    def test_piped_write_allowed_freeform_in_wild_mode(self):
+        # Wild mode has no approval/sandbox - a pipe write runs freeform (argv None).
+        with patch("handlers.create_job._verify_tenant_token", return_value=USER), \
+             patch("handlers.create_job.agents_repo") as ar, \
+             patch("handlers.create_job.audit"), \
+             patch("handlers.create_job.jobs_repo") as jr:
+            ar.get.return_value = _AGENT_ACTIVE   # mode wild
+            r = handle_create_job({"agent_id": AGENT_ID, "command": "cat x | tee /var/log/y"}, "tok")
+        assert r["statusCode"] == 201
+        assert jr.create.call_args[0][0]["argv"] is None   # freeform
+
+    def test_structured_argv_stores_argv_and_derives_command(self):
+        with patch("handlers.create_job._verify_tenant_token", return_value=USER), \
+             patch("handlers.create_job.agents_repo") as ar, \
+             patch("handlers.create_job.audit"), \
+             patch("handlers.create_job.jobs_repo") as jr:
+            ar.get.return_value = _AGENT_ACTIVE
+            r = handle_create_job({"agent_id": AGENT_ID, "argv": ["systemctl", "restart", "nginx"]}, "tok")
+        assert r["statusCode"] == 201
+        created = jr.create.call_args[0][0]
+        assert created["argv"] == ["systemctl", "restart", "nginx"]
+        assert created["command"] == "systemctl restart nginx"   # display form
+
+    def test_structured_argv_invalid_rejected(self):
+        r = self._call({"agent_id": AGENT_ID, "argv": []})
+        assert r["statusCode"] == 400
+
+    def test_structured_argv_rejected_for_k8s_agent(self):
+        k8s = {**_AGENT_ACTIVE, "type": "k8s"}
+        r = self._call({"agent_id": AGENT_ID, "argv": ["kubectl", "get", "pods"]}, agent=k8s)
+        assert r["statusCode"] == 400
+        assert "host agents" in json.loads(r["body"])["error"]
+
+    def test_dry_run_structured_returns_argv(self):
+        r = self._call({"agent_id": AGENT_ID, "argv": ["systemctl", "restart", "nginx"], "dry_run": True})
+        body = json.loads(r["body"])
+        assert body["structured"] is True and body["argv"] == ["systemctl", "restart", "nginx"]
+        assert body["is_write"] is True   # heuristic on the joined display command
+
     def test_dispatch_writes_job_audit_event(self):
         with patch("handlers.create_job._verify_tenant_token", return_value=USER), \
              patch("handlers.create_job.agents_repo") as ar, \

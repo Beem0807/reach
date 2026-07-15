@@ -263,6 +263,8 @@ def exec_command(command: str, agent_id: str = "", confirm: bool = False, timeou
                 "exit_code": result.get("exit_code"),
                 "stdout": _redact(result.get("stdout") or ""),
                 "stderr": _redact(result.get("stderr") or ""),
+                "stdout_truncated": bool(result.get("stdout_truncated")),
+                "stderr_truncated": bool(result.get("stderr_truncated")),
                 "duration_ms": result.get("duration_ms"),
             }
         time.sleep(2)

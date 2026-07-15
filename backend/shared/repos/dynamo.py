@@ -479,7 +479,8 @@ class JobRepo:
             Key={"job_id": job_id},
             UpdateExpression=(
                 "SET #st = :s, exit_code = :ec, stdout = :out, stderr = :err,"
-                " duration_ms = :dur, completed_at = :ca, is_write = :iw"
+                " duration_ms = :dur, completed_at = :ca, is_write = :iw,"
+                " stdout_truncated = :ot, stderr_truncated = :et"
             ),
             ExpressionAttributeNames={"#st": "status"},
             ExpressionAttributeValues={
@@ -490,6 +491,8 @@ class JobRepo:
                 ":dur": fields["duration_ms"],
                 ":ca": fields["completed_at"],
                 ":iw": fields.get("is_write"),
+                ":ot": bool(fields.get("stdout_truncated", False)),
+                ":et": bool(fields.get("stderr_truncated", False)),
             },
         )
 

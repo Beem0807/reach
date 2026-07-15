@@ -1,8 +1,8 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import type { TenantConfig, Approval, Agent, Fleet, K8sRule } from '../types';
+import type { TenantConfig, Approval, Agent, Fleet, K8sRule, HostRule } from '../types';
 import {
   listAllTenantApprovals, listTenantApprovals, approveTenantApproval, denyTenantApproval,
-  deleteTenantApproval, tenantPreApprove, tenantPreApproveFleet, tenantPreApproveRule,
+  deleteTenantApproval, tenantPreApprove, tenantPreApproveRule, tenantPreApproveHostRule, tenantPreApproveFleetHostRule,
   listTenantAgents, listFleets,
 } from '../api';
 import { Modal } from '../components/Modal';
@@ -11,6 +11,7 @@ import { RefreshButton } from '../components/RefreshButton';
 import { CopyButton } from '../components/CopyButton';
 import { ApprovalTarget, ApprovalScope } from '../components/ApprovalTarget';
 import { K8sRuleForm, EMPTY_RULE } from '../components/K8sRuleForm';
+import { HostRuleForm, EMPTY_HOST_RULE } from '../components/HostRuleForm';
 
 
 function useColumnResize(count: number) {
@@ -185,8 +186,9 @@ function DeveloperApprovalsView({ config }: { config: TenantConfig }) {
 
   useEffect(() => { load(); }, [load]);
 
-  const handleSubmit = async (agentId: string, payload: { command?: string; rule?: K8sRule }) => {
+  const handleSubmit = async (agentId: string, payload: { command?: string; rule?: K8sRule; host_rule?: HostRule }) => {
     if (payload.rule) await tenantPreApproveRule(apiUrl, tenantToken, agentId, payload.rule);
+    else if (payload.host_rule) await tenantPreApproveHostRule(apiUrl, tenantToken, agentId, payload.host_rule);
     else await tenantPreApprove(apiUrl, tenantToken, agentId, payload.command ?? '');
     setShowModal(false);
     load();
@@ -535,16 +537,17 @@ function OperatorApprovalsView({ config }: { config: TenantConfig }) {
     setApprovals(prev => prev.filter(a => a.approval_id !== id));
   };
 
-  const doAddApproval = async (agentId: string, payload: { command?: string; rule?: K8sRule }, duration?: string) => {
+  const doAddApproval = async (agentId: string, payload: { command?: string; rule?: K8sRule; host_rule?: HostRule }, duration?: string) => {
     if (payload.rule) await tenantPreApproveRule(apiUrl, tenantToken, agentId, payload.rule, duration);
+    else if (payload.host_rule) await tenantPreApproveHostRule(apiUrl, tenantToken, agentId, payload.host_rule, duration);
     else await tenantPreApprove(apiUrl, tenantToken, agentId, payload.command ?? '', duration);
     setModal(null);
     setTab('approved');
     reload();
   };
 
-  const doAddFleetApproval = async (fleetId: string, command: string, duration?: string) => {
-    await tenantPreApproveFleet(apiUrl, tenantToken, fleetId, command, duration);
+  const doAddFleetApproval = async (fleetId: string, hostRule: HostRule, duration?: string) => {
+    await tenantPreApproveFleetHostRule(apiUrl, tenantToken, fleetId, hostRule, duration);
     setModal(null);
     setTab('approved');
     reload();
@@ -1082,11 +1085,12 @@ function RequestApprovalModal({
 }: {
   agents: Agent[];
   onClose: () => void;
-  onSubmit: (agentId: string, payload: { command?: string; rule?: K8sRule }) => Promise<void>;
+  onSubmit: (agentId: string, payload: { command?: string; rule?: K8sRule; host_rule?: HostRule }) => Promise<void>;
 }) {
   const [agentId, setAgentId] = useState('');
-  const [command, setCommand] = useState('');
   const [rule, setRule] = useState<K8sRule>(EMPTY_RULE);
+  // Host approvals are structured JSON rules (writes are structured, no strings).
+  const [hostRule, setHostRule] = useState<HostRule>(EMPTY_HOST_RULE);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
@@ -1094,9 +1098,10 @@ function RequestApprovalModal({
 
   const submit = async () => {
     if (!agentId) { setError('Select an agent.'); return; }
-    if (!isK8s && !command.trim()) { setError('Command is required.'); return; }
+    if (!isK8s && !hostRule.bin.trim()) { setError('Binary is required.'); return; }
     setLoading(true); setError('');
-    try { await onSubmit(agentId, isK8s ? { rule } : { command: command.trim() }); }
+    const payload = isK8s ? { rule } : { host_rule: hostRule };
+    try { await onSubmit(agentId, payload); }
     catch (e) { setError((e as Error).message); setLoading(false); }
   };
 
@@ -1135,16 +1140,10 @@ function RequestApprovalModal({
           </div>
         ) : (
         <div>
-          <label className="block text-sm font-semibold text-gray-700 mb-1.5">Command</label>
-          <input
-            value={command}
-            onChange={e => setCommand(e.target.value)}
-            onKeyDown={e => e.key === 'Enter' && submit()}
-            placeholder="docker restart app"
-            className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
-          />
+          <label className="block text-sm font-semibold text-gray-700 mb-1.5">Structured rule</label>
+          <HostRuleForm value={hostRule} onChange={setHostRule} />
           <p className="text-xs text-gray-400 mt-1">
-            Prefix match - approving "docker restart" also permits "docker restart app".
+            Host approvals are structured rules (no shell) - <span className="font-mono">*</span> matches any single arg.
           </p>
         </div>
         )}
@@ -1388,8 +1387,8 @@ function AddApprovalModal({
   agents: Agent[];
   fleets: Fleet[];
   onClose: () => void;
-  onSubmit: (agentId: string, payload: { command?: string; rule?: K8sRule }, duration?: string) => Promise<void>;
-  onSubmitFleet: (fleetId: string, command: string, duration?: string) => Promise<void>;
+  onSubmit: (agentId: string, payload: { command?: string; rule?: K8sRule; host_rule?: HostRule }, duration?: string) => Promise<void>;
+  onSubmitFleet: (fleetId: string, hostRule: HostRule, duration?: string) => Promise<void>;
 }) {
   // The modal has its own Agent/Fleet chooser (defaulting to the current view),
   // so you can add either kind regardless of what the list is filtered to.
@@ -1397,8 +1396,9 @@ function AddApprovalModal({
   const isFleetScope = target === 'fleet';
   const [agentId, setAgentId] = useState('');
   const [fleetId, setFleetId] = useState('');
-  const [command, setCommand] = useState('');
   const [rule, setRule] = useState<K8sRule>(EMPTY_RULE);
+  // Host targets (standalone agent or fleet) use a structured JSON rule; k8s uses a cluster rule.
+  const [hostRule, setHostRule] = useState<HostRule>(EMPTY_HOST_RULE);
   const [duration, setDuration] = useState<Duration>('permanent');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -1411,14 +1411,15 @@ function AddApprovalModal({
     try {
       if (isFleetScope) {
         if (!fleetId) { setError('Select a fleet.'); return; }
-        if (!command.trim()) { setError('Command is required.'); return; }
+        if (!hostRule.bin.trim()) { setError('Binary is required.'); return; }
         setLoading(true);
-        await onSubmitFleet(fleetId, command.trim(), dur);
+        await onSubmitFleet(fleetId, hostRule, dur);
       } else {
         if (!agentId) { setError('Select an agent.'); return; }
-        if (!isK8s && !command.trim()) { setError('Command is required.'); return; }
+        if (!isK8s && !hostRule.bin.trim()) { setError('Binary is required.'); return; }
         setLoading(true);
-        await onSubmit(agentId, isK8s ? { rule } : { command: command.trim() }, dur);
+        const payload = isK8s ? { rule } : { host_rule: hostRule };
+        await onSubmit(agentId, payload, dur);
       }
     } catch (e) { setError((e as Error).message); setLoading(false); }
   };
@@ -1491,16 +1492,10 @@ function AddApprovalModal({
           </div>
         ) : (
         <div>
-          <label className="block text-sm font-semibold text-gray-700 mb-1.5">Command</label>
-          <input
-            value={command}
-            onChange={e => setCommand(e.target.value)}
-            onKeyDown={e => e.key === 'Enter' && submit()}
-            placeholder="docker restart app"
-            className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
-          />
+          <label className="block text-sm font-semibold text-gray-700 mb-1.5">Structured rule</label>
+          <HostRuleForm value={hostRule} onChange={setHostRule} />
           <p className="text-xs text-gray-400 mt-1">
-            Prefix match - "docker restart" also permits "docker restart app".
+            {isFleetScope ? 'Applies to every fleet member. ' : ''}Structured rule (no shell) - <span className="font-mono">*</span> matches any single arg.
           </p>
         </div>
         )}

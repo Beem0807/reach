@@ -161,6 +161,26 @@ class TestAgentSync:
         assert set(body["jobs"][0]["approved_commands"]) == {"docker ps", "git status"}
         apr.list_by_agent.assert_called_once_with(AGENT_ID, status="approved")
 
+    def test_structured_job_includes_argv_and_approved_host_rules(self):
+        approved_agent = {**_AGENT_ACTIVE, "mode": "approved"}
+        approved_records = [
+            {"command": "df -h", "status": "approved"},                                   # freeform
+            {"command": "systemctl restart *", "host_rule": {"bin": "systemctl", "args": ["restart", "*"]}, "status": "approved"},
+        ]
+        structured_job = {**_JOB_PENDING, "mode": "approved", "argv": ["systemctl", "restart", "nginx"]}
+        with patch("handlers.agent_sync._verify_agent_token", return_value=approved_agent), \
+             patch("handlers.agent_sync.agents_repo"), \
+             patch("handlers.agent_sync.approvals_repo") as apr, \
+             patch("handlers.agent_sync.jobs_repo") as jr:
+            jr.get_pending_for_agent.return_value = [structured_job]
+            jr.set_running.return_value = True
+            apr.list_by_agent.return_value = approved_records
+            r = handle_agent_sync(_VALID_BODY, "tok")
+        job = json.loads(r["body"])["jobs"][0]
+        assert job["argv"] == ["systemctl", "restart", "nginx"]
+        assert job["approved_host_rules"] == [{"bin": "systemctl", "args": ["restart", "*"]}]
+        assert job["approved_commands"] == ["df -h"]     # only the freeform host approval
+
     def test_fleet_member_draws_approved_commands_from_fleet(self):
         # A fleet member inherits its fleet's approvals, not per-agent ones.
         member = {**_AGENT_ACTIVE, "mode": "approved", "fleet_id": "fleet_a"}

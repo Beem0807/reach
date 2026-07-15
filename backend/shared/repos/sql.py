@@ -77,6 +77,9 @@ class _Approval(_Base):
     # host agents, which match on the command text above. none_as_null keeps host
     # rows as SQL NULL (not JSON 'null') so the kind filter's IS NULL works.
     k8s_rule = Column(JSON(none_as_null=True))
+    # Structured rule for a host agent's structured exec ({bin, args[]} with "*"
+    # positional wildcards); None for a freeform-command host approval.
+    host_rule = Column(JSON(none_as_null=True))
     requested_by = Column(String)
     requester_name = Column(String)
     job_id = Column(String)
@@ -216,6 +219,9 @@ class _Job(_Base):
     # prior wave completes. 0 for single-wave (non-staged) fan-outs and one-off jobs.
     wave = Column(Integer, default=0)
     command = Column(Text, nullable=False)
+    # Structured exec: when set, the job runs this argv with execve (no shell); `command`
+    # holds the display form. Null = freeform shell string in `command` (legacy path).
+    argv = Column(JSON(none_as_null=True))
     # PENDING (dispatchable) | HELD (staged, not yet released) | RUNNING | SUCCEEDED |
     # FAILED | REJECTED | EXPIRED | CANCELED. Agents only ever receive PENDING.
     status = Column(String, nullable=False, default="PENDING")
@@ -224,6 +230,10 @@ class _Job(_Base):
     exit_code = Column(Integer)
     stdout = Column(Text)
     stderr = Column(Text)
+    # Output was capped (agent-side and/or on ingest) - a structured signal alongside the
+    # inline [TRUNCATED] marker, so callers (CLI/UI/MCP) can flag it without string-matching.
+    stdout_truncated = Column(Boolean, default=False)
+    stderr_truncated = Column(Boolean, default=False)
     duration_ms = Column(Integer)
     created_by = Column(String)
     created_at = Column(String, index=True)

@@ -325,12 +325,23 @@ var (
 	lastSentPermHash string
 )
 
+// HostRule is a structured host approval: a bin plus positional args where an arg may be
+// "*" (wildcard). Mirrors the server's host_rule. Arity is fixed.
+type HostRule struct {
+	Bin  string   `json:"bin"`
+	Args []string `json:"args"`
+}
+
 type Job struct {
 	JobID            string   `json:"job_id"`
 	Command          string   `json:"command"`
 	Mode             string   `json:"mode"`
 	IsWrite          bool     `json:"is_write"`
 	ApprovedCommands []string `json:"approved_commands"`
+	// Structured exec: when set, run this argv with execve (no shell). ApprovedHostRules
+	// are the {bin,args} rules matched for the approved-mode bypass.
+	Argv              []string   `json:"argv"`
+	ApprovedHostRules []HostRule `json:"approved_host_rules"`
 }
 
 type SyncResponse struct {
@@ -486,11 +497,13 @@ func deregister(cfg *Config) {
 // ---------------------------------------------------------------------------
 
 type CommandResult struct {
-	Stdout     string
-	Stderr     string
-	ExitCode   int
-	DurationMS int64
-	Blocked    bool
+	Stdout          string
+	Stderr          string
+	ExitCode        int
+	DurationMS      int64
+	Blocked         bool
+	StdoutTruncated bool
+	StderrTruncated bool
 }
 
 func commandTimeout() time.Duration {
@@ -521,7 +534,20 @@ func truncate(s string, maxBytes int) string {
 	return string(b[:maxBytes]) + "\n[TRUNCATED]"
 }
 
-// isApprovedLocally mirrors the server-side _is_approved: exact match or prefix + space boundary.
+// hasShellOperators reports whether a command contains shell control operators that can
+// chain, substitute, or redirect additional commands: pipe, ;, &, $, backtick, (), <>,
+// or a newline. Such a command must NEVER qualify for the approved-write sandbox bypass -
+// otherwise a prefix-matched approval like "docker restart nginx" would also run
+// "docker restart nginx | tee /etc/x" (or "... && rm -rf /") unsandboxed. An approved
+// command is a single command, no shell plumbing; anything with operators runs sandboxed
+// so Landlock still blocks the appended write.
+func hasShellOperators(command string) bool {
+	return strings.ContainsAny(command, "|;&$`()<>\n")
+}
+
+// isApprovedLocally mirrors the server-side _is_approved: exact match or prefix + space
+// boundary. Callers gate the sandbox bypass on !hasShellOperators so a prefix match can't
+// smuggle an appended pipe/chain past the approval.
 func isApprovedLocally(command string, approved []string) bool {
 	cmd := strings.TrimSpace(command)
 	for _, allowed := range approved {
@@ -533,13 +559,50 @@ func isApprovedLocally(command string, approved []string) bool {
 	return false
 }
 
-func runCmd(ctx context.Context, args []string) (string, string, int) {
+// cappedBuffer is an io.Writer that keeps at most `limit` bytes and records whether any
+// beyond that were dropped. It bounds agent memory even when a command produces unbounded
+// output (`yes`, `find /`, an unfiltered `journalctl`/`docker logs`): excess bytes are
+// counted-as-truncated and discarded instead of buffered. Write never errors or
+// short-writes, so the child never blocks on a full pipe - it runs to completion (or the
+// command timeout) while we retain only a bounded slice.
+type cappedBuffer struct {
+	limit     int
+	buf       bytes.Buffer
+	truncated bool
+}
+
+func (c *cappedBuffer) Write(p []byte) (int, error) {
+	if remaining := c.limit - c.buf.Len(); remaining > 0 {
+		if len(p) <= remaining {
+			c.buf.Write(p)
+		} else {
+			c.buf.Write(p[:remaining])
+			c.truncated = true
+		}
+	} else if len(p) > 0 {
+		c.truncated = true
+	}
+	return len(p), nil
+}
+
+// String returns the captured output, appending the [TRUNCATED] marker when bytes were
+// dropped (mirrors truncate() so the inline signal is identical either way).
+func (c *cappedBuffer) String() string {
+	if c.truncated {
+		return c.buf.String() + "\n[TRUNCATED]"
+	}
+	return c.buf.String()
+}
+
+func runCmd(ctx context.Context, args []string) (stdout, stderr string, exitCode int, stdoutTrunc, stderrTrunc bool) {
 	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
 	cmd.Dir = "/"
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	exitCode := 0
+	limit := maxOutputSize()
+	outBuf := &cappedBuffer{limit: limit}
+	errBuf := &cappedBuffer{limit: limit}
+	cmd.Stdout = outBuf
+	cmd.Stderr = errBuf
+	exitCode = 0
 	if err := cmd.Run(); err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			exitCode = exitErr.ExitCode()
@@ -549,7 +612,7 @@ func runCmd(ctx context.Context, args []string) (string, string, int) {
 			exitCode = 1
 		}
 	}
-	return stdout.String(), stderr.String(), exitCode
+	return outBuf.String(), errBuf.String(), exitCode, outBuf.truncated, errBuf.truncated
 }
 
 func executeCommand(command, mode string, isWrite bool, approvedCommands []string) CommandResult {
@@ -560,7 +623,10 @@ func executeCommand(command, mode string, isWrite bool, approvedCommands []strin
 	// Approved commands bypass the sandbox - writes are explicitly permitted.
 	// Everything else runs under Landlock on Linux: reads pass, unapproved writes
 	// are kernel-blocked and surface as a structured approval error.
-	approvedWrite := mode == "approved" && isApprovedLocally(command, approvedCommands)
+	// The bypass requires no shell operators: a command that pipes/chains/redirects can
+	// never ride an approval past the sandbox (see hasShellOperators). With operators it
+	// runs sandboxed, so any appended write is kernel-blocked.
+	approvedWrite := mode == "approved" && !hasShellOperators(command) && isApprovedLocally(command, approvedCommands)
 	useSandbox := (mode == "readonly" || mode == "approved") && runtime.GOOS == "linux" && !approvedWrite
 
 	// On non-Linux (macOS): no Landlock available. Block unapproved writes in
@@ -586,7 +652,7 @@ func executeCommand(command, mode string, isWrite bool, approvedCommands []strin
 		args = []string{"/bin/bash", "-lc", command}
 	}
 
-	stdout, stderr, exitCode := runCmd(ctx, args)
+	stdout, stderr, exitCode, stdoutTrunc, stderrTrunc := runCmd(ctx, args)
 
 	// If Landlock blocked the command (permission denied), the command tried to
 	// write but was not in the approved list. Return a structured error.
@@ -611,12 +677,114 @@ func executeCommand(command, mode string, isWrite bool, approvedCommands []strin
 		}
 	}
 
-	limit := maxOutputSize()
+	// runCmd already bounded stdout/stderr to maxOutputSize() and set the truncation
+	// flags, so there's no second truncate() here (that would double-cut the marker).
 	return CommandResult{
-		Stdout:     truncate(stdout, limit),
-		Stderr:     truncate(stderr, limit),
-		ExitCode:   exitCode,
+		Stdout:          stdout,
+		Stderr:          stderr,
+		ExitCode:        exitCode,
+		DurationMS:      time.Since(start).Milliseconds(),
+		StdoutTruncated: stdoutTrunc,
+		StderrTruncated: stderrTrunc,
+	}
+}
+
+// hostRuleMatches mirrors the server's host_rule_matches: bin equal, arity equal, each
+// positional arg equal or wildcarded with "*".
+func hostRuleMatches(argv []string, rule HostRule) bool {
+	if len(argv) == 0 || argv[0] != rule.Bin {
+		return false
+	}
+	callArgs := argv[1:]
+	if len(callArgs) != len(rule.Args) {
+		return false
+	}
+	for i, ra := range rule.Args {
+		if ra != "*" && ra != callArgs[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func isHostArgvApproved(argv []string, rules []HostRule) bool {
+	for _, r := range rules {
+		if hostRuleMatches(argv, r) {
+			return true
+		}
+	}
+	return false
+}
+
+func blockedResult(display string, start time.Time) CommandResult {
+	richErr := fmt.Sprintf(
+		"Blocked: approval required\n\nCommand:\n  %s\n\nContact your admin to approve this command for this agent.\n",
+		strings.TrimSpace(display),
+	)
+	return CommandResult{
+		Stdout:     "",
+		Stderr:     truncate(richErr, maxOutputSize()),
+		ExitCode:   126,
 		DurationMS: time.Since(start).Milliseconds(),
+		Blocked:    true,
+	}
+}
+
+// executeStructured runs a structured argv with execve (no shell). It mirrors
+// executeCommand's mode logic but matches approved *rules* instead of command strings:
+//   - approved write matched by a host rule -> run directly (bypass), writes permitted.
+//   - otherwise readonly/approved on Linux -> run under Landlock (reads pass, writes blocked).
+//   - approved-mode unapproved write on non-Linux (no Landlock) -> blocked up front.
+func executeStructured(argv []string, mode string, isWrite bool, rules []HostRule) CommandResult {
+	start := time.Now()
+	display := strings.Join(argv, " ")
+	if len(argv) == 0 {
+		return CommandResult{Stderr: "empty argv", ExitCode: 2, DurationMS: 0}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout())
+	defer cancel()
+
+	// Approved only by a structured host rule (JSON) - no command-string matching.
+	approvedWrite := mode == "approved" && isHostArgvApproved(argv, rules)
+	useSandbox := (mode == "readonly" || mode == "approved") && runtime.GOOS == "linux" && !approvedWrite
+
+	// No Landlock (macOS): block an unapproved write in approved mode up front.
+	if mode == "approved" && runtime.GOOS != "linux" && isWrite && !approvedWrite {
+		return blockedResult(display, start)
+	}
+
+	// Resolve the bin to an absolute path: the sandbox re-exec (syscall.Exec) needs one,
+	// and it makes the bypass explicit about which binary runs.
+	binPath := argv[0]
+	if p, err := exec.LookPath(argv[0]); err == nil {
+		binPath = p
+	}
+	resolved := append([]string{binPath}, argv[1:]...)
+
+	var args []string
+	if useSandbox {
+		args = append([]string{"/proc/self/exe", "--sandbox"}, resolved...)
+	} else {
+		args = resolved
+	}
+	stdout, stderr, exitCode, stdoutTrunc, stderrTrunc := runCmd(ctx, args)
+
+	// Landlock kernel-blocked an unapproved structured write -> structured approval error.
+	if mode == "approved" && useSandbox && isWrite && exitCode != 0 {
+		low := strings.ToLower(stderr)
+		if strings.Contains(low, "permission denied") || strings.Contains(low, "operation not permitted") {
+			return blockedResult(display, start)
+		}
+	}
+
+	// stdout/stderr are already bounded by runCmd - see executeCommand.
+	return CommandResult{
+		Stdout:          stdout,
+		Stderr:          stderr,
+		ExitCode:        exitCode,
+		DurationMS:      time.Since(start).Milliseconds(),
+		StdoutTruncated: stdoutTrunc,
+		StderrTruncated: stderrTrunc,
 	}
 }
 
@@ -633,6 +801,8 @@ type ResultRequest struct {
 	DurationMS         int64  `json:"duration_ms"`
 	Blocked            bool   `json:"blocked,omitempty"`
 	IsWrite            bool   `json:"is_write,omitempty"`
+	StdoutTruncated    bool   `json:"stdout_truncated,omitempty"`
+	StderrTruncated    bool   `json:"stderr_truncated,omitempty"`
 }
 
 func postResult(cfg *Config, jobID string, res CommandResult) error {
@@ -649,6 +819,8 @@ func postResult(cfg *Config, jobID string, res CommandResult) error {
 		DurationMS:         res.DurationMS,
 		Blocked:            res.Blocked,
 		IsWrite:            res.Blocked, // if blocked, the command was a write by definition
+		StdoutTruncated:    res.StdoutTruncated,
+		StderrTruncated:    res.StderrTruncated,
 	}
 	var result map[string]any
 	statusCode, err := apiPost(cfg.APIURL, "/agent/jobs/"+jobID+"/result", cfg.AgentToken, payload, &result)
@@ -911,6 +1083,10 @@ func run(ctx context.Context) error {
 				// Kubernetes: shell-free execution (kubectl + allow-listed filters).
 				// Policy mode is enforced by the backend at submission, not here.
 				res = executeK8sCommand(job.Command, k8sAllowedBinaries)
+			} else if len(job.Argv) > 0 {
+				// Structured exec: run the argv with execve (no shell); approved-mode
+				// writes are gated by host-rule match, not command-string prefix.
+				res = executeStructured(job.Argv, job.Mode, job.IsWrite, job.ApprovedHostRules)
 			} else {
 				res = executeCommand(job.Command, job.Mode, job.IsWrite, job.ApprovedCommands)
 			}

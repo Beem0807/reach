@@ -440,7 +440,7 @@ class TestExec:
         # dry_run pre-check reports a write; the real dispatch returns a job.
         mc = MagicMock()
 
-        def _create(agent_id, command, dry_run=False):
+        def _create(agent_id, command="", dry_run=False, argv=None):
             if dry_run:
                 return {"dry_run": True, "is_write": True, "hostname": "web-01",
                         "mode": "wild", "agent_id": agent_id, "command": command}
@@ -479,7 +479,7 @@ class TestExec:
 
     def test_read_command_does_not_prompt(self):
         mc = self._write_client()
-        mc.create_job.side_effect = lambda agent_id, command, dry_run=False: (
+        mc.create_job.side_effect = lambda agent_id, command="", dry_run=False, argv=None: (
             {"dry_run": True, "is_write": False} if dry_run else {"job_id": "job_1"})
         with _mock_cfg(), patch("reach.main.ReachClient", return_value=mc):
             result = runner.invoke(app, ["exec", "--agent", "agent_a", "--", "uptime"])

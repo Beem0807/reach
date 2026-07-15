@@ -1,4 +1,4 @@
-import type { Agent, AgentHistory, ApiToken, Approval, AuditLog, FanoutPreview, FanoutResult, Fleet, FleetRun, FleetToken, FleetWavePolicy, Job, JobPreview, K8sRule, RunStatus, Tenant, TenantSettings, TenantWavePolicy, TenantUser, UserAccessScope } from './types';
+import type { Agent, AgentHistory, ApiToken, Approval, AuditLog, FanoutPreview, FanoutResult, Fleet, FleetRun, FleetToken, FleetWavePolicy, HostRule, Job, JobPreview, K8sRule, RunStatus, Tenant, TenantSettings, TenantWavePolicy, TenantUser, UserAccessScope } from './types';
 
 export async function adminLogin(apiUrl: string, password: string): Promise<string> {
   const url = apiUrl.replace(/\/$/, '');
@@ -431,6 +431,22 @@ export const tenantPreApproveRule = (u: string, t: string, agentId: string, rule
   req<Approval>(u, t, 'POST', '/tenant/approvals', {
     agent_id: agentId,
     k8s_rule: rule,
+    ...(duration ? { duration } : {}),
+  });
+
+// host agents: create/pre-approve a structured exec rule {bin, args[]} instead of a string.
+export const tenantPreApproveHostRule = (u: string, t: string, agentId: string, rule: HostRule, duration?: string) =>
+  req<Approval>(u, t, 'POST', '/tenant/approvals', {
+    agent_id: agentId,
+    host_rule: rule,
+    ...(duration ? { duration } : {}),
+  });
+
+// Fleet-scoped structured rule: applies to every member of the fleet (fleets are host-only).
+export const tenantPreApproveFleetHostRule = (u: string, t: string, fleetId: string, rule: HostRule, duration?: string) =>
+  req<Approval>(u, t, 'POST', '/tenant/approvals', {
+    fleet_id: fleetId,
+    host_rule: rule,
     ...(duration ? { duration } : {}),
   });
 

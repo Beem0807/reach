@@ -17,7 +17,7 @@ import shared.audit as audit
 from shared.access import can_access_fleet, can_write_fleet
 from shared.auth import _bearer, _verify_tenant_token
 from shared.fanout import deterministic_run_id, new_run_row, order_and_limit, parse_max_targets, run_summary_view
-from shared.policy import _is_blocked, _is_readonly_blocked
+from shared.policy import _is_blocked, _is_readonly_blocked, needs_shell, to_argv
 from shared.response import _err, _iso, _now, _ok
 from shared.settings import effective_settings
 from shared.store import agents_repo, approvals_repo, fleets_repo, jobs_repo, runs_repo, tenants_repo
@@ -221,6 +221,20 @@ def handle_cli_fleet_fanout(fleet_id: str, body: dict, raw_token: str, ip: str =
     if is_write and fleet.get("mode") == "readonly":
         return _err("this fleet is read-only; write commands are rejected", 409)
 
+    # Fleets are host-only. A WRITE is structured into an argv (execve, no shell) so approval
+    # is by JSON host rule; a shell/pipe write can't be a rule, so it's rejected in an
+    # approved-mode fleet (unapprovable) and runs freeform in a wild fleet. READS run as-is.
+    argv = None
+    if is_write:
+        if needs_shell(command):
+            if fleet.get("mode") == "approved":
+                return _err("write commands can't use shell operators (| ; && $() ` > < * ?) "
+                            "in an approved-mode fleet - it can't be approved as a structured "
+                            "rule; run a single command per job", 400)
+            # wild fleet -> freeform (argv stays None)
+        else:
+            argv = to_argv(command)
+
     # Eligible members (active). Inactive ones are recorded as skipped so it's clear why
     # they didn't run. Every eligible member runs - in waves of the fan-out cap.
     eligible: list = []
@@ -288,6 +302,7 @@ def handle_cli_fleet_fanout(fleet_id: str, body: dict, raw_token: str, ip: str =
             "wave": wave,
             "created_by": user["user_id"],
             "command": command,
+            "argv": argv,
             "status": status,
             "stdout": None,
             "stderr": None,

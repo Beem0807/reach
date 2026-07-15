@@ -110,6 +110,8 @@ def handle_list_jobs(raw_token: str, agent_id: Optional[str], limit: int, cursor
             "exit_code": j.get("exit_code"),
             "stdout": j.get("stdout"),
             "stderr": j.get("stderr"),
+            "stdout_truncated": bool(j.get("stdout_truncated")),
+            "stderr_truncated": bool(j.get("stderr_truncated")),
             "duration_ms": j.get("duration_ms"),
             "created_at": j.get("created_at"),
             "completed_at": j.get("completed_at"),

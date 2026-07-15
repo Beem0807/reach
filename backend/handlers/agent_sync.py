@@ -133,24 +133,35 @@ def handle_agent_sync(body: dict, raw_token: str) -> dict:
 
     pending_jobs = jobs_repo.get_pending_for_agent(agent_id)
     approved_commands: list = []
+    approved_host_rules: list = []
     if any(j.get("mode") == "approved" for j in pending_jobs):
         # Fleet members inherit their fleet's approvals; standalone agents use their own.
         fleet_id = agent.get("fleet_id")
         approved = (approvals_repo.list_by_fleet(fleet_id, status="approved") if fleet_id
                     else approvals_repo.list_by_agent(agent_id, status="approved"))
-        approved_commands = [a["command"] for a in approved]
+        # Freeform host approvals are command strings; structured host approvals are rules
+        # {bin, args[]} the agent matches against a job's argv. (k8s approvals are enforced
+        # by the agent's own kubectl allowlist, not fed here.)
+        approved_commands = [a["command"] for a in approved if not a.get("host_rule") and not a.get("k8s_rule")]
+        approved_host_rules = [a["host_rule"] for a in approved if a.get("host_rule")]
 
     jobs_payload = []
     for job in pending_jobs:
         if jobs_repo.set_running(job["job_id"], _iso()):
             mode = job.get("mode", "wild")
-            jobs_payload.append({
+            payload = {
                 "job_id": job["job_id"],
                 "command": job["command"],
                 "mode": mode,
                 "is_write": job.get("is_write", False),
                 "approved_commands": approved_commands if mode == "approved" else [],
-            })
+            }
+            # Structured exec: hand the agent the argv (execve, no shell) + the approved
+            # host rules it matches against.
+            if job.get("argv"):
+                payload["argv"] = job["argv"]
+                payload["approved_host_rules"] = approved_host_rules if mode == "approved" else []
+            jobs_payload.append(payload)
 
     if jobs_payload:
         next_poll = 2

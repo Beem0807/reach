@@ -15,8 +15,14 @@ class ReachClient:
     def _url(self, path: str) -> str:
         return self.api_url + path
 
-    def create_job(self, agent_id: str, command: str, dry_run: bool = False) -> dict:
-        body = {"agent_id": agent_id, "command": command}
+    def create_job(self, agent_id: str, command: str = "", dry_run: bool = False,
+                   argv: list = None) -> dict:
+        # Structured exec: pass argv (bin + args) for a no-shell run; else a command string.
+        body = {"agent_id": agent_id}
+        if argv is not None:
+            body["argv"] = argv
+        else:
+            body["command"] = command
         if dry_run:
             body["dry_run"] = True
         resp = self.session.post(

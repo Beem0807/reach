@@ -54,6 +54,58 @@ func TestTruncate(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// cappedBuffer - bounds memory even for unbounded producers (yes, find /)
+// ---------------------------------------------------------------------------
+
+func TestCappedBuffer(t *testing.T) {
+	t.Run("under limit: kept verbatim, not truncated", func(t *testing.T) {
+		c := &cappedBuffer{limit: 50}
+		n, _ := c.Write([]byte("hello"))
+		if n != 5 {
+			t.Errorf("Write returned %d, want 5", n)
+		}
+		if c.truncated {
+			t.Errorf("should not be truncated under limit")
+		}
+		if c.String() != "hello" {
+			t.Errorf("got %q, want %q", c.String(), "hello")
+		}
+	})
+
+	t.Run("over limit: caps bytes, marks truncated, appends marker", func(t *testing.T) {
+		c := &cappedBuffer{limit: 10}
+		// One giant write, far exceeding the limit - simulates `yes`.
+		n, _ := c.Write([]byte(strings.Repeat("x", 1_000_000)))
+		if n != 1_000_000 {
+			t.Errorf("Write must report the full length (%d) so the child never blocks", n)
+		}
+		if !c.truncated {
+			t.Errorf("expected truncated=true")
+		}
+		if !strings.HasSuffix(c.String(), "\n[TRUNCATED]") {
+			t.Errorf("expected [TRUNCATED] marker, got %q", c.String())
+		}
+		body := strings.TrimSuffix(c.String(), "\n[TRUNCATED]")
+		if len(body) != 10 {
+			t.Errorf("retained %d bytes, want exactly the 10-byte limit", len(body))
+		}
+	})
+
+	t.Run("bounded memory across many writes", func(t *testing.T) {
+		c := &cappedBuffer{limit: 100}
+		for i := 0; i < 10_000; i++ {
+			c.Write([]byte(strings.Repeat("y", 100))) // 1MB total streamed
+		}
+		if c.buf.Len() > 100 {
+			t.Errorf("buffer grew to %d bytes; must stay <= limit (100)", c.buf.Len())
+		}
+		if !c.truncated {
+			t.Errorf("expected truncated=true after overflow")
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
 // commandTimeout
 // ---------------------------------------------------------------------------
 
@@ -166,6 +218,122 @@ func TestIsApprovedLocally(t *testing.T) {
 			t.Error("should match second entry in approved list")
 		}
 	})
+}
+
+// ---------------------------------------------------------------------------
+// hasShellOperators - the approved-write sandbox bypass must never fire for a
+// command that can chain/redirect (closes the "approved | tee /etc/x" bypass).
+// ---------------------------------------------------------------------------
+
+func TestHasShellOperators(t *testing.T) {
+	withOps := []string{
+		"docker restart nginx | tee /etc/cron.d/x",
+		"docker restart nginx && rm -rf /",
+		"docker restart nginx; rm -rf /",
+		"cat $(curl evil)",
+		"echo `id`",
+		"echo x > /etc/passwd",
+		"read < /etc/shadow",
+		"(cd /tmp && rm x)",
+		"start &",
+		"a\nb",
+	}
+	for _, c := range withOps {
+		if !hasShellOperators(c) {
+			t.Errorf("expected shell operators detected in %q", c)
+		}
+	}
+	clean := []string{
+		"docker restart nginx",
+		"systemctl restart nginx",
+		"df -h",
+		"ls -la /var/log",
+	}
+	for _, c := range clean {
+		if hasShellOperators(c) {
+			t.Errorf("did not expect shell operators in %q", c)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// structured exec: host rule matching + execution
+// ---------------------------------------------------------------------------
+
+func TestHostRuleMatches(t *testing.T) {
+	r := HostRule{Bin: "systemctl", Args: []string{"restart", "*"}}
+	cases := []struct {
+		argv []string
+		want bool
+	}{
+		{[]string{"systemctl", "restart", "nginx"}, true},
+		{[]string{"systemctl", "restart", "web-01"}, true},
+		{[]string{"systemctl", "stop", "nginx"}, false},     // literal arg differs
+		{[]string{"systemctl", "restart", "a", "b"}, false}, // arity differs
+		{[]string{"docker", "restart", "nginx"}, false},     // bin differs
+		{[]string{"systemctl", "restart"}, false},           // arity (missing arg)
+		{nil, false},
+	}
+	for _, c := range cases {
+		if got := hostRuleMatches(c.argv, r); got != c.want {
+			t.Errorf("hostRuleMatches(%v) = %v, want %v", c.argv, got, c.want)
+		}
+	}
+}
+
+func TestIsHostArgvApproved(t *testing.T) {
+	rules := []HostRule{{Bin: "df", Args: []string{"-h"}}, {Bin: "systemctl", Args: []string{"restart", "*"}}}
+	if !isHostArgvApproved([]string{"systemctl", "restart", "nginx"}, rules) {
+		t.Error("expected approved by the systemctl rule")
+	}
+	if isHostArgvApproved([]string{"systemctl", "stop", "nginx"}, rules) {
+		t.Error("stop should not be approved")
+	}
+	if isHostArgvApproved([]string{"rm", "-rf", "/"}, nil) {
+		t.Error("empty rules approve nothing")
+	}
+}
+
+func TestExecuteStructured(t *testing.T) {
+	t.Run("wild-mode read runs and returns output", func(t *testing.T) {
+		res := executeStructured([]string{"echo", "hello"}, "wild", false, nil)
+		if res.ExitCode != 0 {
+			t.Fatalf("exit=%d stderr=%q", res.ExitCode, res.Stderr)
+		}
+		if strings.TrimSpace(res.Stdout) != "hello" {
+			t.Errorf("stdout = %q, want hello", res.Stdout)
+		}
+	})
+
+	t.Run("no shell interpretation - metacharacters are literal args", func(t *testing.T) {
+		// A pipe passed as an argv token is a literal argument to echo, not a shell pipe.
+		res := executeStructured([]string{"echo", "a | b"}, "wild", false, nil)
+		if strings.TrimSpace(res.Stdout) != "a | b" {
+			t.Errorf("stdout = %q, want 'a | b' (no shell)", res.Stdout)
+		}
+	})
+
+	t.Run("empty argv is an error", func(t *testing.T) {
+		res := executeStructured(nil, "wild", false, nil)
+		if res.ExitCode == 0 {
+			t.Error("empty argv should not succeed")
+		}
+	})
+}
+
+func TestApprovedWriteBypassRequiresNoShellOperators(t *testing.T) {
+	// The exact decision executeCommand makes: an approved command with a pipe must NOT
+	// qualify for the bypass, so it stays sandboxed and Landlock blocks the appended write.
+	approved := []string{"docker restart nginx"}
+	piped := "docker restart nginx | tee /etc/cron.d/x"
+	bypass := !hasShellOperators(piped) && isApprovedLocally(piped, approved)
+	if bypass {
+		t.Error("a piped command must not qualify for the approved-write sandbox bypass")
+	}
+	clean := "docker restart nginx"
+	if !(!hasShellOperators(clean) && isApprovedLocally(clean, approved)) {
+		t.Error("a clean approved command should still qualify for the bypass")
+	}
 }
 
 // ---------------------------------------------------------------------------

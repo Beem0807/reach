@@ -1,6 +1,7 @@
 import json
 import logging
 import secrets
+import shlex
 
 from shared.access import can_access_agent, can_write_agent
 from shared.auth import _bearer, _verify_tenant_token
@@ -8,8 +9,12 @@ from shared.policy import (
     _is_blocked,
     _is_readonly_blocked,
     derive_k8s_rule,
+    is_host_argv_approved,
     is_k8s_command_approved,
     is_k8s_write,
+    needs_shell,
+    normalize_argv,
+    to_argv,
 )
 import shared.audit as audit
 from shared.response import _err, _iso, _now, _ok
@@ -21,7 +26,16 @@ logger.setLevel(logging.INFO)
 
 def handle_create_job(body: dict, raw_token: str, ip: str = "") -> dict:
     agent_id = body.get("agent_id", "").strip()
-    command = body.get("command", "").strip()
+    # Structured exec: `argv` is a bin+args list the agent runs with execve (no shell).
+    # `command` is derived for display/classification. Freeform string path is unchanged.
+    argv = body.get("argv")
+    if argv is not None:
+        argv = normalize_argv(argv)
+        if argv is None:
+            return _err("argv must be a non-empty list of strings", 400)
+        command = shlex.join(argv)
+    else:
+        command = body.get("command", "").strip()
 
     if not agent_id or not command:
         return _err("agent_id and command required")
@@ -48,7 +62,24 @@ def handle_create_job(body: dict, raw_token: str, ip: str = "") -> dict:
     # write-ness is authoritative. Host agents keep the regex heuristic and are
     # gated by the agent (Landlock + approvals).
     is_k8s = (agent.get("type") or "host") == "k8s"
+    if argv is not None and is_k8s:
+        return _err("structured exec (argv) is for host agents; k8s uses kubectl commands", 400)
     is_write = is_k8s_write(command) if is_k8s else _is_readonly_blocked(command)
+    # Host WRITES are structured (argv, no shell) so approval is JSON-rule-based - no
+    # command strings. A write that needs the shell (pipe/redirect/glob/expansion) can't be
+    # a structured rule: in **approved** mode it's unapprovable, so it's rejected; in **wild**
+    # mode there's no approval and no sandbox, so it runs freeform (blocking it there is pure
+    # friction - backups, config writes). readonly writes are refused below regardless.
+    # READS always run as-is (freeform, Landlock-gated) and never need approval.
+    if not is_k8s and is_write and argv is None:
+        if needs_shell(command):
+            if mode == "approved":
+                return _err("write commands can't use shell operators (| ; && $() ` > < * ?) "
+                            "in approved mode - it can't be approved as a structured rule; "
+                            "run a single command per job", 400)
+            # wild -> freeform (argv stays None); readonly -> refused by the readonly check below
+        else:
+            argv = to_argv(command)
 
     # Per-user read-only scope: a user granted read-only access to this agent may
     # never write, in any mode. This only narrows - it never bypasses the mode
@@ -66,14 +97,21 @@ def handle_create_job(body: dict, raw_token: str, ip: str = "") -> dict:
     # fan-out dry_run preview.
     if body.get("dry_run"):
         approval_required = False
-        if is_k8s and mode == "approved" and is_write:
-            rules = [a["k8s_rule"] for a in approvals_repo.list_by_agent(agent_id, status="approved") if a.get("k8s_rule")]
-            approval_required = not is_k8s_command_approved(command, rules)
+        if mode == "approved" and is_write:
+            if is_k8s:
+                rules = [a["k8s_rule"] for a in approvals_repo.list_by_agent(agent_id, status="approved") if a.get("k8s_rule")]
+                approval_required = not is_k8s_command_approved(command, rules)
+            elif argv is not None:
+                # Structured host write: approved only by a JSON host rule (no strings).
+                host_rules = [a["host_rule"] for a in approvals_repo.list_by_agent(agent_id, status="approved") if a.get("host_rule")]
+                approval_required = not is_host_argv_approved(argv, host_rules)
         # `type` lets a client convey how authoritative is_write is: for k8s it's an
         # exact verb parse; for a host it's a best-effort regex and the agent's Landlock
         # sandbox (readonly/approved) is the real gate - and wild mode is unsandboxed.
+        # For structured host exec, is_write is still the heuristic but there is no shell.
         return _ok({"dry_run": True, "agent_id": agent_id, "hostname": agent.get("hostname"),
                     "command": command, "mode": mode, "type": ("k8s" if is_k8s else "host"),
+                    "structured": argv is not None, "argv": argv,
                     "is_write": is_write, "approval_required": approval_required})
 
     # k8s + approved: a write that is not permitted by an approved rule is blocked
@@ -98,6 +136,7 @@ def handle_create_job(body: dict, raw_token: str, ip: str = "") -> dict:
         "agent_id": agent_id,
         "created_by": tenant["user_id"],
         "command": command,
+        "argv": argv,
         "status": "PENDING",
         "stdout": None,
         "stderr": None,
@@ -118,7 +157,8 @@ def handle_create_job(body: dict, raw_token: str, ip: str = "") -> dict:
                 actor_id=tenant["user_id"], actor_name=tenant.get("username"),
                 actor_role=tenant.get("role"), resource_type="job", resource_id=job_id,
                 metadata={"agent_id": agent_id, "hostname": agent.get("hostname"),
-                          "command": command[:200], "is_write": is_write, "mode": mode},
+                          "command": command[:200], "is_write": is_write, "mode": mode,
+                          "structured": argv is not None},
                 ip_address=ip)
 
     return _ok({"job_id": job_id, "status": "PENDING"}, 201)

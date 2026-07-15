@@ -697,13 +697,23 @@ function JobDetailModal({ job, fleetName, onClose, onBack }: {
 
         {job.stdout && (
           <div>
-            <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-1.5">stdout</p>
+            <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-1.5">
+              stdout
+              {job.stdout_truncated && (
+                <span className="ml-2 text-amber-600 normal-case tracking-normal font-semibold">⚠ truncated</span>
+              )}
+            </p>
             <pre className="text-xs bg-gray-950 text-emerald-400 rounded-xl px-4 py-3 overflow-auto whitespace-pre-wrap max-h-56">{job.stdout}</pre>
           </div>
         )}
         {job.stderr && (
           <div>
-            <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-1.5">stderr</p>
+            <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-1.5">
+              stderr
+              {job.stderr_truncated && (
+                <span className="ml-2 text-amber-600 normal-case tracking-normal font-semibold">⚠ truncated</span>
+              )}
+            </p>
             <pre className="text-xs bg-gray-950 text-red-400 rounded-xl px-4 py-3 overflow-auto whitespace-pre-wrap max-h-56">{job.stderr}</pre>
           </div>
         )}

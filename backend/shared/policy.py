@@ -20,6 +20,7 @@ the agent is permitted to perform.
 """
 import re
 import shlex
+from typing import Optional
 
 # Splits on shell operators: ; && || and single pipe |
 # Each segment is checked independently so chained writes are caught.
@@ -444,8 +445,119 @@ def compute_access_level(
     return "managed" if running_as_root else "restricted"
 
 
+# Shell control operators that let a command chain, substitute, or redirect additional
+# commands. A host approval is a single command with no shell plumbing - the agent gates
+# its sandbox bypass on the same check (hasShellOperators in agent/main.go), so an approval
+# whose command contains any of these can never smuggle an appended pipe/chain past the gate.
+_SHELL_OPERATOR_CHARS = "|;&$`()<>\n"
+
+
+def has_shell_operators(command: str) -> bool:
+    return any(c in command for c in _SHELL_OPERATOR_CHARS)
+
+
+# Characters that mean a command relies on the shell (operators above + globbing,
+# brace/tilde expansion, quoting, escaping). A command with NONE of these is a plain
+# "bin arg arg" that can be structured into an argv and run with execve (no shell); a
+# command with any of them keeps the freeform shell path (Landlock-gated).
+_SHELL_SPECIAL_CHARS = _SHELL_OPERATOR_CHARS + "*?[]{}~'\"\\"
+
+
+def needs_shell(command: str) -> bool:
+    return any(c in command for c in _SHELL_SPECIAL_CHARS)
+
+
+def to_argv(command: str) -> Optional[list]:
+    """Convert a plain command string to an argv (whitespace split) when it uses no shell
+    features; None if it needs the shell (so the caller keeps the freeform path)."""
+    cmd = command.strip()
+    if not cmd or needs_shell(cmd):
+        return None
+    return cmd.split()
+
+
+# --- Structured host exec: {bin, args[]} + positional-wildcard rule matching ----
+# A structured exec runs a single binary with an explicit argv and NO shell (the agent
+# execve's it), so there is nothing to pipe/chain/substitute. A host approval rule is
+# {bin, args} where bin is a literal and each arg is a literal or the "*" wildcard - the
+# positional analog of the k8s {verb, resource, namespace, name} rule (reuses
+# _rule_field_matches). Arity is fixed: a rule for 2 args does not permit 3.
+
+def normalize_argv(raw) -> Optional[list]:
+    """Validate a structured argv: a non-empty list of strings (bin + args), first
+    non-empty. Returns the list, or None if invalid."""
+    if not isinstance(raw, list) or not raw:
+        return None
+    out = []
+    for tok in raw:
+        if not isinstance(tok, str):
+            return None
+        out.append(tok)
+    if not out[0].strip():
+        return None
+    return out
+
+
+def normalize_host_rule(raw: dict) -> Optional[dict]:
+    """Validate/normalize a host approval rule {bin, args}. bin is mandatory; args
+    defaults to [] and each element is a literal or "*". Returns None if invalid."""
+    if not isinstance(raw, dict):
+        return None
+    binary = str(raw.get("bin") or "").strip()
+    if not binary:
+        return None
+    raw_args = raw.get("args")
+    if raw_args is None:
+        raw_args = []
+    if not isinstance(raw_args, list):
+        return None
+    # A structured argv token never contains shell metacharacters (a command only becomes
+    # an argv when it has none), so a rule with them can never match - reject it as invalid.
+    # "*" is the one allowed metacharacter: a whole-arg wildcard.
+    if needs_shell(binary):
+        return None
+    args = []
+    for a in raw_args:
+        if not isinstance(a, (str, int, float)):
+            return None
+        a = str(a)
+        if a != "*" and needs_shell(a):
+            return None
+        args.append(a)
+    return {"bin": binary, "args": args}
+
+
+def host_rule_matches(argv: list, rule: dict) -> bool:
+    """A structured argv [bin, *args] is permitted by a rule when the bin matches and
+    every positional arg equals the rule's arg or the rule wildcards it with "*"."""
+    if not argv or not rule:
+        return False
+    if argv[0] != rule.get("bin", ""):
+        return False
+    call_args, rule_args = argv[1:], rule.get("args", [])
+    if len(call_args) != len(rule_args):
+        return False
+    return all(_rule_field_matches(str(r), c) for r, c in zip(rule_args, call_args))
+
+
+def is_host_argv_approved(argv: list, rules: list) -> bool:
+    """Whether a structured argv is permitted by some approved host rule."""
+    return any(host_rule_matches(argv, r) for r in rules if isinstance(r, dict))
+
+
+def host_rule_to_command(rule: dict) -> str:
+    """Display form: {bin: systemctl, args: [restart, "*"]} -> 'systemctl restart *'."""
+    if not rule:
+        return ""
+    return " ".join([rule.get("bin", "")] + [str(a) for a in rule.get("args", [])]).strip()
+
+
 def _is_approved(command: str, approved_commands: list) -> bool:
     cmd = command.strip()
+    # A command with shell operators is never "approved" - it must run sandboxed so Landlock
+    # blocks any appended write (mirrors the agent's bypass gate).
+    if has_shell_operators(cmd):
+        return False
     for allowed in approved_commands:
         allowed = allowed.strip()
         if cmd == allowed or cmd.startswith(allowed + " "):

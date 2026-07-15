@@ -115,13 +115,17 @@ This is where host and Kubernetes differ the most.
 
 ### Host - shell + Landlock
 
-Jobs run via `/bin/bash -lc <command>`. Policy mode is enforced with the kernel:
+**Reads** run via `/bin/bash -lc <command>` (freeform shell). A **write** is parsed
+into an `argv` and run with `execve` (**no shell**), so it can be matched against
+structured rules. Policy mode is enforced with the kernel:
 
-- **wild** - runs anything.
+- **wild** - runs anything (a shell-operator write runs freeform).
 - **readonly** - the command runs inside a **Landlock** sandbox (Linux) that
   blocks filesystem writes; write attempts fail at the kernel.
-- **approved** - same sandbox, plus a per-agent allowlist of write commands;
-  an unapproved write is blocked and raised for admin approval.
+- **approved** - same sandbox, plus a per-agent allowlist of write **rules**
+  `{bin, args[]}` (each arg a literal or `*`) matched against the write's argv;
+  an unapproved write is blocked and raised for admin approval. A write with shell
+  operators can't be structured and is rejected in approved mode.
 
 (macOS has no Landlock, so readonly/approved fall back to the server's write
 classification - weaker than the Linux kernel guarantee.)

@@ -1,4 +1,4 @@
-import type { Approval, K8sRule } from '../types';
+import type { Approval, K8sRule, HostRule } from '../types';
 
 // A wildcard field is shown muted ("any") since it matches everything.
 function RuleField({ label, value }: { label: string; value: string }) {
@@ -24,11 +24,27 @@ export function K8sRuleChips({ rule }: { rule: K8sRule }) {
   );
 }
 
-// Renders an approval's target appropriately: a structured rule for k8s agents,
-// or the raw command string for host agents.
+// A host approval rule {bin, args[]}: the binary plus positional args, each a literal
+// or "*" (shown muted as "any"). Mirrors K8sRuleChips.
+export function HostRuleChips({ rule }: { rule: HostRule }) {
+  return (
+    <span className="inline-flex flex-wrap items-center gap-x-3 gap-y-1 text-sm">
+      <RuleField label="bin" value={rule.bin} />
+      {rule.args.length === 0
+        ? <span className="text-[10px] uppercase tracking-wider text-gray-400 italic">no args</span>
+        : rule.args.map((a, i) => <RuleField key={i} label={`arg ${i + 1}`} value={a} />)}
+    </span>
+  );
+}
+
+// Renders an approval's target appropriately: a structured rule for k8s agents, a
+// structured host rule for host agents, or the raw command string (legacy host approval).
 export function ApprovalTarget({ approval }: { approval: Approval }) {
   if (approval.k8s_rule) {
     return <K8sRuleChips rule={approval.k8s_rule} />;
+  }
+  if (approval.host_rule) {
+    return <HostRuleChips rule={approval.host_rule} />;
   }
   return (
     <span className="font-mono text-sm text-gray-800 bg-gray-100 px-2 py-0.5 rounded block truncate">
@@ -84,6 +100,9 @@ export function approvalMatchesQuery(a: Approval, query: string): boolean {
   if (a.k8s_rule) {
     const r = a.k8s_rule;
     parts.push(r.verb, r.resource, r.namespace, r.name);
+  }
+  if (a.host_rule) {
+    parts.push(a.host_rule.bin, ...a.host_rule.args);
   }
   return parts.some(p => p.toLowerCase().includes(q));
 }

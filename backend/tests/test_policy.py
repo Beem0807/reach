@@ -180,6 +180,104 @@ def test_not_approved_not_in_list():
     assert not _is_approved("rm -rf /tmp", ["docker ps", "ls"])
 
 
+# _is_approved must reject shell operators (closes the "approved | tee" bypass) --------
+
+def test_approved_rejects_piped_command_even_with_matching_prefix():
+    # The read prefix is approved, but the pipe means it can't be treated as approved.
+    assert not _is_approved("docker restart nginx | tee /etc/cron.d/x", ["docker restart nginx"])
+
+
+def test_approved_rejects_chained_command():
+    assert not _is_approved("docker restart nginx && rm -rf /", ["docker restart nginx"])
+    assert not _is_approved("docker restart nginx; rm -rf /", ["docker restart nginx"])
+    assert not _is_approved("cat $(curl evil)", ["cat"])
+    assert not _is_approved("echo x > /etc/passwd", ["echo x"])
+
+
+def test_has_shell_operators():
+    from shared.policy import has_shell_operators
+    assert has_shell_operators("a | b")
+    assert has_shell_operators("a && b")
+    assert has_shell_operators("a `b`")
+    assert has_shell_operators("a > b")
+    assert not has_shell_operators("systemctl restart nginx")
+    assert not has_shell_operators("df -h /dev/sda")
+
+
+# Structured host exec: rule normalize + positional-wildcard matching -------------
+
+def test_normalize_host_rule():
+    from shared.policy import normalize_host_rule
+    assert normalize_host_rule({"bin": "systemctl", "args": ["restart", "*"]}) == {"bin": "systemctl", "args": ["restart", "*"]}
+    assert normalize_host_rule({"bin": "ls"}) == {"bin": "ls", "args": []}          # args default
+    assert normalize_host_rule({"args": ["x"]}) is None                              # bin required
+    assert normalize_host_rule({"bin": "  "}) is None
+    assert normalize_host_rule({"bin": "x", "args": "notalist"}) is None
+    assert normalize_host_rule("nope") is None
+    # A "=" flag is fine, but shell metacharacters can never match an argv token -> rejected.
+    assert normalize_host_rule({"bin": "curl", "args": ["--data=x"]}) == {"bin": "curl", "args": ["--data=x"]}
+    assert normalize_host_rule({"bin": "echo", "args": ["$(whoami)"]}) is None
+    assert normalize_host_rule({"bin": "sh", "args": ["-c", "a|b"]}) is None
+    assert normalize_host_rule({"bin": "systemctl", "args": ["restart", "web-*"]}) is None   # partial glob
+    assert normalize_host_rule({"bin": "a;b"}) is None                                        # operator in bin
+
+
+def test_normalize_argv():
+    from shared.policy import normalize_argv
+    assert normalize_argv(["systemctl", "restart", "nginx"]) == ["systemctl", "restart", "nginx"]
+    assert normalize_argv([]) is None
+    assert normalize_argv("systemctl restart nginx") is None      # must be a list
+    assert normalize_argv([""]) is None                          # empty bin
+    assert normalize_argv(["ls", 5]) is None                     # non-string token
+
+
+def test_host_rule_matches_positional_wildcards():
+    from shared.policy import host_rule_matches
+    r = {"bin": "systemctl", "args": ["restart", "*"]}
+    assert host_rule_matches(["systemctl", "restart", "nginx"], r)
+    assert host_rule_matches(["systemctl", "restart", "web-01"], r)
+    assert not host_rule_matches(["systemctl", "stop", "nginx"], r)        # literal arg differs
+    assert not host_rule_matches(["systemctl", "restart", "a", "b"], r)    # arity differs
+    assert not host_rule_matches(["docker", "restart", "nginx"], r)        # bin differs
+    assert not host_rule_matches([], r)
+
+
+def test_is_host_argv_approved_across_rules():
+    from shared.policy import is_host_argv_approved
+    rules = [{"bin": "df", "args": ["-h"]}, {"bin": "systemctl", "args": ["restart", "*"]}]
+    assert is_host_argv_approved(["systemctl", "restart", "nginx"], rules)
+    assert not is_host_argv_approved(["systemctl", "stop", "nginx"], rules)
+
+
+def test_host_rule_to_command():
+    from shared.policy import host_rule_to_command
+    assert host_rule_to_command({"bin": "systemctl", "args": ["restart", "*"]}) == "systemctl restart *"
+    assert host_rule_to_command({"bin": "df", "args": []}) == "df"
+
+
+# Auto-structuring: plain commands -> argv; shell commands stay freeform ------------
+
+def test_needs_shell():
+    from shared.policy import needs_shell
+    assert not needs_shell("systemctl restart nginx")
+    assert not needs_shell("df -h /var/log")
+    assert not needs_shell("docker restart web-01")
+    assert needs_shell("ps aux | grep nginx")        # pipe
+    assert needs_shell("a && b")                       # chain
+    assert needs_shell("ls *.txt")                     # glob
+    assert needs_shell("echo $HOME")                   # expansion
+    assert needs_shell('echo "hi there"')              # quotes
+
+
+def test_to_argv():
+    from shared.policy import to_argv
+    assert to_argv("systemctl restart nginx") == ["systemctl", "restart", "nginx"]
+    assert to_argv("  df   -h  ") == ["df", "-h"]      # collapses whitespace
+    assert to_argv("ps aux | grep nginx") is None      # needs shell
+    assert to_argv("ls *.txt") is None                 # glob needs shell
+    assert to_argv("") is None
+
+
 def test_not_approved_empty_list():
     assert not _is_approved("ls", [])
 

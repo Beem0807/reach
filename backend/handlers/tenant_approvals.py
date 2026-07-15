@@ -8,7 +8,13 @@ import shared.audit as audit
 from shared.access import (accessible_agent_ids, can_access_agent, can_access_fleet,
                            can_write_agent, can_write_fleet, is_agent_restricted)
 from shared.auth import _bearer, _verify_tenant_token
-from shared.policy import normalize_k8s_rule, rule_to_command
+from shared.policy import (
+    has_shell_operators,
+    host_rule_to_command,
+    normalize_host_rule,
+    normalize_k8s_rule,
+    rule_to_command,
+)
 from shared.response import _err, _iso, _ok
 from shared.store import agents_repo, approvals_repo, fleets_repo
 
@@ -287,8 +293,9 @@ def handle_tenant_create_approval(body: dict, raw_token: str) -> dict:
         return _err("agent_id or fleet_id is required", 400)
 
     if fleet_id:
-        # Fleet approval: applies to every current and future member. Fleets are
-        # host-only, so these are always command-based (never k8s rules).
+        # Fleet approval: applies to every current and future member. Fleets are host-only,
+        # so these are host approvals - a structured host_rule (preferred) or a legacy
+        # command string, never a k8s rule.
         fleet = fleets_repo.get(fleet_id)
         if not fleet or fleet.get("tenant_id") != user["tenant_id"] or not can_access_fleet(user, fleet):
             return _err("fleet not found", 404)
@@ -321,18 +328,34 @@ def handle_tenant_create_approval(body: dict, raw_token: str) -> dict:
     if not _require_role(user, "operator"):
         # Developer path: single command/rule → pending
         if is_k8s:
+            host_rule = None
             k8s_rule = normalize_k8s_rule((body or {}).get("k8s_rule") or {})
             if not k8s_rule:
                 return _err("k8s_rule with a valid write verb is required for k8s agents", 400)
             command = rule_to_command(k8s_rule)
         else:
             k8s_rule = None
-            command = (body or {}).get("command", "").strip()
-            if not command:
-                return _err("command is required", 400)
+            raw_host_rule = (body or {}).get("host_rule")
+            if raw_host_rule is not None:
+                host_rule = normalize_host_rule(raw_host_rule)
+                if not host_rule:
+                    return _err("host_rule needs a 'bin' and 'args' list with no shell operators (use * for a wildcard arg)", 400)
+                command = host_rule_to_command(host_rule)
+            else:
+                host_rule = None
+                command = (body or {}).get("command", "").strip()
+                if not command:
+                    return _err("command or host_rule is required", 400)
+                if has_shell_operators(command):
+                    return _err("approved commands can't contain shell operators (| ; && $() ` > <) "
+                                "- request approval for a single command", 400)
 
         def _same(a):
-            return a.get("k8s_rule") == k8s_rule if is_k8s else a.get("command") == command
+            if is_k8s:
+                return a.get("k8s_rule") == k8s_rule
+            if host_rule is not None:
+                return a.get("host_rule") == host_rule
+            return a.get("host_rule") is None and a.get("command") == command
 
         active = _active("approved")
         if any(_same(a) for a in active):
@@ -353,6 +376,7 @@ def handle_tenant_create_approval(body: dict, raw_token: str) -> dict:
             "fleet_id": scope_fleet_id,
             "command": command,
             "k8s_rule": k8s_rule,
+            "host_rule": host_rule,
             "requested_by": user.get("user_id", ""),
             "requester_name": requester,
             "job_id": None,
@@ -397,7 +421,24 @@ def handle_tenant_create_approval(body: dict, raw_token: str) -> dict:
             rule = normalize_k8s_rule(raw)
             if not rule:
                 return _err("each k8s_rule needs a valid write verb (verb, resource, namespace, name)", 400)
-            items.append({"command": rule_to_command(rule), "k8s_rule": rule})
+            items.append({"command": rule_to_command(rule), "k8s_rule": rule, "host_rule": None})
+    elif (body or {}).get("host_rule") is not None or (body or {}).get("host_rules") is not None:
+        # Structured host approval(s): {bin, args[]} with positional "*" wildcards.
+        rule_list = (body or {}).get("host_rules")
+        if rule_list is not None:
+            if not isinstance(rule_list, list) or not rule_list:
+                return _err("host_rules must be a non-empty list", 400)
+            raw_rules = rule_list
+            bulk = True
+        else:
+            raw_rules = [(body or {}).get("host_rule")]
+            bulk = False
+        items = []
+        for raw in raw_rules:
+            hr = normalize_host_rule(raw)
+            if not hr:
+                return _err("each host_rule needs a 'bin' and 'args' list with no shell operators (use * for a wildcard arg)", 400)
+            items.append({"command": host_rule_to_command(hr), "k8s_rule": None, "host_rule": hr})
     else:
         single_command = (body or {}).get("command", "").strip()
         command_list = (body or {}).get("commands")
@@ -412,8 +453,12 @@ def handle_tenant_create_approval(body: dict, raw_token: str) -> dict:
             commands = [single_command]
             bulk = False
         else:
-            return _err("command or commands is required", 400)
-        items = [{"command": c, "k8s_rule": None} for c in commands]
+            return _err("command, commands, host_rule, or host_rules is required", 400)
+        bad = next((c for c in commands if has_shell_operators(c)), None)
+        if bad is not None:
+            return _err("approved commands can't contain shell operators (| ; && $() ` > <); "
+                        f"offending: {bad!r}", 400)
+        items = [{"command": c, "k8s_rule": None, "host_rule": None} for c in commands]
 
     duration = (body or {}).get("duration")
     if duration == "now":
@@ -423,16 +468,22 @@ def handle_tenant_create_approval(body: dict, raw_token: str) -> dict:
         return _err(f"invalid duration '{duration}'; use 1h, 8h, 24h, 7d, permanent, or Nh/Nd", 400)
 
     active = _active("approved")
-    active_commands = {a["command"] for a in active}
+    active_commands = {a["command"] for a in active if not a.get("host_rule")}
     active_rules = [a.get("k8s_rule") for a in active if a.get("k8s_rule")]
+    active_host_rules = [a.get("host_rule") for a in active if a.get("host_rule")]
     now = _iso()
     reviewer = user.get("username") or user.get("user_id", "")
     created = []
     skipped = []
 
     for item in items:
-        command, rule = item["command"], item["k8s_rule"]
-        already = (rule in active_rules) if is_k8s else (command in active_commands)
+        command, rule, host_rule = item["command"], item["k8s_rule"], item["host_rule"]
+        if is_k8s:
+            already = rule in active_rules
+        elif host_rule is not None:
+            already = host_rule in active_host_rules
+        else:
+            already = command in active_commands
         if already:
             skipped.append({"command": command, "reason": "already_approved"})
             continue
@@ -443,6 +494,7 @@ def handle_tenant_create_approval(body: dict, raw_token: str) -> dict:
             "fleet_id": scope_fleet_id,
             "command": command,
             "k8s_rule": rule,
+            "host_rule": host_rule,
             "requested_by": user.get("user_id", ""),
             "requester_name": reviewer,
             "job_id": None,

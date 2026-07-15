@@ -273,6 +273,19 @@ a member's sync draws its approved-command allow-list from the fleet. Creating a
 approval for a member's `agent_id` is rejected (`409`). Access follows the same rule as agents:
 reviewing/pre-approving a fleet approval requires **read-write** access to that fleet.
 
+**Host writes are structured, and host approvals are JSON rules.** A plain host **write**
+command is parsed into an `argv` (`{bin, args}`) and executed with `execve` - **no shell** -
+so there is nothing to pipe, chain, substitute, or glob. A write that needs shell features
+can't be a rule, so it is **rejected in approved mode** (unapprovable), **runs freeform in
+wild mode** (no approval, no sandbox - blocking there is pure friction), and is refused in
+readonly. Approvals for host writes are **structured rules** `{bin, args[]}` where each arg
+is a literal or `*` (positional wildcard, fixed arity) - matched against the argv, never by
+string comparison. This mirrors the k8s `{verb, resource, namespace, name}` model, and applies
+to **fleet** fan-outs the same way (fleet writes are structured; the fleet's host rules gate
+approved-mode writes). **Reads** are unaffected: they run as-is (freeform shell) under Landlock
+in readonly/approved mode and never need approval. The agent gates an approved-mode structured
+write on a rule match; an unmatched write is blocked (structured approval error).
+
 **Approvals are cascade-deleted when their target is torn down**, so a stale pre-approval can
 never outlive the agent/fleet it was scoped to (and can't be inherited by a future id reuse):
 permanently **removing** an agent purges its `agent_id` approvals; **revoking a fleet with
@@ -351,18 +364,32 @@ macOS does not have Landlock. Enforcement differs by mode:
 
 **Approved mode logic (both platforms)**
 
-When the agent receives a job in approved mode, it also receives the current approved command list and the `is_write` flag from the sync response.
+When the agent receives a job in approved mode it also receives, from the sync response, the
+`is_write` flag plus the approvals it should match against: the current **approved host rules**
+(`{bin, args[]}`) and, for legacy command approvals, the approved command-string list.
 
-- If the command matches an entry in the approved list (prefix match with word boundary), it runs normally - the write is explicitly permitted.
-- **Linux:** if not approved, runs under Landlock. If Landlock blocks the command (permission denied), the agent posts `blocked=true, is_write=true` in the job result.
-- **macOS:** if not approved and `is_write=true`, the agent returns `blocked=true, is_write=true` immediately without running the command.
-- The backend receives `blocked=true`, updates `is_write` on the job record, looks up the requesting user, and creates a pending record in the `approvals` table - scoped to the agent, or to its **fleet** if the agent is a fleet member (see [Fleets](#fleets)).
-- An operator or admin can review these records (tenant console → Approvals, or the `/tenant/approvals` endpoints) and approve or deny them.
-- Once approved, the command prefix is included in the approved list on the next sync, and the command runs without restriction.
+- **Structured write** (the job carries an `argv`): approved iff some **host rule** matches the
+  argv (bin equal, arity equal, each arg literal-or-`*`). If matched it runs directly (execve,
+  no shell); if not, it's a blocked write.
+- **Legacy freeform write** (a command string): approved iff it prefix-matches an approved
+  command string (see below). Kept for backward compatibility; new host writes are structured.
+- **Linux:** an unapproved write runs under Landlock and is blocked at the kernel (permission
+  denied) → the agent posts `blocked=true, is_write=true`.
+- **macOS:** an unapproved write (`is_write=true`) returns `blocked=true` immediately (no Landlock).
+- The backend receives `blocked=true`, updates `is_write` on the job, looks up the requester, and
+  creates a **pending** record in the `approvals` table - scoped to the agent, or to its **fleet**
+  if the agent is a fleet member (see [Fleets](#fleets)).
+- An operator/admin reviews these (tenant console → Approvals, or the `/tenant/approvals` endpoints)
+  and approves or denies. Once approved, the rule (or command) feeds the next sync and the write runs.
 
-### Approved list matching
+### Approved matching
 
-The match is prefix-based with a word boundary: an approved entry of `docker logs` permits `docker logs myapp --tail 100` but not `docker rm myapp`. Matching checks `cmd == approved` or `cmd.startswith(approved + " ")`.
+A **structured** write matches a host rule `{bin, args[]}` positionally - bin equal, arity equal,
+each arg equal or `*` (mirrors the k8s `{verb, resource, namespace, name}` rule). This is the
+default and involves no string comparison. The **legacy** command-string path is prefix-based with
+a word boundary (`cmd == approved` or `cmd.startswith(approved + " ")`) - an approved `docker logs`
+permits `docker logs myapp --tail 100` but not `docker rm myapp` - and approved commands may not
+contain shell operators (so a prefix can't smuggle an appended `| tee` / `&& rm`).
 
 ### Kubernetes agents
 

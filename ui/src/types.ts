@@ -240,6 +240,12 @@ export interface K8sRule {
   name: string;
 }
 
+// Structured host approval rule: a bin + positional args, each a literal or "*" wildcard.
+export interface HostRule {
+  bin: string;
+  args: string[];
+}
+
 export interface Approval {
   approval_id: string;
   agent_id: string | null;
@@ -253,6 +259,7 @@ export interface Approval {
   tenant_id: string;
   command: string;
   k8s_rule?: K8sRule | null;
+  host_rule?: HostRule | null;
   status: 'pending' | 'approved' | 'denied' | 'expired';
   requested_by?: string;
   requester_name?: string;
@@ -278,6 +285,8 @@ export interface Job {
   exit_code?: number;
   stdout?: string;
   stderr?: string;
+  stdout_truncated?: boolean;   // output was capped (agent-side and/or on ingest)
+  stderr_truncated?: boolean;
   created_at: string;
   started_at?: string;
   completed_at?: string;

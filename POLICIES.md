@@ -28,23 +28,23 @@ On macOS, Landlock is not available. Readonly mode relies entirely on the server
 
 ## Approved mode
 
-Reads are always allowed - you do not need to add read commands to any list. Write and destructive operations (anything blocked in readonly mode) are only permitted if the exact command has been pre-approved for this agent.
+Reads are always allowed - you do not need to add them to any list. Write and destructive operations (anything blocked in readonly mode) are only permitted if they match an approved **structured rule** for this agent.
 
 **How it works (host agents):**
 
-1. When a command is submitted, the server classifies it as a write or read (`is_write: true/false`) using the same pattern list as readonly mode, and queues it to the agent.
-2. The agent checks whether the command matches the approved list.
-   - **Approved match** - runs the command normally (write explicitly permitted).
-   - **Not approved, Linux** - runs under Landlock. If Landlock blocks the write, the agent returns a structured error and the backend creates a pending approval record.
-   - **Not approved, macOS** - no Landlock available. The agent uses the server-supplied `is_write` flag: if the command is a write and not approved, it is refused immediately and a pending approval record is created. Read commands always run.
+1. When a command is submitted, the server classifies it as a write or read (`is_write: true/false`). A **write** is parsed into an `argv` (`{bin, args}`) and will run with `execve` (**no shell**); a **read** runs as-is (freeform shell). A write that uses shell operators (`| ; && $() > *`) can't be structured, so it is **refused in approved mode** (unapprovable).
+2. The agent checks whether the write's `argv` matches an approved **host rule** `{bin, args[]}` (each arg a literal or `*`).
+   - **Rule match** - runs directly (write explicitly permitted).
+   - **Not approved, Linux** - runs under Landlock; the write is kernel-blocked, the agent returns a structured error, and the backend creates a pending approval record.
+   - **Not approved, macOS** - no Landlock; a write that matches no rule is refused immediately and a pending record is created. Reads always run.
 3. An operator or admin reviews pending approvals and approves or denies them in the tenant console under **Approvals**.
-4. Once approved, the command prefix is included in the approved list on the next sync and runs without restriction.
+4. Once approved, the rule feeds the agent's allowlist on the next sync and the write runs.
 
 On **Kubernetes** agents the flow is different - the backend gates the write at submission, before dispatch. An unapproved write is recorded as a `REJECTED` job and a pending approval is raised; the agent never receives it. See [Host vs Kubernetes enforcement](#host-vs-kubernetes-enforcement).
 
-For a member of a **fleet**, approvals are **fleet-scoped** rather than per-agent: pre-approve a command once on the fleet and every member inherits it, and a member's blocked write raises a single fleet-scoped request. This is what makes `approved` mode practical for an autoscaling fleet where individual instances come and go. Manage them from the fleet (tenant console → **Fleets → [fleet]**, or `POST /tenant/approvals` with `fleet_id`).
+For a member of a **fleet**, approvals are **fleet-scoped** rather than per-agent: pre-approve a rule once on the fleet and every member inherits it, and a member's blocked write raises a single fleet-scoped request. This makes `approved` mode practical for an autoscaling fleet where instances come and go. Manage them from the fleet (tenant console → **Fleets → [fleet]**, or `POST /tenant/approvals` with `fleet_id`).
 
-The match is prefix-based with a word boundary: approving `docker logs` permits `docker logs myapp --tail 100` but not `docker rm myapp`.
+A host rule matches the argv **positionally** - bin equal, arity equal, each arg equal or `*`: approving `{bin: systemctl, args: [restart, *]}` permits `systemctl restart nginx` and `systemctl restart web-01`, but not `systemctl stop nginx`. This mirrors the k8s rule model below. (A legacy command-string prefix path still exists for backward compatibility and rejects shell operators.)
 
 **Approvals from the CLI:**
 
@@ -61,24 +61,30 @@ reach fleets approvals list <fleet>       # effective approved commands for the 
 reach fleets approvals request <fleet> "<cmd>"  # request / pre-approve for the whole fleet
 ```
 
-The output adapts to the agent type: **host** agents show the command; **Kubernetes** agents show the structured rule as `verb / resource / namespace / name` columns (with `✱` for wildcard fields). `--pending`, `--denied`, and `--expired` show only your own records; expired entries are visually marked so you can see why a command stopped working. `approve`/`deny` act on an approval **id** and work for both agent and fleet approvals.
+The output adapts to the agent type: **host** agents show the structured rule as `bin / args` columns; **Kubernetes** agents show it as `verb / resource / namespace / name` columns (with `✱` for wildcard fields). `--pending`, `--denied`, and `--expired` show only your own records; expired entries are visually marked so you can see why a command stopped working. `approve`/`deny` act on an approval **id** and work for both agent and fleet approvals.
 
 ## Host vs Kubernetes enforcement
 
-The three modes mean the same thing on both agent types, but **how** a command is classified and **where** the decision is made differ - because host agents run a shell (gated on the agent with Landlock) while Kubernetes agents run `kubectl` with no shell (gated at the backend).
+The three modes mean the same thing on both agent types, but **how** a command is classified and **where** the decision is made differ. Host **writes** now run with no shell too (structured `argv` via `execve`, gated on the agent with Landlock); host **reads** still run as a freeform shell. Kubernetes runs `kubectl` with no shell (gated at the backend).
 
 | | **Host** | **Kubernetes** |
 |---|---|---|
-| Write classification | regex heuristic over the command (the readonly pattern list - `rm`, `kill`, `systemctl`, package installs, …) | the `kubectl` **verb**, default-deny: `get`/`logs`/`describe`/… are reads, every other verb (incl. `exec`, `cp`, `port-forward`, and any unknown verb) is a write |
+| Write classification | regex heuristic over the command (the readonly pattern list - `rm`, `kill`, `systemctl`, package installs, …); a write is parsed to `argv` and run with `execve` | the `kubectl` **verb**, default-deny: `get`/`logs`/`describe`/… are reads, every other verb (incl. `exec`, `cp`, `port-forward`, and any unknown verb) is a write |
 | `readonly` write | rejected at submission; Landlock on Linux is added defence-in-depth on the agent | rejected at submission |
-| `approved` write, not pre-approved | **dispatched**; enforced on the **agent** (Landlock on Linux, server `is_write` flag on macOS), which raises the pending approval | **blocked at submission** - recorded as a `REJECTED` job and a pending approval is raised; never dispatched |
-| `wild` | runs anything except the always-blocked set | runs any `kubectl`, still bounded by the agent's no-shell allowlist and cluster RBAC |
+| `approved` write, not pre-approved | **dispatched**; enforced on the **agent** (Landlock on Linux, server `is_write` flag on macOS), which raises the pending approval. A write with **shell operators** can't be structured and is **rejected at submission** | **blocked at submission** - recorded as a `REJECTED` job and a pending approval is raised; never dispatched |
+| `wild` | runs anything except the always-blocked set; a shell-operator write runs freeform (no rule needed) | runs any `kubectl`, still bounded by the agent's no-shell allowlist and cluster RBAC |
 
 The net effect: on host agents the agent is the final gate for approved-mode writes; on Kubernetes the backend is, and the no-shell allowlist + RBAC bound the pod regardless of policy mode.
 
-## Kubernetes approvals are structured rules
+## Approvals are structured rules
 
-Host approvals are **command text** (prefix match). For Kubernetes agents a text prefix is a poor fit - `kubectl create pod nginx -n team-a` and `… redis …` are the same intent - so k8s approvals are **structured rules** instead:
+Both agent types use **structured rules** rather than command text. A host write is matched against a rule `{bin, args[]}` (each arg a literal or `*`); reads never need approval:
+
+```json
+{ "bin": "systemctl", "args": ["restart", "*"] }
+```
+
+For Kubernetes agents a rule is a poor fit for text prefix - `kubectl create pod nginx -n team-a` and `… redis …` are the same intent - so k8s approvals carry the parsed `kubectl` fields instead:
 
 ```json
 { "verb": "delete", "resource": "pods", "namespace": "team-a", "name": "*" }
@@ -90,7 +96,7 @@ Host approvals are **command text** (prefix match). For Kubernetes agents a text
 - Pipes and flags are handled: each `kubectl` write stage is checked; read stages and filters (`| jq`) pass; flags like `-n`, `-l`, `--from-literal=k=v` don't confuse parsing; anything unparseable stays blocked (never over-approved).
 - **Double verbs** (`rollout`, `auth`, `apply`, `set`, `certificate`) and `--dry-run` are classified precisely - e.g. `rollout status` is a read, `rollout restart` a write; `--dry-run=client` makes a mutating command a read. See [ARCHITECTURE.md](ARCHITECTURE.md#kubernetes-agents).
 
-In the console (**Approvals**), host and Kubernetes approvals are shown **separately** via a toggle - host as commands, k8s as rule chips - with the default view showing the 10 most recent and a **Search** box (case-insensitive) for filtering. See [API.md](API.md#approvals) for the `type`, `q`, `limit`, and `offset` query parameters.
+In the console (**Approvals**), host and Kubernetes approvals are shown **separately** via a toggle - both as **rule chips** (host `bin / args`, k8s `verb / resource / namespace / name`) - with the default view showing the 10 most recent and a **Search** box (case-insensitive) for filtering. See [API.md](API.md#approvals) for the `type`, `q`, `limit`, and `offset` query parameters.
 
 ## Access level
 

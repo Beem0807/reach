@@ -46,11 +46,20 @@ def handle_agent_job_result(job_id: str, body: dict, raw_token: str) -> dict:
     if job.get("status") not in ("RUNNING", "PENDING"):
         return _err(f"job already in terminal state: {job.get('status')}", 409)
 
+    # The agent already caps output to its own limit and reports whether it dropped
+    # bytes. The server re-caps as defence-in-depth (and to stay under the DynamoDB
+    # item-size ceiling), and ORs the flag True whenever it has to cut further - so
+    # `stdout_truncated`/`stderr_truncated` is authoritative regardless of which side
+    # trimmed. See docs (SELF_HOSTING → Output limits).
+    stdout_truncated = bool(body.get("stdout_truncated", False))
+    stderr_truncated = bool(body.get("stderr_truncated", False))
     max_bytes = 50_000
     if len(stdout.encode()) > max_bytes:
         stdout = stdout.encode()[:max_bytes].decode(errors="replace") + "\n[TRUNCATED]"
+        stdout_truncated = True
     if len(stderr.encode()) > max_bytes:
         stderr = stderr.encode()[:max_bytes].decode(errors="replace") + "\n[TRUNCATED]"
+        stderr_truncated = True
 
     stdout = redact(stdout)
     stderr = redact(stderr)
@@ -63,6 +72,8 @@ def handle_agent_job_result(job_id: str, body: dict, raw_token: str) -> dict:
         "duration_ms": duration_ms,
         "completed_at": _iso(),
         "is_write": is_write,
+        "stdout_truncated": stdout_truncated,
+        "stderr_truncated": stderr_truncated,
     })
 
     # Keep the run's cached counts/state current as each member reports (so the run
