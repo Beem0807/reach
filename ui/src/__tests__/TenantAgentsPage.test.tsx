@@ -512,6 +512,22 @@ describe('Agent type column and filter', () => {
     expect(screen.getByRole('button', { name: /Acknowledge/i })).toBeInTheDocument();
   });
 
+  it('shows the k8s execution allowlist in the detail modal', async () => {
+    renderPage([{ ...K8S_AGENT_PERMS, k8s_allowed_binaries: ['kubectl', 'jq', 'helm'] }]);
+    await screen.findByText('cluster-1');
+    fireEvent.click(screen.getByText('cluster-1'));
+    expect(await screen.findByText('Execution allowlist')).toBeInTheDocument();
+    expect(screen.getByText('helm')).toBeInTheDocument();
+  });
+
+  it('shows a "not yet reported" note when the allowlist is absent', async () => {
+    renderPage([{ ...K8S_AGENT_PERMS, k8s_allowed_binaries: null }]);
+    await screen.findByText('cluster-1');
+    fireEvent.click(screen.getByText('cluster-1'));
+    expect(await screen.findByText('Execution allowlist')).toBeInTheDocument();
+    expect(screen.getByText(/Not yet reported/i)).toBeInTheDocument();
+  });
+
   it('shows n/a in the Cluster RBAC column for host agents', async () => {
     renderPage([HOST_AGENT]);
     await screen.findByText('host-1');

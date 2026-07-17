@@ -26,13 +26,14 @@ def repo():
     return sql.ApprovalRepo()
 
 
-def _mk(repo, i, *, command, k8s_rule=None, requester="alice", status="pending", agent_id="agent_1"):
+def _mk(repo, i, *, command, k8s_rule=None, host_rule=None, requester="alice", status="pending", agent_id="agent_1"):
     repo.create({
         "approval_id": f"appr_{i}",
         "tenant_id": "t1",
         "agent_id": agent_id,
         "command": command,
         "k8s_rule": k8s_rule,
+        "host_rule": host_rule,
         "requested_by": "u1",
         "requester_name": requester,
         "job_id": None,
@@ -64,6 +65,18 @@ def test_kind_filter_k8s_only_rules(repo):
     items, total = repo.search_by_tenant("t1", kind="k8s", limit=100)
     assert total == 6
     assert all(a["k8s_rule"] is not None for a in items)
+
+
+def test_kind_uses_agent_type_for_nonkubectl_k8s_approval(repo):
+    # A k8s agent's non-kubectl approval (helm) carries a host_rule, not a k8s_rule - but
+    # with the agent's id in k8s_agent_ids it must be categorized under Kubernetes, not host.
+    _mk(repo, 0, command="helm install rel", host_rule={"bin": "helm", "args": ["install", "*"]}, agent_id="k8s_agent")
+    _mk(repo, 1, command="docker restart svc", host_rule={"bin": "docker", "args": ["restart", "svc"]}, agent_id="host_agent")
+    k8s_ids = ["k8s_agent"]
+    k8s_items, k8s_total = repo.search_by_tenant("t1", kind="k8s", k8s_agent_ids=k8s_ids, limit=100)
+    host_items, host_total = repo.search_by_tenant("t1", kind="host", k8s_agent_ids=k8s_ids, limit=100)
+    assert k8s_total == 1 and k8s_items[0]["agent_id"] == "k8s_agent"     # helm shows under k8s
+    assert host_total == 1 and host_items[0]["agent_id"] == "host_agent"  # docker stays host
 
 
 def test_like_search_on_command(repo):

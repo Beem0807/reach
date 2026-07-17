@@ -30,13 +30,25 @@ reach:
 # -- Name of the Secret that stores the claimed agent token (shared across replicas, survives restarts/rotation). The chart creates it so Helm owns it and removes it on uninstall; the agent writes the token into it at runtime. Defaults to `<release>-token`.
 tokenSecretName: ""
 
-# -- Add binaries to the default allowlist (the safe way to extend it). E.g. `[helm, kustomize]` keeps `kubectl` + the default read-only filters AND adds these. Jobs run connected by pipes, with no shell.
+# -- Add CLIs to the default allowlist (`kubectl` + read-only filters). Each entry is a dict that BOTH allow-lists the binary AND provides it, so the two can never drift. `name` is required; add `url` + `sha256` to install it at pod start (an initContainer downloads it into a shared volume on the agent's `PATH` - no bespoke image, and the base image keeps updating: bump `image.tag` and tools re-fetch unchanged). `archivePath` is the file to extract from a `.tar.gz` (omit for a raw binary). Omit `url` entirely when the binary is already in the image (your own build) - it's allow-listed only. Whichever way, an initContainer VERIFIES every name resolves on `PATH` and hard-fails the pod otherwise, so you can't allow-list a binary the agent can't run. Needs egress at pod start; air-gapped clusters bake tools into a mirrored/derived image. NOTE: only `kubectl` + the read filters count as reads; every other binary is a **write** (default-deny) - approved via a structured `{bin, args[]}` rule (positional `*`, trailing `...` for the rest); helm's arbitrary-exec escapes (`--post-renderer`, `helm plugin`) are always blocked. Example:
+# extraAllowedBinaries:
+#   - name: helm
+#     url: https://get.helm.sh/helm-v3.16.3-linux-arm64.tar.gz   # match your nodes' arch
+#     sha256: "5bd34ed774df6914b323ff84a0a156ea6ff2ba1eaf0113962fa773f3f9def798"
+#     archivePath: linux-arm64/helm
+#   - name: mytool          # already baked into a custom image: allow-list only
 extraAllowedBinaries: []
-# -- REPLACE the entire allowlist (lock-down / full control). When non-empty this is the exact set - the default (`kubectl` + grep, jq, head, tail, wc, sort, uniq, cut, tr) is dropped. Use `[kubectl]` to restrict to kubectl only. Prefer `extraAllowedBinaries` unless you specifically need to remove defaults.
+# -- REPLACE the entire allowlist (lock-down / full control). When non-empty this is the exact set - the default (`kubectl` + grep, jq, head, tail, wc, sort, uniq, cut, tr) is dropped. A plain list of names; entries must already be in the image (this knob restricts, it doesn't install - use `extraAllowedBinaries` to install). Use `[kubectl]` to restrict to kubectl only. Prefer `extraAllowedBinaries` unless you specifically need to remove defaults.
 allowedBinaries: []
 
 # -- How often (seconds) the agent re-reviews its cluster-wide RBAC. Empty uses the agent default (300s / 5 min). Lower = faster drift detection; higher = less API load on very large clusters (cost scales with namespace count). Floored at 30s.
 permissionReviewIntervalSeconds: ""
+
+# -- Max wall-clock seconds for a single command before the agent kills it and returns a timeout result. Empty uses the agent default (60s).
+commandTimeoutSeconds: ""
+
+# -- Max bytes of `stdout`/`stderr` retained per command. Capture is bounded as it streams, so chatty output (a large `kubectl`/`jq` pipeline) can't balloon agent memory; output beyond this is truncated and the result is flagged. Empty uses the agent default (50000).
+maxOutputBytes: ""
 
 leaderElection:
   # -- Lease name used for leader election. Defaults to `<release>`.

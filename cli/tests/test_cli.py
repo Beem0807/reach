@@ -772,7 +772,8 @@ class TestApprovals:
         result, client = self._run([])
         assert result.exit_code == 0
         client.list_agent_approved.assert_called_once_with("agent_a", status="approved")
-        assert "docker ps" in result.output
+        # Rendered as structured bin / args cells (legacy command split for display).
+        assert "docker" in result.output and "ps" in result.output
 
     def test_pending_flag_calls_pending_status(self):
         result, client = self._run(["--pending"], approvals=[{**_APPROVAL, "status": "pending"}])
@@ -795,11 +796,23 @@ class TestApprovals:
         assert result.exit_code == 2
         assert "only one" in result.output
 
-    def test_host_approval_shows_command_column(self):
+    def test_host_approval_shows_bin_args_columns(self):
         result, _ = self._run([])
-        assert "Command" in result.output
-        # host view has no structured-rule columns
+        # host approvals render as structured bin / args, not a flat Command column
+        assert "Bin" in result.output and "Args" in result.output
+        assert "Command" not in result.output
         assert "Namespace" not in result.output
+
+    def test_host_structured_rule_renders_wildcard(self):
+        rule = {
+            "host_rule": {"bin": "systemctl", "args": ["restart", "*"]},
+            "command": "systemctl restart *",
+            "requester_name": "Alice", "status": "approved", "created_at": "2026-06-01T10:00:00Z",
+        }
+        result, _ = self._run([], approvals=[rule])
+        assert result.exit_code == 0
+        assert "systemctl" in result.output and "restart" in result.output
+        assert "✱" in result.output   # the "*" wildcard arg renders as a dim asterisk
 
     def test_k8s_approval_renders_structured_rule_columns(self):
         k8s = {
@@ -811,8 +824,23 @@ class TestApprovals:
         for col in ("Verb", "Resource", "Namespace", "Name"):
             assert col in result.output
         assert "delete" in result.output and "team-a" in result.output
-        # k8s view does not use the flat Command column
-        assert "Kubernetes agent" in result.output
+        # k8s rules render under their own header
+        assert "Kubernetes rules" in result.output
+
+    def test_k8s_agent_with_helm_host_rule_renders_both_tables(self):
+        # A k8s agent can hold kubectl verb rules AND {bin,args} rules (helm etc.);
+        # each renders in its own table (mixed-safe).
+        mixed = [
+            {"k8s_rule": {"verb": "delete", "resource": "pods", "namespace": "team-a", "name": "*"},
+             "requester_name": "Alice", "status": "approved", "created_at": "2026-06-01T10:00:00Z"},
+            {"host_rule": {"bin": "helm", "args": ["install", "*"]},
+             "requester_name": "Bob", "status": "approved", "created_at": "2026-06-01T10:00:00Z"},
+        ]
+        result, _ = self._run([], approvals=mixed)
+        assert result.exit_code == 0
+        assert "Kubernetes rules" in result.output       # kubectl verb table
+        assert "Verb" in result.output and "Bin" in result.output   # both column sets present
+        assert "helm" in result.output and "delete" in result.output
 
     def test_agent_flag_overrides_default(self):
         result, client = self._run(["--agent", "agent_b"])
@@ -1284,12 +1312,14 @@ class TestFleetsApprovals:
         mock_client.list_fleet_approved.return_value = {
             "fleet_id": "fleet_1", "fleet_name": "web-asg",
             "approved_commands": ["docker restart web"],
-            "approvals": [{"command": "docker restart web", "status": "approved", "requested_by": "alice"}],
+            "approvals": [{"host_rule": {"bin": "docker", "args": ["restart", "web"]},
+                           "command": "docker restart web", "status": "approved", "requested_by": "alice"}],
         }
         with _mock_cfg(), patch("reach.main.ReachClient", return_value=mock_client):
             result = runner.invoke(app, ["fleets", "approvals", "list", "web-asg"])
         assert result.exit_code == 0
-        assert "docker restart web" in result.output
+        # structured bin / args rendering (fleets are host-only)
+        assert "docker" in result.output and "restart web" in result.output
         mock_client.list_fleet_approved.assert_called_once_with("fleet_1", status="approved")
 
     def test_pending_flag_passes_status(self):

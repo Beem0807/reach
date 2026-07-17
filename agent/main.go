@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	stdsync "sync"
 	"syscall"
 	"time"
 )
@@ -315,6 +316,10 @@ type SyncRequest struct {
 	// sync and whenever it changes - omitted otherwise to keep the heartbeat
 	// small. See k8sPermsProvider / lastSentPermHash.
 	K8sPermissions *K8sPermissions `json:"k8s_permissions,omitempty"`
+	// In k8s mode the agent reports its effective execution allowlist (kubectl +
+	// filters + any extras) so the console can warn/block approving a command whose
+	// binary the agent won't run. Omitted for host agents.
+	K8sAllowedBinaries []string `json:"k8s_allowed_binaries,omitempty"`
 }
 
 // k8sPermsProvider returns the agent's current effective permissions (set in
@@ -333,11 +338,10 @@ type HostRule struct {
 }
 
 type Job struct {
-	JobID            string   `json:"job_id"`
-	Command          string   `json:"command"`
-	Mode             string   `json:"mode"`
-	IsWrite          bool     `json:"is_write"`
-	ApprovedCommands []string `json:"approved_commands"`
+	JobID   string `json:"job_id"`
+	Command string `json:"command"`
+	Mode    string `json:"mode"`
+	IsWrite bool   `json:"is_write"`
 	// Structured exec: when set, run this argv with execve (no shell). ApprovedHostRules
 	// are the {bin,args} rules matched for the approved-mode bypass.
 	Argv              []string   `json:"argv"`
@@ -369,6 +373,12 @@ func sync(cfg *Config) (*SyncResponse, error) {
 		} else if perms != nil && perms.Hash != lastSentPermHash {
 			payload.K8sPermissions = perms
 		}
+	}
+	// In k8s mode, report the effective execution allowlist (kubectl + filters + any
+	// REACH_K8S_EXTRA_BINARIES / REACH_K8S_ALLOWED_BINARIES) so the console can warn
+	// against approving a command whose binary the agent won't run.
+	if k8sAllowedBinaries != nil {
+		payload.K8sAllowedBinaries = k8sAllowedBinaries
 	}
 	var result SyncResponse
 	status, err := apiPost(cfg.APIURL, "/agent/sync", cfg.AgentToken, payload, &result)
@@ -534,44 +544,25 @@ func truncate(s string, maxBytes int) string {
 	return string(b[:maxBytes]) + "\n[TRUNCATED]"
 }
 
-// hasShellOperators reports whether a command contains shell control operators that can
-// chain, substitute, or redirect additional commands: pipe, ;, &, $, backtick, (), <>,
-// or a newline. Such a command must NEVER qualify for the approved-write sandbox bypass -
-// otherwise a prefix-matched approval like "docker restart nginx" would also run
-// "docker restart nginx | tee /etc/x" (or "... && rm -rf /") unsandboxed. An approved
-// command is a single command, no shell plumbing; anything with operators runs sandboxed
-// so Landlock still blocks the appended write.
-func hasShellOperators(command string) bool {
-	return strings.ContainsAny(command, "|;&$`()<>\n")
-}
-
-// isApprovedLocally mirrors the server-side _is_approved: exact match or prefix + space
-// boundary. Callers gate the sandbox bypass on !hasShellOperators so a prefix match can't
-// smuggle an appended pipe/chain past the approval.
-func isApprovedLocally(command string, approved []string) bool {
-	cmd := strings.TrimSpace(command)
-	for _, allowed := range approved {
-		allowed = strings.TrimSpace(allowed)
-		if cmd == allowed || strings.HasPrefix(cmd, allowed+" ") {
-			return true
-		}
-	}
-	return false
-}
 
 // cappedBuffer is an io.Writer that keeps at most `limit` bytes and records whether any
 // beyond that were dropped. It bounds agent memory even when a command produces unbounded
 // output (`yes`, `find /`, an unfiltered `journalctl`/`docker logs`): excess bytes are
 // counted-as-truncated and discarded instead of buffered. Write never errors or
 // short-writes, so the child never blocks on a full pipe - it runs to completion (or the
-// command timeout) while we retain only a bounded slice.
+// command timeout) while we retain only a bounded slice. It is mutex-guarded so a single
+// buffer can safely take concurrent writers (the k8s pipeline shares one stderr buffer
+// across stages).
 type cappedBuffer struct {
 	limit     int
+	mu        stdsync.Mutex
 	buf       bytes.Buffer
 	truncated bool
 }
 
 func (c *cappedBuffer) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if remaining := c.limit - c.buf.Len(); remaining > 0 {
 		if len(p) <= remaining {
 			c.buf.Write(p)
@@ -588,10 +579,19 @@ func (c *cappedBuffer) Write(p []byte) (int, error) {
 // String returns the captured output, appending the [TRUNCATED] marker when bytes were
 // dropped (mirrors truncate() so the inline signal is identical either way).
 func (c *cappedBuffer) String() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.truncated {
 		return c.buf.String() + "\n[TRUNCATED]"
 	}
 	return c.buf.String()
+}
+
+// Truncated reports whether any bytes were dropped (mutex-guarded for concurrent writers).
+func (c *cappedBuffer) Truncated() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.truncated
 }
 
 func runCmd(ctx context.Context, args []string) (stdout, stderr string, exitCode int, stdoutTrunc, stderrTrunc bool) {
@@ -612,26 +612,24 @@ func runCmd(ctx context.Context, args []string) (stdout, stderr string, exitCode
 			exitCode = 1
 		}
 	}
-	return outBuf.String(), errBuf.String(), exitCode, outBuf.truncated, errBuf.truncated
+	return outBuf.String(), errBuf.String(), exitCode, outBuf.Truncated(), errBuf.Truncated()
 }
 
-func executeCommand(command, mode string, isWrite bool, approvedCommands []string) CommandResult {
+// executeCommand runs a command freeform under the shell. It is used for reads (any mode)
+// and wild-mode commands; approved-mode *writes* are structured and run via executeStructured
+// (matched against host rules), or rejected at submission if they need a shell - so a write
+// never rides an approval past the sandbox here. Reads/unapproved writes run under Landlock on
+// Linux (reads pass, writes are kernel-blocked); on macOS an approved-mode write is refused.
+func executeCommand(command, mode string, isWrite bool) CommandResult {
 	start := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout())
 	defer cancel()
 
-	// Approved commands bypass the sandbox - writes are explicitly permitted.
-	// Everything else runs under Landlock on Linux: reads pass, unapproved writes
-	// are kernel-blocked and surface as a structured approval error.
-	// The bypass requires no shell operators: a command that pipes/chains/redirects can
-	// never ride an approval past the sandbox (see hasShellOperators). With operators it
-	// runs sandboxed, so any appended write is kernel-blocked.
-	approvedWrite := mode == "approved" && !hasShellOperators(command) && isApprovedLocally(command, approvedCommands)
-	useSandbox := (mode == "readonly" || mode == "approved") && runtime.GOOS == "linux" && !approvedWrite
+	useSandbox := (mode == "readonly" || mode == "approved") && runtime.GOOS == "linux"
 
-	// On non-Linux (macOS): no Landlock available. Block unapproved writes in
-	// approved mode using the is_write flag annotated by the server.
-	if mode == "approved" && runtime.GOOS != "linux" && isWrite && !approvedWrite {
+	// On non-Linux (macOS): no Landlock available. Block writes in approved mode using the
+	// is_write flag annotated by the server (approved-mode writes run structured, not here).
+	if mode == "approved" && runtime.GOOS != "linux" && isWrite {
 		richErr := fmt.Sprintf(
 			"Blocked: approval required\n\nCommand:\n  %s\n\nContact your admin to approve this command for this agent.\n",
 			strings.TrimSpace(command),
@@ -689,13 +687,27 @@ func executeCommand(command, mode string, isWrite bool, approvedCommands []strin
 	}
 }
 
-// hostRuleMatches mirrors the server's host_rule_matches: bin equal, arity equal, each
-// positional arg equal or wildcarded with "*".
+// hostRuleMatches mirrors the server's host_rule_matches: bin equal, each positional arg
+// equal or wildcarded with "*". Arity is fixed unless the rule's last arg is "..." (the
+// trailing variadic wildcard), in which case the leading args must match and any number
+// of remaining call args (including none) are permitted.
 func hostRuleMatches(argv []string, rule HostRule) bool {
 	if len(argv) == 0 || argv[0] != rule.Bin {
 		return false
 	}
 	callArgs := argv[1:]
+	if n := len(rule.Args); n > 0 && rule.Args[n-1] == "..." {
+		prefix := rule.Args[:n-1]
+		if len(callArgs) < len(prefix) {
+			return false
+		}
+		for i, ra := range prefix {
+			if ra != "*" && ra != callArgs[i] {
+				return false
+			}
+		}
+		return true
+	}
 	if len(callArgs) != len(rule.Args) {
 		return false
 	}
@@ -1088,7 +1100,7 @@ func run(ctx context.Context) error {
 				// writes are gated by host-rule match, not command-string prefix.
 				res = executeStructured(job.Argv, job.Mode, job.IsWrite, job.ApprovedHostRules)
 			} else {
-				res = executeCommand(job.Command, job.Mode, job.IsWrite, job.ApprovedCommands)
+				res = executeCommand(job.Command, job.Mode, job.IsWrite)
 			}
 			log.Printf("Job %s done: exit=%d duration=%dms", job.JobID, res.ExitCode, res.DurationMS)
 			recordJob(res)

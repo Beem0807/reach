@@ -98,6 +98,7 @@ def upgrade() -> None:
         sa.Column('k8s_permissions_hash', sa.String(), nullable=True),
         sa.Column('k8s_permissions_acked_hash', sa.String(), nullable=True),
         sa.Column('k8s_permissions_acked', sa.JSON(), nullable=True),
+        sa.Column('k8s_allowed_binaries', sa.JSON(), nullable=True),
         sa.Column('fleet_id', sa.String(), nullable=True),
         sa.Column('tags', sa.JSON(), nullable=True),
         sa.Column('created_at', sa.String(), nullable=True),

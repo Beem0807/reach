@@ -150,10 +150,27 @@ which RBAC bounds. So in Kubernetes the agent **never uses a shell**:
    `kubectl get pods -o json | jq …` works; arbitrary code does not.
 
 The allowlist is tunable from the chart: `extraAllowedBinaries` adds to the
-default (safe), `allowedBinaries` replaces it (lock-down).
+default (safe) - it's a list of dicts where each entry both allow-lists a binary
+**and** provides it (an initContainer installs it from a pinned `url`+`sha256`, or you
+omit the url for a binary already in a custom image), so you never allow-list a tool the
+agent can't run. `allowedBinaries` replaces the set (lock-down). Any binary you add
+beyond `kubectl` + the read filters (helm, flux, a custom tool) is **default-denied
+as a write** - in `approved` mode it needs a structured `{bin, args[]}` approval
+(the same model as host approvals, matched positionally: `*` = any one arg, a trailing
+`...` = any remaining args, so `helm list ...` covers `helm list` and `helm list -n prod`
+alike); in `wild` it runs bounded by RBAC. `helm`'s arbitrary-exec escapes
+(`--post-renderer`, `helm plugin`) are always blocked.
+
+The agent reports its effective allowlist on every sync, so the console knows which
+binaries this agent will actually run. Approving a `{bin, args[]}` rule for a binary
+that isn't allow-listed is a no-op - the command still hard-blocks at execution - so
+the approval screen warns and blocks it: allow-list the binary (redeploy) first, then
+approve. The allowlist is unknown until the agent's first k8s sync; enforcement kicks
+in once it's reported.
 
 **Policy mode for k8s is enforced by the backend at submission**, not the agent -
-it classifies the `kubectl` verb (default-deny) and never dispatches a blocked
+it classifies each stage (default-deny: only `kubectl` reads and read-only filters
+are reads; every other verb/binary is a write) and never dispatches a blocked
 command: `readonly` rejects writes, `approved` holds writes/`exec` for approval,
 `wild` runs anything. The agent's no-shell + allowlist is the compromise-resistant
 backstop that bounds the pod regardless.

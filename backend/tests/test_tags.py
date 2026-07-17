@@ -1,9 +1,23 @@
 import pytest
-from shared.tags import validate_tags
+from shared.tags import former_fleet_tag, validate_tags
 
 
 def test_empty_list_is_valid():
     assert validate_tags([]) is None
+
+
+def test_former_fleet_tag_is_valid_and_slugified():
+    # Always produces a valid lowercase key:value tag, slugifying the name.
+    for name, expected in [
+        ("test", "oldfleet:test"),
+        ("web-prod", "oldfleet:web-prod"),
+        ("My Fleet!", "oldfleet:my-fleet"),          # uppercase/space/punct -> slug
+        ("fleet_dpBsh35B_pt7Ew", "oldfleet:fleet_dpbsh35b_pt7ew"),  # id has uppercase
+        ("", "oldfleet:unknown"),                    # empty -> unknown
+    ]:
+        tag = former_fleet_tag(name)
+        assert tag == expected
+        assert validate_tags([tag]) is None
 
 
 def test_single_valid_tag():

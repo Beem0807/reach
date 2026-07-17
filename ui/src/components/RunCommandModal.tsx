@@ -1,8 +1,11 @@
-import { useState } from 'react';
-import type { TenantConfig, Agent, Fleet, FanoutPreview, FanoutResult, JobPreview } from '../types';
-import { createJob, fleetFanout, fanoutByTag, ApiError } from '../api';
+import { useState, useEffect } from 'react';
+import type { TenantConfig, Agent, Fleet, FanoutPreview, FanoutResult, JobPreview, Job } from '../types';
+import { createJob, fleetFanout, fanoutByTag, getJob, ApiError } from '../api';
 import { Modal } from './Modal';
 import { Spinner } from './Spinner';
+
+// A job the agent has finished with (or that was rejected at submission) - no more polling.
+const TERMINAL = new Set(['SUCCEEDED', 'FAILED', 'REJECTED', 'EXPIRED', 'CANCELED']);
 
 // A command run launched from the console. Targets come in two flavours:
 //   fixed  - the caller already knows the target (a row/menu action).
@@ -29,6 +32,18 @@ function PlanRow({ label, children }: { label: string; children: React.ReactNode
     <div className="flex items-baseline justify-between gap-4 py-1">
       <span className="text-xs text-slate-400">{label}</span>
       <span className="text-sm text-slate-700 text-right">{children}</span>
+    </div>
+  );
+}
+
+function OutputBlock({ label, text, truncated, err }: { label: string; text: string; truncated?: boolean; err?: boolean }) {
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-1">
+        <span className="text-[10px] uppercase tracking-wider text-slate-400">{label}</span>
+        {truncated && <span className="text-[10px] text-amber-600">truncated</span>}
+      </div>
+      <pre className={`text-xs font-mono whitespace-pre-wrap break-words max-h-56 overflow-auto rounded-lg border px-3 py-2 ${err ? 'border-red-200 bg-red-50 text-red-800' : 'border-slate-200 bg-slate-50 text-slate-700'}`}>{text}</pre>
     </div>
   );
 }
@@ -68,6 +83,33 @@ export function RunCommandModal({ config, target, onClose }: {
   const [result, setResult] = useState<FanoutResult | { job_id: string; status: string } | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Single-agent runs poll the job until it finishes (the agent runs it on its next poll),
+  // then show exit code + stdout/stderr inline - mirroring `reach exec`.
+  const [jobResult, setJobResult] = useState<Job | null>(null);
+  const [timedOut, setTimedOut] = useState(false);
+
+  const singleJobId = result && 'job_id' in result ? result.job_id : null;
+  useEffect(() => {
+    if (phase !== 'done' || scope !== 'agent' || !singleJobId) return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout>;
+    let elapsed = 0;
+    const INTERVAL = 1500, TIMEOUT = 90_000;
+    setTimedOut(false);
+    const tick = async () => {
+      try {
+        const j = await getJob(apiUrl, tenantToken, singleJobId);
+        if (cancelled) return;
+        setJobResult(j);
+        if (TERMINAL.has(j.status)) return;
+      } catch { /* transient - keep polling until timeout */ }
+      elapsed += INTERVAL;
+      if (elapsed >= TIMEOUT) { if (!cancelled) setTimedOut(true); return; }
+      if (!cancelled) timer = setTimeout(tick, INTERVAL);
+    };
+    timer = setTimeout(tick, 300);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [phase, scope, singleJobId, apiUrl, tenantToken]);
 
   const targetLabel =
     scope === 'agent'
@@ -334,28 +376,55 @@ export function RunCommandModal({ config, target, onClose }: {
       {/* ---- Done phase ---- */}
       {phase === 'done' && result && (
         <div className="space-y-4">
-          <div className="flex items-center gap-2 text-emerald-700">
-            <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" /></svg>
-            <span className="text-sm font-semibold">Dispatched</span>
-          </div>
-          {'job_id' in result ? (
-            <div className="rounded-xl border border-slate-200 px-4 py-3">
-              <PlanRow label="Job"><span className="font-mono text-xs">{result.job_id}</span></PlanRow>
-              <PlanRow label="Status">{result.status}</PlanRow>
-            </div>
-          ) : (
-            <div className="rounded-xl border border-slate-200 px-4 py-3">
-              <PlanRow label="Run"><span className="font-mono text-xs">{result.run_id ?? '-'}</span></PlanRow>
-              <PlanRow label="Dispatched now"><span className="font-semibold">{result.dispatched}</span> of {result.total}</PlanRow>
-              {result.wave_total > 1 && <PlanRow label="Waves">{result.wave_total} (later waves held)</PlanRow>}
-              {result.skipped.length > 0 && <PlanRow label="Skipped">{result.skipped.length}</PlanRow>}
-            </div>
+          {'job_id' in result ? (() => {
+            // Single-agent: reflect the live job state (polled) - running, then the result.
+            const st = jobResult?.status ?? result.status;
+            const done = TERMINAL.has(st);
+            const ok = st === 'SUCCEEDED';
+            const heading = !done ? 'Running…'
+              : ok ? 'Succeeded'
+              : st === 'REJECTED' ? 'Approval required'
+              : st === 'FAILED' ? 'Failed'
+              : st.charAt(0) + st.slice(1).toLowerCase();
+            return (
+              <>
+                <div className={`flex items-center gap-2 ${!done ? 'text-amber-600' : ok ? 'text-emerald-700' : 'text-red-600'}`}>
+                  {!done && !timedOut ? <Spinner className="w-4 h-4" />
+                    : ok ? <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" /></svg>
+                    : done ? <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
+                    : <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" d="M12 8v4m0 4h.01M12 3a9 9 0 100 18 9 9 0 000-18z" /></svg>}
+                  <span className="text-sm font-semibold">{heading}</span>
+                </div>
+                <div className="rounded-xl border border-slate-200 px-4 py-3">
+                  <PlanRow label="Job"><span className="font-mono text-xs">{result.job_id}</span></PlanRow>
+                  <PlanRow label="Status">{st}</PlanRow>
+                  {jobResult?.exit_code != null && <PlanRow label="Exit code">{jobResult.exit_code}</PlanRow>}
+                </div>
+                {jobResult?.stdout && <OutputBlock label="stdout" text={jobResult.stdout} truncated={jobResult.stdout_truncated} />}
+                {jobResult?.stderr && <OutputBlock label="stderr" text={jobResult.stderr} truncated={jobResult.stderr_truncated} err />}
+                {!done && !timedOut && <p className="text-[11px] text-slate-400">Waiting for the agent to run this…</p>}
+                {timedOut && !done && <p className="text-[11px] text-amber-600">Still running - track it under Jobs.</p>}
+              </>
+            );
+          })() : (
+            <>
+              <div className="flex items-center gap-2 text-emerald-700">
+                <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" /></svg>
+                <span className="text-sm font-semibold">Dispatched</span>
+              </div>
+              <div className="rounded-xl border border-slate-200 px-4 py-3">
+                <PlanRow label="Run"><span className="font-mono text-xs">{result.run_id ?? '-'}</span></PlanRow>
+                <PlanRow label="Dispatched now"><span className="font-semibold">{result.dispatched}</span> of {result.total}</PlanRow>
+                {result.wave_total > 1 && <PlanRow label="Waves">{result.wave_total} (later waves held)</PlanRow>}
+                {result.skipped.length > 0 && <PlanRow label="Skipped">{result.skipped.length}</PlanRow>}
+              </div>
+              <p className="text-[11px] text-slate-400">Track progress under Jobs / Runs.</p>
+            </>
           )}
-          <p className="text-[11px] text-slate-400">Track progress under Jobs{isFanout ? ' / Runs' : ''}.</p>
           <div className="flex items-center gap-3">
             <button onClick={onClose} className="bg-slate-800 hover:bg-slate-700 text-white text-sm font-semibold px-5 py-2 rounded-lg transition-colors">Done</button>
             <button
-              onClick={() => { setResult(null); setPreview(null); setCommand(''); setPhase('input'); }}
+              onClick={() => { setResult(null); setJobResult(null); setTimedOut(false); setPreview(null); setCommand(''); setPhase('input'); }}
               className="text-sm font-medium text-slate-500 hover:text-slate-800 px-2 py-2"
             >Run another</button>
           </div>

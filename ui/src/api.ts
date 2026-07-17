@@ -326,6 +326,11 @@ export const acknowledgeCapability = (u: string, t: string, agentId: string, cap
 export const listTenantJobs = (u: string, t: string, params: Record<string, string> = {}) =>
   req<{ jobs: Job[]; next_cursor?: string }>(u, t, 'GET', `/jobs?${new URLSearchParams(params)}`);
 
+// A single job by id - used to poll a just-dispatched run until it reaches a terminal
+// state (the agent runs it on its next poll, then posts stdout/exit back).
+export const getJob = (u: string, t: string, jobId: string) =>
+  req<Job>(u, t, 'GET', `/jobs/${jobId}`);
+
 // Fan-out runs for a fleet. Uses the CLI/API-token endpoint, which also accepts the
 // console session token.
 export const listFleetRuns = (u: string, t: string, fleetId: string, params: Record<string, string> = {}) =>

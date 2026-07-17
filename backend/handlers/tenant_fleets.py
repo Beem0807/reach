@@ -22,7 +22,7 @@ from shared.settings import effective_settings, validate_fleet_wave_policy, wave
 from shared.exceptions import NameTakenError
 from shared.response import _err, _iso, _iso_offset, _now, _ok
 from shared.store import agent_history_repo, agents_repo, approvals_repo, fleets_repo, tenants_repo
-from shared.tags import validate_tags
+from shared.tags import former_fleet_tag, validate_tags
 from handlers.tenant_agents import _build_install_commands, _require_role
 
 logger = logging.getLogger()
@@ -404,7 +404,9 @@ def handle_revoke_fleet(fleet_id: str, body: dict, raw_token: str) -> dict:
         # Members are gone - drop their fleet-scoped approvals too.
         approvals_repo.delete_by_fleet(fleet_id)
     else:
-        affected = agents_repo.detach_fleet(fleet_id)
+        # Detached members drop the fleet's operational tags (which would otherwise still
+        # match tag fan-outs) and keep a single provenance tag instead.
+        affected = agents_repo.detach_fleet(fleet_id, tags=[former_fleet_tag(fleet.get("name") or fleet_id)])
 
     _audit("fleet.revoked", user, fleet_id, {"members": members, "affected": affected})
     logger.info("Revoked fleet=%s members=%s affected=%d", fleet_id, members, affected)
@@ -455,7 +457,10 @@ def handle_remove_fleet_member(fleet_id: str, agent_id: str, raw_token: str) -> 
     if not agent or agent.get("tenant_id") != user["tenant_id"] or agent.get("fleet_id") != fleet_id:
         return _err("agent not found in this fleet", 404)
 
-    agents_repo.detach_from_fleet(agent_id)
+    # Drop the fleet's operational tags (they'd still match tag fan-outs); keep one
+    # provenance tag so the now-standalone agent stays identifiable. The exact fleet-id
+    # is recorded in the history entry below.
+    agents_repo.detach_from_fleet(agent_id, tags=[former_fleet_tag(fleet.get("name") or fleet_id)])
     agent_history_repo.create({
         "history_id": "agenthistory_" + secrets.token_urlsafe(8),
         "agent_id": agent_id,

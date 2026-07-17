@@ -90,6 +90,10 @@ BULK_USERS        = int(os.environ.get("SEED_BULK_USERS", "30"))
 BULK_JOBS         = int(os.environ.get("SEED_BULK_JOBS", "60"))
 N_BULK_TENANTS    = int(os.environ.get("SEED_BULK_TENANTS", "25"))
 
+# The k8s agent's default execution allowlist (kubectl + read-only stdin filters), mirroring
+# the agent's defaultK8sBinaries. A cluster that also runs helm reports this + ["helm"].
+_K8S_DEFAULT_BINARIES = ["kubectl", "grep", "jq", "head", "tail", "wc", "sort", "uniq", "cut", "tr"]
+
 def _k8s_effective_rbac() -> dict:
     """A realistic SelfSubjectRulesReview snapshot the k8s agent would report:
     read-only cluster-wide plus write in one namespace. `hash` drives drift."""
@@ -335,6 +339,10 @@ def make_agents(tenant_id: str) -> list[dict]:
             "k8s_permissions":         k8s_perms,
             "k8s_permissions_hash":    k8s_perms["hash"],
             "k8s_permissions_acked_hash": k8s_perms["hash"],  # acknowledged → no drift
+            # Effective exec allowlist this agent self-reports on sync: the default
+            # (kubectl + read filters) plus helm as an extra - so its seeded helm
+            # host_rule approval is valid (the binary is allow-listed).
+            "k8s_allowed_binaries":    _K8S_DEFAULT_BINARIES + ["helm"],
         },
         # 7. DELETED - soft-deleted host; hidden from user endpoints, admin-only
         {
@@ -396,6 +404,9 @@ def make_agents(tenant_id: str) -> list[dict]:
             "k8s_permissions_hash":       k8s_perms_drifted["hash"],
             "k8s_permissions_acked_hash": k8s_perms["hash"],
             "k8s_permissions_acked":      k8s_perms,
+            # Default allowlist only (no helm) - so the console warns/blocks if someone
+            # tries to approve a helm/non-kubectl command for this cluster.
+            "k8s_allowed_binaries":       _K8S_DEFAULT_BINARIES,
         },
         # 9 & 10. ACTIVE standalone hosts sharing the env:prod + role:cache tags, so a
         #    tag fan-out (`exec --tag env:prod`) has a real multi-host target set and
@@ -1168,6 +1179,43 @@ def make_approvals(
             "status":        "pending",
             "expires_at":    None,
             "created_at":    _iso(0.03),
+            "reviewed_at":   None,
+            "reviewed_by":   None,
+        },
+        # 8b. k8s APPROVED - a NON-kubectl tool (helm) on the same k8s agent, approved via a
+        #     {bin, args[]} host_rule (not a kubectl verb rule). The trailing "..." matches
+        #     `helm list` and `helm list <any args>` alike; helm is in the agent's allowlist.
+        {
+            "approval_id":   "appr_" + secrets.token_hex(8),
+            "tenant_id":     tenant_id,
+            "agent_id":      k8s_agent_id or agent_ids[0],
+            "command":       "helm list ...",              # host_rule_to_command(host_rule)
+            "host_rule":     {"bin": "helm", "args": ["list", "..."]},
+            "k8s_rule":      None,
+            "requested_by":  uid1,
+            "requester_name": "Alice",
+            "job_id":        None,
+            "status":        "approved",
+            "expires_at":    None,                          # permanent
+            "created_at":    _iso(1.5),
+            "reviewed_at":   _iso(1.4),
+            "reviewed_by":   "admin",
+        },
+        # 8c. k8s PENDING - a non-kubectl helm write (upgrade) awaiting review, showing the
+        #     positional "*" wildcard in a host_rule for a k8s agent.
+        {
+            "approval_id":   "appr_" + secrets.token_hex(8),
+            "tenant_id":     tenant_id,
+            "agent_id":      k8s_agent_id or agent_ids[0],
+            "command":       "helm upgrade *",
+            "host_rule":     {"bin": "helm", "args": ["upgrade", "*"]},
+            "k8s_rule":      None,
+            "requested_by":  uid2,
+            "requester_name": "Bob",
+            "job_id":        None,
+            "status":        "pending",
+            "expires_at":    None,
+            "created_at":    _iso(0.04),
             "reviewed_at":   None,
             "reviewed_by":   None,
         },

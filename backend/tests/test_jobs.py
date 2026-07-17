@@ -303,6 +303,43 @@ class TestCreateJobK8s:
         r, jr, apr = self._call("kubectl delete pod x -n team-b", _AGENT_K8S_APPROVED, approved=[rule])
         assert json.loads(r["body"])["status"] == "REJECTED"
 
+    def test_helm_write_rejected_and_raises_host_rule(self):
+        # A non-kubectl tool is approvable via a {bin, args[]} rule (not a kubectl verb rule).
+        r, jr, apr = self._call("helm install rel ./chart", _AGENT_K8S_APPROVED)
+        assert json.loads(r["body"])["status"] == "REJECTED"
+        rec = apr.create.call_args[0][0]
+        assert rec["host_rule"] == {"bin": "helm", "args": ["install", "rel", "./chart"]}
+        assert rec["k8s_rule"] is None
+
+    def test_helm_write_preapproved_by_host_rule_dispatches(self):
+        with patch("handlers.create_job._verify_tenant_token", return_value=USER), \
+             patch("handlers.create_job.agents_repo") as ar, \
+             patch("handlers.create_job.jobs_repo") as jr, \
+             patch("handlers.create_job.approvals_repo") as apr, \
+             patch("handlers.create_job.users_repo"):
+            ar.get.return_value = _AGENT_K8S_APPROVED
+            # A positional wildcard rule covering `helm install <rel> <chart>`.
+            apr.list_by_agent.return_value = [{"host_rule": {"bin": "helm", "args": ["install", "*", "*"]}}]
+            r = handle_create_job({"agent_id": AGENT_ID, "command": "helm install rel ./chart"}, "tok")
+        assert json.loads(r["body"])["status"] == "PENDING"
+        apr.create.assert_not_called()
+
+    def test_helm_bare_command_covered_by_trailing_variadic_rule(self):
+        # `helm list ...` covers the bare `helm list` (and any trailing args), so running
+        # `helm list` dispatches instead of raising a fresh `helm list` approval.
+        with patch("handlers.create_job._verify_tenant_token", return_value=USER), \
+             patch("handlers.create_job.agents_repo") as ar, \
+             patch("handlers.create_job.jobs_repo") as jr, \
+             patch("handlers.create_job.approvals_repo") as apr, \
+             patch("handlers.create_job.users_repo"):
+            ar.get.return_value = _AGENT_K8S_APPROVED
+            apr.list_by_agent.return_value = [{"host_rule": {"bin": "helm", "args": ["list", "..."]}}]
+            r_bare = handle_create_job({"agent_id": AGENT_ID, "command": "helm list"}, "tok")
+            r_args = handle_create_job({"agent_id": AGENT_ID, "command": "helm list -n prod --all"}, "tok")
+        assert json.loads(r_bare["body"])["status"] == "PENDING"
+        assert json.loads(r_args["body"])["status"] == "PENDING"
+        apr.create.assert_not_called()
+
     def test_derived_rule_stored_on_pending_approval(self):
         r, jr, apr = self._call("kubectl delete pod nginx -n team-a", _AGENT_K8S_APPROVED)
         assert json.loads(r["body"])["status"] == "REJECTED"

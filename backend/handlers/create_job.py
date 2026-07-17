@@ -12,8 +12,11 @@ from shared.policy import (
     is_host_argv_approved,
     is_k8s_command_approved,
     is_k8s_write,
+    k8s_nonkubectl_argv,
+    k8s_uses_unapprovable_binary,
     needs_shell,
     normalize_argv,
+    normalize_host_rule,
     to_argv,
 )
 import shared.audit as audit
@@ -99,8 +102,14 @@ def handle_create_job(body: dict, raw_token: str, ip: str = "") -> dict:
         approval_required = False
         if mode == "approved" and is_write:
             if is_k8s:
-                rules = [a["k8s_rule"] for a in approvals_repo.list_by_agent(agent_id, status="approved") if a.get("k8s_rule")]
-                approval_required = not is_k8s_command_approved(command, rules)
+                approved = approvals_repo.list_by_agent(agent_id, status="approved")
+                k8s_argv = k8s_nonkubectl_argv(command)
+                if k8s_argv:   # helm/flux/… - approved via a {bin,args} rule on the argv
+                    host_rules = [a["host_rule"] for a in approved if a.get("host_rule")]
+                    approval_required = not is_host_argv_approved(k8s_argv, host_rules)
+                else:
+                    rules = [a["k8s_rule"] for a in approved if a.get("k8s_rule")]
+                    approval_required = not is_k8s_command_approved(command, rules)
             elif argv is not None:
                 # Structured host write: approved only by a JSON host rule (no strings).
                 host_rules = [a["host_rule"] for a in approvals_repo.list_by_agent(agent_id, status="approved") if a.get("host_rule")]
@@ -125,9 +134,19 @@ def handle_create_job(body: dict, raw_token: str, ip: str = "") -> dict:
     # paths instead: agent_sync draws its approved-command list from the fleet, and a
     # blocked write raises a fleet-scoped pending request in agent_job_result.
     if is_k8s and mode == "approved" and is_write:
-        rules = [a["k8s_rule"] for a in approvals_repo.list_by_agent(agent_id, status="approved") if a.get("k8s_rule")]
-        if not is_k8s_command_approved(command, rules):
-            return _reject_for_approval(tenant, agent_id, command, mode, now, is_k8s=True)
+        approved = approvals_repo.list_by_agent(agent_id, status="approved")
+        k8s_argv = k8s_nonkubectl_argv(command)
+        if k8s_argv:
+            # Non-kubectl tool (helm, flux, …): approve via a positional {bin, args[]} rule
+            # on its argv - the same structured model as host approvals - rather than a
+            # kubectl {verb,resource,namespace,name} rule.
+            host_rules = [a["host_rule"] for a in approved if a.get("host_rule")]
+            if not is_host_argv_approved(k8s_argv, host_rules):
+                return _reject_for_approval(tenant, agent_id, command, mode, now, k8s_argv=k8s_argv)
+        else:
+            rules = [a["k8s_rule"] for a in approved if a.get("k8s_rule")]
+            if not is_k8s_command_approved(command, rules):
+                return _reject_for_approval(tenant, agent_id, command, mode, now, is_k8s=True)
 
     job_id = "job_" + secrets.token_urlsafe(16)
     jobs_repo.create({
@@ -164,14 +183,18 @@ def handle_create_job(body: dict, raw_token: str, ip: str = "") -> dict:
     return _ok({"job_id": job_id, "status": "PENDING"}, 201)
 
 
-def _reject_for_approval(tenant: dict, agent_id: str, command: str, mode: str, now: int, is_k8s: bool = False) -> dict:
-    """Record a REJECTED job + a pending approval for a blocked k8s write. The
-    pending approval carries the structured rule derived from the command so the
-    operator reviews (and can widen) verb/resource/namespace/name.
+def _reject_for_approval(tenant: dict, agent_id: str, command: str, mode: str, now: int,
+                         is_k8s: bool = False, k8s_argv: list = None) -> dict:
+    """Record a REJECTED job + a pending approval for a blocked k8s write. The pending
+    approval carries the structured rule derived from the command: a kubectl write gets a
+    {verb,resource,namespace,name} k8s_rule; a non-kubectl write (helm/flux/…) gets a
+    {bin,args[]} host_rule derived from `k8s_argv`. The operator reviews (and can widen with
+    `*`) either.
 
     k8s-only (fleets are host-only), so this is always agent-scoped - a fleet
     member's approvals are raised at the fleet by agent_job_result instead."""
-    k8s_rule = derive_k8s_rule(command) if is_k8s else None
+    host_rule = normalize_host_rule({"bin": k8s_argv[0], "args": k8s_argv[1:]}) if k8s_argv else None
+    k8s_rule = derive_k8s_rule(command) if (is_k8s and not host_rule) else None
     job_id = "job_" + secrets.token_urlsafe(16)
     jobs_repo.create({
         "job_id": job_id,
@@ -199,6 +222,7 @@ def _reject_for_approval(tenant: dict, agent_id: str, command: str, mode: str, n
             "agent_id": agent_id,
             "command": command,
             "k8s_rule": k8s_rule,
+            "host_rule": host_rule,
             "requested_by": tenant["user_id"],
             "requester_name": user.get("name") if user else None,
             "job_id": job_id,

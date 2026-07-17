@@ -15,7 +15,6 @@ package main
 // bounded by the agent's RBAC - which is exactly the model the chart advertises.
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -125,6 +124,33 @@ func argReadsLocalFile(args []string) (string, bool) {
 // k8sBlockReason applies the pre-execution guards (no shell operators, allow-listed
 // binaries only, no local-file reads) and reports why a command would be blocked,
 // if at all. Pure: it runs no process, so it's the hermetic hook tests assert on.
+// execEscapeReason blocks flags/subcommands of allow-listed tools that run an ARBITRARY
+// executable, which would escape the no-shell allowlist. Currently helm (the common opt-in
+// tool): `--post-renderer <exe>` runs any binary, and `helm plugin …` installs/runs plugin
+// code. Other allow-listed tools rely on the layered defenses (no shell, RBAC, the
+// local-file-read guard, and structured approval). Returns ("", false) when clean.
+func execEscapeReason(bin string, args []string) (string, bool) {
+	if bin != "helm" {
+		return "", false
+	}
+	// The first positional after helm is its subcommand; `helm plugin` runs arbitrary code.
+	for _, a := range args {
+		if !strings.HasPrefix(a, "-") {
+			if a == "plugin" {
+				return "helm plugin management is not permitted (it runs arbitrary code)", true
+			}
+			break
+		}
+	}
+	for _, a := range args {
+		if l := strings.ToLower(a); l == "--post-renderer" || strings.HasPrefix(l, "--post-renderer=") {
+			return "helm --post-renderer runs an arbitrary executable, which is not permitted (it escapes the no-shell allowlist)", true
+		}
+	}
+	return "", false
+}
+
+
 func k8sBlockReason(command string, allowed []string) (string, bool) {
 	stages, err := splitPipeline(command)
 	if err != nil {
@@ -137,6 +163,11 @@ func k8sBlockReason(command string, allowed []string) (string, bool) {
 		bin := filepath.Base(st[0])
 		if !containsStr(allowed, bin) {
 			return fmt.Sprintf("%q is not an allowed command", bin), true
+		}
+		// Some allow-listed tools have flags/subcommands that run an arbitrary executable,
+		// escaping the no-shell allowlist. Block the known ones.
+		if reason, ok := execEscapeReason(bin, st[1:]); ok {
+			return reason, true
 		}
 		// Reject reading existing local files. Without this, an allow-listed binary
 		// (grep, jq, head, even `kubectl create --from-file`) could dump the mounted
@@ -165,13 +196,15 @@ func executeK8sCommand(command string, allowed []string) CommandResult {
 
 	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout())
 	defer cancel()
-	stdout, stderr, exitCode := runK8sPipeline(ctx, stages)
-	limit := maxOutputSize()
+	stdout, stderr, exitCode, stdoutTrunc, stderrTrunc := runK8sPipeline(ctx, stages)
+	// runK8sPipeline already bounded stdout/stderr to maxOutputSize() and set the flags.
 	return CommandResult{
-		Stdout:     truncate(stdout, limit),
-		Stderr:     truncate(stderr, limit),
-		ExitCode:   exitCode,
-		DurationMS: time.Since(start).Milliseconds(),
+		Stdout:          stdout,
+		Stderr:          stderr,
+		ExitCode:        exitCode,
+		DurationMS:      time.Since(start).Milliseconds(),
+		StdoutTruncated: stdoutTrunc,
+		StderrTruncated: stderrTrunc,
 	}
 }
 
@@ -238,31 +271,35 @@ func applyDefaultNamespace(stages [][]string) {
 // runK8sPipeline execs the stages directly (no shell), wiring each stage's
 // stdout to the next stage's stdin. Exit code is the last stage's, matching a
 // shell pipeline without pipefail.
-func runK8sPipeline(ctx context.Context, stages [][]string) (string, string, int) {
+func runK8sPipeline(ctx context.Context, stages [][]string) (stdout, stderr string, exitCode int, stdoutTrunc, stderrTrunc bool) {
 	cmds := make([]*exec.Cmd, len(stages))
-	var errBuf bytes.Buffer
+	limit := maxOutputSize()
+	// One stderr buffer shared across concurrently-running stages, and the final stage's
+	// stdout - both bounded so a chatty kubectl/jq can't balloon agent memory. cappedBuffer
+	// is mutex-guarded, making the shared stderr safe for concurrent stage writes.
+	errBuf := &cappedBuffer{limit: limit}
+	outBuf := &cappedBuffer{limit: limit}
 	for i, st := range stages {
 		c := exec.CommandContext(ctx, st[0], st[1:]...)
 		c.Dir = "/"
-		c.Stderr = &errBuf
+		c.Stderr = errBuf
 		cmds[i] = c
 	}
 	for i := 0; i < len(cmds)-1; i++ {
 		pipe, err := cmds[i].StdoutPipe()
 		if err != nil {
-			return "", err.Error(), 1
+			return "", err.Error(), 1, false, false
 		}
 		cmds[i+1].Stdin = pipe
 	}
-	var outBuf bytes.Buffer
-	cmds[len(cmds)-1].Stdout = &outBuf
+	cmds[len(cmds)-1].Stdout = outBuf
 
 	for _, c := range cmds {
 		if err := c.Start(); err != nil {
-			return "", err.Error(), 1
+			return "", err.Error(), 1, false, false
 		}
 	}
-	exitCode := 0
+	exitCode = 0
 	for i, c := range cmds {
 		err := c.Wait()
 		if err == nil {
@@ -281,7 +318,7 @@ func runK8sPipeline(ctx context.Context, stages [][]string) (string, string, int
 			}
 		}
 	}
-	return outBuf.String(), errBuf.String(), exitCode
+	return outBuf.String(), errBuf.String(), exitCode, outBuf.Truncated(), errBuf.Truncated()
 }
 
 // splitPipeline tokenizes a command into pipeline stages (split on top-level

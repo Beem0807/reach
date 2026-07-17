@@ -24,6 +24,13 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
     spec:
+      {{- /* Names allow-listed by extraAllowedBinaries (dicts), and the full allow-list
+             (extras + the replace-mode allowedBinaries) the initContainer must verify. */}}
+      {{- $extraNames := list }}
+      {{- range .Values.extraAllowedBinaries }}
+      {{- $extraNames = append $extraNames (required "each extraAllowedBinaries entry needs a name" .name) }}
+      {{- end }}
+      {{- $allowNames := concat $extraNames (.Values.allowedBinaries | default list) | uniq }}
       serviceAccountName: {{ include "reach-agent.serviceAccountName" . }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
@@ -32,6 +39,57 @@ spec:
       {{- with .Values.podSecurityContext }}
       securityContext:
         {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if $allowNames }}
+      # Install each extraAllowedBinaries entry that carries a url into a shared volume on
+      # the agent's PATH - no bespoke image, and the base image keeps updating (bump
+      # image.tag; tools re-fetch). Each is pinned by url + sha256 (verified). Then VERIFY
+      # every allow-listed binary resolves on PATH and hard-fail otherwise - so allow-listing
+      # a binary you didn't provide crashes the pod here, not silently at approval/exec time.
+      initContainers:
+        - name: install-tools
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              dest=/opt/reach/bin
+              export PATH="$dest:$PATH"
+              {{- range .Values.extraAllowedBinaries }}
+              {{- $name := required "each extraAllowedBinaries entry needs a name" .name }}
+              {{- if .url }}
+              echo "reach: installing {{ $name }}"
+              wget -qO "$dest/.dl" {{ .url | quote }}
+              echo {{ printf "%s  %s" (required (printf "extraAllowedBinaries %q has a url, so it needs a sha256" $name) .sha256) "$dest/.dl" | quote }} | sha256sum -c -
+              {{- if .archivePath }}
+              rm -rf "$dest/.x"; mkdir -p "$dest/.x"
+              tar -xzf "$dest/.dl" -C "$dest/.x" {{ .archivePath | quote }}
+              mv "$dest/.x/{{ .archivePath }}" "$dest/{{ $name }}"
+              rm -rf "$dest/.x"
+              {{- else }}
+              mv "$dest/.dl" "$dest/{{ $name }}"
+              {{- end }}
+              chmod 0755 "$dest/{{ $name }}"
+              rm -f "$dest/.dl"
+              {{- end }}
+              {{- end }}
+              # Every allow-listed binary MUST be runnable (present != allowed, but allowed
+              # must be present) - covers installed tools and image-baked ones alike.
+              for bin in {{ $allowNames | join " " }}; do
+                command -v "$bin" >/dev/null 2>&1 || { echo "reach: FATAL '$bin' is allow-listed but not found on PATH - give it a url+sha256 in extraAllowedBinaries, or bake it into the image"; exit 1; }
+              done
+              echo "reach: allowlist verified:" {{ $allowNames | join " " | quote }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- if .Values.extraAllowedBinaries }}
+          volumeMounts:
+            - name: reach-bin
+              mountPath: /opt/reach/bin
+          {{- end }}
       {{- end }}
       containers:
         - name: agent
@@ -42,6 +100,11 @@ spec:
             {{- toYaml . | nindent 12 }}
           {{- end }}
           env:
+            {{- if .Values.extraAllowedBinaries }}
+            # Put initContainer-installed tools (helm/flux/…) ahead of the image's PATH.
+            - name: PATH
+              value: "/opt/reach/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+            {{- end }}
             # --- claim bootstrap (from the tenant console) ---
             - name: REACH_API_URL
               valueFrom:
@@ -71,13 +134,22 @@ spec:
             - name: REACH_K8S_ALLOWED_BINARIES
               value: {{ join "," . | quote }}
             {{- end }}
-            {{- with .Values.extraAllowedBinaries }}
-            # Added to the default allowlist (kubectl + filters are kept).
+            {{- if $extraNames }}
+            # Added to the default allowlist (kubectl + filters are kept). Names only; the
+            # initContainer installs any that carry a url and verifies they resolve.
             - name: REACH_K8S_EXTRA_BINARIES
-              value: {{ join "," . | quote }}
+              value: {{ join "," $extraNames | quote }}
             {{- end }}
             {{- with .Values.permissionReviewIntervalSeconds }}
             - name: REACH_K8S_REVIEW_INTERVAL_SECONDS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.commandTimeoutSeconds }}
+            - name: REACH_COMMAND_TIMEOUT_SECONDS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.maxOutputBytes }}
+            - name: REACH_MAX_OUTPUT_BYTES
               value: {{ . | quote }}
             {{- end }}
             {{- if .Values.livenessProbe.enabled }}
@@ -121,9 +193,19 @@ spec:
             # an emptyDir so the read-only root filesystem stays read-only.
             - name: tmp
               mountPath: /tmp
+            {{- if .Values.extraAllowedBinaries }}
+            # initContainer-installed tools, read-only for the agent (it only execs them).
+            - name: reach-bin
+              mountPath: /opt/reach/bin
+              readOnly: true
+            {{- end }}
       volumes:
         - name: tmp
           emptyDir: {}
+        {{- if .Values.extraAllowedBinaries }}
+        - name: reach-bin
+          emptyDir: {}
+        {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

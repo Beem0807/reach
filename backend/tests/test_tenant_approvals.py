@@ -373,17 +373,18 @@ class TestHandleTenantListAllApprovals:
     def test_status_filter_passed_to_repo(self):
         r, ar = self._call(query={"status": "approved"}, approvals=[_APPROVED])
         ar.search_by_tenant.assert_called_once_with(
-            TENANT_ID, status="approved", agent_id=None, agent_ids=None, fleet_id=None, fleet_ids=None, scope=None, kind=None, q=None, limit=20, offset=0)
+            TENANT_ID, status="approved", agent_id=None, agent_ids=None, fleet_id=None, fleet_ids=None, scope=None, kind=None, k8s_agent_ids=None, q=None, limit=20, offset=0)
 
     def test_no_status_filter_passes_none(self):
         r, ar = self._call(query={})
         ar.search_by_tenant.assert_called_once_with(
-            TENANT_ID, status=None, agent_id=None, agent_ids=None, fleet_id=None, fleet_ids=None, scope=None, kind=None, q=None, limit=20, offset=0)
+            TENANT_ID, status=None, agent_id=None, agent_ids=None, fleet_id=None, fleet_ids=None, scope=None, kind=None, k8s_agent_ids=None, q=None, limit=20, offset=0)
 
     def test_type_and_search_and_paging_passed_to_repo(self):
+        # kind is set, so the handler resolves the tenant's k8s agent ids (empty mock → []).
         r, ar = self._call(query={"type": "k8s", "q": "team-a", "limit": "10", "offset": "20"})
         ar.search_by_tenant.assert_called_once_with(
-            TENANT_ID, status=None, agent_id=None, agent_ids=None, fleet_id=None, fleet_ids=None, scope=None, kind="k8s", q="team-a", limit=10, offset=20)
+            TENANT_ID, status=None, agent_id=None, agent_ids=None, fleet_id=None, fleet_ids=None, scope=None, kind="k8s", k8s_agent_ids=[], q="team-a", limit=10, offset=20)
 
     def test_invalid_type_returns_400(self):
         r, _ = self._call(query={"type": "vm"})
@@ -695,13 +696,37 @@ class TestHandleTenantCreateApproval:
         assert rec["host_rule"] == {"bin": "df", "args": ["-h"]}
         assert rec["command"] == "df -h"
 
+    def test_plain_command_is_auto_structured_into_host_rule(self):
+        # A command-only submission (CLI/legacy client) is transparently structured into a
+        # {bin, args[]} rule - no client flag - matching the UI and create_job.
+        r, ar = self._call(user=_DEV, body={"agent_id": AGENT_ID, "command": "systemctl restart nginx"})
+        assert r["statusCode"] == 201
+        rec = ar.create.call_args[0][0]
+        assert rec["host_rule"] == {"bin": "systemctl", "args": ["restart", "nginx"]}
+        assert rec["command"] == "systemctl restart nginx"
+
+    def test_plain_command_wildcard_token_becomes_wildcard_arg(self):
+        r, ar = self._call(user=_OPERATOR, body={"agent_id": AGENT_ID, "command": "systemctl restart *"})
+        assert r["statusCode"] == 200
+        rec = ar.create.call_args[0][0]
+        assert rec["host_rule"] == {"bin": "systemctl", "args": ["restart", "*"]}
+
+    def test_developer_command_dedups_against_existing_structured_rule(self):
+        # A command submission structures to a {bin, args} rule; if that rule is already
+        # approved, it's a 409 (every host approval is structured - no legacy strings).
+        existing = {**_APPROVED, "command": "systemctl restart nginx",
+                    "host_rule": {"bin": "systemctl", "args": ["restart", "nginx"]}}
+        r, _ = self._call(user=_DEV, body={"agent_id": AGENT_ID, "command": "systemctl restart nginx"},
+                          active_approvals=[existing])
+        assert r["statusCode"] == 409
+
     def test_developer_already_approved_command_returns_409(self):
-        existing = {**_APPROVED, "command": "ls"}
+        existing = {**_APPROVED, "command": "ls", "host_rule": {"bin": "ls", "args": []}}
         r, _ = self._call(user=_DEV, body={"agent_id": AGENT_ID, "command": "ls"}, active_approvals=[existing])
         assert r["statusCode"] == 409
 
     def test_developer_already_pending_returns_409(self):
-        existing_pending = {**_PENDING, "command": "ls"}
+        existing_pending = {**_PENDING, "command": "ls", "host_rule": {"bin": "ls", "args": []}}
         with patch("handlers.tenant_approvals._verify_tenant_token", return_value=_DEV), \
              patch("handlers.tenant_approvals.agents_repo") as agr, \
              patch("handlers.tenant_approvals.approvals_repo") as ar:
@@ -751,7 +776,7 @@ class TestHandleTenantCreateApproval:
         assert r["statusCode"] == 400
 
     def test_single_already_approved_command_returns_409(self):
-        existing = {**_APPROVED, "command": "ls"}
+        existing = {**_APPROVED, "command": "ls", "host_rule": {"bin": "ls", "args": []}}
         r, _ = self._call(
             body={"agent_id": AGENT_ID, "command": "ls"},
             active_approvals=[existing],
@@ -775,7 +800,7 @@ class TestHandleTenantCreateApproval:
         assert len(body["created"]) == 2
 
     def test_bulk_skips_already_approved(self):
-        existing = {**_APPROVED, "command": "ls"}
+        existing = {**_APPROVED, "command": "ls", "host_rule": {"bin": "ls", "args": []}}
         r, ar = self._call(
             body={"agent_id": AGENT_ID, "commands": ["ls", "pwd"]},
             active_approvals=[existing],
@@ -848,11 +873,65 @@ class TestHandleTenantCreateApproval:
         r, _ = self._call(agent=self._AGENT_K8S, body={"agent_id": AGENT_ID, "k8s_rule": self._RULE}, active_approvals=[existing])
         assert r["statusCode"] == 409
 
+    # A k8s agent also pre-approves non-kubectl tools (helm/flux/…) via a {bin,args} rule.
+    _HOST_RULE = {"bin": "helm", "args": ["install", "*"]}
+
+    def test_k8s_developer_creates_host_rule_for_nonkubectl(self):
+        r, ar = self._call(user=_DEV, agent=self._AGENT_K8S, body={"agent_id": AGENT_ID, "host_rule": self._HOST_RULE})
+        assert r["statusCode"] == 201
+        stored = ar.create.call_args[0][0]
+        assert stored["status"] == "pending"
+        assert stored["host_rule"] == self._HOST_RULE
+        assert stored["k8s_rule"] is None
+
+    def test_k8s_operator_preapproves_host_rule(self):
+        r, ar = self._call(agent=self._AGENT_K8S, body={"agent_id": AGENT_ID, "host_rule": self._HOST_RULE})
+        assert r["statusCode"] == 200
+        stored = ar.create.call_args[0][0]
+        assert stored["status"] == "approved"
+        assert stored["host_rule"] == self._HOST_RULE
+        assert stored["k8s_rule"] is None
+
+    def test_k8s_operator_skips_already_approved_host_rule(self):
+        # A k8s agent's non-kubectl host_rule must dedup against an existing one - it used
+        # to fall into the kubectl branch (rule=None), never match, and create a duplicate.
+        existing = {**_APPROVED, "command": "helm install *", "host_rule": self._HOST_RULE, "k8s_rule": None}
+        r, ar = self._call(agent=self._AGENT_K8S, body={"agent_id": AGENT_ID, "host_rule": self._HOST_RULE}, active_approvals=[existing])
+        assert r["statusCode"] == 409
+        ar.create.assert_not_called()
+
     def test_k8s_wildcard_rule_accepted(self):
         rule = {"verb": "*", "resource": "*", "namespace": "team-a", "name": "*"}
         r, ar = self._call(agent=self._AGENT_K8S, body={"agent_id": AGENT_ID, "k8s_rule": rule})
         assert r["statusCode"] == 200
         assert ar.create.call_args[0][0]["k8s_rule"] == rule
+
+    # A k8s host_rule for a binary the agent doesn't allow-list is a no-op - reject it
+    # (once the agent has reported its allowlist).
+    _AGENT_K8S_ALLOW = {**_AGENT_K8S, "k8s_allowed_binaries": ["kubectl", "jq", "helm"]}
+
+    def test_k8s_developer_rejects_non_allowlisted_binary(self):
+        agent = {**self._AGENT_K8S, "k8s_allowed_binaries": ["kubectl", "jq"]}  # no helm
+        r, ar = self._call(user=_DEV, agent=agent, body={"agent_id": AGENT_ID, "host_rule": self._HOST_RULE})
+        assert r["statusCode"] == 409
+        ar.create.assert_not_called()
+
+    def test_k8s_developer_allows_allowlisted_binary(self):
+        r, ar = self._call(user=_DEV, agent=self._AGENT_K8S_ALLOW, body={"agent_id": AGENT_ID, "host_rule": self._HOST_RULE})
+        assert r["statusCode"] == 201
+        assert ar.create.call_args[0][0]["host_rule"] == self._HOST_RULE
+
+    def test_k8s_operator_rejects_non_allowlisted_binary(self):
+        agent = {**self._AGENT_K8S, "k8s_allowed_binaries": ["kubectl", "jq"]}
+        r, ar = self._call(agent=agent, body={"agent_id": AGENT_ID, "host_rule": self._HOST_RULE})
+        assert r["statusCode"] == 409
+        ar.create.assert_not_called()
+
+    def test_k8s_host_rule_not_enforced_before_allowlist_reported(self):
+        # allowlist null (agent hasn't synced its k8s allowlist yet) - don't block.
+        r, ar = self._call(agent=self._AGENT_K8S, body={"agent_id": AGENT_ID, "host_rule": self._HOST_RULE})
+        assert r["statusCode"] == 200
+        assert ar.create.call_args[0][0]["host_rule"] == self._HOST_RULE
 
 
 # ---------------------------------------------------------------------------
@@ -1047,7 +1126,8 @@ class TestFleetScopedCreate:
         assert r["statusCode"] in (403, 404)
 
     def test_duplicate_fleet_approval_returns_409(self):
-        existing = {**_APPROVED, "command": "docker ps", "fleet_id": FLEET_ID, "agent_id": None}
+        existing = {**_APPROVED, "command": "docker ps", "host_rule": {"bin": "docker", "args": ["ps"]},
+                    "fleet_id": FLEET_ID, "agent_id": None}
         r, _ = self._call(user=_FLEET_OPERATOR, body={"fleet_id": FLEET_ID, "command": "docker ps"}, active=[existing])
         assert r["statusCode"] == 409
 

@@ -1091,16 +1091,30 @@ function RequestApprovalModal({
   const [rule, setRule] = useState<K8sRule>(EMPTY_RULE);
   // Host approvals are structured JSON rules (writes are structured, no strings).
   const [hostRule, setHostRule] = useState<HostRule>(EMPTY_HOST_RULE);
+  // A k8s agent approves kubectl writes as a verb rule, or a non-kubectl tool (helm/flux/…)
+  // as a {bin,args} rule - same structured host model.
+  const [k8sKind, setK8sKind] = useState<'kubectl' | 'command'>('kubectl');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
-  const isK8s = agents.find(a => a.agent_id === agentId)?.type === 'k8s';
+  const selectedAgent = agents.find(a => a.agent_id === agentId);
+  const isK8s = selectedAgent?.type === 'k8s';
+  const useHostRule = !isK8s || k8sKind === 'command';
+  // For a k8s non-kubectl approval, the agent won't run a binary that isn't in its
+  // self-reported execution allowlist - approving one is a no-op. Block it when the
+  // allowlist is known (null until the agent's first sync, so we can't enforce yet).
+  const allowedBins = isK8s ? selectedAgent?.k8s_allowed_binaries : null;
+  const binaryNotAllowed = Boolean(
+    isK8s && k8sKind === 'command' && allowedBins && hostRule.bin.trim() &&
+    !allowedBins.includes(hostRule.bin.trim())
+  );
 
   const submit = async () => {
     if (!agentId) { setError('Select an agent.'); return; }
-    if (!isK8s && !hostRule.bin.trim()) { setError('Binary is required.'); return; }
+    if (useHostRule && !hostRule.bin.trim()) { setError('Binary is required.'); return; }
+    if (binaryNotAllowed) { setError(`'${hostRule.bin.trim()}' is not in this agent's execution allowlist.`); return; }
     setLoading(true); setError('');
-    const payload = isK8s ? { rule } : { host_rule: hostRule };
+    const payload = useHostRule ? { host_rule: hostRule } : { rule };
     try { await onSubmit(agentId, payload); }
     catch (e) { setError((e as Error).message); setLoading(false); }
   };
@@ -1135,8 +1149,32 @@ function RequestApprovalModal({
         </div>
         {isK8s ? (
           <div>
-            <label className="block text-sm font-semibold text-gray-700 mb-1.5">Cluster rule</label>
-            <K8sRuleForm value={rule} onChange={setRule} />
+            <label className="block text-sm font-semibold text-gray-700 mb-1.5">Command type</label>
+            <div className="inline-flex rounded-lg border border-gray-300 p-0.5 mb-2 text-xs font-medium">
+              <button type="button" onClick={() => setK8sKind('kubectl')}
+                className={`px-3 py-1 rounded-md ${k8sKind === 'kubectl' ? 'bg-indigo-600 text-white' : 'text-gray-600'}`}>kubectl</button>
+              <button type="button" onClick={() => setK8sKind('command')}
+                className={`px-3 py-1 rounded-md ${k8sKind === 'command' ? 'bg-indigo-600 text-white' : 'text-gray-600'}`}>helm / other tool</button>
+            </div>
+            {k8sKind === 'kubectl' ? (
+              <K8sRuleForm value={rule} onChange={setRule} />
+            ) : (
+              <>
+                <HostRuleForm value={hostRule} onChange={setHostRule} />
+                <p className="text-xs text-gray-400 mt-1">
+                  A non-kubectl tool (helm, flux, …) - <span className="font-mono">*</span> matches any single arg.
+                </p>
+                {binaryNotAllowed ? (
+                  <div className="mt-2 text-xs bg-red-50 border border-red-200 text-red-700 rounded-md px-2.5 py-2">
+                    <strong>'{hostRule.bin.trim()}' is not allow-listed on this agent.</strong> The agent will hard-block it no matter what you approve. Add it to the agent's <code className="font-mono">extraAllowedBinaries</code> and redeploy first.{allowedBins && allowedBins.length > 0 && <> Currently allowed: <span className="font-mono">{allowedBins.join(', ')}</span>.</>}
+                  </div>
+                ) : (
+                  <div className="mt-2 text-xs bg-amber-50 border border-amber-200 text-amber-800 rounded-md px-2.5 py-2">
+                    The tool must also be <strong>allow-listed on the agent</strong> (<code className="font-mono">extraAllowedBinaries</code> in the Helm chart). Approving here does <strong>not</strong> allow-list it - an approved command still hard-blocks if its binary isn't allowed.
+                  </div>
+                )}
+              </>
+            )}
           </div>
         ) : (
         <div>
@@ -1152,7 +1190,7 @@ function RequestApprovalModal({
           <button onClick={onClose} className="text-sm text-gray-500 hover:text-gray-700 px-3 py-2">Cancel</button>
           <button
             onClick={submit}
-            disabled={loading}
+            disabled={loading || binaryNotAllowed}
             className="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-semibold px-4 py-2 rounded-lg disabled:opacity-60 transition-colors shadow-sm"
           >
             {loading && <Spinner className="h-4 w-4" />} Submit request
@@ -1399,11 +1437,23 @@ function AddApprovalModal({
   const [rule, setRule] = useState<K8sRule>(EMPTY_RULE);
   // Host targets (standalone agent or fleet) use a structured JSON rule; k8s uses a cluster rule.
   const [hostRule, setHostRule] = useState<HostRule>(EMPTY_HOST_RULE);
+  // A k8s agent approves kubectl writes as a verb rule, or a non-kubectl tool (helm/…) as a rule.
+  const [k8sKind, setK8sKind] = useState<'kubectl' | 'command'>('kubectl');
   const [duration, setDuration] = useState<Duration>('permanent');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
-  const isK8s = !isFleetScope && agents.find(a => a.agent_id === agentId)?.type === 'k8s';
+  const selectedAgent = isFleetScope ? undefined : agents.find(a => a.agent_id === agentId);
+  const isK8s = !isFleetScope && selectedAgent?.type === 'k8s';
+  const useHostRule = !isK8s || k8sKind === 'command';
+  // Same allowlist guard as the request modal: a k8s agent won't run a binary that isn't
+  // in its self-reported execution allowlist, so approving one is a no-op. Enforced only
+  // when the allowlist is known (null until the agent's first sync).
+  const allowedBins = isK8s ? selectedAgent?.k8s_allowed_binaries : null;
+  const binaryNotAllowed = Boolean(
+    isK8s && k8sKind === 'command' && allowedBins && hostRule.bin.trim() &&
+    !allowedBins.includes(hostRule.bin.trim())
+  );
 
   const submit = async () => {
     const dur = duration === 'permanent' ? undefined : duration;
@@ -1416,9 +1466,10 @@ function AddApprovalModal({
         await onSubmitFleet(fleetId, hostRule, dur);
       } else {
         if (!agentId) { setError('Select an agent.'); return; }
-        if (!isK8s && !hostRule.bin.trim()) { setError('Binary is required.'); return; }
+        if (useHostRule && !hostRule.bin.trim()) { setError('Binary is required.'); return; }
+        if (binaryNotAllowed) { setError(`'${hostRule.bin.trim()}' is not in this agent's execution allowlist.`); return; }
         setLoading(true);
-        const payload = isK8s ? { rule } : { host_rule: hostRule };
+        const payload = useHostRule ? { host_rule: hostRule } : { rule };
         await onSubmit(agentId, payload, dur);
       }
     } catch (e) { setError((e as Error).message); setLoading(false); }
@@ -1487,8 +1538,32 @@ function AddApprovalModal({
         )}
         {isK8s ? (
           <div>
-            <label className="block text-sm font-semibold text-gray-700 mb-1.5">Cluster rule</label>
-            <K8sRuleForm value={rule} onChange={setRule} />
+            <label className="block text-sm font-semibold text-gray-700 mb-1.5">Command type</label>
+            <div className="inline-flex rounded-lg border border-gray-300 p-0.5 mb-2 text-xs font-medium">
+              <button type="button" onClick={() => setK8sKind('kubectl')}
+                className={`px-3 py-1 rounded-md ${k8sKind === 'kubectl' ? 'bg-indigo-600 text-white' : 'text-gray-600'}`}>kubectl</button>
+              <button type="button" onClick={() => setK8sKind('command')}
+                className={`px-3 py-1 rounded-md ${k8sKind === 'command' ? 'bg-indigo-600 text-white' : 'text-gray-600'}`}>helm / other tool</button>
+            </div>
+            {k8sKind === 'kubectl' ? (
+              <K8sRuleForm value={rule} onChange={setRule} />
+            ) : (
+              <>
+                <HostRuleForm value={hostRule} onChange={setHostRule} />
+                <p className="text-xs text-gray-400 mt-1">
+                  A non-kubectl tool (helm, flux, …) - <span className="font-mono">*</span> matches any single arg.
+                </p>
+                {binaryNotAllowed ? (
+                  <div className="mt-2 text-xs bg-red-50 border border-red-200 text-red-700 rounded-md px-2.5 py-2">
+                    <strong>'{hostRule.bin.trim()}' is not allow-listed on this agent.</strong> The agent will hard-block it no matter what you approve. Add it to the agent's <code className="font-mono">extraAllowedBinaries</code> and redeploy first.{allowedBins && allowedBins.length > 0 && <> Currently allowed: <span className="font-mono">{allowedBins.join(', ')}</span>.</>}
+                  </div>
+                ) : (
+                  <div className="mt-2 text-xs bg-amber-50 border border-amber-200 text-amber-800 rounded-md px-2.5 py-2">
+                    The tool must also be <strong>allow-listed on the agent</strong> (<code className="font-mono">extraAllowedBinaries</code> in the Helm chart). Approving here does <strong>not</strong> allow-list it - an approved command still hard-blocks if its binary isn't allowed.
+                  </div>
+                )}
+              </>
+            )}
           </div>
         ) : (
         <div>
@@ -1523,7 +1598,7 @@ function AddApprovalModal({
           <button onClick={onClose} className="text-sm text-gray-500 hover:text-gray-700 px-3 py-2">Cancel</button>
           <button
             onClick={submit}
-            disabled={loading}
+            disabled={loading || binaryNotAllowed}
             className="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-semibold px-4 py-2 rounded-lg disabled:opacity-60 transition-colors shadow-sm"
           >
             {loading && <Spinner className="h-4 w-4" />} Add approval

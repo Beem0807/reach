@@ -19,6 +19,15 @@ describe('ApprovalTarget', () => {
     expect(screen.getByText('bin')).toBeInTheDocument();    // field label
   });
 
+  it('renders a trailing "..." host-rule arg as "any args"', () => {
+    const a: Approval = { ...base, command: 'helm list ...',
+      host_rule: { bin: 'helm', args: ['list', '...'] } };
+    render(<ApprovalTarget approval={a} />);
+    expect(screen.getByText('helm')).toBeInTheDocument();
+    expect(screen.getByText('list')).toBeInTheDocument();
+    expect(screen.getByText('any args')).toBeInTheDocument();   // the "..." arg
+  });
+
   it('renders a k8s rule as chips (unchanged)', () => {
     const a: Approval = { ...base, command: 'kubectl delete pods',
       k8s_rule: { verb: 'delete', resource: 'pods', namespace: 'team-a', name: '*' } };

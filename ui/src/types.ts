@@ -175,6 +175,7 @@ export interface Agent {
   k8s_permissions_acked?: K8sPermissions | null;
   k8s_permissions_drift?: boolean;
   k8s_permissions_reported?: boolean;
+  k8s_allowed_binaries?: string[] | null;
   mode: 'wild' | 'readonly' | 'approved';
   access_level: 'open' | 'elevated' | 'managed' | 'restricted';
   writable?: boolean;  // whether the requesting user may run write commands (read-only grant → false)

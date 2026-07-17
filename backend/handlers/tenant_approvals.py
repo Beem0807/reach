@@ -193,9 +193,17 @@ def handle_tenant_list_all_approvals(query: dict, raw_token: str) -> dict:
         else:
             agent_ids, fleet_ids = allowed_agents, allowed_fleets
 
+    # host/k8s is the AGENT's type, not the rule type - a k8s agent's non-kubectl
+    # (helm/flux) approval carries a host_rule but still belongs under Kubernetes.
+    k8s_agent_ids = None
+    if kind is not None:
+        k8s_agent_ids = [a["agent_id"] for a in agents_repo.list_by_tenant(user["tenant_id"])
+                         if (a.get("type") or "host") == "k8s"]
+
     approvals, total = approvals_repo.search_by_tenant(
         user["tenant_id"], status=status, agent_id=agent_id, agent_ids=agent_ids,
-        fleet_id=fleet_id, fleet_ids=fleet_ids, scope=scope, kind=kind, q=q, limit=limit, offset=offset,
+        fleet_id=fleet_id, fleet_ids=fleet_ids, scope=scope, kind=kind, k8s_agent_ids=k8s_agent_ids,
+        q=q, limit=limit, offset=offset,
     )
     _ac: dict = {}
     _fc: dict = {}
@@ -277,6 +285,39 @@ def handle_tenant_review_approval(approval_id: str, action: str, raw_token: str,
     return _ok(updated)
 
 
+def _host_command_to_rule(command: str):
+    """Structure a plain host command into a {bin, args[]} rule (positional, a bare '*'
+    token = wildcard arg), so a command-submitted approval (e.g. the CLI's
+    `reach approvals request "<cmd>"`) becomes the same structured rule the UI and
+    create_job produce. Returns None if it can't be structured (empty, or an arg with a
+    shell metacharacter that isn't a whole-arg '*') - the caller then rejects it, since
+    every host approval is a structured rule (no legacy command-string approvals)."""
+    toks = command.split()
+    if not toks:
+        return None
+    return normalize_host_rule({"bin": toks[0], "args": toks[1:]})
+
+
+def _k8s_binary_rejection(agent: dict, host_rule: Optional[dict]) -> Optional[str]:
+    """For a k8s agent, an approval for a non-kubectl tool the agent won't run is a no-op:
+    it lands in the Approved list but the job still hard-blocks at execution (the binary
+    isn't allow-listed). Returns an error message when the host_rule's binary isn't in the
+    agent's self-reported execution allowlist, else None. Only enforced once the agent has
+    reported its allowlist (null until first k8s sync) so we never block on unknown state."""
+    if not host_rule:
+        return None
+    allowed = agent.get("k8s_allowed_binaries")
+    if not allowed:  # not yet reported - can't enforce without guessing
+        return None
+    bin_ = host_rule.get("bin")
+    if bin_ and bin_ not in allowed:
+        return (f"'{bin_}' is not in this agent's execution allowlist "
+                f"({', '.join(allowed)}). Add it to the agent's extraAllowedBinaries and "
+                f"redeploy before approving - approving a binary the agent won't run has no "
+                f"effect (the command still hard-blocks at execution).")
+    return None
+
+
 def handle_tenant_create_approval(body: dict, raw_token: str) -> dict:
     """Create an approval for a standalone agent or a whole fleet. Operators/admins
     create directly approved; developers create pending. Fleet members carry no
@@ -294,8 +335,8 @@ def handle_tenant_create_approval(body: dict, raw_token: str) -> dict:
 
     if fleet_id:
         # Fleet approval: applies to every current and future member. Fleets are host-only,
-        # so these are host approvals - a structured host_rule (preferred) or a legacy
-        # command string, never a k8s rule.
+        # so these are host approvals - a structured host_rule (submitted directly, or
+        # structured from a command string), never a k8s rule.
         fleet = fleets_repo.get(fleet_id)
         if not fleet or fleet.get("tenant_id") != user["tenant_id"] or not can_access_fleet(user, fleet):
             return _err("fleet not found", 404)
@@ -328,11 +369,24 @@ def handle_tenant_create_approval(body: dict, raw_token: str) -> dict:
     if not _require_role(user, "operator"):
         # Developer path: single command/rule → pending
         if is_k8s:
-            host_rule = None
-            k8s_rule = normalize_k8s_rule((body or {}).get("k8s_rule") or {})
-            if not k8s_rule:
-                return _err("k8s_rule with a valid write verb is required for k8s agents", 400)
-            command = rule_to_command(k8s_rule)
+            # A k8s agent approves kubectl writes via a {verb,resource,namespace,name}
+            # k8s_rule, and non-kubectl tools (helm/flux/…) via a {bin,args[]} host_rule.
+            raw_host_rule = (body or {}).get("host_rule")
+            if raw_host_rule is not None:
+                host_rule = normalize_host_rule(raw_host_rule)
+                if not host_rule:
+                    return _err("host_rule needs a 'bin' and 'args' list with no shell operators (use * for a wildcard arg)", 400)
+                rejection = _k8s_binary_rejection(agent, host_rule)
+                if rejection:
+                    return _err(rejection, 409)
+                k8s_rule = None
+                command = host_rule_to_command(host_rule)
+            else:
+                host_rule = None
+                k8s_rule = normalize_k8s_rule((body or {}).get("k8s_rule") or {})
+                if not k8s_rule:
+                    return _err("k8s_rule (kubectl) or host_rule (a non-kubectl tool like helm) is required for k8s agents", 400)
+                command = rule_to_command(k8s_rule)
         else:
             k8s_rule = None
             raw_host_rule = (body or {}).get("host_rule")
@@ -342,20 +396,24 @@ def handle_tenant_create_approval(body: dict, raw_token: str) -> dict:
                     return _err("host_rule needs a 'bin' and 'args' list with no shell operators (use * for a wildcard arg)", 400)
                 command = host_rule_to_command(host_rule)
             else:
-                host_rule = None
                 command = (body or {}).get("command", "").strip()
                 if not command:
                     return _err("command or host_rule is required", 400)
                 if has_shell_operators(command):
                     return _err("approved commands can't contain shell operators (| ; && $() ` > <) "
                                 "- request approval for a single command", 400)
+                # Every host approval is a structured {bin, args[]} rule; structure the plain
+                # command or reject it if it can't be (e.g. a glob arg that isn't a whole '*').
+                host_rule = _host_command_to_rule(command)
+                if not host_rule:
+                    return _err("this command can't be structured into an approval rule "
+                                "(an argument uses a shell metacharacter that isn't a whole-arg *)", 400)
+                command = host_rule_to_command(host_rule)
 
         def _same(a):
-            if is_k8s:
+            if is_k8s and k8s_rule is not None:
                 return a.get("k8s_rule") == k8s_rule
-            if host_rule is not None:
-                return a.get("host_rule") == host_rule
-            return a.get("host_rule") is None and a.get("command") == command
+            return a.get("host_rule") == host_rule
 
         active = _active("approved")
         if any(_same(a) for a in active):
@@ -401,9 +459,10 @@ def handle_tenant_create_approval(body: dict, raw_token: str) -> dict:
         return _ok(approval, 201)
 
     # Operator/admin path: create directly as approved, supports bulk + duration.
-    # k8s agents pre-approve structured rules ({verb, resource, namespace, name});
-    # host agents pre-approve command strings. Each item is {command, k8s_rule}.
-    if is_k8s:
+    # k8s agents pre-approve structured rules ({verb, resource, namespace, name}); host
+    # agents pre-approve structured host rules (submitted, or structured from a command
+    # string). Each item is {command (display), k8s_rule, host_rule}.
+    if is_k8s and ((body or {}).get("k8s_rule") is not None or (body or {}).get("k8s_rules") is not None):
         rule_list = (body or {}).get("k8s_rules")
         single_rule = (body or {}).get("k8s_rule")
         if rule_list is not None:
@@ -411,11 +470,9 @@ def handle_tenant_create_approval(body: dict, raw_token: str) -> dict:
                 return _err("k8s_rules must be a non-empty list", 400)
             raw_rules = rule_list
             bulk = True
-        elif single_rule is not None:
+        else:
             raw_rules = [single_rule]
             bulk = False
-        else:
-            return _err("k8s_rule or k8s_rules is required for k8s agents", 400)
         items = []
         for raw in raw_rules:
             rule = normalize_k8s_rule(raw)
@@ -438,7 +495,16 @@ def handle_tenant_create_approval(body: dict, raw_token: str) -> dict:
             hr = normalize_host_rule(raw)
             if not hr:
                 return _err("each host_rule needs a 'bin' and 'args' list with no shell operators (use * for a wildcard arg)", 400)
+            if is_k8s:
+                rejection = _k8s_binary_rejection(agent, hr)
+                if rejection:
+                    return _err(rejection, 409)
             items.append({"command": host_rule_to_command(hr), "k8s_rule": None, "host_rule": hr})
+    elif is_k8s:
+        # A k8s agent takes a kubectl k8s_rule or a non-kubectl host_rule - never a bare
+        # command string (host-only).
+        return _err("k8s_rule/k8s_rules (kubectl) or host_rule/host_rules (a non-kubectl "
+                    "tool like helm) is required for k8s agents", 400)
     else:
         single_command = (body or {}).get("command", "").strip()
         command_list = (body or {}).get("commands")
@@ -458,7 +524,15 @@ def handle_tenant_create_approval(body: dict, raw_token: str) -> dict:
         if bad is not None:
             return _err("approved commands can't contain shell operators (| ; && $() ` > <); "
                         f"offending: {bad!r}", 400)
-        items = [{"command": c, "k8s_rule": None, "host_rule": None} for c in commands]
+        # Every host approval is a structured {bin, args[]} rule (this else-branch is
+        # host-only; k8s is handled above). Structure each command or reject it.
+        items = []
+        for c in commands:
+            hr = _host_command_to_rule(c)
+            if not hr:
+                return _err("this command can't be structured into an approval rule "
+                            f"(an argument uses a shell metacharacter that isn't a whole-arg *): {c!r}", 400)
+            items.append({"command": host_rule_to_command(hr), "k8s_rule": None, "host_rule": hr})
 
     duration = (body or {}).get("duration")
     if duration == "now":
@@ -468,7 +542,6 @@ def handle_tenant_create_approval(body: dict, raw_token: str) -> dict:
         return _err(f"invalid duration '{duration}'; use 1h, 8h, 24h, 7d, permanent, or Nh/Nd", 400)
 
     active = _active("approved")
-    active_commands = {a["command"] for a in active if not a.get("host_rule")}
     active_rules = [a.get("k8s_rule") for a in active if a.get("k8s_rule")]
     active_host_rules = [a.get("host_rule") for a in active if a.get("host_rule")]
     now = _iso()
@@ -478,12 +551,13 @@ def handle_tenant_create_approval(body: dict, raw_token: str) -> dict:
 
     for item in items:
         command, rule, host_rule = item["command"], item["k8s_rule"], item["host_rule"]
-        if is_k8s:
+        if is_k8s and rule is not None:
+            # kubectl rule on a k8s agent.
             already = rule in active_rules
-        elif host_rule is not None:
-            already = host_rule in active_host_rules
         else:
-            already = command in active_commands
+            # Structured host rule - a host agent's rule OR a k8s agent's non-kubectl tool
+            # (helm/…). Every host approval is a structured rule, so this is a pure rule dedup.
+            already = host_rule in active_host_rules
         if already:
             skipped.append({"command": command, "reason": "already_approved"})
             continue

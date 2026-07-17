@@ -966,6 +966,28 @@ function AgentDetailModal({
               />
             )}
 
+            {agent.type === 'k8s' && (
+              <div className="bg-gray-50 rounded-lg px-3 py-2.5">
+                <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-1">Execution allowlist</p>
+                {agent.k8s_allowed_binaries && agent.k8s_allowed_binaries.length > 0 ? (
+                  <>
+                    <div className="flex flex-wrap gap-1.5">
+                      {agent.k8s_allowed_binaries.map(bin => (
+                        <span key={bin} className="inline-flex items-center bg-slate-100 border border-slate-200 text-slate-700 text-xs font-mono px-2 py-0.5 rounded-md">
+                          {bin}
+                        </span>
+                      ))}
+                    </div>
+                    <p className="text-[10px] text-gray-400 mt-2 leading-tight">
+                      The binaries this agent will run (kubectl + read filters, plus any <span className="font-mono">extraAllowedBinaries</span>). Approving a command whose binary isn't here has no effect - it still hard-blocks at execution.
+                    </p>
+                  </>
+                ) : (
+                  <p className="text-xs text-gray-400">Not yet reported - the agent sends its allowlist on first sync.</p>
+                )}
+              </div>
+            )}
+
             {(agent.tags ?? []).length > 0 && (
               <div className="bg-gray-50 rounded-lg px-3 py-2.5">
                 <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-2">Tags</p>
@@ -1580,6 +1602,16 @@ function InstallModal({
                 <code className="text-xs text-green-400 break-all whitespace-pre-wrap">{cmd}</code>
                 <CopyButton text={cmd} className="absolute top-2 right-2" />
               </div>
+              {!isHelm && (
+                <p className="text-[11px] text-gray-500 mt-1.5 leading-relaxed">
+                  Linux installs a persistent <code>systemd</code> service under a dedicated{' '}
+                  <code>reach-agent</code> user. On <strong>macOS</strong>, add{' '}
+                  <code>--background</code> for the same (a <code>launchd</code> daemon under a
+                  dedicated user, started on boot). <strong>Without <code>--background</code> on
+                  macOS</strong>, the agent runs in the <strong>foreground as the user who installs
+                  it</strong> - no dedicated user is created, and it stops when the terminal closes.
+                </p>
+              )}
             </div>
           );
         })()}

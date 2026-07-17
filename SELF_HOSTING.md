@@ -428,8 +428,10 @@ Pin the chart with `--version <chartVersion>`; the agent image comes from that c
 Key differences from a host agent:
 
 - **Access is Kubernetes RBAC.** What the agent can do in the cluster is the `clusterAccess` you bind in the chart (defaults to read-only `view`); the host-only Docker / service-management grants don't apply. The agent **auto-discovers and reports its effective cluster-wide RBAC**, which you **acknowledge** in the console - and any permission added later (in any namespace) shows up as **drift** to re-acknowledge.
-- **Execution is gated, no shell.** Jobs run as `kubectl` (plus a few read-only filters) connected by pipes - no arbitrary shell. Tune the allowlist with `extraAllowedBinaries` / `allowedBinaries`.
-- **Policy mode still applies** (`readonly` / `approved` / `wild`), enforced by the backend per `kubectl` verb.
+- **Execution is gated, no shell.** Jobs run as `kubectl` (plus read-only filters `grep jq head tail wc sort uniq cut tr`) connected by pipes - no arbitrary shell.
+- **Adding other CLIs (helm, flux, custom).** Extend the allowlist with `extraAllowedBinaries` - **a list of dicts** where each entry both allow-lists the binary *and* provides it (an initContainer downloads it, pinned by `url` + `sha256`, into the agent's `PATH`; omit `url` for a binary already in a custom image). An initContainer **verifies every allow-listed binary resolves and hard-fails the pod otherwise**, so you can't allow-list a tool you didn't provide. `allowedBinaries` (a plain name list) replaces the default set for lock-down. See the chart's [Adding CLIs](deploy/helm/reach-agent#adding-clis-helm-flux-custom-tools) section.
+- **Non-`kubectl` tools are writes** (default-deny), approved with a `{bin, args[]}` **host rule** - positional `*`, trailing `...` for the rest (e.g. `{bin: helm, args: [upgrade, ...]}`). `helm`'s arbitrary-exec escapes (`--post-renderer`, `helm plugin`) are always blocked. The agent reports its execution allowlist so the console **warns/blocks** approving a binary it won't run.
+- **Policy mode still applies** (`readonly` / `approved` / `wild`), enforced by the backend at submission (default-deny: only `kubectl` reads and read-only filters are reads).
 
 The chart's image (`nabeemdev/reach-agent`) and all values are documented in [deploy/helm/reach-agent](deploy/helm/reach-agent); how the agent itself works is in [agent/README.md](agent/README.md).
 

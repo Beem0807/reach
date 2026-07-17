@@ -578,7 +578,10 @@ class TestRevokeAndDelete:
             r = handle_revoke_fleet(FLEET_ID, {"members": "keep"}, TOKEN)
         assert json.loads(r["body"])["status"] == "REVOKED"
         fr.set_status.assert_called_once_with(FLEET_ID, "REVOKED")
-        ar.detach_fleet.assert_called_once_with(FLEET_ID)
+        # Detach now also swaps the fleet's tags for a single provenance tag.
+        assert ar.detach_fleet.call_args[0][0] == FLEET_ID
+        prov = ar.detach_fleet.call_args[1]["tags"]
+        assert len(prov) == 1 and prov[0].startswith("oldfleet:")
         ar.delete_by_fleet.assert_not_called()
         # Kept members stay standalone - their approvals are not purged here.
         apr.delete_by_fleet.assert_not_called()
@@ -642,7 +645,10 @@ class TestRemoveFleetMember:
             r = handle_remove_fleet_member(FLEET_ID, "agent_m", TOKEN)
         assert r["statusCode"] == 200
         assert json.loads(r["body"])["detached"] is True
-        ar.detach_from_fleet.assert_called_once_with("agent_m")
+        # Detach swaps the fleet's tags for a single provenance tag (fleet-id in history).
+        assert ar.detach_from_fleet.call_args[0][0] == "agent_m"
+        prov = ar.detach_from_fleet.call_args[1]["tags"]
+        assert len(prov) == 1 and prov[0].startswith("oldfleet:")
         ar.delete.assert_not_called()             # detach keeps the agent
         hr.create.assert_called_once()            # history entry recorded
 

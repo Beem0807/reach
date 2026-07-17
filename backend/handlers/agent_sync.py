@@ -131,18 +131,24 @@ def handle_agent_sync(body: dict, raw_token: str) -> dict:
         if perm_hash and perm_hash != agent.get("k8s_permissions_hash"):
             agents_repo.set_k8s_permissions(agent_id, k8s_permissions, perm_hash)
 
+    # The k8s agent reports its effective execution allowlist (kubectl + filters + any
+    # extras). Store it when it changes so the console can warn/block approving a command
+    # whose binary the agent won't run. Only a list of non-empty strings is accepted.
+    k8s_allowed = body.get("k8s_allowed_binaries")
+    if isinstance(k8s_allowed, list):
+        binaries = [b for b in k8s_allowed if isinstance(b, str) and b.strip()]
+        if binaries and binaries != (agent.get("k8s_allowed_binaries") or []):
+            agents_repo.set_k8s_allowed_binaries(agent_id, binaries)
+
     pending_jobs = jobs_repo.get_pending_for_agent(agent_id)
-    approved_commands: list = []
     approved_host_rules: list = []
     if any(j.get("mode") == "approved" for j in pending_jobs):
         # Fleet members inherit their fleet's approvals; standalone agents use their own.
         fleet_id = agent.get("fleet_id")
         approved = (approvals_repo.list_by_fleet(fleet_id, status="approved") if fleet_id
                     else approvals_repo.list_by_agent(agent_id, status="approved"))
-        # Freeform host approvals are command strings; structured host approvals are rules
-        # {bin, args[]} the agent matches against a job's argv. (k8s approvals are enforced
-        # by the agent's own kubectl allowlist, not fed here.)
-        approved_commands = [a["command"] for a in approved if not a.get("host_rule") and not a.get("k8s_rule")]
+        # Host approvals are structured rules {bin, args[]} the agent matches against a job's
+        # argv. (k8s approvals are enforced at submission, not fed to the agent here.)
         approved_host_rules = [a["host_rule"] for a in approved if a.get("host_rule")]
 
     jobs_payload = []
@@ -154,7 +160,6 @@ def handle_agent_sync(body: dict, raw_token: str) -> dict:
                 "command": job["command"],
                 "mode": mode,
                 "is_write": job.get("is_write", False),
-                "approved_commands": approved_commands if mode == "approved" else [],
             }
             # Structured exec: hand the agent the argv (execve, no shell) + the approved
             # host rules it matches against.

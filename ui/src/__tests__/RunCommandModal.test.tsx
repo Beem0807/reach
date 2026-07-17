@@ -23,11 +23,15 @@ const FLEET: Fleet = {
 beforeEach(() => { vi.restoreAllMocks(); });
 
 describe('RunCommandModal - single agent', () => {
-  it('previews (dry-run) then dispatches the job on confirm', async () => {
+  it('previews (dry-run), dispatches, then polls the job to its result', async () => {
     const spy = vi.spyOn(api, 'createJob')
       .mockResolvedValueOnce({ dry_run: true, agent_id: 'agent_1', hostname: 'web-01',
         command: 'rm -rf /tmp/x', mode: 'wild', is_write: true, approval_required: false } as never)
       .mockResolvedValueOnce({ job_id: 'job_abc', status: 'PENDING' } as never);
+    // The modal polls getJob until terminal - RUNNING first, then SUCCEEDED with output.
+    const getJobSpy = vi.spyOn(api, 'getJob')
+      .mockResolvedValueOnce({ job_id: 'job_abc', status: 'RUNNING' } as never)
+      .mockResolvedValueOnce({ job_id: 'job_abc', status: 'SUCCEEDED', exit_code: 0, stdout: 'removed' } as never);
     render(<RunCommandModal config={CONFIG} target={{ kind: 'agent', agent: AGENT }} onClose={() => {}} />);
 
     await userEvent.type(screen.getByPlaceholderText('uptime'), 'rm -rf /tmp/x');
@@ -40,8 +44,11 @@ describe('RunCommandModal - single agent', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Confirm & run' }));
     await waitFor(() => expect(spy).toHaveBeenNthCalledWith(2, CONFIG.apiUrl, CONFIG.tenantToken, 'agent_1', 'rm -rf /tmp/x'));
-    expect(await screen.findByText('Dispatched')).toBeInTheDocument();
-    expect(screen.getByText('job_abc')).toBeInTheDocument();
+    expect(await screen.findByText('job_abc')).toBeInTheDocument();
+    // Polls to the terminal result and shows exit code + stdout inline.
+    expect(await screen.findByText('Succeeded', {}, { timeout: 4000 })).toBeInTheDocument();
+    expect(screen.getByText('removed')).toBeInTheDocument();
+    expect(getJobSpy).toHaveBeenCalledWith(CONFIG.apiUrl, CONFIG.tenantToken, 'job_abc');
   });
 
   it('flags the host heuristic and warns on a wild-mode write', async () => {

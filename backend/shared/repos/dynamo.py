@@ -162,6 +162,13 @@ class AgentRepo:
             ExpressionAttributeValues={":p": _truncate_k8s_permissions(permissions), ":h": perm_hash},
         )
 
+    def set_k8s_allowed_binaries(self, agent_id: str, binaries: list) -> None:
+        _TABLE_AGENTS.update_item(
+            Key={"agent_id": agent_id},
+            UpdateExpression="SET k8s_allowed_binaries = :b",
+            ExpressionAttributeValues={":b": binaries},
+        )
+
     def acknowledge_k8s_permissions(self, agent_id: str, perm_hash: str, acked_permissions: Optional[dict] = None) -> None:
         _TABLE_AGENTS.update_item(
             Key={"agent_id": agent_id},
@@ -265,13 +272,17 @@ class AgentRepo:
             kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
         return ids
 
-    def detach_fleet(self, fleet_id: str) -> int:
+    def detach_fleet(self, fleet_id: str, tags: Optional[list] = None) -> int:
         ids = self._fleet_member_ids(fleet_id)
         for aid in ids:
-            _TABLE_AGENTS.update_item(
-                Key={"agent_id": aid},
-                UpdateExpression="REMOVE fleet_id",
-            )
+            if tags is None:
+                _TABLE_AGENTS.update_item(Key={"agent_id": aid}, UpdateExpression="REMOVE fleet_id")
+            else:
+                _TABLE_AGENTS.update_item(
+                    Key={"agent_id": aid},
+                    UpdateExpression="SET tags = :t REMOVE fleet_id",
+                    ExpressionAttributeValues={":t": tags},
+                )
         return len(ids)
 
     def delete_by_fleet(self, fleet_id: str) -> int:
@@ -301,8 +312,15 @@ class AgentRepo:
             )
         return len(ids)
 
-    def detach_from_fleet(self, agent_id: str) -> None:
-        _TABLE_AGENTS.update_item(Key={"agent_id": agent_id}, UpdateExpression="REMOVE fleet_id")
+    def detach_from_fleet(self, agent_id: str, tags: Optional[list] = None) -> None:
+        if tags is None:
+            _TABLE_AGENTS.update_item(Key={"agent_id": agent_id}, UpdateExpression="REMOVE fleet_id")
+        else:
+            _TABLE_AGENTS.update_item(
+                Key={"agent_id": agent_id},
+                UpdateExpression="SET tags = :t REMOVE fleet_id",
+                ExpressionAttributeValues={":t": tags},
+            )
 
     def reenroll(self, agent_id: str, fields: dict) -> None:
         _TABLE_AGENTS.update_item(
@@ -1053,6 +1071,7 @@ class ApprovalRepo:
     def search_by_tenant(self, tenant_id: str, *, status: Optional[str] = None, agent_id: Optional[str] = None,
                          agent_ids: Optional[list] = None, fleet_id: Optional[str] = None, fleet_ids: Optional[list] = None,
                          scope: Optional[str] = None, requested_by: Optional[str] = None, kind: Optional[str] = None,
+                         k8s_agent_ids: Optional[list] = None,
                          q: Optional[str] = None, limit: int = 20, offset: int = 0) -> tuple:
         """Server-side search + pagination for DynamoDB.
 
@@ -1111,10 +1130,13 @@ class ApprovalRepo:
         if status == "approved":
             results = self._lazy_expire(results)
             results = self._dedup_by_command(results)
+        # host/k8s is the AGENT's type, not the rule type: a k8s agent's non-kubectl
+        # (helm/flux) approval carries a host_rule but still belongs under Kubernetes.
+        k8s_ids = set(k8s_agent_ids or [])
         if kind == "k8s":
-            results = [r for r in results if r.get("k8s_rule")]
+            results = [r for r in results if r.get("k8s_rule") or r.get("agent_id") in k8s_ids]
         elif kind == "host":
-            results = [r for r in results if not r.get("k8s_rule")]
+            results = [r for r in results if not r.get("k8s_rule") and r.get("agent_id") not in k8s_ids]
         # scope: 'agent' = standalone (no fleet), 'fleet' = fleet-scoped.
         if scope == "agent":
             results = [r for r in results if not r.get("fleet_id")]

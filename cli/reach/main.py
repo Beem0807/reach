@@ -68,10 +68,12 @@ def _http_die(e: "requests.RequestException") -> None:
     if resp is None:
         # No response = never reached the server (connection refused, DNS, timeout).
         url = getattr(getattr(e, "request", None), "url", None)
-        where = f" ({url.split('/')[2]})" if isinstance(url, str) and "//" in url else ""
+        where = f" ({url.split('/')[2]})" if isinstance(url,
+                                                        str) and "//" in url else ""
         if isinstance(e, requests.Timeout):
             _die(f"the backend timed out{where} - is it up and reachable?", 2)
-        _die(f"cannot reach the backend{where} - is it running and is your API URL correct? (`reach whoami`)", 2)
+        _die(
+            f"cannot reach the backend{where} - is it running and is your API URL correct? (`reach whoami`)", 2)
 
     status = getattr(resp, "status_code", None)
     message = None
@@ -128,7 +130,8 @@ def _root(
 # ---------------------------------------------------------------------------
 # reach config
 # ---------------------------------------------------------------------------
-config_app = typer.Typer(help="Inspect local CLI configuration.", no_args_is_help=True)
+config_app = typer.Typer(
+    help="Inspect local CLI configuration.", no_args_is_help=True)
 app.add_typer(config_app, name="config")
 
 
@@ -138,7 +141,8 @@ def config_show():
     active = cfg_module.active_profile_name()
     cfg = cfg_module.load_profile()
     if not cfg:
-        console.print("[yellow]No configuration found. Run `reach login` first.[/yellow]")
+        console.print(
+            "[yellow]No configuration found. Run `reach login` first.[/yellow]")
         raise typer.Exit(2)
 
     table = Table(show_header=False, box=None)
@@ -148,12 +152,14 @@ def config_show():
     table.add_row("Config file", str(cfg_module.CONFIG_FILE))
     table.add_row("Active profile", f"[cyan]{active}[/cyan]")
     table.add_row("API URL", cfg.get("api_url") or "[dim]-[/dim]")
-    table.add_row("Default agent", cfg.get("default_agent_id") or "[dim]-[/dim]")
+    table.add_row("Default agent", cfg.get(
+        "default_agent_id") or "[dim]-[/dim]")
     table.add_row("Default fleet", cfg.get("default_fleet") or "[dim]-[/dim]")
 
     aliases = cfg.get("aliases") or {}
     if aliases:
-        alias_str = ", ".join(f"[cyan]{k}[/cyan]={v}" for k, v in sorted(aliases.items()))
+        alias_str = ", ".join(
+            f"[cyan]{k}[/cyan]={v}" for k, v in sorted(aliases.items()))
         table.add_row("Aliases", alias_str)
     else:
         table.add_row("Aliases", "[dim]none[/dim]")
@@ -167,14 +173,17 @@ def config_show():
 @app.command()
 def login(
     api_url: str = typer.Option(..., "--api-url", help="Backend API URL"),
-    api_key: str = typer.Option(..., "--api-key", help="API key (from the tenant console → API Tokens)"),
-    profile: str = typer.Option("default", "--profile", "-p", help="Profile name to save under"),
+    api_key: str = typer.Option(..., "--api-key",
+                                help="API key (from the tenant console → API Tokens)"),
+    profile: str = typer.Option(
+        "default", "--profile", "-p", help="Profile name to save under"),
 ):
     """Store API URL and API key. Use --profile to manage multiple tenants."""
     full = cfg_module.load()
     existing = full.get("profiles", {}).get(profile, {})
     if existing.get("api_url") or existing.get("api_key") or existing.get("tenant_token"):
-        console.print(f"[yellow]Profile '{profile}' already exists (API: {existing.get('api_url')}).[/yellow]")
+        console.print(
+            f"[yellow]Profile '{profile}' already exists (API: {existing.get('api_url')}).[/yellow]")
         if not Confirm.ask("Overwrite?", default=False):
             raise typer.Exit(0)
     profile_data = dict(existing)
@@ -185,9 +194,8 @@ def login(
     full.setdefault("profiles", {})[profile] = profile_data
     full["active_profile"] = profile
     cfg_module.save(full)
-    console.print(f"[green]Logged in[/green] (profile: [cyan]{profile}[/cyan]). API: {api_url}")
-
-
+    console.print(
+        f"[green]Logged in[/green] (profile: [cyan]{profile}[/cyan]). API: {api_url}")
 
 
 # ---------------------------------------------------------------------------
@@ -244,13 +252,15 @@ def status():
     table.add_row("Type", _type_label(agent.get("type")))
     table.add_row("Hostname", agent.get("hostname") or "-")
     table.add_row("Version", agent.get("agent_version") or "-")
-    table.add_row("Fingerprint", (agent.get("machine_fingerprint") or "-")[:24] + "...")
+    table.add_row("Fingerprint", (agent.get(
+        "machine_fingerprint") or "-")[:24] + "...")
     table.add_row("Claimed at", agent.get("claimed_at") or "-")
     table.add_row("Last heartbeat", agent.get("last_heartbeat_at") or "-")
     table.add_row("Mode", agent.get("mode") or "-")
     table.add_row("Access level", agent.get("access_level") or "-")
     if agent.get("writable") is False:
-        table.add_row("Your access", "[cyan]read-only[/cyan] (write commands are blocked)")
+        table.add_row(
+            "Your access", "[cyan]read-only[/cyan] (write commands are blocked)")
 
     console.print(table)
 
@@ -258,13 +268,15 @@ def status():
 # ---------------------------------------------------------------------------
 # reach agents
 # ---------------------------------------------------------------------------
-agents_app = typer.Typer(help="Manage and list remote agents.", no_args_is_help=True)
+agents_app = typer.Typer(
+    help="Manage and list remote agents.", no_args_is_help=True)
 app.add_typer(agents_app, name="agents")
 
 
 @agents_app.command("list")
 def agents_list(
-    tag: Optional[str] = typer.Option(None, "--tag", "-t", help="Filter by tag (e.g. env:prod)"),
+    tag: Optional[str] = typer.Option(
+        None, "--tag", "-t", help="Filter by tag (e.g. env:prod)"),
 ):
     """List your standalone agents.
 
@@ -285,7 +297,8 @@ def agents_list(
     if _emit({**data, "agents": items}):  # full envelope, collection filtered to standalone
         return
     if not items:
-        console.print("[yellow]No standalone agents found.[/yellow] [dim]Try `reach fleets list`.[/dim]")
+        console.print(
+            "[yellow]No standalone agents found.[/yellow] [dim]Try `reach fleets list`.[/dim]")
         return
 
     aliases = cfg_module.list_aliases()
@@ -305,7 +318,8 @@ def agents_list(
         table.add_column("Tags")
     table.add_column("Claimed at")
 
-    _mode_colors = {"wild": "[yellow]wild[/yellow]", "readonly": "[cyan]readonly[/cyan]", "approved": "[green]approved[/green]"}
+    _mode_colors = {"wild": "[yellow]wild[/yellow]",
+                    "readonly": "[cyan]readonly[/cyan]", "approved": "[green]approved[/green]"}
     _access_colors = {
         "open": "[dim]open[/dim]",
         "elevated": "[yellow]elevated[/yellow]",
@@ -334,7 +348,8 @@ def agents_list(
         ]
         if show_tags:
             tags = a.get("tags") or []
-            row.append(", ".join(f"[dim]{t}[/dim]" for t in tags) if tags else "-")
+            row.append(
+                ", ".join(f"[dim]{t}[/dim]" for t in tags) if tags else "-")
         row.append(a.get("claimed_at") or "-")
         table.add_row(*row)
 
@@ -354,7 +369,8 @@ def agents_use(agent_id: str = typer.Argument(..., help="Agent ID or alias to se
 @agents_app.command("show")
 def agents_show(agent_id: str = typer.Argument(..., help="Agent ID or alias")):
     """Show one agent's full detail (mode, access, tags, capabilities)."""
-    client = ReachClient(cfg_module.require("api_url"), cfg_module.require("api_key"))
+    client = ReachClient(cfg_module.require("api_url"),
+                         cfg_module.require("api_key"))
     resolved = cfg_module.resolve_agent(agent_id)
     try:
         agent = client.get_agent(resolved)
@@ -377,9 +393,11 @@ def agents_show(agent_id: str = typer.Argument(..., help="Agent ID or alias")):
     table.add_row("Mode", agent.get("mode") or "-")
     table.add_row("Access level", agent.get("access_level") or "-")
     if agent.get("writable") is False:
-        table.add_row("Your access", "[cyan]read-only[/cyan] (write commands are blocked)")
+        table.add_row(
+            "Your access", "[cyan]read-only[/cyan] (write commands are blocked)")
     tags = agent.get("tags") or []
-    table.add_row("Tags", ", ".join(f"[dim]{t}[/dim]" for t in tags) if tags else "-")
+    table.add_row("Tags", ", ".join(
+        f"[dim]{t}[/dim]" for t in tags) if tags else "-")
     table.add_row("Claimed at", agent.get("claimed_at") or "-")
     table.add_row("Last heartbeat", agent.get("last_heartbeat_at") or "-")
     console.print(table)
@@ -388,7 +406,8 @@ def agents_show(agent_id: str = typer.Argument(..., help="Agent ID or alias")):
 # ---------------------------------------------------------------------------
 # reach fleets
 # ---------------------------------------------------------------------------
-fleets_app = typer.Typer(help="List fleets and run commands across their members.", no_args_is_help=True)
+fleets_app = typer.Typer(
+    help="List fleets and run commands across their members.", no_args_is_help=True)
 app.add_typer(fleets_app, name="fleets")
 
 _FLEET_MODE_COLORS = {
@@ -417,25 +436,29 @@ def _resolve_fleet(client: ReachClient, identifier: Optional[str] = None) -> dic
             return f
     console.print(f"[red]Fleet not found:[/red] {identifier}")
     if fleets:
-        console.print("[dim]Available: " + ", ".join(f.get("name") or f["fleet_id"] for f in fleets) + "[/dim]")
+        console.print("[dim]Available: " + ", ".join(f.get("name")
+                      or f["fleet_id"] for f in fleets) + "[/dim]")
     raise typer.Exit(2)
 
 
 @fleets_app.command("use")
 def fleets_use(fleet: str = typer.Argument(..., help="Fleet id or name to set as default")):
     """Set the default fleet for the active profile (so fleet commands can omit it)."""
-    client = ReachClient(cfg_module.require("api_url"), cfg_module.require("api_key"))
+    client = ReachClient(cfg_module.require("api_url"),
+                         cfg_module.require("api_key"))
     fleet_obj = _resolve_fleet(client, fleet)
     prof = cfg_module.load_profile()
     prof["default_fleet"] = fleet_obj["fleet_id"]
     cfg_module.save_profile(prof)
-    console.print(f"[green]Default fleet set to:[/green] [magenta]{fleet_obj.get('name') or fleet_obj['fleet_id']}[/magenta]")
+    console.print(
+        f"[green]Default fleet set to:[/green] [magenta]{fleet_obj.get('name') or fleet_obj['fleet_id']}[/magenta]")
 
 
 @fleets_app.command("list")
 def fleets_list():
     """List the fleets you can access, with live member counts."""
-    client = ReachClient(cfg_module.require("api_url"), cfg_module.require("api_key"))
+    client = ReachClient(cfg_module.require("api_url"),
+                         cfg_module.require("api_key"))
     try:
         data = client.list_fleets()
     except requests.RequestException as e:
@@ -457,7 +480,8 @@ def fleets_list():
     table.add_column("Access")
     for f in items:
         mode = f.get("mode", "wild")
-        access = "[cyan]read-only[/cyan]" if f.get("writable") is False else "[green]read-write[/green]"
+        access = "[cyan]read-only[/cyan]" if f.get(
+            "writable") is False else "[green]read-write[/green]"
         table.add_row(
             f"[magenta]{f.get('name') or '-'}[/magenta]",
             f["fleet_id"],
@@ -472,13 +496,15 @@ def fleets_list():
 @fleets_app.command("show")
 def fleets_show(fleet: Optional[str] = typer.Argument(None, help="Fleet id or name (default: `reach fleets use`)")):
     """Show one fleet's detail (mode, tags, member breakdown, your access)."""
-    client = ReachClient(cfg_module.require("api_url"), cfg_module.require("api_key"))
+    client = ReachClient(cfg_module.require("api_url"),
+                         cfg_module.require("api_key"))
     fleet_obj = _resolve_fleet(client, fleet)
 
     # Member status breakdown is best-effort (needs a second call).
     active = inactive = None
     try:
-        members = client.list_fleet_agents(fleet_obj["fleet_id"]).get("agents", [])
+        members = client.list_fleet_agents(
+            fleet_obj["fleet_id"]).get("agents", [])
         active = sum(1 for m in members if m.get("status") == "ACTIVE")
         inactive = sum(1 for m in members if m.get("status") == "INACTIVE")
     except requests.RequestException:
@@ -502,16 +528,20 @@ def fleets_show(fleet: Optional[str] = typer.Argument(None, help="Fleet id or na
     table.add_row("Status", _status_color(fleet_obj.get("status", "")))
     table.add_row("Mode", _FLEET_MODE_COLORS.get(mode, mode))
     table.add_row("Members", members_cell)
-    table.add_row("Your access", "[cyan]read-only[/cyan]" if fleet_obj.get("writable") is False else "[green]read-write[/green]")
-    table.add_row("Tags", ", ".join(f"[dim]{t}[/dim]" for t in tags) if tags else "-")
+    table.add_row("Your access", "[cyan]read-only[/cyan]" if fleet_obj.get(
+        "writable") is False else "[green]read-write[/green]")
+    table.add_row("Tags", ", ".join(
+        f"[dim]{t}[/dim]" for t in tags) if tags else "-")
     console.print(table)
-    console.print("[dim]Members: `reach fleets agents`. Approvals: `reach fleets approvals list`.[/dim]")
+    console.print(
+        "[dim]Members: `reach fleets agents`. Approvals: `reach fleets approvals list`.[/dim]")
 
 
 @fleets_app.command("agents")
 def fleets_agents(fleet: Optional[str] = typer.Argument(None, help="Fleet id or name (default: `reach fleets use`)")):
     """List the member agents of a fleet."""
-    client = ReachClient(cfg_module.require("api_url"), cfg_module.require("api_key"))
+    client = ReachClient(cfg_module.require("api_url"),
+                         cfg_module.require("api_key"))
     fleet_obj = _resolve_fleet(client, fleet)
     try:
         data = client.list_fleet_agents(fleet_obj["fleet_id"])
@@ -521,9 +551,11 @@ def fleets_agents(fleet: Optional[str] = typer.Argument(None, help="Fleet id or 
     if _emit(data):
         return
     items = data.get("agents", [])
-    console.print(f"[bold]Fleet:[/bold] [magenta]{fleet_obj.get('name') or fleet_obj['fleet_id']}[/magenta]  [dim]({len(items)} members)[/dim]")
+    console.print(
+        f"[bold]Fleet:[/bold] [magenta]{fleet_obj.get('name') or fleet_obj['fleet_id']}[/magenta]  [dim]({len(items)} members)[/dim]")
     if not items:
-        console.print("[yellow]No members yet - install a host with this fleet's join token to enroll it.[/yellow]")
+        console.print(
+            "[yellow]No members yet - install a host with this fleet's join token to enroll it.[/yellow]")
         return
 
     table = Table(show_header=True, header_style="bold cyan")
@@ -593,7 +625,8 @@ def _print_fanout_preview(p: dict) -> None:
     """Render a fan-out dry-run preview: what it matched and how it will roll out
     (wave size / strategy / failure policy), shown before the Proceed? prompt."""
     if p.get("fleet_name") or p.get("fleet_id"):
-        console.print(f"[dim]Fleet:[/dim] [magenta]{p.get('fleet_name') or p.get('fleet_id')}[/magenta]")
+        console.print(
+            f"[dim]Fleet:[/dim] [magenta]{p.get('fleet_name') or p.get('fleet_id')}[/magenta]")
     if p.get("tag"):
         typ = f"  [dim]type={p.get('type')}[/dim]" if p.get("type") else ""
         console.print(f"[dim]Tag:[/dim] [cyan]{p.get('tag')}[/cyan]{typ}")
@@ -602,9 +635,11 @@ def _print_fanout_preview(p: dict) -> None:
     if p.get("mode"):
         console.print(f"[dim]Mode:[/dim] {p['mode']}")
     console.print(f"[dim]Wave size:[/dim] {p.get('wave_size')}")
-    console.print(f"[dim]Wave strategy:[/dim] {(p.get('wave_strategy') or 'auto').upper()}")
+    console.print(
+        f"[dim]Wave strategy:[/dim] {(p.get('wave_strategy') or 'auto').upper()}")
     fp = (p.get("failure_policy") or "stop").lower()
-    console.print(f"[dim]Failure policy:[/dim] {'STOP_ON_FAILURE' if fp == 'stop' else 'CONTINUE'}")
+    console.print(
+        f"[dim]Failure policy:[/dim] {'STOP_ON_FAILURE' if fp == 'stop' else 'CONTINUE'}")
     if p.get("approval_required"):
         console.print("[dim]Approval required:[/dim] [yellow]yes[/yellow]")
     skipped = p.get("skipped") or []
@@ -613,20 +648,27 @@ def _print_fanout_preview(p: dict) -> None:
     matched = p.get("matched", 0)
     ws = p.get("wave_size") or matched
     if (p.get("wave_total") or 1) > 1:
-        console.print(f"\n[dim]This will create {matched} child jobs, but only {ws} will be released per wave.[/dim]")
+        console.print(
+            f"\n[dim]This will create {matched} child jobs, but only {ws} will be released per wave.[/dim]")
 
 
 @fleets_app.command(
     name="exec",
-    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+    context_settings={"allow_extra_args": True,
+                      "ignore_unknown_options": True},
 )
 def fleets_exec(
     ctx: typer.Context,
-    fleet: Optional[str] = typer.Argument(None, help="Fleet id or name (or `reach fleets use`)"),
-    yes: bool = typer.Option(False, "--yes", "-y", "--force", help="Skip the interactive preview + confirmation (force)"),
-    timeout: int = typer.Option(60, "--timeout", "-t", help="Seconds to wait for each member's result"),
-    no_wait: bool = typer.Option(False, "--no-wait", help="Dispatch and exit without waiting for results"),
-    max_targets: int = typer.Option(0, "--max-targets", "-n", help="Cap how many members to run on per wave (0 = the fan-out cap; required above the server's safety cap)"),
+    fleet: Optional[str] = typer.Argument(
+        None, help="Fleet id or name (or `reach fleets use`)"),
+    yes: bool = typer.Option(False, "--yes", "-y", "--force",
+                             help="Skip the interactive preview + confirmation (force)"),
+    timeout: int = typer.Option(
+        60, "--timeout", "-t", help="Seconds to wait for each member's result"),
+    no_wait: bool = typer.Option(
+        False, "--no-wait", help="Dispatch and exit without waiting for results"),
+    max_targets: int = typer.Option(
+        0, "--max-targets", "-n", help="Cap how many members to run on per wave (0 = the fan-out cap; required above the server's safety cap)"),
 ):
     """Run a command on every member of a fleet.
 
@@ -653,17 +695,20 @@ def fleets_exec(
             fleet = None
         full_command = " ".join(args)
     if not full_command:
-        console.print("[red]Usage:[/red] reach fleets exec [<fleet>] -- <command>")
+        console.print(
+            "[red]Usage:[/red] reach fleets exec [<fleet>] -- <command>")
         raise typer.Exit(2)
 
-    client = ReachClient(cfg_module.require("api_url"), cfg_module.require("api_key"))
+    client = ReachClient(cfg_module.require("api_url"),
+                         cfg_module.require("api_key"))
     fleet_obj = _resolve_fleet(client, fleet)
     fleet_id = fleet_obj["fleet_id"]
     fleet_label = fleet_obj.get("name") or fleet_id
     count = fleet_obj.get("member_count", 0)
 
     if fleet_obj.get("writable") is False:
-        console.print(f"[red]You have read-only access to fleet[/red] {fleet_label}.")
+        console.print(
+            f"[red]You have read-only access to fleet[/red] {fleet_label}.")
         raise typer.Exit(2)
     if count == 0:
         console.print(f"[yellow]Fleet {fleet_label} has no members.[/yellow]")
@@ -673,7 +718,8 @@ def fleets_exec(
         # Interactive: fetch the server-resolved plan (matched members, wave size, strategy,
         # failure policy, approval need) and confirm before dispatching. Skip with --force.
         try:
-            preview = client.fleet_fanout(fleet_id, full_command, max_targets=max_targets or None, dry_run=True)
+            preview = client.fleet_fanout(
+                fleet_id, full_command, max_targets=max_targets or None, dry_run=True)
         except requests.RequestException as e:
             _http_die(e)
         _print_fanout_preview(preview)
@@ -682,7 +728,8 @@ def fleets_exec(
             raise typer.Exit(2)
 
     try:
-        result = client.fleet_fanout(fleet_id, full_command, max_targets=max_targets or None)
+        result = client.fleet_fanout(
+            fleet_id, full_command, max_targets=max_targets or None)
     except requests.RequestException as e:
         _http_die(e)
 
@@ -697,22 +744,26 @@ def fleets_exec(
                       f"{held} held for later waves; {len(skipped)} skipped."
                       + (f"  Run: [magenta]{run_id}[/magenta]" if run_id else "") + "[/dim]")
         if run_id:
-            console.print(f"[dim]Control it with `reach runs pause|resume|cancel {run_id}`.[/dim]")
+            console.print(
+                f"[dim]Control it with `reach runs pause|resume|cancel {run_id}`.[/dim]")
     else:
         console.print(f"[dim]Dispatched to {len(jobs)} member(s); {len(skipped)} skipped."
                       + (f"  Batch: [magenta]{run_id}[/magenta]" if run_id else "") + "[/dim]")
     for s in skipped:
-        console.print(f"  [yellow]skip[/yellow] {s.get('hostname') or s.get('agent_id')} - {s.get('reason')}")
+        console.print(
+            f"  [yellow]skip[/yellow] {s.get('hostname') or s.get('agent_id')} - {s.get('reason')}")
 
     # A staged run advances across waves server-side over time, so a single blocking
     # poll doesn't fit - dispatch and let the user watch it via `reach runs run`.
     if no_wait or not jobs or wave_total > 1:
         for j in jobs:
             tag = " [dim](held)[/dim]" if j.get("status") == "HELD" else ""
-            console.print(f"  [dim]{j.get('hostname') or j['agent_id']}: job {j['job_id']}[/dim]{tag}")
+            console.print(
+                f"  [dim]{j.get('hostname') or j['agent_id']}: job {j['job_id']}[/dim]{tag}")
         if run_id:
             hint = "reach runs status" if wave_total > 1 else "reach fleets run"
-            console.print(f"[dim]Check results later with `{hint} {run_id}`.[/dim]")
+            console.print(
+                f"[dim]Check results later with `{hint} {run_id}`.[/dim]")
         return
 
     # Poll every dispatched job until terminal (or the shared deadline).
@@ -763,20 +814,26 @@ def fleets_exec(
             job_id,
         )
     console.print(table)
-    console.print(f"[dim]Full output of any member: `reach job <job-id>`. All fleet jobs: `reach fleets jobs {fleet_label}`.[/dim]")
+    console.print(
+        f"[dim]Full output of any member: `reach job <job-id>`. All fleet jobs: `reach fleets jobs {fleet_label}`.[/dim]")
     if any_failed:
         raise typer.Exit(1)
 
 
 @fleets_app.command("jobs")
 def fleets_jobs(
-    fleet: Optional[str] = typer.Argument(None, help="Fleet id or name (default: `reach fleets use`)"),
-    member: Optional[str] = typer.Option(None, "--member", "-m", help="Show only one member's jobs (agent id or hostname)"),
-    limit: int = typer.Option(20, "--limit", "-n", help="Number of jobs to show (max 100)"),
-    cursor: Optional[str] = typer.Option(None, "--cursor", help="Pagination cursor from a previous response"),
+    fleet: Optional[str] = typer.Argument(
+        None, help="Fleet id or name (default: `reach fleets use`)"),
+    member: Optional[str] = typer.Option(
+        None, "--member", "-m", help="Show only one member's jobs (agent id or hostname)"),
+    limit: int = typer.Option(
+        20, "--limit", "-n", help="Number of jobs to show (max 100)"),
+    cursor: Optional[str] = typer.Option(
+        None, "--cursor", help="Pagination cursor from a previous response"),
 ):
     """Show recent jobs across a fleet's members, or one member with --member."""
-    client = ReachClient(cfg_module.require("api_url"), cfg_module.require("api_key"))
+    client = ReachClient(cfg_module.require("api_url"),
+                         cfg_module.require("api_key"))
     fleet_obj = _resolve_fleet(client, fleet)
     fleet_label = fleet_obj.get("name") or fleet_obj["fleet_id"]
 
@@ -784,22 +841,28 @@ def fleets_jobs(
     if member:
         # Resolve the member within this fleet (accept agent id or hostname).
         try:
-            members = client.list_fleet_agents(fleet_obj["fleet_id"]).get("agents", [])
+            members = client.list_fleet_agents(
+                fleet_obj["fleet_id"]).get("agents", [])
         except requests.RequestException as e:
             _http_die(e)
-        match = next((a for a in members if a.get("agent_id") == member or a.get("hostname") == member), None)
+        match = next((a for a in members if a.get("agent_id") ==
+                     member or a.get("hostname") == member), None)
         if not match:
-            console.print(f"[red]{member} is not a member of fleet {fleet_label}.[/red]")
+            console.print(
+                f"[red]{member} is not a member of fleet {fleet_label}.[/red]")
             if members:
-                console.print("[dim]Members: " + ", ".join(a.get("hostname") or a["agent_id"] for a in members) + "[/dim]")
+                console.print("[dim]Members: " + ", ".join(a.get("hostname")
+                              or a["agent_id"] for a in members) + "[/dim]")
             raise typer.Exit(2)
         member_id = match["agent_id"]
 
     try:
         if member_id:
-            data = client.list_jobs(agent_id=member_id, limit=limit, cursor=cursor)
+            data = client.list_jobs(
+                agent_id=member_id, limit=limit, cursor=cursor)
         else:
-            data = client.list_jobs(fleet_id=fleet_obj["fleet_id"], limit=limit, cursor=cursor)
+            data = client.list_jobs(
+                fleet_id=fleet_obj["fleet_id"], limit=limit, cursor=cursor)
     except requests.RequestException as e:
         _http_die(e)
 
@@ -807,7 +870,8 @@ def fleets_jobs(
         return
     items = data.get("jobs", [])
     scope = f" · member [cyan]{member}[/cyan]" if member else ""
-    console.print(f"[bold]Fleet jobs:[/bold] [magenta]{fleet_label}[/magenta]{scope}")
+    console.print(
+        f"[bold]Fleet jobs:[/bold] [magenta]{fleet_label}[/magenta]{scope}")
     if not items:
         console.print("[yellow]No jobs found.[/yellow]")
         return
@@ -834,20 +898,25 @@ def fleets_jobs(
             f"[magenta]{batch}[/magenta]" if batch else "[dim]-[/dim]",
         )
     console.print(table)
-    console.print("[dim]Full output: `reach job <job-id>`. Group a fan-out: `reach fleets runs <fleet>`.[/dim]")
+    console.print(
+        "[dim]Full output: `reach job <job-id>`. Group a fan-out: `reach fleets runs <fleet>`.[/dim]")
 
     next_cursor = data.get("next_cursor")
     if next_cursor:
-        console.print(f"\n[dim]More results available. Run with --cursor {next_cursor} to see the next page.[/dim]")
+        console.print(
+            f"\n[dim]More results available. Run with --cursor {next_cursor} to see the next page.[/dim]")
 
 
 @fleets_app.command("runs")
 def fleets_runs(
-    fleet: Optional[str] = typer.Argument(None, help="Fleet id or name (default: `reach fleets use`)"),
-    limit: int = typer.Option(20, "--limit", "-n", help="Number of runs to show (max 100)"),
+    fleet: Optional[str] = typer.Argument(
+        None, help="Fleet id or name (default: `reach fleets use`)"),
+    limit: int = typer.Option(
+        20, "--limit", "-n", help="Number of runs to show (max 100)"),
 ):
     """List fan-out runs for a fleet - one row per `fleets exec`, with pass/fail counts."""
-    client = ReachClient(cfg_module.require("api_url"), cfg_module.require("api_key"))
+    client = ReachClient(cfg_module.require("api_url"),
+                         cfg_module.require("api_key"))
     fleet_obj = _resolve_fleet(client, fleet)
     try:
         data = client.list_fleet_runs(fleet_obj["fleet_id"], limit=limit)
@@ -857,9 +926,11 @@ def fleets_runs(
     if _emit(data):
         return
     runs = data.get("runs", [])
-    console.print(f"[bold]Fleet runs:[/bold] [magenta]{fleet_obj.get('name') or fleet_obj['fleet_id']}[/magenta]")
+    console.print(
+        f"[bold]Fleet runs:[/bold] [magenta]{fleet_obj.get('name') or fleet_obj['fleet_id']}[/magenta]")
     if not runs:
-        console.print("[yellow]No fan-out runs yet.[/yellow] [dim]Create one with `reach fleets exec <fleet> -- <cmd>`.[/dim]")
+        console.print(
+            "[yellow]No fan-out runs yet.[/yellow] [dim]Create one with `reach fleets exec <fleet> -- <cmd>`.[/dim]")
         return
 
     table = Table(show_header=True, header_style="bold cyan")
@@ -884,13 +955,15 @@ def fleets_runs(
             f"[yellow]{pend}[/yellow]" if pend else "0",
         )
     console.print(table)
-    console.print("[dim]Expand a run with `reach fleets run <batch-id>`.[/dim]")
+    console.print(
+        "[dim]Expand a run with `reach fleets run <batch-id>`.[/dim]")
 
 
 @fleets_app.command("run")
 def fleets_run(run_id: str = typer.Argument(..., help="Batch id from `reach fleets runs`")):
     """Show the per-member results of one fan-out run (batch)."""
-    client = ReachClient(cfg_module.require("api_url"), cfg_module.require("api_key"))
+    client = ReachClient(cfg_module.require("api_url"),
+                         cfg_module.require("api_key"))
     try:
         data = client.list_jobs(run_id=run_id, limit=100)
     except requests.RequestException as e:
@@ -937,7 +1010,8 @@ app.add_typer(runs_app, name="runs")
 @runs_app.callback(invoke_without_command=True)
 def runs_main(
     ctx: typer.Context,
-    limit: int = typer.Option(20, "--limit", "-n", help="Number of runs to show (max 100)"),
+    limit: int = typer.Option(
+        20, "--limit", "-n", help="Number of runs to show (max 100)"),
 ):
     """List tag fan-out runs across standalone agents - one row per `exec --tag`.
 
@@ -947,7 +1021,8 @@ def runs_main(
     """
     if ctx.invoked_subcommand is not None:
         return
-    client = ReachClient(cfg_module.require("api_url"), cfg_module.require("api_key"))
+    client = ReachClient(cfg_module.require("api_url"),
+                         cfg_module.require("api_key"))
     try:
         data = client.list_tag_runs(limit=limit)
     except requests.RequestException as e:
@@ -958,7 +1033,8 @@ def runs_main(
     items = data.get("runs", [])
     console.print("[bold]Tag runs[/bold] [dim](standalone fan-outs)[/dim]")
     if not items:
-        console.print("[yellow]No tag fan-out runs yet.[/yellow] [dim]Create one with `reach exec --tag <tag> -- <cmd>`.[/dim]")
+        console.print(
+            "[yellow]No tag fan-out runs yet.[/yellow] [dim]Create one with `reach exec --tag <tag> -- <cmd>`.[/dim]")
         return
 
     table = Table(show_header=True, header_style="bold cyan")
@@ -996,11 +1072,12 @@ def _print_run_status(s: dict) -> None:
     wave_total = s.get("wave_total") or 1
     wave_size = max(waves) if waves else (s.get("total") or 0)
     cur = min((s.get("current_wave") or 0) + 1, wave_total)
-    console.print(f"[bold]Run:[/bold] [magenta]{s.get('run_id')}[/magenta]  {_status_color(state)}")
+    console.print(
+        f"[bold]Run:[/bold] [magenta]{s.get('run_id')}[/magenta]  {_status_color(state)}")
     console.print(f"[dim]Command:[/dim] {s.get('command', '')}")
     # Every run is wave-based: show its wave size, strategy, and failure policy.
     console.print(f"[dim]Wave size:[/dim] {wave_size}   "
-                  f"[dim]Strategy:[/dim] {(rollout.get('mode') or 'auto').upper()}   "
+                  f"[dim]Strategy:[/dim] {(rollout.get('mode') or 'au-o').upper()}   "
                   f"[dim]On failure:[/dim] {(rollout.get('on_failure') or 'stop').upper()}")
     wtxt = f"  [dim]{waves}[/dim]" if wave_total > 1 and waves else ""
     held = f"  [dim]{s.get('staged', 0)} held[/dim]" if s.get("staged") else ""
@@ -1014,7 +1091,8 @@ def _print_run_status(s: dict) -> None:
 @runs_app.command("status")
 def runs_status(run_id: str = typer.Argument(..., help="Run id (from `reach fleets runs` or `fleets exec`)")):
     """Show a run's status, incl. staged-rollout wave progress."""
-    client = ReachClient(cfg_module.require("api_url"), cfg_module.require("api_key"))
+    client = ReachClient(cfg_module.require("api_url"),
+                         cfg_module.require("api_key"))
     try:
         s = client.get_run(run_id)
     except requests.RequestException as e:
@@ -1025,7 +1103,8 @@ def runs_status(run_id: str = typer.Argument(..., help="Run id (from `reach flee
 
 
 def _run_control_cmd(action: str, run_id: str, fn) -> None:
-    client = ReachClient(cfg_module.require("api_url"), cfg_module.require("api_key"))
+    client = ReachClient(cfg_module.require("api_url"),
+                         cfg_module.require("api_key"))
     try:
         result = fn(client, run_id)
     except requests.RequestException as e:
@@ -1055,16 +1134,43 @@ def runs_cancel(run_id: str = typer.Argument(..., help="Run id of a staged run")
 
 
 # Fleet approvals are their own group (separate from standalone `reach approvals`).
-fleets_approvals_app = typer.Typer(help="View or request a fleet's shared approvals.", no_args_is_help=True)
+fleets_approvals_app = typer.Typer(
+    help="View or request a fleet's shared approvals.", no_args_is_help=True)
 fleets_app.add_typer(fleets_approvals_app, name="approvals")
+
+
+def _host_rule_row(a: dict) -> tuple:
+    """Render a host approval as (bin, args) display cells for the approvals tables.
+    Prefers the structured host_rule; falls back to splitting a legacy command string
+    (first token = bin, rest = args). A '*' arg renders as a dim ✱ ("any"); a trailing
+    '...' renders as a dim '…' ("any remaining args")."""
+    hr = a.get("host_rule")
+    if hr:
+        binv, args = hr.get("bin", ""), hr.get("args", []) or []
+    else:
+        toks = (a.get("command") or "").split()
+        binv, args = (toks[0] if toks else ""), toks[1:]
+
+    def _cell(x):
+        if x in ("*", "", None):
+            return "[dim]✱[/dim]"
+        if x == "...":
+            return "[dim]…[/dim]"
+        return str(x)
+    args_cell = (" ".join(_cell(x) for x in args) if args else "[dim]-[/dim]")
+    return (binv or "-", args_cell)
 
 
 @fleets_approvals_app.command("list")
 def fleets_approvals_list(
-    fleet: Optional[str] = typer.Argument(None, help="Fleet id or name (default: `reach fleets use`)"),
-    pending: bool = typer.Option(False, "--pending", help="Show your pending requests for this fleet"),
-    denied: bool = typer.Option(False, "--denied", help="Show your denied requests for this fleet"),
-    expired: bool = typer.Option(False, "--expired", help="Show your expired approvals for this fleet"),
+    fleet: Optional[str] = typer.Argument(
+        None, help="Fleet id or name (default: `reach fleets use`)"),
+    pending: bool = typer.Option(
+        False, "--pending", help="Show your pending requests for this fleet"),
+    denied: bool = typer.Option(
+        False, "--denied", help="Show your denied requests for this fleet"),
+    expired: bool = typer.Option(
+        False, "--expired", help="Show your expired approvals for this fleet"),
 ):
     """Show a fleet's approval records (shared by every member).
 
@@ -1072,11 +1178,13 @@ def fleets_approvals_list(
     --pending / --denied / --expired: your own records filtered by status.
     """
     if sum([pending, denied, expired]) > 1:
-        console.print("[red]Error:[/red] use only one of --pending, --denied, --expired at a time")
+        console.print(
+            "[red]Error:[/red] use only one of --pending, --denied, --expired at a time")
         raise typer.Exit(2)
     status = "pending" if pending else "denied" if denied else "expired" if expired else "approved"
 
-    client = ReachClient(cfg_module.require("api_url"), cfg_module.require("api_key"))
+    client = ReachClient(cfg_module.require("api_url"),
+                         cfg_module.require("api_key"))
     fleet_obj = _resolve_fleet(client, fleet)
     try:
         data = client.list_fleet_approved(fleet_obj["fleet_id"], status=status)
@@ -1098,18 +1206,23 @@ def fleets_approvals_list(
         console.print(f"[yellow]{_empty.get(status, 'No records.')}[/yellow]")
         return
 
-    # Fleets are host-only, so approvals are always command strings (no k8s rules).
+    # Fleets are host-only, so approvals are structured host rules (bin / args).
     show_status = status != "approved"
-    table = Table(show_header=True, header_style="bold cyan", box=None, padding=(0, 1))
-    table.add_column("Command")
+    table = Table(show_header=True, header_style="bold cyan",
+                  box=None, padding=(0, 1))
+    table.add_column("Bin")
+    table.add_column("Args")
     table.add_column("Requested by", style="dim")
     if show_status:
         table.add_column("Status")
     table.add_column("At", style="dim")
     table.add_column("Expires")
     for a in items:
-        at = (a.get("reviewed_at") or a.get("created_at") or "")[:19].replace("T", " ")
-        row = [a.get("command", ""), a.get("requester_name") or a.get("requested_by") or "-"]
+        at = (a.get("reviewed_at") or a.get("created_at") or "")[
+            :19].replace("T", " ")
+        binv, argv = _host_rule_row(a)
+        row = [binv, argv, a.get("requester_name")
+               or a.get("requested_by") or "-"]
         if show_status:
             st = a.get("status", "")
             style = _STATUS_STYLE.get(st, "")
@@ -1122,33 +1235,41 @@ def fleets_approvals_list(
 @fleets_approvals_app.command("request")
 def fleets_approvals_request(
     fleet: str = typer.Argument(..., help="Fleet id or name"),
-    command: str = typer.Argument(..., help="The command to request approval for (quote if multi-word)"),
-    duration: Optional[str] = typer.Option(None, "--duration", "-d", help="For operators: approve for this long (e.g. 8h, 7d, permanent)"),
+    command: str = typer.Argument(
+        ..., help="The command to request approval for (quote if multi-word)"),
+    duration: Optional[str] = typer.Option(
+        None, "--duration", "-d", help="For operators: approve for this long (e.g. 8h, 7d, permanent)"),
 ):
     """Request approval for a command on a whole fleet (developer), or pre-approve it (operator).
 
     Every member shares the fleet's approvals, so this covers current and future members.
     """
-    client = ReachClient(cfg_module.require("api_url"), cfg_module.require("api_key"))
+    client = ReachClient(cfg_module.require("api_url"),
+                         cfg_module.require("api_key"))
     fleet_obj = _resolve_fleet(client, fleet)
     try:
-        r = client.create_approval(command, fleet_id=fleet_obj["fleet_id"], duration=duration)
+        r = client.create_approval(
+            command, fleet_id=fleet_obj["fleet_id"], duration=duration)
     except requests.RequestException as e:
         _http_die(e)
     if _emit(r):
         return
     label = fleet_obj.get("name") or fleet_obj["fleet_id"]
     if r.get("status") == "approved":
-        console.print(f"[green]Pre-approved for fleet[/green] [magenta]{label}[/magenta]. [dim]{r.get('approval_id','')}[/dim]")
+        console.print(
+            f"[green]Pre-approved for fleet[/green] [magenta]{label}[/magenta]. [dim]{r.get('approval_id', '')}[/dim]")
     else:
-        console.print(f"[yellow]Requested for fleet[/yellow] [magenta]{label}[/magenta] - pending review. [dim]{r.get('approval_id','')}[/dim]")
-    console.print("[dim]Operators review with `reach approvals approve/deny <approval-id>`.[/dim]")
+        console.print(
+            f"[yellow]Requested for fleet[/yellow] [magenta]{label}[/magenta] - pending review. [dim]{r.get('approval_id', '')}[/dim]")
+    console.print(
+        "[dim]Operators review with `reach approvals approve/deny <approval-id>`.[/dim]")
 
 
 # ---------------------------------------------------------------------------
 # reach alias
 # ---------------------------------------------------------------------------
-alias_app = typer.Typer(help="Manage agent aliases (e.g. prod, staging).", no_args_is_help=True)
+alias_app = typer.Typer(
+    help="Manage agent aliases (e.g. prod, staging).", no_args_is_help=True)
 app.add_typer(alias_app, name="alias")
 
 
@@ -1160,7 +1281,8 @@ def alias_set(
     """Map an alias to an agent ID."""
     resolved = cfg_module.resolve_agent(agent_id)
     cfg_module.set_alias(name, resolved)
-    console.print(f"[green]Alias set:[/green] [cyan]{name}[/cyan] → {resolved}")
+    console.print(
+        f"[green]Alias set:[/green] [cyan]{name}[/cyan] → {resolved}")
 
 
 @alias_app.command("remove")
@@ -1235,7 +1357,8 @@ def _render_fanout_results(jobs: list, results: dict) -> bool:
         label = j.get("hostname") or j.get("agent_id", "")
         r = results.get(j["job_id"])
         if not r:
-            table.add_row(label, "[yellow]TIMEOUT[/yellow]", "-", "-", j["job_id"])
+            table.add_row(
+                label, "[yellow]TIMEOUT[/yellow]", "-", "-", j["job_id"])
             any_failed = True
             continue
         status = r.get("status", "")
@@ -1246,7 +1369,8 @@ def _render_fanout_results(jobs: list, results: dict) -> bool:
         table.add_row(label, _status_color(status), "-" if code is None else str(code),
                       f"{dur}ms" if dur is not None else "-", j["job_id"])
     console.print(table)
-    console.print("[dim]Full output of any target: `reach job <job-id>`.[/dim]")
+    console.print(
+        "[dim]Full output of any target: `reach job <job-id>`.[/dim]")
     return any_failed
 
 
@@ -1270,15 +1394,18 @@ def _exec_fanout_by_tag(client: ReachClient, tag: str, command: str, *, agent_ty
         if len(present) > 1:
             _die("tag matches both host and k8s agents - pass --type host or --type k8s", 2)
         resolved_type = present.pop() if present else "host"
-    targets = [a for a in standalone if (a.get("type") or "host") == resolved_type]
+    targets = [a for a in standalone if (
+        a.get("type") or "host") == resolved_type]
     if not targets:
-        _die(f"no writable, active standalone {resolved_type} agents with tag '{tag}'", 2)
+        _die(
+            f"no writable, active standalone {resolved_type} agents with tag '{tag}'", 2)
 
     if not yes and not _JSON["on"]:
         # Interactive: server-resolved plan (matched agents, wave size/strategy/failure
         # policy) before the Proceed? prompt. Skip with --force (or --json for scripting).
         try:
-            preview = client.fanout_by_tag(tag, command, agent_type=resolved_type, dry_run=True)
+            preview = client.fanout_by_tag(
+                tag, command, agent_type=resolved_type, dry_run=True)
         except requests.RequestException as e:
             _http_die(e)
         _print_fanout_preview(preview)
@@ -1301,38 +1428,50 @@ def _exec_fanout_by_tag(client: ReachClient, tag: str, command: str, *, agent_ty
         console.print(f"[dim]Dispatched to {len(jobs)} agent(s); {len(skipped)} skipped."
                       + (f"  Batch: [magenta]{run_id}[/magenta]" if run_id else "") + "[/dim]")
         for s in skipped:
-            console.print(f"  [yellow]skip[/yellow] {s.get('hostname') or s.get('agent_id')} - {s.get('reason')}")
+            console.print(
+                f"  [yellow]skip[/yellow] {s.get('hostname') or s.get('agent_id')} - {s.get('reason')}")
         for j in jobs:
-            console.print(f"  [dim]{j.get('hostname') or j['agent_id']}: job {j['job_id']}[/dim]")
+            console.print(
+                f"  [dim]{j.get('hostname') or j['agent_id']}: job {j['job_id']}[/dim]")
         if run_id:
-            console.print(f"[dim]Check results later with `reach run {run_id}` (or `reach runs`).[/dim]")
+            console.print(
+                f"[dim]Check results later with `reach run {run_id}` (or `reach runs`).[/dim]")
         return
 
     results = _poll_jobs(client, jobs, timeout)
     if _emit({**result, "results": [
-        {**j, **{k: results.get(j["job_id"], {}).get(k) for k in ("status", "exit_code", "duration_ms")}}
-        for j in jobs]}):
+        {**j, **{k: results.get(j["job_id"], {}).get(k)
+                 for k in ("status", "exit_code", "duration_ms")}}
+            for j in jobs]}):
         return
     console.print(f"[dim]Dispatched to {len(jobs)} {resolved_type} agent(s); {len(skipped)} skipped."
                   + (f"  Batch: [magenta]{run_id}[/magenta]" if run_id else "") + "[/dim]")
     for s in skipped:
-        console.print(f"  [yellow]skip[/yellow] {s.get('hostname') or s.get('agent_id')} - {s.get('reason')}")
+        console.print(
+            f"  [yellow]skip[/yellow] {s.get('hostname') or s.get('agent_id')} - {s.get('reason')}")
     if _render_fanout_results(jobs, results):
         raise typer.Exit(1)
 
 
 @app.command(
     name="exec",
-    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+    context_settings={"allow_extra_args": True,
+                      "ignore_unknown_options": True},
 )
 def exec_cmd(
     ctx: typer.Context,
-    agent: Optional[str] = typer.Option(None, "--agent", "-a", help="Agent ID to target (overrides default)"),
-    tag: Optional[str] = typer.Option(None, "--tag", "-t", help="Fan out to all standalone agents with this tag (e.g. env:prod)"),
-    agent_type: Optional[str] = typer.Option(None, "--type", help="With --tag: pick host or k8s when the tag spans both"),
-    yes: bool = typer.Option(False, "--yes", "-y", "--force", help="Skip the confirmation prompt (fan-out preview, or the single-agent write confirm)"),
-    timeout: int = typer.Option(60, "--timeout", help="Seconds to wait for a result before giving up"),
-    no_wait: bool = typer.Option(False, "--no-wait", help="Submit the job and exit without waiting for the result"),
+    agent: Optional[str] = typer.Option(
+        None, "--agent", "-a", help="Agent ID to target (overrides default)"),
+    tag: Optional[str] = typer.Option(
+        None, "--tag", "-t", help="Fan out to all standalone agents with this tag (e.g. env:prod)"),
+    agent_type: Optional[str] = typer.Option(
+        None, "--type", help="With --tag: pick host or k8s when the tag spans both"),
+    yes: bool = typer.Option(False, "--yes", "-y", "--force",
+                             help="Skip the confirmation prompt (fan-out preview, or the single-agent write confirm)"),
+    timeout: int = typer.Option(
+        60, "--timeout", help="Seconds to wait for a result before giving up"),
+    no_wait: bool = typer.Option(
+        False, "--no-wait", help="Submit the job and exit without waiting for the result"),
 ):
     """Execute a command on a remote agent, or fan out to a tag with --tag.
 
@@ -1361,7 +1500,8 @@ def exec_cmd(
                             yes=yes, timeout=timeout, no_wait=no_wait)
         return
 
-    agent_id = cfg_module.resolve_agent(agent) if agent else cfg_module.require("default_agent_id")
+    agent_id = cfg_module.resolve_agent(
+        agent) if agent else cfg_module.require("default_agent_id")
 
     # Single agent: confirm before a *write* (destructive) command - the blast radius is
     # one host, but `rm -rf` still shouldn't run unprompted. Mirrors the fan-out
@@ -1376,13 +1516,16 @@ def exec_cmd(
             mode = preview.get("mode", "?")
             is_host = preview.get("type") != "k8s"
             label = "Write command" + (" (host heuristic)" if is_host else "")
-            console.print(f"[yellow]{label}[/yellow] on [cyan]{host}[/cyan] ([dim]mode:[/dim] {mode}):")
+            console.print(
+                f"[yellow]{label}[/yellow] on [cyan]{host}[/cyan] ([dim]mode:[/dim] {mode}):")
             console.print(f"  [bold]{full_command}[/bold]")
             if preview.get("approval_required"):
-                console.print("[dim]This will be queued for approval (not pre-approved).[/dim]")
+                console.print(
+                    "[dim]This will be queued for approval (not pre-approved).[/dim]")
             elif is_host and mode == "wild":
                 # Wild = unsandboxed: nothing on the agent blocks the write.
-                console.print("[dim]Wild mode: runs unsandboxed - writes aren't blocked on the agent.[/dim]")
+                console.print(
+                    "[dim]Wild mode: runs unsandboxed - writes aren't blocked on the agent.[/dim]")
             if not Confirm.ask("Proceed?", default=False):
                 console.print("[yellow]Aborted.[/yellow]")
                 raise typer.Exit(2)
@@ -1394,12 +1537,14 @@ def exec_cmd(
 
     job_id = job["job_id"]
     if not _JSON["on"]:
-        console.print(f"[dim]Job ID:[/dim] {job_id}  [dim]Agent:[/dim] {agent_id}")
+        console.print(
+            f"[dim]Job ID:[/dim] {job_id}  [dim]Agent:[/dim] {agent_id}")
 
     if no_wait:
         if _emit({"job_id": job_id, "agent_id": agent_id, "status": job.get("status", "PENDING")}):
             return
-        console.print(f"[dim]Use `reach job {job_id}` to check the result.[/dim]")
+        console.print(
+            f"[dim]Use `reach job {job_id}` to check the result.[/dim]")
         return
 
     def _poll_single() -> dict:
@@ -1457,11 +1602,16 @@ def job_cmd(job_id: str = typer.Argument(..., help="Job ID to fetch")):
 # ---------------------------------------------------------------------------
 @app.command(name="jobs")
 def jobs(
-    agent: Optional[str] = typer.Option(None, "--agent", "-a", help="Filter by agent ID or alias"),
-    status: Optional[str] = typer.Option(None, "--status", "-s", help="Filter by status (PENDING/RUNNING/SUCCEEDED/FAILED/REJECTED/EXPIRED)"),
-    failed: bool = typer.Option(False, "--failed", help="Shortcut for failed/rejected jobs"),
-    limit: int = typer.Option(20, "--limit", "-n", help="Number of jobs to show (max 100)"),
-    cursor: Optional[str] = typer.Option(None, "--cursor", help="Pagination cursor from a previous response"),
+    agent: Optional[str] = typer.Option(
+        None, "--agent", "-a", help="Filter by agent ID or alias"),
+    status: Optional[str] = typer.Option(
+        None, "--status", "-s", help="Filter by status (PENDING/RUNNING/SUCCEEDED/FAILED/REJECTED/EXPIRED)"),
+    failed: bool = typer.Option(
+        False, "--failed", help="Shortcut for failed/rejected jobs"),
+    limit: int = typer.Option(
+        20, "--limit", "-n", help="Number of jobs to show (max 100)"),
+    cursor: Optional[str] = typer.Option(
+        None, "--cursor", help="Pagination cursor from a previous response"),
 ):
     """Show your recent jobs on standalone agents (or one member with --agent).
 
@@ -1502,7 +1652,8 @@ def jobs(
     if not items:
         console.print("[yellow]No jobs found.[/yellow]")
         if hidden_fleet_jobs:
-            console.print("[dim]Fleet jobs are hidden here - see `reach fleets jobs <fleet>`.[/dim]")
+            console.print(
+                "[dim]Fleet jobs are hidden here - see `reach fleets jobs <fleet>`.[/dim]")
         return
 
     aliases = cfg_module.list_aliases()
@@ -1533,20 +1684,24 @@ def jobs(
         )
 
     console.print(table)
-    console.print("[dim]See a job's full output with `reach job <job-id>`.[/dim]")
+    console.print(
+        "[dim]See a job's full output with `reach job <job-id>`.[/dim]")
 
     if hidden_fleet_jobs:
-        console.print("[dim]Fleet-member jobs are hidden here - see `reach fleets jobs <fleet>`.[/dim]")
+        console.print(
+            "[dim]Fleet-member jobs are hidden here - see `reach fleets jobs <fleet>`.[/dim]")
 
     next_cursor = data.get("next_cursor")
     if next_cursor:
-        console.print(f"\n[dim]More results available. Run with --cursor {next_cursor} to see the next page.[/dim]")
+        console.print(
+            f"\n[dim]More results available. Run with --cursor {next_cursor} to see the next page.[/dim]")
 
 
 @app.command(name="run")
 def run(run_id: str = typer.Argument(..., help="Batch id from `reach runs`")):
     """Show the per-agent results of one tag fan-out run (batch)."""
-    client = ReachClient(cfg_module.require("api_url"), cfg_module.require("api_key"))
+    client = ReachClient(cfg_module.require("api_url"),
+                         cfg_module.require("api_key"))
     try:
         data = client.list_jobs(run_id=run_id, limit=100)
     except requests.RequestException as e:
@@ -1587,7 +1742,8 @@ def run(run_id: str = typer.Argument(..., help="Batch id from `reach runs`")):
 # ---------------------------------------------------------------------------
 # reach approvals
 # ---------------------------------------------------------------------------
-_STATUS_STYLE = {"approved": "green", "denied": "red", "pending": "yellow", "expired": "dim"}
+_STATUS_STYLE = {"approved": "green", "denied": "red",
+                 "pending": "yellow", "expired": "dim"}
 
 
 def _expires_label(record: dict) -> str:
@@ -1616,28 +1772,34 @@ def _expires_label(record: dict) -> str:
         return f"[dim]{raw[:19].replace('T', ' ')}[/dim]"
 
 
-approvals_app = typer.Typer(help="View approval records for an agent.", no_args_is_help=True)
+approvals_app = typer.Typer(
+    help="View approval records for an agent.", no_args_is_help=True)
 app.add_typer(approvals_app, name="approvals")
 
 
 @approvals_app.command("list")
 def approvals_list(
-    agent: Optional[str] = typer.Option(None, "--agent", "-a", help="Agent ID or alias (default: default agent)"),
-    pending: bool = typer.Option(False, "--pending", help="Show your pending requests for this agent"),
-    denied: bool = typer.Option(False, "--denied", help="Show your denied requests for this agent"),
-    expired: bool = typer.Option(False, "--expired", help="Show your expired approvals for this agent"),
+    agent: Optional[str] = typer.Option(
+        None, "--agent", "-a", help="Agent ID or alias (default: default agent)"),
+    pending: bool = typer.Option(
+        False, "--pending", help="Show your pending requests for this agent"),
+    denied: bool = typer.Option(
+        False, "--denied", help="Show your denied requests for this agent"),
+    expired: bool = typer.Option(
+        False, "--expired", help="Show your expired approvals for this agent"),
 ):
     """Show approval records for an agent.
 
     Default: currently effective approved commands (agent-wide).
     --pending / --denied / --expired: your own records filtered by status.
 
-    Host agents show the command; Kubernetes agents show the structured rule
-    (verb / resource / namespace / name, where ✱ means "any").
+    Approvals are structured rules: host agents show bin / args, Kubernetes agents show
+    verb / resource / namespace / name (where ✱ means "any").
     """
     flags = [pending, denied, expired]
     if sum(flags) > 1:
-        console.print("[red]Error:[/red] use only one of --pending, --denied, --expired at a time")
+        console.print(
+            "[red]Error:[/red] use only one of --pending, --denied, --expired at a time")
         raise typer.Exit(2)
 
     if pending:
@@ -1651,7 +1813,8 @@ def approvals_list(
 
     api_url = cfg_module.require("api_url")
     api_key = cfg_module.require("api_key")
-    agent_id = cfg_module.resolve_agent(agent) if agent else cfg_module.require("default_agent_id")
+    agent_id = cfg_module.resolve_agent(
+        agent) if agent else cfg_module.require("default_agent_id")
 
     client = ReachClient(api_url, api_key)
     try:
@@ -1675,74 +1838,85 @@ def approvals_list(
         "expired":  "No expired approvals for this agent.",
     }
     if not items:
-        console.print(f"[yellow]{_STATUS_EMPTY.get(status, 'No records.')}[/yellow]")
+        console.print(
+            f"[yellow]{_STATUS_EMPTY.get(status, 'No records.')}[/yellow]")
         return
 
-    # A single agent is one type, so the result set is homogeneous. Kubernetes
-    # approvals are structured rules - render verb/resource/namespace/name as
-    # columns; host approvals render the command string.
-    is_k8s = any(a.get("k8s_rule") for a in items)
+    # Approvals are structured rules. Most agents are one kind, but a k8s agent can now
+    # hold BOTH kubectl verb rules (k8s_rule) AND {bin,args} rules for non-kubectl tools
+    # like helm (host_rule) - so render each kind in its own table with fitting columns.
     show_status = status != "approved"
-
-    if is_k8s:
-        console.print("[dim]Kubernetes agent - showing structured rules (✱ = any)[/dim]")
-
-    table = Table(show_header=True, header_style="bold cyan", box=None, padding=(0, 1))
-    if is_k8s:
-        table.add_column("Verb")
-        table.add_column("Resource")
-        table.add_column("Namespace")
-        table.add_column("Name")
-    else:
-        table.add_column("Command")
-    table.add_column("Requested by", style="dim")
-    if show_status:
-        table.add_column("Status")
-    table.add_column("At", style="dim")
-    table.add_column("Expires")
+    k8s_items = [a for a in items if a.get("k8s_rule")]
+    other_items = [a for a in items if not a.get(
+        "k8s_rule")]   # host_rule or legacy command
 
     def _rule_cell(v) -> str:
         # Show a wildcard as a dim asterisk so it reads as "any".
         return "[dim]✱[/dim]" if v in ("*", "", None) else str(v)
 
-    for a in items:
-        at = (a.get("reviewed_at") or a.get("created_at") or "")[:19].replace("T", " ")
-        if is_k8s:
-            rule = a.get("k8s_rule") or {}
-            row = [
-                _rule_cell(rule.get("verb")),
-                _rule_cell(rule.get("resource")),
-                _rule_cell(rule.get("namespace")),
-                _rule_cell(rule.get("name")),
-            ]
-        else:
-            row = [a.get("command", "")]
-        row.append(a.get("requester_name") or a.get("requested_by") or "-")
+    def _meta_row(a: list, rec: dict) -> list:
+        a.append(rec.get("requester_name") or rec.get("requested_by") or "-")
         if show_status:
-            st = a.get("status", "")
+            st = rec.get("status", "")
             style = _STATUS_STYLE.get(st, "")
-            row.append(f"[{style}]{st}[/{style}]" if style else st)
-        row += [at, _expires_label(a)]
-        table.add_row(*row)
-    console.print(table)
+            a.append(f"[{style}]{st}[/{style}]" if style else st)
+        at = (rec.get("reviewed_at") or rec.get(
+            "created_at") or "")[:19].replace("T", " ")
+        return a + [at, _expires_label(rec)]
+
+    def _render(group: list, kind: str) -> None:
+        if not group:
+            return
+        table = Table(show_header=True, header_style="bold cyan",
+                      box=None, padding=(0, 1))
+        if kind == "k8s":
+            console.print("[dim]Kubernetes rules (✱ = any)[/dim]")
+            for c in ("Verb", "Resource", "Namespace", "Name"):
+                table.add_column(c)
+        else:
+            for c in ("Bin", "Args"):
+                table.add_column(c)
+        table.add_column("Requested by", style="dim")
+        if show_status:
+            table.add_column("Status")
+        table.add_column("At", style="dim")
+        table.add_column("Expires")
+        for rec in group:
+            if kind == "k8s":
+                rule = rec.get("k8s_rule") or {}
+                cells = [_rule_cell(rule.get("verb")), _rule_cell(rule.get("resource")),
+                         _rule_cell(rule.get("namespace")), _rule_cell(rule.get("name"))]
+            else:
+                cells = list(_host_rule_row(rec))
+            table.add_row(*_meta_row(cells, rec))
+        console.print(table)
+
+    _render(k8s_items, "k8s")
+    _render(other_items, "host")
 
 
 @approvals_app.command("request")
 def approvals_request(
-    command: str = typer.Argument(..., help="The command to request approval for (quote if multi-word)"),
-    agent: Optional[str] = typer.Option(None, "--agent", "-a", help="Target agent id or alias (default: default agent)"),
-    duration: Optional[str] = typer.Option(None, "--duration", "-d", help="For operators: approve for this long (e.g. 8h, 7d, permanent)"),
+    command: str = typer.Argument(
+        ..., help="The command to request approval for (quote if multi-word)"),
+    agent: Optional[str] = typer.Option(
+        None, "--agent", "-a", help="Target agent id or alias (default: default agent)"),
+    duration: Optional[str] = typer.Option(
+        None, "--duration", "-d", help="For operators: approve for this long (e.g. 8h, 7d, permanent)"),
 ):
     """Request approval for a command on a standalone agent (developer), or pre-approve it (operator).
 
     For a whole fleet, use `reach fleets approvals request <fleet> <cmd>`.
     Developers create a pending request; operators/admins create it approved.
     """
-    client = ReachClient(cfg_module.require("api_url"), cfg_module.require("api_key"))
-    agent_id = cfg_module.resolve_agent(agent) if agent else cfg_module.require("default_agent_id")
+    client = ReachClient(cfg_module.require("api_url"),
+                         cfg_module.require("api_key"))
+    agent_id = cfg_module.resolve_agent(
+        agent) if agent else cfg_module.require("default_agent_id")
 
     try:
-        r = client.create_approval(command, agent_id=agent_id, duration=duration)
+        r = client.create_approval(
+            command, agent_id=agent_id, duration=duration)
     except requests.RequestException as e:
         _http_die(e)
 
@@ -1752,16 +1926,20 @@ def approvals_request(
     if r.get("status") == "approved":
         console.print(f"[green]Pre-approved.[/green] [dim]{aid}[/dim]")
     else:
-        console.print(f"[yellow]Requested - pending operator/admin review.[/yellow] [dim]{aid}[/dim]")
+        console.print(
+            f"[yellow]Requested - pending operator/admin review.[/yellow] [dim]{aid}[/dim]")
 
 
 @approvals_app.command("approve")
 def approvals_approve(
-    approval_id: str = typer.Argument(..., help="Approval id (from `reach approvals list --pending`)"),
-    duration: Optional[str] = typer.Option(None, "--duration", "-d", help="Approve for this long (e.g. 8h, 7d, permanent, now to expire)"),
+    approval_id: str = typer.Argument(
+        ..., help="Approval id (from `reach approvals list --pending`)"),
+    duration: Optional[str] = typer.Option(
+        None, "--duration", "-d", help="Approve for this long (e.g. 8h, 7d, permanent, now to expire)"),
 ):
     """Approve a pending request, or change an approved record's duration (operator+)."""
-    client = ReachClient(cfg_module.require("api_url"), cfg_module.require("api_key"))
+    client = ReachClient(cfg_module.require("api_url"),
+                         cfg_module.require("api_key"))
     try:
         r = client.approve_approval(approval_id, duration=duration)
     except requests.RequestException as e:
@@ -1773,10 +1951,12 @@ def approvals_approve(
 
 @approvals_app.command("deny")
 def approvals_deny(
-    approval_id: str = typer.Argument(..., help="Approval id (from `reach approvals list --pending`)"),
+    approval_id: str = typer.Argument(
+        ..., help="Approval id (from `reach approvals list --pending`)"),
 ):
     """Deny a pending approval request (operator+). Terminal - cannot be reversed."""
-    client = ReachClient(cfg_module.require("api_url"), cfg_module.require("api_key"))
+    client = ReachClient(cfg_module.require("api_url"),
+                         cfg_module.require("api_key"))
     try:
         r = client.deny_approval(approval_id)
     except requests.RequestException as e:
@@ -1791,20 +1971,26 @@ def approvals_deny(
 # ---------------------------------------------------------------------------
 @app.command("agent-init")
 def agent_init(
-    for_agent: Optional[str] = typer.Option(None, "--for", help="Target agent: claude, cursor, system-prompt, mcp"),
+    for_agent: Optional[str] = typer.Option(
+        None, "--for", help="Target agent: claude, cursor, system-prompt, mcp"),
 ):
     """Generate remote machine context for your AI agent."""
     VALID = ("claude", "cursor", "system-prompt", "mcp")
     if for_agent is None:
         console.print("\n[bold]Select your agent:[/bold]")
         console.print("  [cyan]1[/cyan]  claude        - writes CLAUDE.md")
-        console.print("  [cyan]2[/cyan]  cursor        - writes .cursor/rules/reach.mdc")
-        console.print("  [cyan]3[/cyan]  system-prompt - prints to stdout, paste anywhere")
-        console.print("  [cyan]4[/cyan]  mcp           - prints MCP server config to stdout")
+        console.print(
+            "  [cyan]2[/cyan]  cursor        - writes .cursor/rules/reach.mdc")
+        console.print(
+            "  [cyan]3[/cyan]  system-prompt - prints to stdout, paste anywhere")
+        console.print(
+            "  [cyan]4[/cyan]  mcp           - prints MCP server config to stdout")
         choice = Prompt.ask("\nChoice", choices=["1", "2", "3", "4"])
-        for_agent = {"1": "claude", "2": "cursor", "3": "system-prompt", "4": "mcp"}[choice]
+        for_agent = {"1": "claude", "2": "cursor",
+                     "3": "system-prompt", "4": "mcp"}[choice]
     elif for_agent not in VALID:
-        console.print(f"[red]Error:[/red] --for must be one of: {', '.join(VALID)}")
+        console.print(
+            f"[red]Error:[/red] --for must be one of: {', '.join(VALID)}")
         raise typer.Exit(2)
 
     if for_agent == "mcp":
@@ -1816,7 +2002,8 @@ def agent_init(
     api_key = cfg.get("api_key") or cfg.get("tenant_token")
     default_agent_id = cfg.get("default_agent_id", "")
 
-    console.print(f"\n[bold cyan]reach agent-init --for {for_agent}[/bold cyan]\n")
+    console.print(
+        f"\n[bold cyan]reach agent-init --for {for_agent}[/bold cyan]\n")
 
     # Fetch agents from API
     fetched: list[dict] = []
@@ -1833,16 +2020,19 @@ def agent_init(
     agents_config: list[dict] = []
 
     if fetched:
-        console.print(f"Found [bold]{len(fetched)}[/bold] agent(s) in your tenant:\n")
+        console.print(
+            f"Found [bold]{len(fetched)}[/bold] agent(s) in your tenant:\n")
         for a in fetched:
-            console.print(f"  [cyan]{a['agent_id']}[/cyan]  {a.get('hostname') or 'unknown'}  {_status_color(a.get('status', ''))}")
+            console.print(
+                f"  [cyan]{a['agent_id']}[/cyan]  {a.get('hostname') or 'unknown'}  {_status_color(a.get('status', ''))}")
         console.print()
 
         for a in fetched:
             agent_id = a["agent_id"]
             hostname = a.get("hostname") or ""
             console.print(f"[bold]─── {agent_id}[/bold] ({hostname})")
-            role = Prompt.ask("  Role / notes (e.g. production, staging, home lab)", default="")
+            role = Prompt.ask(
+                "  Role / notes (e.g. production, staging, home lab)", default="")
             app_name = Prompt.ask("  Main app name (e.g. my-api)", default="")
             agents_config.append({
                 "agent_id": agent_id,
@@ -1854,25 +2044,30 @@ def agent_init(
             })
             console.print()
 
-        stack = Prompt.ask("Shared tech stack (e.g. docker, nginx)", default="")
+        stack = Prompt.ask(
+            "Shared tech stack (e.g. docker, nginx)", default="")
         extra_notes = Prompt.ask("Extra notes for your agent", default="")
     else:
-        console.print("[dim]Could not fetch agents from API - entering manually.[/dim]\n")
+        console.print(
+            "[dim]Could not fetch agents from API - entering manually.[/dim]\n")
         hostname = Prompt.ask("Hostname or IP", default="")
         role = Prompt.ask("Role / notes", default="")
         app_name = Prompt.ask("Main app name", default="")
         stack = Prompt.ask("Tech stack", default="")
         extra_notes = ""
-        agents_config.append({"agent_id": default_agent_id, "hostname": hostname, "role": role, "app_name": app_name})
+        agents_config.append({"agent_id": default_agent_id,
+                             "hostname": hostname, "role": role, "app_name": app_name})
 
-    content = _build_agent_context(agents_config, default_agent_id, stack, extra_notes if fetched else "")
+    content = _build_agent_context(
+        agents_config, default_agent_id, stack, extra_notes if fetched else "")
 
     if for_agent == "claude":
         _write_claude_md(content)
     elif for_agent == "cursor":
         _write_cursor_rules(content)
     elif for_agent == "system-prompt":
-        console.print("\n[bold]── System prompt ──────────────────────────────────────[/bold]")
+        console.print(
+            "\n[bold]── System prompt ──────────────────────────────────────[/bold]")
         console.print(content)
 
 
@@ -1886,12 +2081,15 @@ def _print_mcp_config():
             }
         }
     }
-    console.print("\n[bold]── MCP server config ──────────────────────────────────[/bold]")
+    console.print(
+        "\n[bold]── MCP server config ──────────────────────────────────[/bold]")
     console.print("\nAdd this to your MCP client settings:\n")
     console.print(json.dumps(config, indent=2))
     console.print("\n[dim]Common locations:[/dim]")
-    console.print("  [dim]Claude Code   [/dim] .claude/settings.json  [dim](project)[/dim]  or  ~/.claude.json  [dim](global)[/dim]")
-    console.print("  [dim]Claude Desktop[/dim] ~/Library/Application Support/Claude/claude_desktop_config.json")
+    console.print(
+        "  [dim]Claude Code   [/dim] .claude/settings.json  [dim](project)[/dim]  or  ~/.claude.json  [dim](global)[/dim]")
+    console.print(
+        "  [dim]Claude Desktop[/dim] ~/Library/Application Support/Claude/claude_desktop_config.json")
     console.print("  [dim]Cursor        [/dim] .cursor/mcp.json")
     console.print("\n[dim]Make sure you've run `reach login` first.[/dim]\n")
 
@@ -2081,7 +2279,8 @@ def _print_job_result(result: dict) -> None:
     duration = result.get("duration_ms")
 
     color = "green" if status == "SUCCEEDED" else "red"
-    console.print(f"\n[bold {color}]Status:[/bold {color}] {status}", highlight=False)
+    console.print(
+        f"\n[bold {color}]Status:[/bold {color}] {status}", highlight=False)
     if exit_code is not None:
         console.print(f"[dim]Exit code:[/dim] {exit_code}")
     if duration is not None:
@@ -2093,7 +2292,8 @@ def _print_job_result(result: dict) -> None:
         if not stdout.endswith("\n"):
             console.print()
         if result.get("stdout_truncated"):
-            console.print("[yellow]⚠ stdout truncated - output exceeded the size limit[/yellow]")
+            console.print(
+                "[yellow]⚠ stdout truncated - output exceeded the size limit[/yellow]")
 
     if stderr:
         console.print("\n[bold red]stderr:[/bold red]")
@@ -2101,13 +2301,15 @@ def _print_job_result(result: dict) -> None:
         if not stderr.endswith("\n"):
             console.print()
         if result.get("stderr_truncated"):
-            console.print("[yellow]⚠ stderr truncated - output exceeded the size limit[/yellow]")
+            console.print(
+                "[yellow]⚠ stderr truncated - output exceeded the size limit[/yellow]")
 
 
 # ---------------------------------------------------------------------------
 # reach profile
 # ---------------------------------------------------------------------------
-profile_app = typer.Typer(help="Manage profiles for multiple tenants.", no_args_is_help=True)
+profile_app = typer.Typer(
+    help="Manage profiles for multiple tenants.", no_args_is_help=True)
 app.add_typer(profile_app, name="profile")
 
 
@@ -2119,7 +2321,8 @@ def profile_list():
     profiles = full.get("profiles", {})
 
     if not profiles:
-        console.print("[yellow]No profiles configured. Run `reach login` first.[/yellow]")
+        console.print(
+            "[yellow]No profiles configured. Run `reach login` first.[/yellow]")
         return
 
     table = Table(show_header=True, header_style="bold cyan")
@@ -2128,8 +2331,10 @@ def profile_list():
     table.add_column("Default agent")
 
     for name, p in profiles.items():
-        label = f"[cyan]{name}[/cyan]" + (" [bold](active)[/bold]" if name == active else "")
-        table.add_row(label, p.get("api_url") or "-", p.get("default_agent_id") or "-")
+        label = f"[cyan]{name}[/cyan]" + \
+            (" [bold](active)[/bold]" if name == active else "")
+        table.add_row(label, p.get("api_url") or "-",
+                      p.get("default_agent_id") or "-")
 
     console.print(table)
 
@@ -2153,7 +2358,8 @@ def profile_delete(name: str = typer.Argument(..., help="Profile name to delete"
         console.print(f"[red]Error:[/red] profile '{name}' not found.")
         raise typer.Exit(2)
     if full.get("active_profile") == name:
-        console.print(f"[red]Error:[/red] cannot delete the active profile. Run 'reach profile use <other>' first.")
+        console.print(
+            f"[red]Error:[/red] cannot delete the active profile. Run 'reach profile use <other>' first.")
         raise typer.Exit(2)
     if not Confirm.ask(f"Are you sure you want to delete profile '[cyan]{name}[/cyan]'?", default=False):
         raise typer.Exit(0)
@@ -2172,7 +2378,8 @@ def profile_rename(
     except SystemExit as e:
         console.print(f"[red]Error:[/red] {e}")
         raise typer.Exit(2)
-    console.print(f"[green]Renamed profile:[/green] [cyan]{old}[/cyan] → [cyan]{new}[/cyan]")
+    console.print(
+        f"[green]Renamed profile:[/green] [cyan]{old}[/cyan] → [cyan]{new}[/cyan]")
 
 
 # ---------------------------------------------------------------------------
@@ -2204,86 +2411,136 @@ def man():
         table.add_column("Description")
         for cmd, desc in rows:
             table.add_row(cmd, desc)
-        console.print(Panel(table, title=f"[bold]{title}[/bold]", title_align="left", border_style="dim"))
+        console.print(Panel(
+            table, title=f"[bold]{title}[/bold]", title_align="left", border_style="dim"))
         console.print()
 
     console.print()
-    console.print("[bold white]reach[/bold white] - remote machine command bridge\n", highlight=False)
+    console.print(
+        "[bold white]reach[/bold white] - remote machine command bridge\n", highlight=False)
 
     section("Auth & setup", [
-        ("reach login --api-url <url> --api-key <key>",      "Save credentials (default profile)"),
-        ("reach login --profile <name> ...",                  "Save credentials under a named profile"),
-        ("reach whoami",                                      "Show current user, tenant, and API URL"),
+        ("reach login --api-url <url> --api-key <key>",
+         "Save credentials (default profile)"),
+        ("reach login --profile <name> ...",
+         "Save credentials under a named profile"),
+        ("reach whoami",
+         "Show current user, tenant, and API URL"),
         ("reach --version  (or -V)",                          "Show CLI version"),
-        ("reach config show",                                 "Show active profile, default agent/fleet, and aliases"),
-        ("reach --json <command>",                            "Output raw JSON instead of tables (for scripting)"),
-        ("reach man",                                         "This full command reference"),
+        ("reach config show",
+         "Show active profile, default agent/fleet, and aliases"),
+        ("reach --json <command>",
+         "Output raw JSON instead of tables (for scripting)"),
+        ("reach man",
+         "This full command reference"),
     ])
 
     section("Profiles  (multiple tenants / deployments)", [
-        ("reach profile list",                               "List all profiles; active one is marked"),
-        ("reach profile use <name>",                         "Switch active profile"),
+        ("reach profile list",
+         "List all profiles; active one is marked"),
+        ("reach profile use <name>",
+         "Switch active profile"),
         ("reach profile rename <old> <new>",                 "Rename a profile"),
         ("reach profile delete <name>",                      "Delete a profile"),
     ])
 
     section("Agents", [
-        ("reach agents list",                                "List your standalone machines (fleet members: `reach fleets agents`)"),
-        ("reach agents list --tag <key:value>",              "Filter machines by tag"),
-        ("reach agents show <id|alias>",                     "Full detail of one agent (mode, access, tags, capabilities)"),
+        ("reach agents list",
+         "List your standalone machines (fleet members: `reach fleets agents`)"),
+        ("reach agents list --tag <key:value>",
+         "Filter machines by tag"),
+        ("reach agents show <id|alias>",
+         "Full detail of one agent (mode, access, tags, capabilities)"),
         ("reach agents use <id|alias>",                      "Set default machine"),
-        ("reach status",                                     "Show default machine status and access level"),
-        ("reach alias set <name> <id>",                      "Create a friendly alias for an agent (or `add`)"),
+        ("reach status",
+         "Show default machine status and access level"),
+        ("reach alias set <name> <id>",
+         "Create a friendly alias for an agent (or `add`)"),
         ("reach alias list",                                  "List all aliases"),
-        ("reach alias remove <name>",                        "Remove an alias (or `rm`)"),
+        ("reach alias remove <name>",
+         "Remove an alias (or `rm`)"),
     ])
 
     section("Fleets  (autoscaling groups of hosts sharing a join token)", [
-        ("reach fleets list",                                "List fleets you can access, with member counts and access"),
-        ("reach fleets use <id|name>",                       "Set the default fleet (so fleet commands can omit it)"),
-        ("reach fleets show [<id|name>]",                    "One fleet's detail (mode, tags, member breakdown, access)"),
-        ("reach fleets agents [<id|name>]",                  "List a fleet's member agents"),
-        ("reach fleets exec [<id|name>] -- <cmd>",           "Run a command on every member (confirms first; -y to skip)"),
-        ("reach fleets jobs [<id|name>]",                    "Recent jobs across all members of the fleet"),
-        ("reach fleets jobs [<id|name>] --member <id|host>", "Jobs for one member of the fleet"),
-        ("reach fleets runs [<id|name>]",                    "Fan-out runs (one row per `fleets exec`) with pass/fail counts"),
-        ("reach fleets run <batch-id>",                      "Per-member results of one fan-out run"),
-        ("reach fleets approvals list [<id|name>]",          "A fleet's approved commands (shared by members); --pending/--denied/--expired"),
-        ("reach fleets approvals request <id|name> <cmd>",   "Request/pre-approve a command for the whole fleet"),
+        ("reach fleets list",
+         "List fleets you can access, with member counts and access"),
+        ("reach fleets use <id|name>",
+         "Set the default fleet (so fleet commands can omit it)"),
+        ("reach fleets show [<id|name>]",
+         "One fleet's detail (mode, tags, member breakdown, access)"),
+        ("reach fleets agents [<id|name>]",
+         "List a fleet's member agents"),
+        ("reach fleets exec [<id|name>] -- <cmd>",
+         "Run a command on every member (confirms first; -y to skip)"),
+        ("reach fleets jobs [<id|name>]",
+         "Recent jobs across all members of the fleet"),
+        ("reach fleets jobs [<id|name>] --member <id|host>",
+         "Jobs for one member of the fleet"),
+        ("reach fleets runs [<id|name>]",
+         "Fan-out runs (one row per `fleets exec`) with pass/fail counts"),
+        ("reach fleets run <batch-id>",
+         "Per-member results of one fan-out run"),
+        ("reach fleets approvals list [<id|name>]",
+         "A fleet's approved commands (shared by members); --pending/--denied/--expired"),
+        ("reach fleets approvals request <id|name> <cmd>",
+         "Request/pre-approve a command for the whole fleet"),
     ])
 
     section("Execution", [
-        ("reach exec -- <cmd>",                              "Run command on default machine"),
-        ("reach exec --agent <id|alias> -- <cmd>",           "Run command on a specific machine"),
-        ("reach exec --tag <key:value> -- <cmd>",            "Fan out to standalone agents with a tag (confirms; -y; --type host|k8s)"),
-        ("reach exec --timeout <s> -- <cmd>",                "Override wait timeout (default 60 s)"),
-        ("reach exec --no-wait -- <cmd>",                    "Submit and exit; poll later with `reach job <id>`"),
-        ("reach job <job_id>",                               "Re-view stdout / stderr of a past job"),
-        ("reach jobs",                                       "Recent jobs on standalone agents (fleet: `reach fleets jobs`)"),
-        ("reach jobs --agent <id|alias>",                    "Filter to one machine (a member shows its own jobs)"),
-        ("reach jobs --failed / --status <S>",               "Filter by outcome / status"),
-        ("reach jobs --limit <n>  /  --cursor <c>",          "Page size (max 100) / next page"),
-        ("reach runs",                                       "Tag fan-out runs across standalone agents (fleet: `reach fleets runs`)"),
-        ("reach run <batch-id>",                             "Per-agent results of one tag fan-out run"),
+        ("reach exec -- <cmd>",
+         "Run command on default machine"),
+        ("reach exec --agent <id|alias> -- <cmd>",
+         "Run command on a specific machine"),
+        ("reach exec --tag <key:value> -- <cmd>",
+         "Fan out to standalone agents with a tag (confirms; -y; --type host|k8s)"),
+        ("reach exec --timeout <s> -- <cmd>",
+         "Override wait timeout (default 60 s)"),
+        ("reach exec --no-wait -- <cmd>",
+         "Submit and exit; poll later with `reach job <id>`"),
+        ("reach job <job_id>",
+         "Re-view stdout / stderr of a past job"),
+        ("reach jobs",
+         "Recent jobs on standalone agents (fleet: `reach fleets jobs`)"),
+        ("reach jobs --agent <id|alias>",
+         "Filter to one machine (a member shows its own jobs)"),
+        ("reach jobs --failed / --status <S>",
+         "Filter by outcome / status"),
+        ("reach jobs --limit <n>  /  --cursor <c>",
+         "Page size (max 100) / next page"),
+        ("reach runs",
+         "Tag fan-out runs across standalone agents (fleet: `reach fleets runs`)"),
+        ("reach run <batch-id>",
+         "Per-agent results of one tag fan-out run"),
     ])
 
     section("Approvals  (standalone agents; fleet approvals: `reach fleets approvals`)", [
-        ("reach approvals list [--agent <id|alias>]",        "Effective approved commands/rules (default or a specific agent)"),
-        ("reach approvals list --pending / --denied / --expired", "Your own records by status"),
-        ("reach approvals request <cmd> [--agent <id>]",     "Request/pre-approve for a standalone agent (fleets: `reach fleets approvals request`)"),
-        ("reach approvals approve <approval-id> [--duration <d>]", "Approve a pending request, agent or fleet (operator+)"),
-        ("reach approvals deny <approval-id>",               "Deny a pending request, agent or fleet (operator+)"),
+        ("reach approvals list [--agent <id|alias>]",
+         "Effective approved commands/rules (default or a specific agent)"),
+        ("reach approvals list --pending / --denied / --expired",
+         "Your own records by status"),
+        ("reach approvals request <cmd> [--agent <id>]",
+         "Request/pre-approve for a standalone agent (fleets: `reach fleets approvals request`)"),
+        ("reach approvals approve <approval-id> [--duration <d>]",
+         "Approve a pending request, agent or fleet (operator+)"),
+        ("reach approvals deny <approval-id>",
+         "Deny a pending request, agent or fleet (operator+)"),
     ])
 
     section("AI integration", [
-        ("reach agent-init",                                 "Interactively generate context for your AI agent"),
-        ("reach agent-init --for claude",                    "Write CLAUDE.md for Claude Code"),
-        ("reach agent-init --for cursor",                    "Write .cursor/rules/reach.mdc for Cursor"),
-        ("reach agent-init --for system-prompt",             "Print system prompt snippet to stdout"),
-        ("reach mcp",                                        "Start the MCP server (stdio, for MCP-compatible clients)"),
+        ("reach agent-init",
+         "Interactively generate context for your AI agent"),
+        ("reach agent-init --for claude",
+         "Write CLAUDE.md for Claude Code"),
+        ("reach agent-init --for cursor",
+         "Write .cursor/rules/reach.mdc for Cursor"),
+        ("reach agent-init --for system-prompt",
+         "Print system prompt snippet to stdout"),
+        ("reach mcp",
+         "Start the MCP server (stdio, for MCP-compatible clients)"),
     ])
 
-    console.print("[dim]Tip: every command also accepts --help for full option details.[/dim]\n")
+    console.print(
+        "[dim]Tip: every command also accepts --help for full option details.[/dim]\n")
 
 
 if __name__ == "__main__":

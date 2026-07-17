@@ -209,6 +209,36 @@ class TestAgentJobResult:
         assert record["job_id"] == JOB_ID
         assert record["approval_id"].startswith("appr_")
 
+    def test_blocked_approval_is_structured_from_command(self):
+        # Block-raised approvals are structured {bin, args[]} like the rest of the model.
+        job_with_meta = {**_JOB_RUNNING, "tenant_id": "tenant_1", "command": "rm -rf /tmp/x", "created_by": "user_1"}
+        with patch("handlers.agent_job_result._verify_agent_token", return_value=_AGENT), \
+             patch("handlers.agent_job_result.jobs_repo") as jr, \
+             patch("handlers.agent_job_result.approvals_repo") as apr, \
+             patch("handlers.agent_job_result.users_repo") as ur:
+            jr.get.return_value = job_with_meta
+            apr.exists_pending.return_value = False
+            ur.get.return_value = {"user_id": "user_1", "name": "Alice"}
+            handle_agent_job_result(JOB_ID, {**_VALID_BODY, "blocked": True, "status": "FAILED"}, "tok")
+        record = apr.create.call_args[0][0]
+        assert record["host_rule"] == {"bin": "rm", "args": ["-rf", "/tmp/x"]}
+        assert record["command"] == "rm -rf /tmp/x"   # canonical display form
+
+    def test_blocked_approval_prefers_dispatched_argv(self):
+        # When the blocked job carries an argv, the rule is built from it directly.
+        job_with_argv = {**_JOB_RUNNING, "tenant_id": "tenant_1", "command": "systemctl restart nginx",
+                         "argv": ["systemctl", "restart", "nginx"], "created_by": "user_1"}
+        with patch("handlers.agent_job_result._verify_agent_token", return_value=_AGENT), \
+             patch("handlers.agent_job_result.jobs_repo") as jr, \
+             patch("handlers.agent_job_result.approvals_repo") as apr, \
+             patch("handlers.agent_job_result.users_repo") as ur:
+            jr.get.return_value = job_with_argv
+            apr.exists_pending.return_value = False
+            ur.get.return_value = {"user_id": "user_1", "name": "Alice"}
+            handle_agent_job_result(JOB_ID, {**_VALID_BODY, "blocked": True, "status": "FAILED"}, "tok")
+        record = apr.create.call_args[0][0]
+        assert record["host_rule"] == {"bin": "systemctl", "args": ["restart", "nginx"]}
+
     def test_blocked_creates_fleet_scoped_approval_for_member(self):
         # A blocked write on a fleet member raises a fleet-scoped pending request.
         member = {**_AGENT, "fleet_id": "fleet_a"}
@@ -237,6 +267,38 @@ class TestAgentJobResult:
             handle_agent_job_result(JOB_ID, {**_VALID_BODY, "blocked": True, "status": "FAILED"}, "tok")
         apr.create.assert_not_called()
 
+    def test_blocked_skips_create_when_rule_already_approved(self):
+        # A transient block of an already-approved write (e.g. agent hadn't synced the
+        # grant yet) must NOT raise a pending - otherwise the same command lands in both
+        # the Approved and Pending lists.
+        job = {**_JOB_RUNNING, "tenant_id": "tenant_1", "command": "rm -rf /tmp/x",
+               "argv": ["rm", "-rf", "/tmp/x"], "created_by": "user_1"}
+        with patch("handlers.agent_job_result._verify_agent_token", return_value=_AGENT), \
+             patch("handlers.agent_job_result.jobs_repo") as jr, \
+             patch("handlers.agent_job_result.approvals_repo") as apr, \
+             patch("handlers.agent_job_result.users_repo"):
+            jr.get.return_value = job
+            apr.exists_pending.return_value = False
+            apr.list_by_agent.return_value = [
+                {"host_rule": {"bin": "rm", "args": ["-rf", "/tmp/x"]}, "command": "rm -rf /tmp/x", "status": "approved"},
+            ]
+            handle_agent_job_result(JOB_ID, {**_VALID_BODY, "blocked": True, "status": "FAILED"}, "tok")
+        apr.create.assert_not_called()
+
+    def test_blocked_skips_create_when_derived_rule_already_approved(self):
+        # Guard: the rule derived from the blocked command already matches an approved
+        # structured rule, so don't duplicate it into the Pending list.
+        job = {**_JOB_RUNNING, "tenant_id": "tenant_1", "command": "rm -rf /tmp/x", "created_by": "user_1"}
+        with patch("handlers.agent_job_result._verify_agent_token", return_value=_AGENT), \
+             patch("handlers.agent_job_result.jobs_repo") as jr, \
+             patch("handlers.agent_job_result.approvals_repo") as apr, \
+             patch("handlers.agent_job_result.users_repo"):
+            jr.get.return_value = job
+            apr.exists_pending.return_value = False
+            apr.list_by_agent.return_value = [{"host_rule": {"bin": "rm", "args": ["-rf", "/tmp/x"]}, "command": "rm -rf /tmp/x", "status": "approved"}]
+            handle_agent_job_result(JOB_ID, {**_VALID_BODY, "blocked": True, "status": "FAILED"}, "tok")
+        apr.create.assert_not_called()
+
     def test_not_blocked_does_not_create_approval(self):
         with patch("handlers.agent_job_result._verify_agent_token", return_value=_AGENT), \
              patch("handlers.agent_job_result.jobs_repo") as jr, \
@@ -245,4 +307,17 @@ class TestAgentJobResult:
             jr.get.return_value = _JOB_RUNNING
             ur.get.return_value = None
             handle_agent_job_result(JOB_ID, _VALID_BODY, "tok")
+        apr.create.assert_not_called()
+
+    def test_blocked_k8s_agent_does_not_raise_approval(self):
+        # A k8s agent's block is a HARD block (allowlist / no-shell / escape / local-file),
+        # not an approvable write - writes are gated at submission - so no pending is raised.
+        k8s_agent = {**_AGENT, "type": "k8s"}
+        job = {**_JOB_RUNNING, "tenant_id": "tenant_1", "command": "helm install rel", "created_by": "user_1"}
+        with patch("handlers.agent_job_result._verify_agent_token", return_value=k8s_agent), \
+             patch("handlers.agent_job_result.jobs_repo") as jr, \
+             patch("handlers.agent_job_result.approvals_repo") as apr, \
+             patch("handlers.agent_job_result.users_repo"):
+            jr.get.return_value = job
+            handle_agent_job_result(JOB_ID, {**_VALID_BODY, "blocked": True, "status": "FAILED"}, "tok")
         apr.create.assert_not_called()

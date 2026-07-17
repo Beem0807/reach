@@ -142,29 +142,28 @@ class TestAgentSync:
         body = json.loads(r["body"])
         assert body["jobs"][0]["is_write"] is False
 
-    def test_approved_mode_includes_approved_commands_per_job(self):
+    def test_approved_mode_omits_legacy_approved_commands(self):
+        # The legacy freeform approved_commands list is gone - host approvals are structured
+        # rules, matched against a job's argv. A freeform (non-argv) job carries neither field.
         approved_agent = {**_AGENT_ACTIVE, "mode": "approved"}
-        approved_records = [
-            {"command": "docker ps", "status": "approved"},
-            {"command": "git status", "status": "approved"},
-        ]
-        job_approved_mode = {**_JOB_PENDING, "mode": "approved"}
+        job_approved_mode = {**_JOB_PENDING, "mode": "approved"}   # no argv (a read)
         with patch("handlers.agent_sync._verify_agent_token", return_value=approved_agent), \
              patch("handlers.agent_sync.agents_repo"), \
              patch("handlers.agent_sync.approvals_repo") as apr, \
              patch("handlers.agent_sync.jobs_repo") as jr:
             jr.get_pending_for_agent.return_value = [job_approved_mode]
             jr.set_running.return_value = True
-            apr.list_by_agent.return_value = approved_records
+            apr.list_by_agent.return_value = [
+                {"command": "systemctl restart *", "host_rule": {"bin": "systemctl", "args": ["restart", "*"]}, "status": "approved"},
+            ]
             r = handle_agent_sync(_VALID_BODY, "tok")
-        body = json.loads(r["body"])
-        assert set(body["jobs"][0]["approved_commands"]) == {"docker ps", "git status"}
-        apr.list_by_agent.assert_called_once_with(AGENT_ID, status="approved")
+        job = json.loads(r["body"])["jobs"][0]
+        assert "approved_commands" not in job          # legacy field removed
+        assert "approved_host_rules" not in job         # only structured (argv) jobs carry rules
 
     def test_structured_job_includes_argv_and_approved_host_rules(self):
         approved_agent = {**_AGENT_ACTIVE, "mode": "approved"}
         approved_records = [
-            {"command": "df -h", "status": "approved"},                                   # freeform
             {"command": "systemctl restart *", "host_rule": {"bin": "systemctl", "args": ["restart", "*"]}, "status": "approved"},
         ]
         structured_job = {**_JOB_PENDING, "mode": "approved", "argv": ["systemctl", "restart", "nginx"]}
@@ -179,29 +178,30 @@ class TestAgentSync:
         job = json.loads(r["body"])["jobs"][0]
         assert job["argv"] == ["systemctl", "restart", "nginx"]
         assert job["approved_host_rules"] == [{"bin": "systemctl", "args": ["restart", "*"]}]
-        assert job["approved_commands"] == ["df -h"]     # only the freeform host approval
+        assert "approved_commands" not in job
 
-    def test_fleet_member_draws_approved_commands_from_fleet(self):
-        # A fleet member inherits its fleet's approvals, not per-agent ones.
+    def test_fleet_member_draws_approved_host_rules_from_fleet(self):
+        # A fleet member inherits its fleet's approvals (structured rules), not per-agent ones.
         member = {**_AGENT_ACTIVE, "mode": "approved", "fleet_id": "fleet_a"}
-        job_approved_mode = {**_JOB_PENDING, "mode": "approved"}
+        structured_job = {**_JOB_PENDING, "mode": "approved", "argv": ["docker", "restart", "web"]}
         with patch("handlers.agent_sync._verify_agent_token", return_value=member), \
              patch("handlers.agent_sync.agents_repo"), \
              patch("handlers.agent_sync.approvals_repo") as apr, \
              patch("handlers.agent_sync.jobs_repo") as jr:
-            jr.get_pending_for_agent.return_value = [job_approved_mode]
+            jr.get_pending_for_agent.return_value = [structured_job]
             jr.set_running.return_value = True
-            apr.list_by_fleet.return_value = [{"command": "docker ps", "status": "approved"}]
+            apr.list_by_fleet.return_value = [{"command": "docker restart web", "host_rule": {"bin": "docker", "args": ["restart", "web"]}, "status": "approved"}]
             r = handle_agent_sync(_VALID_BODY, "tok")
-        body = json.loads(r["body"])
-        assert body["jobs"][0]["approved_commands"] == ["docker ps"]
+        job = json.loads(r["body"])["jobs"][0]
+        assert job["approved_host_rules"] == [{"bin": "docker", "args": ["restart", "web"]}]
         apr.list_by_fleet.assert_called_once_with("fleet_a", status="approved")
         apr.list_by_agent.assert_not_called()
 
-    def test_non_approved_mode_sends_empty_approved_commands(self):
+    def test_non_approved_mode_omits_approved_fields(self):
         r = self._call(jobs=[_JOB_PENDING])  # default mode is "wild"
-        body = json.loads(r["body"])
-        assert body["jobs"][0]["approved_commands"] == []
+        job = json.loads(r["body"])["jobs"][0]
+        assert "approved_commands" not in job
+        assert "approved_host_rules" not in job
 
     def test_rotate_token_signal_when_flag_set(self):
         agent_with_flag = {**_AGENT_ACTIVE, "rotation_requested": True}
@@ -264,6 +264,36 @@ class TestAgentSync:
         _, kwargs = ar.update_heartbeat.call_args
         assert kwargs.get("docker_detected") is None
         assert kwargs.get("service_mgmt_detected") is None
+
+    def _sync_allowlist(self, body, agent=_AGENT_ACTIVE):
+        with patch("handlers.agent_sync._verify_agent_token", return_value=agent), \
+             patch("handlers.agent_sync.agents_repo") as ar, \
+             patch("handlers.agent_sync.approvals_repo"), \
+             patch("handlers.agent_sync.jobs_repo") as jr, \
+             patch("handlers.agent_sync.audit"):
+            jr.get_pending_for_agent.return_value = []
+            handle_agent_sync(body, "tok")
+        return ar
+
+    def test_k8s_allowed_binaries_stored_when_reported(self):
+        body = {**_VALID_BODY, "k8s_allowed_binaries": ["kubectl", "jq", "helm"]}
+        ar = self._sync_allowlist(body)
+        ar.set_k8s_allowed_binaries.assert_called_once_with(AGENT_ID, ["kubectl", "jq", "helm"])
+
+    def test_k8s_allowed_binaries_filters_blanks_and_non_strings(self):
+        body = {**_VALID_BODY, "k8s_allowed_binaries": ["kubectl", "", "  ", 5, "helm"]}
+        ar = self._sync_allowlist(body)
+        ar.set_k8s_allowed_binaries.assert_called_once_with(AGENT_ID, ["kubectl", "helm"])
+
+    def test_k8s_allowed_binaries_not_rewritten_when_unchanged(self):
+        agent = {**_AGENT_ACTIVE, "k8s_allowed_binaries": ["kubectl", "jq"]}
+        body = {**_VALID_BODY, "k8s_allowed_binaries": ["kubectl", "jq"]}
+        ar = self._sync_allowlist(body, agent=agent)
+        ar.set_k8s_allowed_binaries.assert_not_called()
+
+    def test_k8s_allowed_binaries_absent_leaves_it_untouched(self):
+        ar = self._sync_allowlist(_VALID_BODY)
+        ar.set_k8s_allowed_binaries.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

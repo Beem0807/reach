@@ -44,7 +44,7 @@ On **Kubernetes** agents the flow is different - the backend gates the write at 
 
 For a member of a **fleet**, approvals are **fleet-scoped** rather than per-agent: pre-approve a rule once on the fleet and every member inherits it, and a member's blocked write raises a single fleet-scoped request. This makes `approved` mode practical for an autoscaling fleet where instances come and go. Manage them from the fleet (tenant console → **Fleets → [fleet]**, or `POST /tenant/approvals` with `fleet_id`).
 
-A host rule matches the argv **positionally** - bin equal, arity equal, each arg equal or `*`: approving `{bin: systemctl, args: [restart, *]}` permits `systemctl restart nginx` and `systemctl restart web-01`, but not `systemctl stop nginx`. This mirrors the k8s rule model below. (A legacy command-string prefix path still exists for backward compatibility and rejects shell operators.)
+A host rule matches the argv **positionally** - bin equal, arity equal, each arg equal or `*` (a single-argument wildcard): approving `{bin: systemctl, args: [restart, *]}` permits `systemctl restart nginx` and `systemctl restart web-01`, but not `systemctl stop nginx`. Arity is fixed unless the rule ends in `...` - a **trailing variadic wildcard** that matches zero or more remaining args - so `{bin: helm, args: [list, ...]}` covers `helm list`, `helm list prod`, and `helm list -n prod --all` alike, while `helm list *` still requires exactly one arg. This mirrors the k8s rule model below. A command string submitted for approval (e.g. from the CLI) is structured into this same rule, or rejected if it can't be - every host approval is a structured rule, never a raw command string.
 
 **Approvals from the CLI:**
 
@@ -69,7 +69,7 @@ The three modes mean the same thing on both agent types, but **how** a command i
 
 | | **Host** | **Kubernetes** |
 |---|---|---|
-| Write classification | regex heuristic over the command (the readonly pattern list - `rm`, `kill`, `systemctl`, package installs, …); a write is parsed to `argv` and run with `execve` | the `kubectl` **verb**, default-deny: `get`/`logs`/`describe`/… are reads, every other verb (incl. `exec`, `cp`, `port-forward`, and any unknown verb) is a write |
+| Write classification | regex heuristic over the command (the readonly pattern list - `rm`, `kill`, `systemctl`, package installs, …); a write is parsed to `argv` and run with `execve` | **default-deny**: only `kubectl` read-verbs (`get`/`logs`/`describe`/…) and pure read-only filters (`grep jq head tail wc sort uniq cut tr`) are reads. Every other `kubectl` verb (incl. `exec`, `cp`, `port-forward`, unknown verbs) is a write; **any non-`kubectl` binary** (`helm`, `flux`, `argocd`, a custom tool) is also a write, approved via a `{bin, args[]}` host rule like a host command |
 | `readonly` write | rejected at submission; Landlock on Linux is added defence-in-depth on the agent | rejected at submission |
 | `approved` write, not pre-approved | **dispatched**; enforced on the **agent** (Landlock on Linux, server `is_write` flag on macOS), which raises the pending approval. A write with **shell operators** can't be structured and is **rejected at submission** | **blocked at submission** - recorded as a `REJECTED` job and a pending approval is raised; never dispatched |
 | `wild` | runs anything except the always-blocked set; a shell-operator write runs freeform (no rule needed) | runs any `kubectl`, still bounded by the agent's no-shell allowlist and cluster RBAC |
@@ -78,7 +78,7 @@ The net effect: on host agents the agent is the final gate for approved-mode wri
 
 ## Approvals are structured rules
 
-Both agent types use **structured rules** rather than command text. A host write is matched against a rule `{bin, args[]}` (each arg a literal or `*`); reads never need approval:
+Both agent types use **structured rules** rather than command text. A host write is matched against a rule `{bin, args[]}` (each arg a literal, the single-arg wildcard `*`, or a trailing `...` matching the rest); reads never need approval:
 
 ```json
 { "bin": "systemctl", "args": ["restart", "*"] }
@@ -95,6 +95,8 @@ For Kubernetes agents a rule is a poor fit for text prefix - `kubectl create pod
 - When an unapproved write is blocked, the backend **derives** the rule from the command onto the pending request, so the operator reviews (and can widen to `*`) verb/resource/namespace/name. Operators can also author rules directly.
 - Pipes and flags are handled: each `kubectl` write stage is checked; read stages and filters (`| jq`) pass; flags like `-n`, `-l`, `--from-literal=k=v` don't confuse parsing; anything unparseable stays blocked (never over-approved).
 - **Double verbs** (`rollout`, `auth`, `apply`, `set`, `certificate`) and `--dry-run` are classified precisely - e.g. `rollout status` is a read, `rollout restart` a write; `--dry-run=client` makes a mutating command a read. See [ARCHITECTURE.md](ARCHITECTURE.md#kubernetes-agents).
+
+**Non-`kubectl` tools on Kubernetes** (`helm`, `flux`, a custom CLI you allow-listed) are default-denied writes, and are approved with a `{bin, args[]}` **host rule** - the same positional model as host agents (`*` and trailing `...`), not a `verb/resource` rule. So `helm upgrade` needs an approved `{bin: helm, args: [upgrade, ...]}` before it dispatches; `helm`'s arbitrary-exec escapes (`--post-renderer`, `helm plugin …`) are **always blocked** on the agent and no approval can satisfy them. A tool only runs if it's also in the agent's **execution allowlist** (the chart's `extraAllowedBinaries`) - the agent reports that allowlist to the console, which **warns and blocks** an approval for a binary the agent won't run (approving it would be a no-op that still hard-blocks at execution). See [SELF_HOSTING → Kubernetes agents](SELF_HOSTING.md#kubernetes-agents) and the [chart README](deploy/helm/reach-agent/README.md).
 
 In the console (**Approvals**), host and Kubernetes approvals are shown **separately** via a toggle - both as **rule chips** (host `bin / args`, k8s `verb / resource / namespace / name`) - with the default view showing the 10 most recent and a **Search** box (case-insensitive) for filtering. See [API.md](API.md#approvals) for the `type`, `q`, `limit`, and `offset` query parameters.
 

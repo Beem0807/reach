@@ -79,6 +79,12 @@ mcp = FastMCP(
         "submitted earlier with --no-wait. Prefer read-only checks (ps, logs, df) before "
         "write or restart commands. Explain what you are about to do before running "
         "destructive commands.\n\n"
+        "OUTPUT LIMITS: stdout and stderr are capped (~50 KB each). If a result has "
+        "stdout_truncated or stderr_truncated set to true, the output was cut - do NOT "
+        "treat it as complete or reason over it as if it were. Re-run with a filter that "
+        "returns only what you need (e.g. grep <pattern>, tail -n / tail -c, head -c, "
+        "sed -n '<from>,<to>p', or kubectl logs --tail=N) instead of dumping the whole "
+        "thing.\n\n"
         "FLEETS: a fleet is a group of identical hosts. list_fleets / list_fleet_agents / "
         "list_fleet_jobs / list_fleet_runs / list_fleet_run / list_fleet_approved are read-only. "
         "fleet_exec runs a command on EVERY member - in waves of the fan-out cap - and is "
@@ -273,6 +279,10 @@ def exec_command(command: str, agent_id: str = "", confirm: bool = False, timeou
 @mcp.tool()
 def get_job(job_id: str) -> dict:
     """Fetch the result of a previously submitted job.
+
+    Returns stdout/stderr (capped ~50 KB each) plus stdout_truncated/stderr_truncated:
+    if either is true the output was cut - re-run the command with a filter (grep, tail,
+    head -c, kubectl logs --tail=N) rather than treating the result as complete.
 
     Args:
         job_id: The job ID returned by exec_command.

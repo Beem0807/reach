@@ -1,13 +1,15 @@
 import type { Approval, K8sRule, HostRule } from '../types';
 
-// A wildcard field is shown muted ("any") since it matches everything.
+// A wildcard field is shown muted ("any") since it matches everything; a trailing "..."
+// (matches any remaining args) is shown muted as "any args".
 function RuleField({ label, value }: { label: string; value: string }) {
   const wild = value === '*' || value === '';
+  const rest = value === '...';
   return (
     <span className="inline-flex items-baseline gap-1">
-      <span className="text-[10px] uppercase tracking-wider text-gray-400">{label}</span>
-      <span className={wild ? 'text-gray-400 italic' : 'font-mono text-gray-800'}>
-        {wild ? 'any' : value}
+      <span className="text-[10px] uppercase tracking-wider text-gray-400">{rest ? '…' : label}</span>
+      <span className={wild || rest ? 'text-gray-400 italic' : 'font-mono text-gray-800'}>
+        {wild ? 'any' : rest ? 'any args' : value}
       </span>
     </span>
   );

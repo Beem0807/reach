@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { render, screen, fireEvent } from '@testing-library/react';
-import { HostRuleForm, EMPTY_HOST_RULE, parseHostRule, hostRuleToText } from '../components/HostRuleForm';
+import { HostRuleForm, EMPTY_HOST_RULE, parseHostRule, hostRuleToText, ruleHasMisplacedRest } from '../components/HostRuleForm';
 import type { HostRule } from '../types';
 
 describe('parseHostRule', () => {
@@ -9,6 +9,7 @@ describe('parseHostRule', () => {
     expect(parseHostRule('  df   -h ')).toEqual({ bin: 'df', args: ['-h'] });
     expect(parseHostRule('uptime')).toEqual({ bin: 'uptime', args: [] });
     expect(parseHostRule('')).toEqual({ bin: '', args: [] });
+    expect(parseHostRule('helm list ...')).toEqual({ bin: 'helm', args: ['list', '...'] });  // trailing variadic preserved
   });
   it('round-trips via hostRuleToText', () => {
     const r: HostRule = { bin: 'systemctl', args: ['restart', '*'] };
@@ -35,5 +36,26 @@ describe('HostRuleForm', () => {
   it('prefills the input from an existing rule', () => {
     render(<HostRuleForm value={{ bin: 'df', args: ['-h'] }} onChange={() => {}} />);
     expect(screen.getByLabelText('Command pattern')).toHaveValue('df -h');
+  });
+
+  it('renders a trailing "..." as "any args"', () => {
+    render(<HostRuleForm value={{ bin: 'helm', args: ['list', '...'] }} onChange={() => {}} />);
+    expect(screen.getByText('helm')).toBeInTheDocument();
+    expect(screen.getByText('list')).toBeInTheDocument();
+    expect(screen.getByText('any args')).toBeInTheDocument();
+  });
+
+  it('warns when "..." is not the last token', () => {
+    render(<HostRuleForm value={{ bin: 'helm', args: ['...', 'list'] }} onChange={() => {}} />);
+    expect(screen.getByText(/only works as the/i)).toBeInTheDocument();
+  });
+});
+
+describe('ruleHasMisplacedRest', () => {
+  it('flags "..." anywhere but the last position', () => {
+    expect(ruleHasMisplacedRest({ bin: 'helm', args: ['list', '...'] })).toBe(false);
+    expect(ruleHasMisplacedRest({ bin: 'helm', args: ['...'] })).toBe(false);
+    expect(ruleHasMisplacedRest({ bin: 'helm', args: ['...', 'list'] })).toBe(true);
+    expect(ruleHasMisplacedRest({ bin: 'helm', args: ['list', '...', 'x'] })).toBe(true);
   });
 });

@@ -238,9 +238,56 @@ def _stage_is_write(tokens: list) -> bool:
     return not _is_read_verb(_kubectl_verb(tokens))
 
 
+# Pure pipe-filters: they consume stdin and print - they never touch the cluster or exec
+# anything. These are the only non-kubectl binaries the classifier can PROVE are read-only.
+# Mirrors the agent's default k8s allowlist filters (agent/k8s_exec.go). Anything else -
+# helm, flux, argocd, kustomize, a krew plugin, a custom script - is default-denied as a
+# write, because we can't prove it doesn't mutate the cluster (or exec other binaries).
+_K8S_READ_FILTERS = {"grep", "jq", "head", "tail", "wc", "sort", "uniq", "cut", "tr"}
+
+
+def _stage_binary(tokens: list) -> str:
+    return tokens[0].rsplit("/", 1)[-1] if tokens else ""
+
+
+def _stage_is_read(tokens: list) -> bool:
+    """A stage is a proven read only if it's a kubectl read verb (or dry-run) or a pure
+    pipe-filter. Every other binary is treated as a potential write (default-deny)."""
+    binary = _stage_binary(tokens)
+    if binary == "kubectl":
+        return not _stage_is_write(tokens)
+    return binary in _K8S_READ_FILTERS
+
+
 def is_k8s_write(command: str) -> bool:
-    """Whether a k8s job mutates/execs: any kubectl stage that is a write."""
-    return any(_stage_is_write(tokens) for tokens in _kubectl_stages(command))
+    """Whether a k8s job mutates/execs. Default-deny: it's a write unless EVERY stage is a
+    proven read (a kubectl read verb or a pure pipe-filter). So `kubectl get … | grep` is a
+    read, but any non-kubectl tool an operator allow-lists (helm, flux, argocd, kustomize,
+    custom binaries) counts as a write - previously such stages were invisible and slipped
+    through as reads."""
+    return any(tokens and not _stage_is_read(tokens)
+               for tokens in (_tokenize(seg) for seg in _shell_segments(command)))
+
+
+def k8s_nonkubectl_argv(command: str) -> list:
+    """The argv (tokens) of the first non-kubectl, non-filter stage in a k8s command - the
+    stage that makes it non-kubectl (e.g. a `helm upgrade …`). It doesn't fit the kubectl
+    {verb,resource,namespace,name} model, so it's approved with a positional {bin, args[]}
+    rule instead (the same structured host-approval model, matched against this argv).
+    Returns [] when there is no such stage (a pure kubectl/filter command)."""
+    for seg in _shell_segments(command):
+        tokens = _tokenize(seg)
+        binary = _stage_binary(tokens)
+        if binary and binary != "kubectl" and binary not in _K8S_READ_FILTERS:
+            return tokens
+    return []
+
+
+def k8s_uses_unapprovable_binary(command: str) -> bool:
+    """True if the command runs a binary that isn't `kubectl` or a pure pipe-filter (helm,
+    flux, a custom tool). Such a stage is approved via a {bin, args[]} rule rather than a
+    kubectl {verb,resource,namespace,name} rule."""
+    return bool(k8s_nonkubectl_argv(command))
 
 
 # ---------------------------------------------------------------------------
@@ -479,9 +526,16 @@ def to_argv(command: str) -> Optional[list]:
 # --- Structured host exec: {bin, args[]} + positional-wildcard rule matching ----
 # A structured exec runs a single binary with an explicit argv and NO shell (the agent
 # execve's it), so there is nothing to pipe/chain/substitute. A host approval rule is
-# {bin, args} where bin is a literal and each arg is a literal or the "*" wildcard - the
-# positional analog of the k8s {verb, resource, namespace, name} rule (reuses
-# _rule_field_matches). Arity is fixed: a rule for 2 args does not permit 3.
+# {bin, args} where bin is a literal and each arg is a literal, the "*" single-arg
+# wildcard, or a trailing "..." variadic wildcard - the positional analog of the k8s
+# {verb, resource, namespace, name} rule (reuses _rule_field_matches). Arity is fixed
+# unless the rule ends in "...", which matches zero or more remaining args: a rule for
+# 2 literal args does not permit 3, but `helm list ...` permits `helm list` and
+# `helm list -n prod --all` alike.
+
+# Trailing variadic wildcard token: as the final arg it matches zero or more remaining
+# call args. Anywhere else it's rejected (see normalize_host_rule).
+HOST_REST = "..."
 
 def normalize_argv(raw) -> Optional[list]:
     """Validate a structured argv: a non-empty list of strings (bin + args), first
@@ -517,10 +571,17 @@ def normalize_host_rule(raw: dict) -> Optional[dict]:
     if needs_shell(binary):
         return None
     args = []
-    for a in raw_args:
+    for i, a in enumerate(raw_args):
         if not isinstance(a, (str, int, float)):
             return None
         a = str(a)
+        # "..." is the trailing variadic wildcard: matches zero or more remaining args.
+        # It's only meaningful as the final token, so reject it anywhere else.
+        if a == HOST_REST:
+            if i != len(raw_args) - 1:
+                return None
+            args.append(a)
+            continue
         if a != "*" and needs_shell(a):
             return None
         args.append(a)
@@ -529,12 +590,19 @@ def normalize_host_rule(raw: dict) -> Optional[dict]:
 
 def host_rule_matches(argv: list, rule: dict) -> bool:
     """A structured argv [bin, *args] is permitted by a rule when the bin matches and
-    every positional arg equals the rule's arg or the rule wildcards it with "*"."""
+    every positional arg equals the rule's arg or the rule wildcards it with "*". A rule
+    whose last arg is "..." matches variadically: its leading args must match positionally,
+    and any number of remaining call args (including none) are permitted."""
     if not argv or not rule:
         return False
     if argv[0] != rule.get("bin", ""):
         return False
     call_args, rule_args = argv[1:], rule.get("args", [])
+    if rule_args and rule_args[-1] == HOST_REST:
+        prefix = rule_args[:-1]
+        if len(call_args) < len(prefix):
+            return False
+        return all(_rule_field_matches(str(r), c) for r, c in zip(prefix, call_args[:len(prefix)]))
     if len(call_args) != len(rule_args):
         return False
     return all(_rule_field_matches(str(r), c) for r, c in zip(rule_args, call_args))
@@ -552,14 +620,3 @@ def host_rule_to_command(rule: dict) -> str:
     return " ".join([rule.get("bin", "")] + [str(a) for a in rule.get("args", [])]).strip()
 
 
-def _is_approved(command: str, approved_commands: list) -> bool:
-    cmd = command.strip()
-    # A command with shell operators is never "approved" - it must run sandboxed so Landlock
-    # blocks any appended write (mirrors the agent's bypass gate).
-    if has_shell_operators(cmd):
-        return False
-    for allowed in approved_commands:
-        allowed = allowed.strip()
-        if cmd == allowed or cmd.startswith(allowed + " "):
-            return True
-    return False

@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -131,6 +132,46 @@ func TestExecuteK8sCommandRunsPipeline(t *testing.T) {
 	}
 	if got := r.Stdout; got != "beta\n" {
 		t.Fatalf("pipeline output = %q, want %q", got, "beta\n")
+	}
+}
+
+func TestHelmEscapeHatchesBlocked(t *testing.T) {
+	// helm is opt-in via the allowlist; when enabled, its arbitrary-exec escapes are blocked.
+	allowed := []string{"kubectl", "helm"}
+	for _, cmd := range []string{
+		"helm install rel ./chart --post-renderer /bin/sh",
+		"helm upgrade rel ./chart --post-renderer=./evil",
+		"helm plugin install https://example.com/plugin",
+	} {
+		r := executeK8sCommand(cmd, allowed)
+		if !r.Blocked {
+			t.Errorf("expected %q to be blocked (arbitrary-exec escape)", cmd)
+		}
+	}
+	// A normal helm command is not blocked by this rule (the allowlist still permits helm).
+	if r := executeK8sCommand("helm status rel", allowed); r.Blocked && strings.Contains(r.Stderr, "post-renderer") {
+		t.Errorf("normal helm command wrongly blocked by escape rule: %s", r.Stderr)
+	}
+}
+
+func TestExecuteK8sCommandTruncatesLargeOutput(t *testing.T) {
+	// The k8s pipeline uses the same bounded cappedBuffer as the host path: output over
+	// the cap is retained up to the limit, marked, and flagged - agent memory stays bounded.
+	os.Setenv("REACH_MAX_OUTPUT_BYTES", "50")
+	defer os.Unsetenv("REACH_MAX_OUTPUT_BYTES")
+
+	r := executeK8sCommand(`printf %0100d 0`, []string{"printf"}) // 100 bytes > 50-byte cap
+	if r.ExitCode != 0 {
+		t.Fatalf("exit=%d stderr=%s", r.ExitCode, r.Stderr)
+	}
+	if !r.StdoutTruncated {
+		t.Errorf("expected StdoutTruncated=true")
+	}
+	if !strings.HasSuffix(r.Stdout, "\n[TRUNCATED]") {
+		t.Errorf("expected [TRUNCATED] marker, got %q", r.Stdout)
+	}
+	if body := strings.TrimSuffix(r.Stdout, "\n[TRUNCATED]"); len(body) != 50 {
+		t.Errorf("retained %d bytes, want exactly the 50-byte cap", len(body))
 	}
 }
 

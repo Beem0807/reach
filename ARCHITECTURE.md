@@ -96,7 +96,9 @@ and a tag fan-out - plus top-level **Create job / New run** launchers on the Job
 are **write-gated** (only targets the user has read-write access to are runnable; inactive
 agents are shown disabled), and **every** run - single-agent job or fan-out - shows a
 **dry-run preview + confirm** before dispatching (the single-agent preview classifies the
-command read/write and shows the agent's mode; fan-outs show the blast radius + wave plan). The **platform-admin console** manages tenants (create/enable/disable),
+command read/write and shows the agent's mode; fan-outs show the blast radius + wave plan).
+After a **single-agent** dispatch the launcher **polls the job to completion and shows the exit
+code + stdout/stderr inline** (mirroring `reach exec`); fan-outs link to the run view. The **platform-admin console** manages tenants (create/enable/disable),
 can **override a tenant's settings** past its bounds (audit-logged), and reads the platform-wide
 audit log with a tenant filter. Both consoles use the same JSON API as the CLI (session-token
 auth); the console never gets a capability the API doesn't already enforce server-side.
@@ -360,19 +362,18 @@ On Linux, `readonly` and `approved` mode commands run in a sandboxed subprocess:
 
 macOS does not have Landlock. Enforcement differs by mode:
 - `readonly` - fully server-side. The server rejects write commands before queuing; the agent never receives them.
-- `approved` - the agent uses the `is_write` flag from the sync response. If `is_write=true` and the command is not in the approved list, the agent blocks it immediately and returns `blocked=true`. Read commands (`is_write=false`) always run. This matches the Linux Landlock behaviour: reads pass, unapproved writes are blocked and create a pending approval record.
+- `approved` - the agent uses the `is_write` flag from the sync response. A structured write (`argv`) that isn't permitted by an approved host rule is blocked immediately with `blocked=true`; read commands (`is_write=false`) always run. This matches the Linux Landlock behaviour: reads pass, unapproved writes are blocked and create a pending approval record.
 
 **Approved mode logic (both platforms)**
 
 When the agent receives a job in approved mode it also receives, from the sync response, the
-`is_write` flag plus the approvals it should match against: the current **approved host rules**
-(`{bin, args[]}`) and, for legacy command approvals, the approved command-string list.
+`is_write` flag plus the current **approved host rules** (`{bin, args[]}`) to match a structured
+write against. Host writes are always structured (an `argv`); reads and wild-mode commands run
+freeform. There is no command-string approval list - every approval is a rule.
 
 - **Structured write** (the job carries an `argv`): approved iff some **host rule** matches the
-  argv (bin equal, arity equal, each arg literal-or-`*`). If matched it runs directly (execve,
-  no shell); if not, it's a blocked write.
-- **Legacy freeform write** (a command string): approved iff it prefix-matches an approved
-  command string (see below). Kept for backward compatibility; new host writes are structured.
+  argv (bin equal, arity equal, each arg literal-or-`*`, or a trailing `...` for the rest). If
+  matched it runs directly (execve, no shell); if not, it's a blocked write.
 - **Linux:** an unapproved write runs under Landlock and is blocked at the kernel (permission
   denied) → the agent posts `blocked=true, is_write=true`.
 - **macOS:** an unapproved write (`is_write=true`) returns `blocked=true` immediately (no Landlock).
@@ -380,31 +381,32 @@ When the agent receives a job in approved mode it also receives, from the sync r
   creates a **pending** record in the `approvals` table - scoped to the agent, or to its **fleet**
   if the agent is a fleet member (see [Fleets](#fleets)).
 - An operator/admin reviews these (tenant console → Approvals, or the `/tenant/approvals` endpoints)
-  and approves or denies. Once approved, the rule (or command) feeds the next sync and the write runs.
+  and approves or denies. Once approved, the rule feeds the next sync and the write runs.
 
 ### Approved matching
 
 A **structured** write matches a host rule `{bin, args[]}` positionally - bin equal, arity equal,
-each arg equal or `*` (mirrors the k8s `{verb, resource, namespace, name}` rule). This is the
-default and involves no string comparison. The **legacy** command-string path is prefix-based with
-a word boundary (`cmd == approved` or `cmd.startswith(approved + " ")`) - an approved `docker logs`
-permits `docker logs myapp --tail 100` but not `docker rm myapp` - and approved commands may not
-contain shell operators (so a prefix can't smuggle an appended `| tee` / `&& rm`).
+each arg equal or `*` (a single-arg wildcard); a trailing `...` relaxes arity to match zero or more
+remaining args (so `{bin: helm, args: [list, ...]}` covers `helm list` and `helm list -n prod`).
+Mirrors the k8s `{verb, resource, namespace, name}` rule. There is no string comparison and no
+prefix-match path: a write with shell operators can't be a rule, so it's unapprovable in
+`approved` mode (rejected at submission) - which is exactly why an approved action can never be
+extended (`approved-cmd | tee`, `… && rm -rf`) to smuggle an unapproved write.
 
 ### Kubernetes agents
 
 For `type=k8s` agents the model is different - Landlock (a filesystem sandbox) is irrelevant to `kubectl`'s API calls, so policy mode is enforced **server-side at job submission** instead:
 
-- The backend classifies the `kubectl` verb (default-deny: any verb that isn't a known read verb - including `exec`/`cp`/`port-forward` and unknown verbs - is a write). `readonly` rejects writes outright; `approved` records a `REJECTED` job and raises a pending approval (the command never dispatches); pre-approved writes and reads dispatch normally.
-- Approvals for k8s agents are **structured rules** `{verb, resource, namespace, name}` (each field wildcardable with `*`), not command text. A submitted write is permitted when some approved rule matches every field; a blocked write's rule is **derived** from the command onto the pending approval for the operator to review. See [Approvals](#approvals).
-- The **agent** adds two compromise-resistant bounds that are agent-local (not job data, so a malicious backend can't relax them): jobs run **without a shell**, every pipeline stage's binary must be allow-listed (`kubectl` + read-only filters), and arguments that resolve to a local file are rejected (no reading the mounted ServiceAccount token).
+- The backend classifies each command **default-deny**: only `kubectl` read-verbs and pure read-only filters (`grep jq head tail wc sort uniq cut tr`) are reads; every other `kubectl` verb (incl. `exec`/`cp`/`port-forward` and unknown verbs) is a write, and **any non-`kubectl` binary** (`helm`, `flux`, a custom CLI you allow-listed) is also a write. `readonly` rejects writes outright; `approved` records a `REJECTED` job and raises a pending approval (the command never dispatches); pre-approved writes and reads dispatch normally.
+- Approvals for k8s agents are **structured rules**: a `kubectl` write matches a `{verb, resource, namespace, name}` rule; a **non-`kubectl` write** matches a `{bin, args[]}` **host rule** (positional `*` and trailing `...`, the same model as host agents). A submitted write is permitted when some approved rule matches; a blocked write's rule is **derived** from the command onto the pending approval for the operator to review. See [Approvals](#approvals).
+- The **agent** adds compromise-resistant bounds that are agent-local (not job data, so a malicious backend can't relax them): jobs run **without a shell**, every pipeline stage's binary must be in the agent's **execution allowlist** (`kubectl` + read-only filters + any `extraAllowedBinaries`), arguments that resolve to a local file are rejected (no reading the mounted ServiceAccount token), and arbitrary-exec escapes (`helm --post-renderer`, `helm plugin`) are hard-blocked regardless of approval. The agent **reports this allowlist** to the backend so the console warns/blocks approving a binary it won't run.
 - The **API server** enforces **RBAC** as the unbypassable floor.
 
-So three layers compose - RBAC (what's possible) ∩ policy mode (what's allowed) ∩ allowlist/no-shell (blast-radius bound). The agent reports its effective cluster-wide RBAC (`SelfSubjectRulesReview` across all namespaces) for acknowledge/drift; see [agent/README.md](agent/README.md).
+So three layers compose - RBAC (what's possible) ∩ policy mode (what's allowed) ∩ allowlist/no-shell (blast-radius bound). The agent reports both its effective cluster-wide RBAC (`SelfSubjectRulesReview` across all namespaces) for acknowledge/drift and its execution allowlist; see [agent/README.md](agent/README.md).
 
 #### How `kubectl` commands are classified
 
-Write-ness is decided from the `kubectl` verb, **fail-closed** - anything that isn't a known read is a write (so an unrecognized or future verb is gated, never silently allowed). Authoritative in `backend/shared/policy.py` (`_K8S_READ_VERBS`, `_K8S_WRITE_VERBS`, `_K8S_COMPOUND_*`, `is_k8s_write`).
+Write-ness is decided **fail-closed** - anything that isn't a proven read is a write. A pipeline is a read only when **every** stage is a read: a `kubectl` read-verb, or a pure read-only filter. Any other `kubectl` verb, and **any non-`kubectl` binary** (`helm`, `flux`, a custom tool - classified as a write regardless of its subcommand, since Reach can't reason about arbitrary CLIs), is a write. So an unrecognized/future verb or an unknown tool is gated, never silently allowed. Authoritative in `backend/shared/policy.py` (`_K8S_READ_VERBS`, `_K8S_WRITE_VERBS`, `_K8S_COMPOUND_*`, `_K8S_READ_FILTERS`, `is_k8s_write`, `k8s_nonkubectl_argv`).
 
 - **Reads** run in every mode and never need approval: `get`, `describe`, `logs`, `top`, `explain`, `events`, `diff`, `wait`, `api-resources`, `api-versions`, `version`, `cluster-info`. Plus **cluster-inert utilities** that only render/print locally or touch the local kubeconfig - which the agent never uses for auth (it authenticates via its in-cluster ServiceAccount) and can't write (read-only rootfs): `kustomize`, `options`, `completion`, `plugin`, `config` (all subcommands).
 - **Writes** are blocked (`readonly`) or held for approval (`approved`): `create`, `apply`, `delete`, `edit`, `patch`, `replace`, `scale`, `autoscale`, `expose`, `run`, `label`, `annotate`, `drain`, `cordon`/`uncordon`, `taint`, `exec`, `attach`, `cp`, `port-forward`, `proxy`, `debug`, … and anything unrecognized.
@@ -434,8 +436,9 @@ approvals table:
   approval_id    - unique ID (appr_xxx)
   tenant_id      - which tenant
   agent_id       - which agent blocked the command
-  command        - the command text (host agents), or a readable rendering of the rule (k8s)
-  k8s_rule       - structured rule {verb, resource, namespace, name} for k8s agents; null for host
+  command        - a readable rendering of the structured rule (for display/search)
+  host_rule      - structured host rule {bin, args[]} (each arg a literal, `*`, or trailing `...`); used by host agents AND non-kubectl k8s tools (helm/flux); null otherwise
+  k8s_rule       - structured kubectl rule {verb, resource, namespace, name} for k8s agents; null otherwise
   requested_by   - user_id of the submitter
   requester_name - display name of the submitter
   job_id         - the job that triggered this record

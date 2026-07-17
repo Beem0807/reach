@@ -1,11 +1,25 @@
 # reach
 
-Give your AI agents controlled access to every machine you own - without SSH, VPNs, or open ports.
+**Let AI agents operate your production machines - safely.** Reads run freely; every _write_ is **blocked and queued for a human to approve** before it touches anything. No SSH, no VPN, no open ports.
+
+The one idea: on a production agent, an AI (or any automation) can look at everything, but it cannot change anything until a person approves the exact action.
 
 ```bash
-reach exec -- hostname
-reach exec --agent prod -- docker ps
+# your agent asks to do something destructive on prod...
+$ reach exec --agent prod -- kubectl delete pods --all -n payments
+  Status: REJECTED - approval required; a request was sent to your operator.
+
+# ...an operator approves the pending rule once - structured, not a string:
+#   { verb: delete, resource: pods, namespace: payments, name: * }
+$ reach approvals approve appr_9f2c
+  Approved.
+
+# ...and now it runs - this time and next, without re-asking.
+$ reach exec --agent prod -- kubectl delete pods --all -n payments
+  Status: SUCCEEDED
 ```
+
+You approve a **rule**, not a command string - so an approved action can't be extended (`… | tee /etc/x`, `… && rm -rf`) to smuggle something past it. That's the difference between "AI on prod" being a liability and being something you can sleep next to.
 
 ## ⚡ 2-minute Quick Start
 
@@ -31,7 +45,7 @@ Now ask your AI agent to run something - or check it yourself:
 reach exec -- hostname
 ```
 
-That's it: your AI agent has **controlled, audited** access to the machine - no SSH, no VPN, no open ports. On AWS instead? Swap step 1 for `lambda-setup.sh`. Docker, Kubernetes, and production hardening are in [SELF_HOSTING.md](SELF_HOSTING.md).
+That's it: your AI agent has **controlled, audited** access to the machine - no SSH, no VPN, no open ports. Setup **asks you to pick the mode** (`wild`/`readonly`/`approved`, default `wild` for a frictionless local try); when you point Reach at anything real, choose - or later switch to - **`approved` mode** (**Agents → [agent] → Policy**) so writes stop for sign-off - that's the posture up top. On AWS instead? Swap step 1 for `lambda-setup.sh`. Docker, Kubernetes, and production hardening are in [SELF_HOSTING.md](SELF_HOSTING.md).
 
 ---
 
@@ -39,8 +53,8 @@ That's it: your AI agent has **controlled, audited** access to the machine - no 
 >
 > Reach gives AI agents **controlled, audited** command execution on machines you own. It is **not a sandbox for arbitrary untrusted commands.**
 >
-> - **`wild` mode can damage machines** - reboots, deletes, package installs all run. Use it only on personal/dev boxes where you're the sole user.
-> - **For production, use `approved` mode** - only commands you've allowlisted execute; everything else is blocked and queued for review.
+> - **On production, run `approved` mode** - the posture above: reads run, every write needs a human-approved structured rule, everything else is blocked and queued. This is the intended way to point an AI at real infrastructure.
+> - **`wild` mode is the opt-in exception** - it runs anything (reboots, deletes, package installs). Use it only on personal/dev boxes where you're the sole user.
 > - Reach is **not a security boundary against the machine's own owner/root** - whoever controls the host can read the agent's token.
 >
 > See **[SECURITY.md](SECURITY.md)** for the full threat model, and **[POLICIES.md](POLICIES.md)** for how the modes work.
@@ -49,18 +63,18 @@ That's it: your AI agent has **controlled, audited** access to the machine - no 
 
 ## What can I use this for?
 
-- **Let Claude Code inspect a remote dev box** - check what's running, tail logs, or diff configs without leaving your editor
-- **Debug Docker containers without SSH** - `reach exec -- docker ps`, `docker logs`, `docker inspect` from anywhere
-- **Check Kubernetes pods from an in-cluster agent** - install the agent inside the cluster, run `kubectl` through it from your laptop
-- **Run approved operational commands on production** - lock agents to `approved` mode so only allowlisted commands run; everything else is blocked and queued for review
-- **Manage an autoscaling group as one fleet** - bake a fleet join token into your autoscaler's launch/instance template (AWS ASG, GCP MIG, Azure VMSS, …); instances auto-enroll on scale-out and clean themselves up on scale-in
-- **Give AI tools controlled machine access without exposing SSH** - no open ports, no VPN, no key distribution; the agent makes outbound HTTPS calls to your backend
+- **Give an AI agent standing access to production - safely** - lock agents to `approved` mode: reads run, every write waits for a human to approve the exact rule, everything is audited. The headline use case.
+- **Run agent-driven operations you can trust** - restarts, scaling, rollouts, targeted deletes - each gated by a structured rule an operator approved once, not a command string that can be extended past the check.
+- **Check Kubernetes pods from an in-cluster agent** - install the agent inside the cluster, run `kubectl` through it from your laptop; non-`kubectl` tools (helm, flux) are approvable the same way.
+- **Let Claude Code inspect a remote dev box** - check what's running, tail logs, or diff configs without leaving your editor (reads never need approval).
+- **Debug Docker containers without SSH** - `reach exec -- docker ps`, `docker logs`, `docker inspect` from anywhere.
+- **Manage an autoscaling group as one fleet** - bake a fleet join token into your autoscaler's launch/instance template (AWS ASG, GCP MIG, Azure VMSS, …); instances auto-enroll on scale-out and clean themselves up on scale-in, inheriting the fleet's approved rules.
 
 ## Why Reach?
 
-AI agents can reason about your code, but they cannot safely operate your remote machines by default.
+AI agents can reason about your infrastructure, but you can't hand one your production shell. The moment access is real, so is the risk: one confident-but-wrong `kubectl delete` or `rm -rf` and it's your outage.
 
-Reach gives any AI agent - Claude Code, Cursor, custom LLM workflows, or your own automation - a controlled command bridge to your machines without requiring SSH, VPNs, public IPs, or inbound firewall rules.
+Reach removes the all-or-nothing choice. An agent - Claude Code, Cursor, a custom LLM workflow, or your own automation - gets to **read everything and change nothing without sign-off**: every write stops at a human-approved structured rule, every action is audited, and it's all over outbound HTTPS (no SSH, VPNs, public IPs, or inbound firewall rules). You get the usefulness of an agent on prod without granting it a blank check.
 
 ## How it works
 
@@ -96,11 +110,11 @@ The local and Lambda setup scripts do 1-3 for you. See [ARCHITECTURE.md](ARCHITE
 
 Reach is self-hosted: you deploy your own backend, then enroll machines as agents. The **interactive setup script** does the whole first run end to end - deploy the backend, provision your tenant, admin user, API token, and first agent, install the CLI, and log you in:
 
-| Backend | Setup |
-|---|---|
-| **Local** (no cloud account) | `curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh \| bash` |
-| **AWS Lambda + DynamoDB** | `curl -fsSL https://reach-releases.s3.amazonaws.com/lambda-setup.sh \| bash` |
-| **Docker + PostgreSQL** (any cloud) | `docker run … nabeemdev/reach:0.1.0`, then finish in the console at `/ui` |
+| Backend                             | Setup                                                                        |
+| ----------------------------------- | ---------------------------------------------------------------------------- |
+| **Local** (no cloud account)        | `curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh \| bash`  |
+| **AWS Lambda + DynamoDB**           | `curl -fsSL https://reach-releases.s3.amazonaws.com/lambda-setup.sh \| bash` |
+| **Docker + PostgreSQL** (any cloud) | `docker run … nabeemdev/reach:0.1.0`, then finish in the console at `/ui`    |
 
 The Local and Lambda scripts are interactive, safe to re-run, and double as management tools (`--update`, `--down`, …). Full setup for all three - including the Docker environment variables - is in **[SELF_HOSTING.md](SELF_HOSTING.md)**.
 
@@ -134,13 +148,13 @@ The backend ships a web UI at `/ui` with two consoles (choose at login):
 
 The CLI and MCP server authenticate with **API tokens** (created under **API Tokens**), not the admin password.
 
-| Operation | Where |
-|---|---|
-| View agents / job history | Tenant console → Agents / Jobs |
-| Change an agent's policy mode | Tenant console → Agents → [agent] → Policy |
-| Manage approvals | Tenant console → Approvals |
-| Grant a user read-only / read-write access to agents or fleets | Tenant console → Users → [user] → Access |
-| Audit log (tenant / platform) | Tenant console → Audit Logs / Platform admin → Audit Logs |
+| Operation                                                      | Where                                                     |
+| -------------------------------------------------------------- | --------------------------------------------------------- |
+| View agents / job history                                      | Tenant console → Agents / Jobs                            |
+| Change an agent's policy mode                                  | Tenant console → Agents → [agent] → Policy                |
+| Manage approvals                                               | Tenant console → Approvals                                |
+| Grant a user read-only / read-write access to agents or fleets | Tenant console → Users → [user] → Access                  |
+| Audit log (tenant / platform)                                  | Tenant console → Audit Logs / Platform admin → Audit Logs |
 
 Automating any of this? See [API.md](API.md).
 
@@ -168,11 +182,11 @@ Aliases, multi-deployment profiles, fleets, approvals, `--json` output, and the 
 
 Each agent runs in one of three modes (set in the tenant console or via the API):
 
-- **`wild`** - runs almost anything; only a catastrophic/abuse set (`rm -rf /`, `mkfs`, privileged escapes, reverse shells) is always blocked. For personal/dev boxes.
-- **`readonly`** - only reads run; any write/delete/restart/install is blocked.
-- **`approved`** - reads run; writes run only if pre-approved for that agent (blocked and queued otherwise).
+- **`approved`** ← the production mode - reads run; every write runs only if it matches a rule a human pre-approved for that agent, otherwise it's blocked and queued for review. This is the whole point of Reach.
+- **`readonly`** - only reads run; any write/delete/restart/install is blocked. For a locked-down "look but don't touch" agent.
+- **`wild`** - runs almost anything; only a catastrophic/abuse set (`rm -rf /`, `mkfs`, privileged escapes, reverse shells) is always blocked. For personal/dev boxes where you're the sole user.
 
-Host and Kubernetes agents share these modes but enforce them differently - agent-side Landlock vs backend-side `kubectl`-verb gating. Approvals are structured rules on both: host `{bin, args[]}`, k8s `{verb, resource, namespace, name}`. Full detail (enforcement model, structured rules, `access_level`): **[POLICIES.md](POLICIES.md)**.
+Host and Kubernetes agents share these modes but enforce them differently - agent-side Landlock vs backend-side gating. Approvals are structured rules on both: host `{bin, args[]}` (positional `*`, trailing `...`), k8s `{verb, resource, namespace, name}`. Full detail (enforcement model, structured rules, `access_level`): **[POLICIES.md](POLICIES.md)**.
 
 ## Safety
 
@@ -197,16 +211,16 @@ Use **`approved`** mode on production machines (set it when creating the agent, 
 
 ## Documentation
 
-| Doc | What's in it |
-|---|---|
-| [cli/README.md](cli/README.md) | The `reach` CLI and `reach-mcp` server - install, commands, profiles, aliases, MCP setup |
-| [POLICIES.md](POLICIES.md) | Policy modes (wild/readonly/approved), approvals, host vs Kubernetes enforcement, structured host & k8s rules, `access_level` |
-| [agent/README.md](agent/README.md) | How the agent works - host vs Kubernetes, credential-only identity, the poll loop, execution models, leader election, RBAC self-review, metrics |
-| [deploy/helm/reach-agent](deploy/helm/reach-agent) | Kubernetes agent Helm chart - install, RBAC (`clusterAccess`), execution allowlist, and all values |
-| [SELF_HOSTING.md](SELF_HOSTING.md) | Deploy and operate your own backend (Local, AWS Lambda, Docker), setup, agent lifecycle, grants, blocked-command reference |
-| [API.md](API.md) | Complete HTTP endpoint reference, rate limits, pagination, audit-log actions |
-| [ARCHITECTURE.md](ARCHITECTURE.md) | How the pieces fit - command flow, token model, storage split, policy enforcement, approvals, fleets, multi-tenancy |
-| [SECURITY.md](SECURITY.md) | Threat model, token storage and rotation, revoking access, audit history, production hardening |
+| Doc                                                | What's in it                                                                                                                                    |
+| -------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| [cli/README.md](cli/README.md)                     | The `reach` CLI and `reach-mcp` server - install, commands, profiles, aliases, MCP setup                                                        |
+| [POLICIES.md](POLICIES.md)                         | Policy modes (approved/readonly/wild), approvals, host vs Kubernetes enforcement, structured host & k8s rules, `access_level`                   |
+| [agent/README.md](agent/README.md)                 | How the agent works - host vs Kubernetes, credential-only identity, the poll loop, execution models, leader election, RBAC self-review, metrics |
+| [deploy/helm/reach-agent](deploy/helm/reach-agent) | Kubernetes agent Helm chart - install, RBAC (`clusterAccess`), execution allowlist, and all values                                              |
+| [SELF_HOSTING.md](SELF_HOSTING.md)                 | Deploy and operate your own backend (Local, AWS Lambda, Docker), setup, agent lifecycle, grants, blocked-command reference                      |
+| [API.md](API.md)                                   | Complete HTTP endpoint reference, rate limits, pagination, audit-log actions                                                                    |
+| [ARCHITECTURE.md](ARCHITECTURE.md)                 | How the pieces fit - command flow, token model, storage split, policy enforcement, approvals, fleets, multi-tenancy                             |
+| [SECURITY.md](SECURITY.md)                         | Threat model, token storage and rotation, revoking access, audit history, production hardening                                                  |
 
 ---
 

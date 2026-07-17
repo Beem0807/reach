@@ -3,6 +3,7 @@ import logging
 import secrets
 
 from shared.auth import _bearer, _verify_agent_token
+from shared.policy import host_rule_to_command, is_host_argv_approved, normalize_host_rule
 from shared.redact import redact
 from shared.response import _err, _iso, _ok
 from shared.store import approvals_repo, jobs_repo, users_repo
@@ -82,14 +83,48 @@ def handle_agent_job_result(job_id: str, body: dict, raw_token: str) -> dict:
         from handlers.runs import refresh_run
         refresh_run(job.get("tenant_id"), job.get("run_id"))
 
-    if blocked:
+    # A blocked write raises a pending approval so an operator can permit it - HOST agents
+    # only. On a k8s agent, writes are gated at submission (an unapproved write is REJECTED
+    # and never dispatched), so a dispatched job the agent then blocks is a HARD block
+    # (allowlist / no-shell / local-file / escape-hatch) that no approval can satisfy - you
+    # allow-list the binary, not approve it - so raising a request would be spurious.
+    if blocked and (agent.get("type") or "host") != "k8s":
         # A fleet member's approvals live at the fleet level (not per-agent), so a
         # blocked write raises a fleet-scoped pending request.
         command = job.get("command")
         fleet_id = agent.get("fleet_id")
-        already = (approvals_repo.exists_pending_fleet(fleet_id, command) if fleet_id
-                   else approvals_repo.exists_pending(agent_id, command))
-        if not already:
+        # Structure the blocked write into a {bin, args[]} host rule so block-raised
+        # approvals match the structured model (like the create-approval path and the UI) -
+        # every host approval is a structured rule. Prefer the dispatched argv; fall back to
+        # splitting the command. Canonicalize the display command from the rule.
+        host_rule = None
+        argv = job.get("argv")
+        if argv:
+            host_rule = normalize_host_rule({"bin": argv[0], "args": list(argv[1:])})
+        elif command:
+            toks = command.split()
+            if toks:
+                host_rule = normalize_host_rule({"bin": toks[0], "args": toks[1:]})
+        if host_rule:
+            command = host_rule_to_command(host_rule)
+        # Don't raise a request the reviewer would have to duplicate: skip if a pending
+        # already exists, OR if the command is already approved. The latter guards a
+        # transient block - e.g. the agent blocked a write before it had synced a
+        # just-granted approval - which would otherwise land the same command in both the
+        # Approved and Pending lists.
+        argv = job.get("argv")
+        approved = (approvals_repo.list_by_fleet(fleet_id, status="approved") if fleet_id
+                    else approvals_repo.list_by_agent(agent_id, status="approved"))
+        approved_rules = [a["host_rule"] for a in approved if a.get("host_rule")]
+        already_approved = (
+            # the rule we derived from this block already matches an approved one
+            (host_rule is not None and host_rule in approved_rules)
+            # or the dispatched argv is covered by an approved rule
+            or (bool(argv) and is_host_argv_approved(argv, approved_rules))
+        )
+        already_pending = (approvals_repo.exists_pending_fleet(fleet_id, command) if fleet_id
+                           else approvals_repo.exists_pending(agent_id, command))
+        if not already_approved and not already_pending:
             user = users_repo.get(job.get("created_by"))
             approvals_repo.create({
                 "approval_id": "appr_" + secrets.token_urlsafe(12),
@@ -97,6 +132,7 @@ def handle_agent_job_result(job_id: str, body: dict, raw_token: str) -> dict:
                 "agent_id": None if fleet_id else agent_id,
                 "fleet_id": fleet_id,
                 "command": command,
+                "host_rule": host_rule,
                 "requested_by": job.get("created_by"),
                 "requester_name": user.get("name") if user else None,
                 "job_id": job_id,

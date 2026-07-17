@@ -62,6 +62,10 @@ class _Agent(_Base):
     # The snapshot captured at acknowledge time, so the console can diff current vs
     # acknowledged and show *what* drifted. Null until the first acknowledge.
     k8s_permissions_acked = Column(JSON)
+    # The k8s agent's effective execution allowlist (kubectl + filters + any extras), as it
+    # self-reports on sync. Lets the console warn/block when someone tries to approve a
+    # non-kubectl command whose binary the agent won't run. Null until first k8s sync.
+    k8s_allowed_binaries = Column(JSON)
 
 
 class _Approval(_Base):
@@ -220,7 +224,8 @@ class _Job(_Base):
     wave = Column(Integer, default=0)
     command = Column(Text, nullable=False)
     # Structured exec: when set, the job runs this argv with execve (no shell); `command`
-    # holds the display form. Null = freeform shell string in `command` (legacy path).
+    # holds the display form. Null = the job runs `command` freeform under the shell -
+    # reads (always freeform) and wild-mode writes.
     argv = Column(JSON(none_as_null=True))
     # PENDING (dispatchable) | HELD (staged, not yet released) | RUNNING | SUCCEEDED |
     # FAILED | REJECTED | EXPIRED | CANCELED. Agents only ever receive PENDING.
@@ -374,6 +379,15 @@ class AgentRepo:
             )
             db.commit()
 
+    def set_k8s_allowed_binaries(self, agent_id: str, binaries: list) -> None:
+        with SessionLocal() as db:
+            db.execute(
+                update(_Agent).where(_Agent.agent_id == agent_id).values(
+                    k8s_allowed_binaries=binaries
+                )
+            )
+            db.commit()
+
     def acknowledge_k8s_permissions(self, agent_id: str, perm_hash: str, acked_permissions: Optional[dict] = None) -> None:
         # Postgres stores the acknowledged snapshot in full (JSON column, no size
         # limit) so the console can diff current vs acknowledged.
@@ -475,10 +489,15 @@ class AgentRepo:
             )
             db.commit()
 
-    def detach_fleet(self, fleet_id: str) -> int:
-        """Un-fleet all of a fleet's members (they become standalone agents)."""
+    def detach_fleet(self, fleet_id: str, tags: Optional[list] = None) -> int:
+        """Un-fleet all of a fleet's members (they become standalone agents). When `tags`
+        is given, replace each member's tags too (swap inherited fleet tags for a
+        provenance tag on detach)."""
+        values: dict = {"fleet_id": None}
+        if tags is not None:
+            values["tags"] = tags
         with SessionLocal() as db:
-            result = db.execute(update(_Agent).where(_Agent.fleet_id == fleet_id).values(fleet_id=None))
+            result = db.execute(update(_Agent).where(_Agent.fleet_id == fleet_id).values(**values))
             db.commit()
             return result.rowcount or 0
 
@@ -503,10 +522,14 @@ class AgentRepo:
             db.commit()
             return result.rowcount or 0
 
-    def detach_from_fleet(self, agent_id: str) -> None:
-        """Remove a single agent from its fleet (becomes a standalone agent)."""
+    def detach_from_fleet(self, agent_id: str, tags: Optional[list] = None) -> None:
+        """Remove a single agent from its fleet (becomes a standalone agent). When `tags`
+        is given, replace its tags too (swap inherited fleet tags for a provenance tag)."""
+        values: dict = {"fleet_id": None}
+        if tags is not None:
+            values["tags"] = tags
         with SessionLocal() as db:
-            db.execute(update(_Agent).where(_Agent.agent_id == agent_id).values(fleet_id=None))
+            db.execute(update(_Agent).where(_Agent.agent_id == agent_id).values(**values))
             db.commit()
 
     def update_policy(self, agent_id: str, mode: str) -> None:
@@ -1123,6 +1146,7 @@ class ApprovalRepo:
     def search_by_tenant(self, tenant_id: str, *, status: Optional[str] = None, agent_id: Optional[str] = None,
                          agent_ids: Optional[list] = None, fleet_id: Optional[str] = None, fleet_ids: Optional[list] = None,
                          scope: Optional[str] = None, requested_by: Optional[str] = None, kind: Optional[str] = None,
+                         k8s_agent_ids: Optional[list] = None,
                          q: Optional[str] = None, limit: int = 20, offset: int = 0) -> tuple:
         """Server-side search + pagination for the tenant/developer approvals views.
 
@@ -1132,7 +1156,7 @@ class ApprovalRepo:
         paginating, so `total` reflects what the user actually sees. Returns
         (page_items, total).
         """
-        from sqlalchemy import desc, or_
+        from sqlalchemy import and_, desc, or_
         with SessionLocal() as db:
             stmt = select(_Approval).where(_Approval.tenant_id == tenant_id)
             # Scope: an approval is in view if it matches any given agent/fleet filter.
@@ -1158,10 +1182,18 @@ class ApprovalRepo:
                 stmt = stmt.where(_Approval.status == status)
             if requested_by is not None:
                 stmt = stmt.where(_Approval.requested_by == requested_by)
+            # host/k8s is the AGENT's type, not the rule type: a k8s agent's non-kubectl
+            # approval (helm/flux) carries a host_rule but still belongs under Kubernetes.
+            # k8s = has a k8s_rule (covers a since-deleted agent) OR the agent is k8s;
+            # host = neither.
+            k8s_ids = k8s_agent_ids or []
             if kind == "k8s":
-                stmt = stmt.where(_Approval.k8s_rule.isnot(None))
+                stmt = stmt.where(or_(_Approval.k8s_rule.isnot(None), _Approval.agent_id.in_(k8s_ids)))
             elif kind == "host":
-                stmt = stmt.where(_Approval.k8s_rule.is_(None))
+                stmt = stmt.where(and_(
+                    _Approval.k8s_rule.is_(None),
+                    or_(_Approval.agent_id.is_(None), _Approval.agent_id.notin_(k8s_ids)),
+                ))
             if q:
                 like = f"%{q}%"
                 stmt = stmt.where(or_(

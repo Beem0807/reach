@@ -183,6 +183,60 @@ holds a cluster credential, so arbitrary shell would let a job read the token or
 reach internal services regardless of RBAC. Extend the allowlist with
 `extraAllowedBinaries` (additive) or replace it with `allowedBinaries` (lock-down).
 
+## Adding CLIs (helm, flux, custom tools)
+
+The base image ships only `kubectl` + the read-only filters. To run anything else,
+add it to `extraAllowedBinaries` - **a list of dicts where each entry both allow-lists
+the binary AND provides it**, so the two can never drift:
+
+```yaml
+extraAllowedBinaries:
+  - name: helm
+    url: https://get.helm.sh/helm-v3.16.3-linux-arm64.tar.gz   # match your nodes' arch
+    sha256: "5bd34ed774df6914b323ff84a0a156ea6ff2ba1eaf0113962fa773f3f9def798"
+    archivePath: linux-arm64/helm       # path inside the .tar.gz; omit for a raw binary
+  - name: mytool                        # already in your own image -> allow-list only
+```
+
+An initContainer downloads each entry that has a `url` (pinned + `sha256`-verified)
+into a shared volume on the agent's `PATH`, then **verifies every allow-listed binary
+resolves and hard-fails the pod if one is missing**. So you can't allow-list a binary
+you didn't provide - the failure is at pod start, not silently at approval time. The
+base image stays minimal and keeps updating on its own (bump `image.tag`; tools
+re-fetch unchanged). Needs egress at pod start; **air-gapped clusters** bake tools into
+a mirrored/derived image and list them with `name` only.
+
+**Rules of thumb**
+- Every non-default binary you allow-list **must be provided** - give it a `url`+`sha256`, or bake it into a custom image and list it with `name` only.
+- `name` is required; `url` needs a `sha256`; `archivePath` is the file inside a tarball (omit for a raw binary). Missing `name`/`url`+`sha256` fail at `helm install` time.
+- Match the URL's arch to your nodes (`kubectl get nodes -o wide` → ARCH). Mixed-arch → derived multi-arch image.
+
+**Finding the three fields** (any tool):
+
+| Field | Where to get it |
+| --- | --- |
+| `url` | The `linux-<arch>` release asset - helm: `get.helm.sh`; most others: the project's GitHub **Releases**. |
+| `sha256` | Published beside the asset (helm: append `.sha256sum`; GitHub: a `checksums.txt` / `*_SHA256SUMS`). Or compute: `curl -sL <url> \| sha256sum`. |
+| `archivePath` | The binary's path inside a `.tar.gz`: `curl -sL <url> \| tar tzf - \| grep <tool>`. **Omit** when the release is a bare binary. |
+
+More recipes (adjust versions/arch, and fill `sha256` from each release's checksums file):
+
+```yaml
+extraAllowedBinaries:
+  - name: flux
+    url: https://github.com/fluxcd/flux2/releases/download/v2.4.0/flux_2.4.0_linux_arm64.tar.gz
+    sha256: "<from flux2 ..._checksums.txt>"
+    archivePath: flux
+  - name: kustomize
+    url: https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.5.0/kustomize_v5.5.0_linux_arm64.tar.gz
+    sha256: "<from the release's checksums.txt>"
+    archivePath: kustomize
+```
+
+Remember: every non-`kubectl` binary is a **write** (default-deny), approved via a
+structured `{bin, args[]}` rule (positional `*`, trailing `...` for the rest); helm's
+arbitrary-exec escapes (`--post-renderer`, `helm plugin`) are always blocked.
+
 ## Metrics (opt-in)
 
 Off by default. `--set metrics.enabled=true` exposes Prometheus metrics at
@@ -223,13 +277,14 @@ install claims normally).
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | affinity | object | `{}` | Affinity rules for pod scheduling. |
-| allowedBinaries | list | `[]` | REPLACE the entire allowlist (lock-down / full control). When non-empty this is the exact set - the default (`kubectl` + grep, jq, head, tail, wc, sort, uniq, cut, tr) is dropped. Use `[kubectl]` to restrict to kubectl only. Prefer `extraAllowedBinaries` unless you specifically need to remove defaults. |
+| allowedBinaries | list | `[]` | REPLACE the entire allowlist (lock-down / full control). When non-empty this is the exact set - the default (`kubectl` + grep, jq, head, tail, wc, sort, uniq, cut, tr) is dropped. A plain list of names; entries must already be in the image (this knob restricts, it doesn't install - use `extraAllowedBinaries` to install). Use `[kubectl]` to restrict to kubectl only. Prefer `extraAllowedBinaries` unless you specifically need to remove defaults. |
 | clusterAccess.enabled | bool | `true` | Grant the agent permission to operate the cluster. When false, bind your own RBAC to the ServiceAccount out of band. |
 | clusterAccess.namespaces | list | `[]` | Namespaces to grant access in when `scope: namespaces`. |
 | clusterAccess.roleName | string | `"view"` | Existing ClusterRole to bind: `view` (read-only, safe default), `edit`, `admin`, or `cluster-admin` (avoid - effectively root). Ignored when `rules` is set. |
 | clusterAccess.rules | list | `[]` | Inline custom RBAC rules. If non-empty, the chart creates and binds a Role/ClusterRole built from these (overrides `roleName`). |
 | clusterAccess.scope | string | `"cluster"` | Binding scope: `cluster` (every namespace) or `namespaces` (only those in `namespaces` below - least privilege). |
-| extraAllowedBinaries | list | `[]` | Add binaries to the default allowlist (the safe way to extend it). E.g. `[helm, kustomize]` keeps `kubectl` + the default read-only filters AND adds these. Jobs run connected by pipes, with no shell. |
+| commandTimeoutSeconds | string | `""` | Max wall-clock seconds for a single command before the agent kills it and returns a timeout result. Empty uses the agent default (60s). |
+| extraAllowedBinaries | list | `[]` | Add CLIs to the default allowlist (`kubectl` + read-only filters). Each entry is a dict that BOTH allow-lists the binary AND provides it, so the two can never drift. `name` is required; add `url` + `sha256` to install it at pod start (an initContainer downloads it into a shared volume on the agent's `PATH` - no bespoke image, and the base image keeps updating: bump `image.tag` and tools re-fetch unchanged). `archivePath` is the file to extract from a `.tar.gz` (omit for a raw binary). Omit `url` entirely when the binary is already in the image (your own build) - it's allow-listed only. Whichever way, an initContainer VERIFIES every name resolves on `PATH` and hard-fails the pod otherwise, so you can't allow-list a binary the agent can't run. Needs egress at pod start; air-gapped clusters bake tools into a mirrored/derived image. NOTE: only `kubectl` + the read filters count as reads; every other binary is a **write** (default-deny) - approved via a structured `{bin, args[]}` rule (positional `*`, trailing `...` for the rest); helm's arbitrary-exec escapes (`--post-renderer`, `helm plugin`) are always blocked. Example: extraAllowedBinaries:   - name: helm     url: https://get.helm.sh/helm-v3.16.3-linux-arm64.tar.gz   # match your nodes' arch     sha256: "5bd34ed774df6914b323ff84a0a156ea6ff2ba1eaf0113962fa773f3f9def798"     archivePath: linux-arm64/helm   - name: mytool          # already baked into a custom image: allow-list only |
 | extraEnv | list | `[]` | Extra environment variables for the agent container. |
 | image.pullPolicy | string | `"IfNotPresent"` | Image pull policy. |
 | image.repository | string | `"nabeemdev/reach-agent"` | Agent image repository. |
@@ -241,6 +296,7 @@ install claims normally).
 | livenessProbe.initialDelaySeconds | int | `30` | Seconds before the first liveness check. |
 | livenessProbe.periodSeconds | int | `30` | How often to run the liveness check. |
 | livenessProbe.staleSeconds | int | `120` | Max age (seconds) of `/tmp/healthy` before the probe fails. Keep well above the server-driven poll interval (normally <=15s). |
+| maxOutputBytes | string | `""` | Max bytes of `stdout`/`stderr` retained per command. Capture is bounded as it streams, so chatty output (a large `kubectl`/`jq` pipeline) can't balloon agent memory; output beyond this is truncated and the result is flagged. Empty uses the agent default (50000). |
 | metrics.enabled | bool | `false` | Expose Prometheus metrics at :port/metrics (opens the agent's only inbound port). |
 | metrics.networkPolicy.enabled | bool | `true` | Restrict ingress to the metrics port to Prometheus only (recommended). |
 | metrics.networkPolicy.from | list | `[]` | Advanced: full NetworkPolicyPeer list; overrides prometheusNamespace when set. |
