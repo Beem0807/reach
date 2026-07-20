@@ -66,6 +66,13 @@ class _Agent(_Base):
     # self-reports on sync. Lets the console warn/block when someone tries to approve a
     # non-kubectl command whose binary the agent won't run. Null until first k8s sync.
     k8s_allowed_binaries = Column(JSON)
+    # Host agent's filesystem-sandbox (Landlock) capability as self-reported on sync:
+    # "active" | "unavailable" | "unsupported". Null until first host sync.
+    landlock_status = Column(String)
+    # An admin acknowledged running readonly/approved WITHOUT the Landlock sandbox on this
+    # agent (only meaningful when landlock_status="unavailable"). Sent back to the agent so it
+    # runs unsandboxed instead of failing closed. Revocable.
+    sandbox_ack = Column(Boolean, default=False)
 
 
 class _Approval(_Base):
@@ -105,6 +112,10 @@ class _Fleet(_Base):
     mode = Column(String, nullable=False, default="readonly")    # least-privilege default
     grant_service_mgmt = Column(Boolean, default=False)
     grant_docker = Column(Boolean, default=False)
+    # Fleet-level acknowledgement that members may run readonly/approved WITHOUT the Landlock
+    # kernel sandbox (for hosts on an old kernel or macOS). Members churn, so this can't be
+    # per-agent - every member inherits it on sync. Audited + revocable, like the per-agent one.
+    sandbox_ack = Column(Boolean, default=False)
     # Tags are set at the fleet level and inherited by every member; members can't
     # set their own. Editing them propagates to all current members.
     tags = Column(JSON, default=list)
@@ -385,6 +396,20 @@ class AgentRepo:
                 update(_Agent).where(_Agent.agent_id == agent_id).values(
                     k8s_allowed_binaries=binaries
                 )
+            )
+            db.commit()
+
+    def set_landlock_status(self, agent_id: str, status: str) -> None:
+        with SessionLocal() as db:
+            db.execute(
+                update(_Agent).where(_Agent.agent_id == agent_id).values(landlock_status=status)
+            )
+            db.commit()
+
+    def set_sandbox_ack(self, agent_id: str, acknowledged: bool) -> None:
+        with SessionLocal() as db:
+            db.execute(
+                update(_Agent).where(_Agent.agent_id == agent_id).values(sandbox_ack=acknowledged)
             )
             db.commit()
 

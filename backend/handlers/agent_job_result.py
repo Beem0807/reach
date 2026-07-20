@@ -20,6 +20,7 @@ def handle_agent_job_result(job_id: str, body: dict, raw_token: str) -> dict:
     stderr = body.get("stderr", "")
     duration_ms = body.get("duration_ms", 0)
     blocked = body.get("blocked", False)
+    block_reason = (body.get("block_reason") or "").strip()
     is_write = body.get("is_write", blocked)  # agent corrects to True when blocked
 
     if status not in ("SUCCEEDED", "FAILED", "REJECTED"):
@@ -88,7 +89,12 @@ def handle_agent_job_result(job_id: str, body: dict, raw_token: str) -> dict:
     # and never dispatched), so a dispatched job the agent then blocks is a HARD block
     # (allowlist / no-shell / local-file / escape-hatch) that no approval can satisfy - you
     # allow-list the binary, not approve it - so raising a request would be spurious.
-    if blocked and (agent.get("type") or "host") != "k8s":
+    #
+    # A "sandbox_unavailable" block is also unfixable by approval: the host has no kernel
+    # write protection (fail-closed), so the fix is acknowledge-without-protection or a
+    # Landlock kernel - NOT approving the command (which would land reads in the Pending
+    # list and imply approving them unblocks them, when it doesn't). Skip those too.
+    if blocked and block_reason != "sandbox_unavailable" and (agent.get("type") or "host") != "k8s":
         # A fleet member's approvals live at the fleet level (not per-agent), so a
         # blocked write raises a fleet-scoped pending request.
         command = job.get("command")

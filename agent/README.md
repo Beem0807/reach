@@ -127,8 +127,18 @@ structured rules. Policy mode is enforced with the kernel:
   an unapproved write is blocked and raised for admin approval. A write with shell
   operators can't be structured and is rejected in approved mode.
 
-(macOS has no Landlock, so readonly/approved fall back to the server's write
-classification - weaker than the Linux kernel guarantee.)
+**Fail-closed sandbox.** The `readonly`/`approved` guarantee depends on Landlock actually
+being in force, so the agent **fails closed** when it isn't. At startup it probes Landlock
+and reports `landlock_status` (`active` / `unavailable` / `unsupported`) on sync. If there is
+no kernel sandbox - an old/locked-down Linux kernel, or **macOS** (Landlock is Linux-only) -
+`readonly`/`approved` commands are **blocked**, not run unprotected. To run anyway, an operator
+**acknowledges the exception** in the console (`POST /tenant/agents/{id}/acknowledge-sandbox`,
+audited and revocable); the acknowledgement rides back on each sync and the agent then runs
+unsandboxed. Creating an agent as **macOS** pre-acknowledges it so it never blocks. `wild` runs
+unsandboxed regardless, and explicitly-approved structured writes always run (no shell to gate).
+A fail-closed block is **not** raised for admin approval the way an unapproved write is - approving
+can't satisfy a missing sandbox - so the agent tags it `block_reason: sandbox_unavailable` and the
+backend skips the request; the fix is to acknowledge the host or run it on a Landlock kernel.
 
 ### Kubernetes - gated, **no shell**
 

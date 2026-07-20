@@ -183,7 +183,7 @@ export const deleteApiToken = (u: string, t: string, tokenId: string) =>
 
 // Tenant admin - fleets (reusable-join-token groups of host agents)
 export const listFleets = (u: string, t: string, params: Record<string, string> = {}) =>
-  req<{ fleets: Fleet[]; default_reap_after_seconds: number; default_max_fanout?: number; total?: number; limit?: number; offset?: number }>(
+  req<{ fleets: Fleet[]; default_reap_after_seconds: number; default_max_fanout?: number; default_wave_policy?: FleetWavePolicy; total?: number; limit?: number; offset?: number }>(
     u, t, 'GET', `/tenant/fleets${Object.keys(params).length ? `?${new URLSearchParams(params)}` : ''}`);
 
 // A single fleet's members (lazy-loaded on expand, via the fleet_id index) - so the
@@ -195,13 +195,13 @@ export const listFleetAgents = (u: string, t: string, fleetId: string, params: R
 
 export const createFleet = (
   u: string, t: string,
-  body: { name: string; mode?: string; grant_service_mgmt?: boolean; grant_docker?: boolean; tags?: string[]; reap_after_seconds?: number | null; max_fanout?: number | null; wave_policy?: FleetWavePolicy | null },
+  body: { name: string; mode?: string; grant_service_mgmt?: boolean; grant_docker?: boolean; sandbox_ack?: boolean; tags?: string[]; reap_after_seconds?: number | null; max_fanout?: number | null; wave_policy?: FleetWavePolicy | null },
 ) => req<Fleet & FleetToken>(u, t, 'POST', '/tenant/fleets', body);
 
 export const updateFleet = (
   u: string, t: string, fleetId: string,
   body: Partial<{ name: string; mode: string; tags: string[]; reap_after_seconds: number | null;
-                  grant_service_mgmt: boolean; grant_docker: boolean; max_fanout: number | null;
+                  grant_service_mgmt: boolean; grant_docker: boolean; sandbox_ack: boolean; max_fanout: number | null;
                   wave_policy: FleetWavePolicy | null }>,
 ) => req<Fleet>(u, t, 'PUT', `/tenant/fleets/${fleetId}`, body);
 
@@ -270,6 +270,7 @@ export const createTenantAgent = (
   grantUserIds?: string[],
   version?: string,
   grantReadonlyUserIds?: string[],
+  hostOs?: 'linux' | 'mac',
 ) =>
   req<Agent & { install_token: string; install_token_expires_at: string; commands: Record<string, string> }>(
     u, t, 'POST', '/tenant/agents',
@@ -281,6 +282,7 @@ export const createTenantAgent = (
       ...(grantUserIds && grantUserIds.length ? { grant_user_ids: grantUserIds } : {}),
       ...(grantReadonlyUserIds && grantReadonlyUserIds.length ? { grant_readonly_user_ids: grantReadonlyUserIds } : {}),
       ...(version && version !== 'latest' ? { version } : {}),
+      ...(hostOs ? { os: hostOs } : {}),
     },
   );
 
@@ -320,6 +322,13 @@ export const setTenantAgentTags = (u: string, t: string, agentId: string, tags: 
 export const acknowledgeCapability = (u: string, t: string, agentId: string, capability: 'docker' | 'service_mgmt' | 'k8s_permissions') =>
   req<{ agent_id: string; capability: string; acknowledged: boolean }>(
     u, t, 'POST', `/tenant/agents/${agentId}/acknowledge-capability`, { capability }
+  );
+
+// Acknowledge (or revoke) running readonly/approved WITHOUT the Landlock kernel sandbox on a
+// host agent whose kernel lacks it. Delivered to the agent on its next sync.
+export const acknowledgeSandbox = (u: string, t: string, agentId: string, acknowledged: boolean) =>
+  req<{ agent_id: string; sandbox_ack: boolean }>(
+    u, t, 'POST', `/tenant/agents/${agentId}/acknowledge-sandbox`, { acknowledged }
   );
 
 // Tenant console - jobs (all roles). Params: agent_id, fleet_id, run_id, limit, cursor.

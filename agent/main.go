@@ -320,6 +320,9 @@ type SyncRequest struct {
 	// filters + any extras) so the console can warn/block approving a command whose
 	// binary the agent won't run. Omitted for host agents.
 	K8sAllowedBinaries []string `json:"k8s_allowed_binaries,omitempty"`
+	// Host mode: the filesystem-sandbox capability ("active"/"unavailable"/"unsupported"), so
+	// the console can surface when readonly/approved writes aren't kernel-enforced.
+	LandlockStatus string `json:"landlock_status,omitempty"`
 }
 
 // k8sPermsProvider returns the agent's current effective permissions (set in
@@ -353,6 +356,10 @@ type SyncResponse struct {
 	NextPollSeconds int    `json:"next_poll_seconds"`
 	RotateToken     bool   `json:"rotate_token"`
 	Error           string `json:"error"`
+	// Host mode: whether an admin acknowledged running readonly/approved WITHOUT the Landlock
+	// sandbox on this agent. When true and Landlock is unavailable, the agent runs unsandboxed
+	// instead of failing closed. Revocable: it reverts to fail-closed if this goes back to false.
+	UnsandboxedAcknowledged bool `json:"unsandboxed_acknowledged,omitempty"`
 }
 
 func sync(cfg *Config) (*SyncResponse, error) {
@@ -380,6 +387,11 @@ func sync(cfg *Config) (*SyncResponse, error) {
 	if k8sAllowedBinaries != nil {
 		payload.K8sAllowedBinaries = k8sAllowedBinaries
 	}
+	// Host mode: report the sandbox capability so the console can surface it (and offer the
+	// acknowledgement when it's unavailable).
+	if cfg.Type != "k8s" {
+		payload.LandlockStatus = landlockStatus
+	}
 	var result SyncResponse
 	status, err := apiPost(cfg.APIURL, "/agent/sync", cfg.AgentToken, payload, &result)
 	if err != nil {
@@ -404,6 +416,9 @@ func sync(cfg *Config) (*SyncResponse, error) {
 	if payload.K8sPermissions != nil {
 		lastSentPermHash = payload.K8sPermissions.Hash
 	}
+	// Honour the operator's acknowledgement (or its revocation): when the sandbox is
+	// unavailable, this decides whether readonly/approved run unsandboxed or fail closed.
+	unsandboxedAck = result.UnsandboxedAcknowledged
 	return &result, nil
 }
 
@@ -512,6 +527,11 @@ type CommandResult struct {
 	ExitCode        int
 	DurationMS      int64
 	Blocked         bool
+	// BlockReason distinguishes WHY a command was blocked, so the server knows whether an
+	// approval can fix it: "approval_required" (an operator can approve it - the default for
+	// a blocked write) vs "sandbox_unavailable" (fail-closed: no kernel write protection, so
+	// NO approval helps - the fix is acknowledge-without-protection or a Landlock kernel).
+	BlockReason     string
 	StdoutTruncated bool
 	StderrTruncated bool
 }
@@ -615,6 +635,68 @@ func runCmd(ctx context.Context, args []string) (stdout, stderr string, exitCode
 	return outBuf.String(), errBuf.String(), exitCode, outBuf.Truncated(), errBuf.Truncated()
 }
 
+// landlockStatus is the REPORTED filesystem-sandbox capability (host mode), probed at startup:
+//   - "active"      Linux + Landlock -> readonly/approved writes are kernel-enforced.
+//   - "unavailable" Linux without Landlock -> readonly/approved FAIL CLOSED, unless the operator
+//                   acknowledges the exception in the console (then they run unsandboxed).
+//   - "unsupported" non-Linux (macOS) -> Landlock doesn't exist; enforcement is server-side.
+var landlockStatus = "unsupported"
+
+// landlockCapable: the kernel can enforce Landlock. unsandboxedAck: the operator acknowledged
+// (in the console, delivered on each sync) that this agent may run readonly/approved WITHOUT the
+// sandbox - the only opt-out of fail-closed, and it's audited and revocable.
+var (
+	landlockCapable bool
+	unsandboxedAck  bool
+)
+
+// sandboxUnavailableResult is returned when a command would run under the sandbox (readonly or
+// approved on Linux) but Landlock isn't active - we fail closed instead of running unprotected.
+func sandboxUnavailableResult(display, mode string, start time.Time) CommandResult {
+	msg := fmt.Sprintf(
+		"Blocked: this host has no kernel write protection (macOS has none; on Linux it needs "+
+			"kernel 5.13+ with Landlock), so filesystem writes can't be blocked. In %q mode Reach "+
+			"holds the command rather than run it without write protection.\n\nCommand:\n  %s\n\n"+
+			"Allow it: an admin can allow this agent to run without protection in the console "+
+			"(Agents -> this agent -> Write protection), or run it on a Linux host with kernel "+
+			"5.13+ (which has write protection).\n",
+		mode, strings.TrimSpace(display),
+	)
+	return CommandResult{
+		Stderr:      truncate(msg, maxOutputSize()),
+		ExitCode:    126,
+		DurationMS:  time.Since(start).Milliseconds(),
+		Blocked:     true,
+		BlockReason: "sandbox_unavailable", // fail-closed: no approval can satisfy this
+	}
+}
+
+// sbDecision is how a freeform/unapproved command should run given the mode and sandbox state.
+// Pure (all inputs passed) so the fail-closed policy is testable. readonly/approved require a
+// kernel sandbox to bound writes; a host that can't provide one (Linux without Landlock, OR
+// macOS, which has none) fails closed unless the operator acknowledged the exception.
+type sbDecision int
+
+const (
+	sbRun         sbDecision = iota // run as-is (wild - no sandbox needed)
+	sbSandbox                       // run inside the Landlock sandbox
+	sbBlock                         // fail closed: no kernel sandbox and not acknowledged
+	sbUnsandboxed                   // run WITHOUT the sandbox (operator acknowledged the exception)
+)
+
+func sandboxDecision(mode string, capable, acked bool) sbDecision {
+	if mode != "readonly" && mode != "approved" {
+		return sbRun // wild
+	}
+	if capable {
+		return sbSandbox // Linux kernel with Landlock
+	}
+	if acked {
+		return sbUnsandboxed // no kernel sandbox (macOS or old Linux), acknowledged - fail open
+	}
+	return sbBlock // fail closed
+}
+
 // executeCommand runs a command freeform under the shell. It is used for reads (any mode)
 // and wild-mode commands; approved-mode *writes* are structured and run via executeStructured
 // (matched against host rules), or rejected at submission if they need a shell - so a write
@@ -625,7 +707,16 @@ func executeCommand(command, mode string, isWrite bool) CommandResult {
 	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout())
 	defer cancel()
 
-	useSandbox := (mode == "readonly" || mode == "approved") && runtime.GOOS == "linux"
+	// Fail closed: readonly/approved rely on the Landlock sandbox to bound a misclassified or
+	// obscure write. If it isn't active we refuse rather than run unprotected - UNLESS the
+	// operator acknowledged the exception, then we run unsandboxed at their risk.
+	useSandbox := false
+	switch sandboxDecision(mode, landlockCapable, unsandboxedAck) {
+	case sbBlock:
+		return sandboxUnavailableResult(command, mode, start)
+	case sbSandbox:
+		useSandbox = true
+	}
 
 	// On non-Linux (macOS): no Landlock available. Block writes in approved mode using the
 	// is_write flag annotated by the server (approved-mode writes run structured, not here).
@@ -758,7 +849,18 @@ func executeStructured(argv []string, mode string, isWrite bool, rules []HostRul
 
 	// Approved only by a structured host rule (JSON) - no command-string matching.
 	approvedWrite := mode == "approved" && isHostArgvApproved(argv, rules)
-	useSandbox := (mode == "readonly" || mode == "approved") && runtime.GOOS == "linux" && !approvedWrite
+
+	// Fail closed like executeCommand - but an explicitly approved structured write needs no
+	// sandbox (fixed argv, no shell), so it always runs regardless of Landlock.
+	useSandbox := false
+	if !approvedWrite {
+		switch sandboxDecision(mode, landlockCapable, unsandboxedAck) {
+		case sbBlock:
+			return sandboxUnavailableResult(display, mode, start)
+		case sbSandbox:
+			useSandbox = true
+		}
+	}
 
 	// No Landlock (macOS): block an unapproved write in approved mode up front.
 	if mode == "approved" && runtime.GOOS != "linux" && isWrite && !approvedWrite {
@@ -812,6 +914,7 @@ type ResultRequest struct {
 	Stderr             string `json:"stderr"`
 	DurationMS         int64  `json:"duration_ms"`
 	Blocked            bool   `json:"blocked,omitempty"`
+	BlockReason        string `json:"block_reason,omitempty"`
 	IsWrite            bool   `json:"is_write,omitempty"`
 	StdoutTruncated    bool   `json:"stdout_truncated,omitempty"`
 	StderrTruncated    bool   `json:"stderr_truncated,omitempty"`
@@ -830,6 +933,7 @@ func postResult(cfg *Config, jobID string, res CommandResult) error {
 		Stderr:             res.Stderr,
 		DurationMS:         res.DurationMS,
 		Blocked:            res.Blocked,
+		BlockReason:        res.BlockReason,
 		IsWrite:            res.Blocked, // if blocked, the command was a write by definition
 		StdoutTruncated:    res.StdoutTruncated,
 		StderrTruncated:    res.StderrTruncated,
@@ -963,6 +1067,22 @@ func run(ctx context.Context) error {
 		log.Println("No agent_token found, claiming...")
 		if err := claim(cfg, fp); err != nil {
 			return err
+		}
+	}
+
+	// Host mode: probe the filesystem sandbox. readonly/approved rely on Landlock to bound a
+	// misclassified or obscure write; if it's missing we fail closed (and report the status so
+	// an admin can acknowledge the exception). k8s uses no shell/Landlock, so the probe is host-only.
+	if cfg.Type != "k8s" {
+		landlockStatus = detectLandlock()
+		landlockCapable = landlockStatus == "active"
+		switch landlockStatus {
+		case "active":
+			log.Printf("Filesystem sandbox: Landlock active - readonly/approved writes are kernel-enforced")
+		case "unavailable":
+			log.Printf("WARNING: Landlock unavailable on this kernel - readonly/approved mode FAILS CLOSED until an admin acknowledges the exception in the console, or you move to a kernel with Landlock (>= 5.13).")
+		case "unsupported":
+			log.Printf("WARNING: no kernel filesystem sandbox on this OS (macOS) - readonly/approved mode FAILS CLOSED until an admin acknowledges the exception in the console.")
 		}
 	}
 

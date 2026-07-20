@@ -107,17 +107,18 @@ auth); the console never gets a capability the API doesn't already enforce serve
 
 A FastAPI application with a storage-backend abstraction that supports two databases:
 
-| Deployment | Runtime | Database |
-|---|---|---|
-| Docker | FastAPI (uvicorn behind nginx) | PostgreSQL (via SQLAlchemy + Alembic) - default |
+| Deployment    | Runtime                        | Database                                                |
+| ------------- | ------------------------------ | ------------------------------------------------------- |
+| Docker        | FastAPI (uvicorn behind nginx) | PostgreSQL (via SQLAlchemy + Alembic) - default         |
 | Docker on AWS | FastAPI (uvicorn behind nginx) | DynamoDB (boto3) - opt-in with `STORAGE_BACKEND=dynamo` |
-| Lambda | API Gateway + Lambda | DynamoDB (boto3) |
+| Lambda        | API Gateway + Lambda           | DynamoDB (boto3)                                        |
 
 The same handler code runs in every deployment. The storage layer is swapped via the `STORAGE_BACKEND` env var (`postgres` or `dynamo`). Handlers import from `shared.store`, which returns the correct repo implementation.
 
 nginx is required in front of uvicorn for the Docker deployment. Long-polling connections from the agent (`POST /agent/sync`) need to be terminated cleanly; uvicorn alone does not handle this correctly under load.
 
 A background scheduler (APScheduler on FastAPI, EventBridge on Lambda) runs every minute to:
+
 - Mark agents `INACTIVE` if no heartbeat in the last 45 seconds
 - **Reap dead fleet members** whose last heartbeat is older than their fleet's `reap_after_seconds` (default `FLEET_REAP_AFTER_SECONDS`, 30 min)
 - Expire `PENDING` jobs older than 1 hour to `EXPIRED`
@@ -168,12 +169,12 @@ The storage abstraction (`backend/shared/repos/base.py`) defines a common interf
 
 Four token types, none stored raw - only `HMAC-SHA256(TOKEN_PEPPER, token)` hashes are persisted:
 
-| Token | Prefix | Issued by | Used by | Lifetime |
-|---|---|---|---|---|
-| Install token | `install_` | `POST /tenant/agents` (tenant admin) | Agent (once, at claim) | 24 hours |
-| Fleet join token | `fleet_` | `POST /tenant/fleets` (tenant admin) | Any host installer (**reusable**, at claim) | Until rotated or revoked |
-| Agent token | `agent_` | Backend (at claim) | Agent (every sync) | 30 days, auto-rotated |
-| API token | `tok_` | `POST /tenant/api-tokens` (any tenant user) | CLI / MCP server | Until revoked |
+| Token            | Prefix     | Issued by                                   | Used by                                     | Lifetime                 |
+| ---------------- | ---------- | ------------------------------------------- | ------------------------------------------- | ------------------------ |
+| Install token    | `install_` | `POST /tenant/agents` (tenant admin)        | Agent (once, at claim)                      | 24 hours                 |
+| Fleet join token | `fleet_`   | `POST /tenant/fleets` (tenant admin)        | Any host installer (**reusable**, at claim) | Until rotated or revoked |
+| Agent token      | `agent_`   | Backend (at claim)                          | Agent (every sync)                          | 30 days, auto-rotated    |
+| API token        | `tok_`     | `POST /tenant/api-tokens` (any tenant user) | CLI / MCP server                            | Until revoked            |
 
 The install token is one-time use and is cleared after a successful claim. The **fleet join token** is the exception: it is deliberately **reusable** - every host that claims with it enrolls into the fleet - and does not expire until you rotate or revoke it (see [Fleets](#fleets)). The agent token is bound to a machine fingerprint - a token replayed from a different machine is rejected. The agent rotates its own token every 30 days with no lockout window (old token is valid until the new one is persisted). Tenant admins can also request an immediate rotation via `POST /tenant/agents/{id}/request-rotation`; the flag is cleared atomically by `update_agent_token_hash` when the new token is stored.
 
@@ -212,11 +213,11 @@ CREATED ──(claim)──► ACTIVE ──(heartbeat gap)──► INACTIVE
 
 The three-step decommission sequence prevents accidental hard-deletes:
 
-| Step | Endpoint | Requires | Effect |
-|---|---|---|---|
-| 1. Revoke | `POST /tenant/agents/{id}/revoke` | Any active/inactive/created status | Sets REVOKED, removes from user access lists |
-| 2. Soft-delete | `DELETE /tenant/agents/{id}` | REVOKED | Sets DELETED, record stays in table |
-| 3. Remove | `DELETE /tenant/agents/{id}/remove` | DELETED | Permanently removes from database |
+| Step           | Endpoint                            | Requires                           | Effect                                       |
+| -------------- | ----------------------------------- | ---------------------------------- | -------------------------------------------- |
+| 1. Revoke      | `POST /tenant/agents/{id}/revoke`   | Any active/inactive/created status | Sets REVOKED, removes from user access lists |
+| 2. Soft-delete | `DELETE /tenant/agents/{id}`        | REVOKED                            | Sets DELETED, record stays in table          |
+| 3. Remove      | `DELETE /tenant/agents/{id}/remove` | DELETED                            | Permanently removes from database            |
 
 To undo a revoke: call `POST /tenant/agents/{id}/reissue-install-token`. This resets the agent to CREATED with a fresh install token and is the only way to restore a REVOKED agent. DELETED agents cannot be reissued - remove and create a new agent instead.
 
@@ -242,23 +243,23 @@ keyed by **IP** and rate-limited at 120/min so a NAT-shared autoscaling group ca
 instances at once; the 256-bit token makes that limit purely anti-DoS.
 
 **Inheritance.** Members inherit the fleet's mode, tags, and grants at claim, and are
-managed *through the fleet*: changing a fleet's **mode** or **tags** propagates to
+managed _through the fleet_: changing a fleet's **mode** or **tags** propagates to
 every current member, and per-member `set mode`/`set tags`/`reissue` are blocked
 (`409`). **Grants** behave differently from mode/tags: they're baked into the host at
 install (sudoers / docker group), so editing a fleet's grants can't be pushed to a
-running member remotely. An edit changes what *new* instances enroll with (re-issue the
+running member remotely. An edit changes what _new_ instances enroll with (re-issue the
 launch-template command by rotating the join token) and marks existing members as a
 **grant mismatch** (member grants ≠ fleet grants) - the console flags the count and
 per-member. You reconcile out of band (re-provision/replace the host), then `POST
 /tenant/fleets/{id}/resolve-grants` with `{"resolution": "reconcile"}` sets the mismatched
 members' grants to match the fleet. This is deliberately **distinct from a capability/RBAC
-*acknowledge*** (which accepts observed reality): reconciling asserts a fix, so it is
+_acknowledge_** (which accepts observed reality): reconciling asserts a fix, so it is
 **verified against detection** - a member is only reconciled if the host actually reports
 the granted capability (`*_detected`); hosts that don't are returned as `blocked`, so a
 mismatch can't be cleared on a host that was never re-provisioned. If a member is
-*deliberately* allowed to differ, **accept** it instead (same endpoint, `{"resolution":
+_deliberately_ allowed to differ, **accept** it instead (same endpoint, `{"resolution":
 "accept"}`): the member keeps its real grants (nothing falsified) but stops being flagged - recorded
-against a **(member grants, fleet grants)** signature, so it auto-re-flags if *either*
+against a **(member grants, fleet grants)** signature, so it auto-re-flags if _either_
 side changes afterwards (the fleet grants are edited, or the member's own grants shift to
 a new mismatch, e.g. a later capability-acknowledge). The exception is also **dropped
 the moment the member matches the fleet again** (lazy-cleared on the next agent read), so
@@ -309,11 +310,11 @@ fleet list come from a single `GROUP BY` (`member_counts`), not by loading membe
 
 **Leaving a fleet.** Three paths:
 
-| Path | Trigger | Effect |
-|---|---|---|
-| Detach | `DELETE /tenant/fleets/{id}/members/{agent_id}` | Member becomes a standalone individual agent, keeping its config/history and regaining individual controls |
-| Deregister | Agent calls `POST /agent/deregister` on **machine shutdown** | Member removes itself immediately on autoscaler scale-in (a plain service restart does **not** deregister - see below) |
-| Reap | Heartbeat sweep, past the reap window | The backend deletes members that stopped heartbeating (see [Automatic expiry and cleanup](#automatic-expiry-and-cleanup)) |
+| Path       | Trigger                                                      | Effect                                                                                                                    |
+| ---------- | ------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------- |
+| Detach     | `DELETE /tenant/fleets/{id}/members/{agent_id}`              | Member becomes a standalone individual agent, keeping its config/history and regaining individual controls                |
+| Deregister | Agent calls `POST /agent/deregister` on **machine shutdown** | Member removes itself immediately on autoscaler scale-in (a plain service restart does **not** deregister - see below)    |
+| Reap       | Heartbeat sweep, past the reap window                        | The backend deletes members that stopped heartbeating (see [Automatic expiry and cleanup](#automatic-expiry-and-cleanup)) |
 
 **Deregister vs. reap.** Both remove a scaled-in instance; deregister is the fast path
 and the reaper is the backstop. On graceful shutdown (`SIGTERM`) a host distinguishes a
@@ -352,17 +353,20 @@ In `approved` mode, the server does not apply the readonly blocklist - it queues
 
 ### Agent-side enforcement
 
-**Linux (Landlock LSM)**
+**The kernel sandbox (Landlock) and fail-closed**
 
-On Linux, `readonly` and `approved` mode commands run in a sandboxed subprocess:
-- The agent re-execs a new process under [Landlock](https://docs.kernel.org/userspace-api/landlock.html) v3, restricting filesystem access to read-only on `/` and read-write on `/tmp`.
-- The sandboxed process executes the command via bash.
+On Linux, `readonly`/`approved` commands run in a sandboxed subprocess: the agent re-execs itself under [Landlock](https://docs.kernel.org/userspace-api/landlock.html) v3, restricting the filesystem to read-only on `/` (read-write on `/tmp`), then executes the command via bash. So a write a command _attempts_ is blocked by the **kernel**, not just by the read/write classifier.
 
-**macOS (no Landlock)**
+This only holds if the sandbox is actually in force, so the agent **fails closed** when it isn't. At startup it probes Landlock (`landlock/syscall.LandlockGetABIVersion`) and records `landlock_status`: `active` (Linux + Landlock), `unavailable` (Linux without it), or `unsupported` (macOS - Landlock is Linux-only, so there's no kernel sandbox at all). The decision (`sandboxDecision`, pure/unit-tested):
 
-macOS does not have Landlock. Enforcement differs by mode:
-- `readonly` - fully server-side. The server rejects write commands before queuing; the agent never receives them.
-- `approved` - the agent uses the `is_write` flag from the sync response. A structured write (`argv`) that isn't permitted by an approved host rule is blocked immediately with `blocked=true`; read commands (`is_write=false`) always run. This matches the Linux Landlock behaviour: reads pass, unapproved writes are blocked and create a pending approval record.
+| mode                  | Landlock capable | acknowledged | outcome                                          |
+| --------------------- | ---------------- | ------------ | ------------------------------------------------ |
+| `wild`                | -                | -            | run (no sandbox needed)                          |
+| `readonly`/`approved` | yes              | -            | **run sandboxed** (kernel-enforced)              |
+| `readonly`/`approved` | no               | no           | **blocked - fail closed** (exit 126)             |
+| `readonly`/`approved` | no               | yes          | run **unsandboxed** (operator accepted the risk) |
+
+So a host that can't provide the sandbox (an old/locked-down Linux kernel, or macOS) does **not** silently run `readonly`/`approved` unprotected - it refuses, unless an operator has **acknowledged the exception**. That acknowledgement is a deliberate, audited, revocable console action (`POST /tenant/agents/{id}/acknowledge-sandbox`); the backend returns it on each sync (`unsandboxed_acknowledged`), and the agent then runs unsandboxed instead of blocking. Creating an agent as **macOS** pre-acknowledges it (macOS never has Landlock), so it runs without interruption. For a **fleet**, the acknowledgement is a **fleet-level setting inherited by every member** (`fleets.sandbox_ack`, set at create or in fleet settings) - members churn, so they can't be acknowledged one-by-one; each member reads the fleet's flag on sync. The sandbox child _also_ refuses to exec if `Restrict` fails (belt-and-suspenders), and explicitly-approved structured writes (fixed `argv`, no shell) always run - they don't need the sandbox. A fail-closed block is **not** raised as a pending approval (unlike an ordinary unapproved write): the agent tags the result `block_reason: sandbox_unavailable` and the backend skips the request, because approving can't satisfy a sandbox that isn't there - the fix is to acknowledge the host or move it to a Landlock kernel. The console surfaces `landlock_status` per host agent and warns when it's not active.
 
 **Approved mode logic (both platforms)**
 
@@ -413,17 +417,17 @@ Write-ness is decided **fail-closed** - anything that isn't a proven read is a w
 - **Dry runs are reads.** A `--dry-run=client|server` (or the deprecated bare `--dry-run`) makes an otherwise-mutating command non-mutating, so it's classified as a read. `--dry-run=none` really applies and stays a write.
 - **Double verbs** - where the real operation is `base + sub` (and the sub can flip read↔write) - are keyed as the compound `"<base> <sub>"`, so reads and writes are distinguished and each write is **separately approvable** (e.g. allow `certificate approve` but not `certificate deny`):
 
-  | Command | Reads | Writes |
-  |---|---|---|
-  | `rollout` | `status`, `history` | `restart`, `undo`, `pause`, `resume` |
-  | `auth` | `can-i`, `whoami` | `reconcile` (edits RBAC) |
-  | `apply` | `view-last-applied` | `set-last-applied`, `edit-last-applied` |
-  | `set` | - | `image`, `env`, `resources`, `selector`, `serviceaccount`, `subject` |
-  | `certificate` | - | `approve`, `deny` |
+  | Command       | Reads               | Writes                                                               |
+  | ------------- | ------------------- | -------------------------------------------------------------------- |
+  | `rollout`     | `status`, `history` | `restart`, `undo`, `pause`, `resume`                                 |
+  | `auth`        | `can-i`, `whoami`   | `reconcile` (edits RBAC)                                             |
+  | `apply`       | `view-last-applied` | `set-last-applied`, `edit-last-applied`                              |
+  | `set`         | -                   | `image`, `env`, `resources`, `selector`, `serviceaccount`, `subject` |
+  | `certificate` | -                   | `approve`, `deny`                                                    |
 
   An unrecognized sub of a known base is treated as a write (fail-closed). The compound verb lands in the structured rule's `verb` field - e.g. blocking `kubectl rollout restart deploy/web` derives `{verb: "rollout restart", resource: "deployments", name: "web", namespace: "*"}` - so no extra column is needed. The UI approval form offers the same write set, and a backend test (`test_ui_verb_dropdown_mirrors_backend_write_verbs`) keeps the two in lockstep.
 
-  **Namespace inference:** an unqualified command is attributed to `default` (the `-n`/`--all-namespaces` value otherwise). In-cluster `kubectl` would otherwise silently target the agent's *own* pod namespace, so the **agent injects `--namespace=default`** into any kubectl stage that doesn't select one (overridable per install via `REACH_K8S_DEFAULT_NAMESPACE`) - making the command run exactly where the backend classified it. Scope approvals precisely with `-n`, or use the `namespace: *` rule.
+  **Namespace inference:** an unqualified command is attributed to `default` (the `-n`/`--all-namespaces` value otherwise). In-cluster `kubectl` would otherwise silently target the agent's _own_ pod namespace, so the **agent injects `--namespace=default`** into any kubectl stage that doesn't select one (overridable per install via `REACH_K8S_DEFAULT_NAMESPACE`) - making the command run exactly where the backend classified it. Scope approvals precisely with `-n`, or use the `namespace: *` rule.
 
 ---
 
@@ -474,12 +478,12 @@ approvals table:
    (expires_at updated)
 ```
 
-| Current status | approve | deny | Notes |
-|---|---|---|---|
-| `pending` | ✓ → `approved` | ✓ → `denied` | Initial review; `duration=now` not allowed |
-| `approved` | ✓ updates `expires_at` | 409 | Use `duration=now` to instantly move to `expired` |
-| `denied` | 409 | 409 | Terminal - delete and let a new block create a fresh one |
-| `expired` | 409 | 409 | Terminal - delete and let a new block create a fresh one |
+| Current status | approve                | deny         | Notes                                                    |
+| -------------- | ---------------------- | ------------ | -------------------------------------------------------- |
+| `pending`      | ✓ → `approved`         | ✓ → `denied` | Initial review; `duration=now` not allowed               |
+| `approved`     | ✓ updates `expires_at` | 409          | Use `duration=now` to instantly move to `expired`        |
+| `denied`       | 409                    | 409          | Terminal - delete and let a new block create a fresh one |
+| `expired`      | 409                    | 409          | Terminal - delete and let a new block create a fresh one |
 
 Operators and admins manage approvals via `GET /tenant/approvals`, `PUT /tenant/approvals/{id}/approve`, `PUT /tenant/approvals/{id}/deny`, and `DELETE /tenant/approvals/{id}`. `DELETE /tenant/approvals/{id}` permanently removes a record of any status - useful for cleaning up stale pending records or removing an approved command from the effective list immediately. Users manage approvals through `reach approvals list` with status flags: default shows effective approved commands (agent-wide); `--pending`, `--denied`, and `--expired` show the current user's own records for the agent.
 
@@ -491,15 +495,15 @@ If multiple `approved` records accumulate for the same command on the same agent
 
 When approving a `pending` record or updating duration on an `approved` record, the reviewer (operator or admin) can supply a `duration` in the request body:
 
-| Value | Meaning | Allowed on |
-|---|---|---|
-| `permanent` (default) | Never expires | `pending` → approve, `approved` update |
-| `1h` | 1 hour | `pending` → approve, `approved` update |
-| `8h` | 8 hours | `pending` → approve, `approved` update |
-| `24h` | 24 hours | `pending` → approve, `approved` update |
-| `7d` | 7 days | `pending` → approve, `approved` update |
-| `Nh` / `Nd` | Custom N hours or N days | `pending` → approve, `approved` update |
-| `now` | Instantly expire | `approved` update only - sets status to `expired` immediately |
+| Value                 | Meaning                  | Allowed on                                                    |
+| --------------------- | ------------------------ | ------------------------------------------------------------- |
+| `permanent` (default) | Never expires            | `pending` → approve, `approved` update                        |
+| `1h`                  | 1 hour                   | `pending` → approve, `approved` update                        |
+| `8h`                  | 8 hours                  | `pending` → approve, `approved` update                        |
+| `24h`                 | 24 hours                 | `pending` → approve, `approved` update                        |
+| `7d`                  | 7 days                   | `pending` → approve, `approved` update                        |
+| `Nh` / `Nd`           | Custom N hours or N days | `pending` → approve, `approved` update                        |
+| `now`                 | Instantly expire         | `approved` update only - sets status to `expired` immediately |
 
 Once a record reaches `expired` status, the command is no longer in the effective approved list and the next blocked attempt creates a new pending record.
 
@@ -527,12 +531,12 @@ The agent detects whether it is running as root (`os.Getuid() == 0`) and include
 
 `access_level` is a computed label combining the agent's current mode and privilege. It is injected into agent responses at read time - not stored separately (`compute_access_level(mode, running_as_root)` in `shared/policy.py`).
 
-| access_level | Mode | running_as_root |
-|---|---|---|
-| `open` | wild | true |
-| `elevated` | wild (non-root) or approved (root) | - |
-| `managed` | approved (non-root) or readonly (root) | - |
-| `restricted` | readonly | false |
+| access_level | Mode                                   | running_as_root |
+| ------------ | -------------------------------------- | --------------- |
+| `open`       | wild                                   | true            |
+| `elevated`   | wild (non-root) or approved (root)     | -               |
+| `managed`    | approved (non-root) or readonly (root) | -               |
+| `restricted` | readonly                               | false           |
 
 This label is shown in `reach agents list` and `reach status`, and is included in the `GET /agents` and `GET /agents/{id}` API responses so MCP clients receive it directly. It is a factual descriptor of how the agent is configured, not a risk score.
 
@@ -552,12 +556,12 @@ Within a tenant, non-admin users are scoped to a subset of agents/fleets, **read
 
 **Admins are always tenant-wide** (unrestricted). Every other user has **no access by default** and is granted explicitly. A user record carries four scope lists, partitioned by capability:
 
-| Field | Effect |
-|---|---|
+| Field                 | Effect                                                                                    |
+| --------------------- | ----------------------------------------------------------------------------------------- |
 | `readwrite_agent_ids` | Agents this user can **read and write** (run write commands, subject to the agent's mode) |
-| `readonly_agent_ids` | Agents this user can **read** (read commands + view) but not write |
-| `readwrite_fleet_ids` | Fleets whose members are read-write for this user |
-| `readonly_fleet_ids` | Fleets whose members are read-only for this user |
+| `readonly_agent_ids`  | Agents this user can **read** (read commands + view) but not write                        |
+| `readwrite_fleet_ids` | Fleets whose members are read-write for this user                                         |
+| `readonly_fleet_ids`  | Fleets whose members are read-only for this user                                          |
 
 Semantics:
 
@@ -567,7 +571,7 @@ Semantics:
 - The read-write and read-only lists are a **partition** (an id can't be in both); if it ever is, the read-write grant wins.
 - **Fleet members can't be granted by individual `agent_id`** - their ids are ephemeral (they churn as an autoscaler scales), so a specific fleet-member id in the `*_agent_ids` lists is rejected. Grant access to them via their **fleet** (`readwrite_fleet_ids` / `readonly_fleet_ids`) instead.
 
-Both helpers are role-aware only through the data: admins are created with `None` lists (unrestricted); non-admins with empty lists (no access) grow their grants via `PUT /tenant/users/{id}/agents`, which sets all four lists. The read-only cap is enforced at **job submission** and **approval creation** - a read-only user's write is rejected `403` in *any* mode (it never bypasses the agent's own policy mode, it just stops this user attempting the write).
+Both helpers are role-aware only through the data: admins are created with `None` lists (unrestricted); non-admins with empty lists (no access) grow their grants via `PUT /tenant/users/{id}/agents`, which sets all four lists. The read-only cap is enforced at **job submission** and **approval creation** - a read-only user's write is rejected `403` in _any_ mode (it never bypasses the agent's own policy mode, it just stops this user attempting the write).
 
 `can_access_agent` is called on every operation that touches a specific agent, including:
 
@@ -609,10 +613,12 @@ s3://reach-releases/
 ```
 
 Docker images:
+
 - `nabeemdev/reach:{version}` / `:latest` - the **backend** (FastAPI in Docker, or the Lambda image).
 - `nabeemdev/reach-agent:{version}` / `:latest` - the **Kubernetes agent**, pulled by the Helm chart; the chart's `appVersion` selects the tag (see [POLICIES.md](POLICIES.md) / the chart README for the versioning model).
 
 Each component is versioned independently. Release scripts:
+
 - `scripts/release_cli.sh` - the CLI wheel → `cli/`.
 - `scripts/release_agent.sh` - host binaries → `agent/` (and updates `agent/versions.json`), plus the multi-arch k8s image → the registry.
 - `scripts/release_agent_chart.sh` - the Helm chart → `charts/reach-agent/` (refuses to overwrite an existing version unless `--force`).

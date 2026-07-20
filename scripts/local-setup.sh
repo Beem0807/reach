@@ -111,7 +111,7 @@ request_json() {
   local method="$1"
   local url="$2"
   local body="${3:-}"
-  shift 3 || true
+  shift $(( $# < 3 ? $# : 3 )) # drop method/url/body; leave extra curl args (robust if body/args omitted)
 
   local tmp
   tmp="$(mktemp)"
@@ -141,6 +141,39 @@ request_json() {
     exit 1
   fi
 
+  cat "$tmp"
+  rm -f "$tmp"
+}
+
+# Like request_json, but NEVER aborts: on a transport error (e.g. a quick tunnel that
+# isn't resolvable yet) or a non-2xx response it prints nothing and returns 1, so the
+# caller can retry instead of crashing through jq/errexit. Used on the flaky tunnel path.
+request_json_soft() {
+  local method="$1"
+  local url="$2"
+  local body="${3:-}"
+  shift $(( $# < 3 ? $# : 3 )) # drop method/url/body; leave extra curl args (robust if body/args omitted)
+
+  local tmp
+  tmp="$(mktemp)"
+
+  local doh=""
+  case "$url" in
+    *localhost*|*127.0.0.1*) : ;;
+    https://*) doh="$DOH_ARGS" ;;
+  esac
+  local code
+  if [[ -n "$body" ]]; then
+    code=$(curl -sS --http1.1 $doh --max-time 20 -o "$tmp" -w "%{http_code}" -X "$method" "$url" "$@" -d "$body" 2>/dev/null || true)
+  else
+    code=$(curl -sS --http1.1 $doh --max-time 20 -o "$tmp" -w "%{http_code}" -X "$method" "$url" "$@" 2>/dev/null || true)
+  fi
+  code="${code:-000}"
+
+  if [[ "$code" -lt 200 || "$code" -ge 300 ]]; then
+    rm -f "$tmp"
+    return 1
+  fi
   cat "$tmp"
   rm -f "$tmp"
 }
@@ -634,7 +667,7 @@ create_agent_subcommand() {
   ok "Signed in. Creating a new agent in workspace '${tenant_name}' as '${admin_user}'."
 
   # Type / mode / grants (defaults come from the last agent you created).
-  local a_type a_mode g_docker="false" g_svc="false"
+  local a_type a_mode a_os="linux" g_docker="false" g_svc="false"
   echo ""
   echo "    host - a machine (Linux/macOS), installed via install.sh"
   echo "    k8s  - a Kubernetes cluster, installed via Helm"
@@ -645,11 +678,36 @@ create_agent_subcommand() {
     case "$a_type" in host|k8s) break ;; *) echo "    Enter host or k8s." ;; esac
   done
   while true; do
-    read -rp "  Agent mode [wild/readonly/approved] (default: ${AGENT_MODE:-wild}): " a_mode < /dev/tty
-    a_mode="${a_mode:-${AGENT_MODE:-wild}}"
-    case "$a_mode" in wild|readonly|approved) break ;; *) echo "    Enter wild, readonly, or approved." ;; esac
+    read -rp "  Agent mode [readonly/approved/wild] (default: ${AGENT_MODE:-readonly}): " a_mode < /dev/tty
+    a_mode="${a_mode:-${AGENT_MODE:-readonly}}"
+    case "$a_mode" in wild|readonly|approved) break ;; *) echo "    Enter readonly, approved, or wild." ;; esac
   done
   if [[ "$a_type" == "host" ]]; then
+    # macOS has no kernel write protection (Landlock is Linux-only), so a Mac agent would run
+    # readonly/approved UNSANDBOXED. Confirm before pre-acknowledging that; if they decline,
+    # offer to skip rather than create an agent that runs without write protection.
+    while true; do
+      read -rp "  Host OS [linux/mac] (default: linux): " a_os < /dev/tty
+      a_os="${a_os:-linux}"
+      case "$a_os" in
+        linux) break ;;
+        mac|macos|darwin)
+          a_os="mac"
+          echo "    macOS has no kernel write protection: in readonly/approved this agent would"
+          echo "    run UNSANDBOXED (filesystem writes are not blocked)."
+          if [[ "$(prompt_yes_no "Proceed and run this Mac agent unsandboxed?" "N")" == "true" ]]; then
+            echo "    Acknowledged - the Mac agent will run readonly/approved unsandboxed."
+            break
+          fi
+          if [[ "$(prompt_yes_no "Skip creating the agent?" "Y")" == "true" ]]; then
+            echo "    Skipped - no agent was created."
+            return 0
+          fi
+          # Declined both: fall through and re-ask (they can choose linux instead).
+          ;;
+        *) echo "    Enter linux or mac." ;;
+      esac
+    done
     g_docker=$(prompt_yes_no "Grant Docker access?" "N")
     g_svc=$(prompt_yes_no "Grant systemctl access?" "N")
   fi
@@ -738,15 +796,24 @@ create_agent_subcommand() {
       ;;
   esac
 
-  local resp agent_id install_cmd cli_use
-  resp=$(request_json POST "${target_url}/tenant/agents" \
-    "$(mkjson type "$a_type" mode "$a_mode" grant_service_mgmt "$g_svc" grant_docker "$g_docker")" \
-    -H "Authorization: Bearer $target_token" \
-    -H "Content-Type: application/json")
-  agent_id=$(echo "$resp" | json_get '.agent_id')
-  install_cmd=$(echo "$resp" | json_get '.commands.helm // .commands.agent // empty')
-  cli_use=$(echo "$resp" | json_get '.commands.cli_use // empty')
-  [[ -n "$agent_id" && "$agent_id" != "null" ]] || fail "Agent creation failed. Response: $resp"
+  # A public target_url may still be warming up (quick tunnels flake early), so create with a
+  # few automatic retries and never crash through jq - fail cleanly if all attempts miss.
+  local resp="" agent_id="" install_cmd cli_use attempt
+  for attempt in 1 2 3; do
+    resp=$(request_json_soft POST "${target_url}/tenant/agents" \
+      "$(mkjson type "$a_type" mode "$a_mode" os "$a_os" grant_service_mgmt "$g_svc" grant_docker "$g_docker")" \
+      -H "Authorization: Bearer $target_token" \
+      -H "Content-Type: application/json") || resp=""
+    agent_id=$(printf '%s' "$resp" | json_get '.agent_id // empty' 2>/dev/null || true)
+    [[ -n "$agent_id" ]] && break
+    if [[ "$attempt" -lt 3 ]]; then
+      info "Agent creation attempt $attempt/3 failed (endpoint warming up); retrying in 3s..."
+      sleep 3
+    fi
+  done
+  [[ -n "$agent_id" ]] || fail "Agent creation failed against ${target_url}. Response: ${resp:-<none>}"
+  install_cmd=$(printf '%s' "$resp" | json_get '.commands.helm // .commands.agent // empty' 2>/dev/null || true)
+  cli_use=$(printf '%s' "$resp" | json_get '.commands.cli_use // empty' 2>/dev/null || true)
 
   echo ""
   ok "Agent created: ${agent_id} (type=${a_type}, mode=${a_mode}) via ${target_url}"
@@ -1165,7 +1232,8 @@ SETUP_PASSWORD=$(prompt_password)
 echo ""
 CREATE_AGENT=$(prompt_yes_no "Create an agent?" "Y")
 AGENT_TYPE="host"
-AGENT_MODE="wild"
+AGENT_MODE="readonly"
+AGENT_OS="linux"
 GRANT_DOCKER="false"
 GRANT_SERVICE_MGMT="false"
 if [[ "$CREATE_AGENT" == "true" ]]; then
@@ -1182,13 +1250,13 @@ if [[ "$CREATE_AGENT" == "true" ]]; then
     esac
   done
   echo ""
-  echo "    wild     - run any command"
-  echo "    readonly - read-only commands only"
-  echo "    approved - require approval for write commands"
+  echo "    readonly - read-only commands only (safe default)"
+  echo "    approved - reads run; write commands need approval"
+  echo "    wild     - run any command (personal/dev boxes only)"
   echo ""
   while true; do
-    read -rp "  Agent mode [wild]: " AGENT_MODE < /dev/tty
-    AGENT_MODE="${AGENT_MODE:-wild}"
+    read -rp "  Agent mode [readonly]: " AGENT_MODE < /dev/tty
+    AGENT_MODE="${AGENT_MODE:-readonly}"
     case "$AGENT_MODE" in
       wild|readonly|approved) break ;;
       *) echo "    Enter wild, readonly, or approved." ;;
@@ -1196,8 +1264,36 @@ if [[ "$CREATE_AGENT" == "true" ]]; then
   done
   # Docker / service-management grants are host-only; k8s access is governed by RBAC.
   if [[ "$AGENT_TYPE" == "host" ]]; then
-    GRANT_DOCKER=$(prompt_yes_no "Grant Docker access?" "N")
-    GRANT_SERVICE_MGMT=$(prompt_yes_no "Grant systemctl access?" "N")
+    # macOS has no kernel write protection (Landlock is Linux-only), so a Mac agent would run
+    # readonly/approved UNSANDBOXED. Don't pre-acknowledge that silently: confirm it, and if they
+    # decline, offer to skip the agent rather than create one that runs without write protection.
+    while true; do
+      read -rp "  Host OS [linux/mac] (default: linux): " AGENT_OS < /dev/tty
+      AGENT_OS="${AGENT_OS:-linux}"
+      case "$AGENT_OS" in
+        linux) break ;;
+        mac|macos|darwin)
+          AGENT_OS="mac"
+          echo "    macOS has no kernel write protection: in readonly/approved this agent would"
+          echo "    run UNSANDBOXED (filesystem writes are not blocked)."
+          if [[ "$(prompt_yes_no "Proceed and run this Mac agent unsandboxed?" "N")" == "true" ]]; then
+            echo "    Acknowledged - the Mac agent will run readonly/approved unsandboxed."
+            break
+          fi
+          if [[ "$(prompt_yes_no "Skip creating the agent?" "Y")" == "true" ]]; then
+            CREATE_AGENT="false"
+            echo "    Skipped - no agent will be created."
+            break
+          fi
+          # Declined both: fall through and re-ask (they can choose linux instead).
+          ;;
+        *) echo "    Enter linux or mac." ;;
+      esac
+    done
+    if [[ "$CREATE_AGENT" == "true" ]]; then
+      GRANT_DOCKER=$(prompt_yes_no "Grant Docker access?" "N")
+      GRANT_SERVICE_MGMT=$(prompt_yes_no "Grant systemctl access?" "N")
+    fi
   fi
 fi
 
@@ -1410,19 +1506,23 @@ if [[ "$CLI_READY" == "true" ]]; then
   ok "CLI ready"
 fi
 
+# Returns 0 and sets AGENT_ID on success; returns 1 (setting nothing) on a transport/HTTP
+# failure so callers can retry - it does NOT abort. Callers must handle the non-zero return
+# (the tunnel loop retries; the local path hard-fails explicitly).
 create_agent_with_current_target() {
   [[ -n "$AGENT_CREATE_TOKEN" ]] || AGENT_CREATE_TOKEN="$USER_TOKEN"
 
   # The bootstrap agent always installs the latest version; pin a specific
   # version per-agent in the console at create time if you need to.
-  AGENT_RESP=$(request_json POST "$AGENT_CREATE_API_URL/tenant/agents" \
-    "$(mkjson type "$AGENT_TYPE" mode "$AGENT_MODE" grant_service_mgmt "$GRANT_SERVICE_MGMT" grant_docker "$GRANT_DOCKER")" \
+  AGENT_RESP=$(request_json_soft POST "$AGENT_CREATE_API_URL/tenant/agents" \
+    "$(mkjson type "$AGENT_TYPE" mode "$AGENT_MODE" os "$AGENT_OS" grant_service_mgmt "$GRANT_SERVICE_MGMT" grant_docker "$GRANT_DOCKER")" \
     -H "Authorization: Bearer $AGENT_CREATE_TOKEN" \
-    -H "Content-Type: application/json")
-  AGENT_ID=$(echo "$AGENT_RESP" | json_get '.agent_id')
+    -H "Content-Type: application/json") || return 1
+  AGENT_ID=$(printf '%s' "$AGENT_RESP" | json_get '.agent_id // empty' 2>/dev/null || true)
+  [[ -n "$AGENT_ID" ]] || return 1
   # host agents return commands.agent (install.sh); k8s agents return commands.helm.
-  INSTALL_AGENT=$(echo "$AGENT_RESP" | json_get '.commands.helm // .commands.agent // empty')
-  CLI_USE_CMD=$(echo "$AGENT_RESP" | json_get '.commands.cli_use // empty')
+  INSTALL_AGENT=$(printf '%s' "$AGENT_RESP" | json_get '.commands.helm // .commands.agent // empty' 2>/dev/null || true)
+  CLI_USE_CMD=$(printf '%s' "$AGENT_RESP" | json_get '.commands.cli_use // empty' 2>/dev/null || true)
   ok "Agent created using: $AGENT_CREATE_API_URL"
 }
 
@@ -1453,19 +1553,37 @@ if [[ "$CREATE_AGENT" == "true" ]]; then
         TUNNEL_REACHABLE=true
         API_URL="$PUBLIC_API_URL"
         ok "Tunnel: $PUBLIC_API_URL"
-
-        # Re-login through the public URL before agent creation so the backend
-        # generates install commands with the public host, not localhost.
-        AGENT_CREATE_TOKEN=$(request_json POST "$PUBLIC_API_URL/tenant/login" \
-          "$(mkjson tenant_name "$SETUP_TENANT" username "$SETUP_USERNAME" password "$SETUP_PASSWORD")" \
-          -H "Content-Type: application/json" | json_get '.token')
         AGENT_CREATE_API_URL="$PUBLIC_API_URL"
-        create_agent_with_current_target
-        maybe_select_cli_agent
-        break
-      fi
 
-      warn "Public tunnel is not reachable enough to create the agent safely."
+        # The quick tunnel can flake between the probe above and these calls, so re-login and
+        # create tolerantly with a few automatic retries (the hostname is often still warming
+        # up). On repeated failure, fall through to the interactive retry prompt below instead
+        # of aborting through jq/errexit.
+        agent_created=false
+        for attempt in 1 2 3; do
+          # Re-login through the public URL so the backend generates install commands with the
+          # public host, not localhost.
+          login_resp=$(request_json_soft POST "$PUBLIC_API_URL/tenant/login" \
+            "$(mkjson tenant_name "$SETUP_TENANT" username "$SETUP_USERNAME" password "$SETUP_PASSWORD")" \
+            -H "Content-Type: application/json") || login_resp=""
+          AGENT_CREATE_TOKEN=$(printf '%s' "$login_resp" | json_get '.token // empty' 2>/dev/null || true)
+          if [[ -n "$AGENT_CREATE_TOKEN" ]] && create_agent_with_current_target; then
+            agent_created=true
+            break
+          fi
+          if [[ "$attempt" -lt 3 ]]; then
+            info "Agent creation attempt $attempt/3 failed (tunnel warming up); retrying in 3s..."
+            sleep 3
+          fi
+        done
+        if [[ "$agent_created" == true ]]; then
+          maybe_select_cli_agent
+          break
+        fi
+        warn "Tunnel became unreachable during agent creation (quick tunnels can be flaky early)."
+      else
+        warn "Public tunnel is not reachable enough to create the agent safely."
+      fi
       warn "Local backend, workspace, API key, and CLI setup are complete."
 
       retry_agent=$(prompt_yes_no "Retry tunnel check and agent creation now?" "Y")
@@ -1479,7 +1597,10 @@ if [[ "$CREATE_AGENT" == "true" ]]; then
   else
     AGENT_CREATE_API_URL="$LOCAL_API_URL"
     AGENT_CREATE_TOKEN="$USER_TOKEN"
-    create_agent_with_current_target
+    # Local backend should always be reachable; a failure here is a real error (not a
+    # transient tunnel flake), so surface it rather than continuing agent-less.
+    create_agent_with_current_target \
+      || fail "Could not create the agent against $LOCAL_API_URL. Check the backend: docker compose -f $COMPOSE_FILE logs backend"
     maybe_select_cli_agent
     API_URL="$LOCAL_API_URL"
   fi

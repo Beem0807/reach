@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { createPortal } from 'react-dom';
-import type { Agent, Fleet, FleetToken, FleetWavePolicy, TenantConfig } from '../types';
+import type { Agent, Fleet, FleetToken, FleetWavePolicy, WaveStrategy, TenantConfig } from '../types';
 import { listFleets, listFleetAgents, createFleet, updateFleet, rotateFleetToken, revokeFleet, deleteFleet, removeFleetMember, revokeTenantAgent, deleteTenantAgent, reconcileFleetGrants, acceptFleetGrantMismatch } from '../api';
 import { WavePolicyRW } from '../components/WavePolicyEditor';
 import { Modal } from '../components/Modal';
@@ -15,7 +15,7 @@ const MODES = ['wild', 'readonly', 'approved'] as const;
 
 type FleetUpdateBody = Partial<{
   mode: string; tags: string[]; reap_after_seconds: number | null; max_fanout: number | null;
-  grant_service_mgmt: boolean; grant_docker: boolean; wave_policy: FleetWavePolicy | null;
+  grant_service_mgmt: boolean; grant_docker: boolean; sandbox_ack: boolean; wave_policy: FleetWavePolicy | null;
 }>;
 
 // A fleet member is *flagged* when its grants mismatch the fleet AND the divergence
@@ -216,6 +216,7 @@ export function FleetsPage({ config, onOpenAgent, focusFleetId, onFocusFleetCons
   const [loadingMembers, setLoadingMembers] = useState<Set<string>>(new Set());
   const [defaultReap, setDefaultReap] = useState(1800);
   const [defaultMaxFanout, setDefaultMaxFanout] = useState(25);
+  const [defaultWavePolicy, setDefaultWavePolicy] = useState<FleetWavePolicy>({});
   const [loading, setLoading] = useState(false);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [modal, setModal] = useState<Modals>(null);
@@ -251,6 +252,7 @@ export function FleetsPage({ config, onOpenAgent, focusFleetId, onFocusFleetCons
         setTotal(r.total ?? r.fleets.length);
         setDefaultReap(r.default_reap_after_seconds);
         setDefaultMaxFanout(r.default_max_fanout ?? 25);
+        setDefaultWavePolicy(r.default_wave_policy ?? {});
       })
       .finally(() => setLoading(false));
     // Refresh members of any already-expanded fleets (e.g. after an action), keeping
@@ -416,7 +418,7 @@ export function FleetsPage({ config, onOpenAgent, focusFleetId, onFocusFleetCons
       )}
       {modal?.type === 'detail' && (
         <FleetDetailModal fleet={modal.fleet}
-          defaultReap={defaultReap} defaultMaxFanout={defaultMaxFanout} canManage={isOperator && modal.fleet.writable !== false}
+          defaultReap={defaultReap} defaultMaxFanout={defaultMaxFanout} defaultWavePolicy={defaultWavePolicy} canManage={isOperator && modal.fleet.writable !== false}
           onClose={() => setModal(null)} onAction={setModal} />
       )}
       {modal?.type === 'edit' && (
@@ -800,8 +802,8 @@ function DetailField({ label, children }: { label: string; children: React.React
 
 // A read-only detail view of a fleet, mirroring the agent "View details" modal. Members
 // are loaded on open (per-fleet, not from a tenant-wide agent list).
-function FleetDetailModal({ fleet, defaultReap, defaultMaxFanout, canManage, onClose, onAction }: {
-  fleet: Fleet; defaultReap: number; defaultMaxFanout: number; canManage: boolean;
+function FleetDetailModal({ fleet, defaultReap, defaultMaxFanout, defaultWavePolicy, canManage, onClose, onAction }: {
+  fleet: Fleet; defaultReap: number; defaultMaxFanout: number; defaultWavePolicy?: FleetWavePolicy; canManage: boolean;
   onClose: () => void; onAction: (m: Modals) => void; onOpenAgent?: (agentId: string, fromFleetId?: string) => void;
 }) {
   // Members aren't listed here - they're browsed via the fleet row's accordion (and can
@@ -848,9 +850,45 @@ function FleetDetailModal({ fleet, defaultReap, defaultMaxFanout, canManage, onC
             <span className="text-xs text-gray-700 font-mono">{fleet.max_fanout ?? defaultMaxFanout}</span>
             <span className="ml-1 text-[10px] text-gray-400">member(s)/run{fleet.max_fanout == null ? ' (default)' : ''}</span>
           </DetailField>
+          <DetailField label="Write protection">
+            {fleet.sandbox_ack
+              ? <span className="text-xs text-amber-700">Disabled <span className="text-[10px] text-gray-400">(members without it run readonly/approved anyway)</span></span>
+              : <span className="text-xs text-gray-700">Enabled <span className="text-[10px] text-gray-400">(default - members without it are blocked)</span></span>}
+          </DetailField>
           <DetailField label="Created">
             <span className="text-xs text-gray-700">{relTime(fleet.created_at)}</span>
           </DetailField>
+        </div>
+
+        <div className="bg-gray-50 rounded-lg px-3 py-2.5">
+          <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-2">
+            Staged rollout <span className="normal-case font-normal text-gray-400">(how a fan-out run advances across members)</span>
+          </p>
+          <div className="space-y-1">
+            {(() => {
+              // Rollout = how the run ADVANCES (auto/manual) and handles failure (stop/continue).
+              // The wave size derives from Max fan-out (its own field), so it isn't shown here.
+              const describe = (w: WaveStrategy) =>
+                `${w.mode === 'manual' ? 'manual advance' : 'auto advance'}, ${w.on_failure === 'stop' ? 'stop on failure' : 'continue on failure'}`;
+              return (['write', 'read'] as const).map(rw => {
+                const override = fleet.wave_policy?.[rw];
+                const s = override ?? defaultWavePolicy?.[rw];
+                return (
+                  <div key={rw} className="flex items-baseline gap-2 text-xs">
+                    <span className="w-12 shrink-0 font-medium text-gray-500">{rw === 'write' ? 'Writes' : 'Reads'}</span>
+                    {s ? (
+                      <span className="text-gray-700">
+                        {describe(s)}
+                        <span className={`ml-1.5 text-[10px] font-medium ${override ? 'text-amber-600' : 'text-gray-400'}`}>{override ? 'override' : 'tenant default'}</span>
+                      </span>
+                    ) : (
+                      <span className="text-gray-400">tenant default</span>
+                    )}
+                  </div>
+                );
+              });
+            })()}
+          </div>
         </div>
 
         {(fleet.tags ?? []).length > 0 && (
@@ -964,6 +1002,7 @@ function CreateFleetModal({ apiUrl, tenantToken, defaultReap, defaultMaxFanout, 
   const [mode, setMode] = useState<typeof MODES[number]>('readonly');
   const [grantSvc, setGrantSvc] = useState(false);
   const [grantDocker, setGrantDocker] = useState(false);
+  const [sandboxAck, setSandboxAck] = useState(false);
   const [tagPairs, setTagPairs] = useState<KVPair[]>([]);
   const [reapMin, setReapMin] = useState('');
   const [maxFanout, setMaxFanout] = useState('');
@@ -978,6 +1017,7 @@ function CreateFleetModal({ apiUrl, tenantToken, defaultReap, defaultMaxFanout, 
     try {
       const r = await createFleet(apiUrl, tenantToken, {
         name: name.trim(), mode, grant_service_mgmt: grantSvc, grant_docker: grantDocker,
+        sandbox_ack: sandboxAck,
         tags: serializePairs(tagPairs),
         reap_after_seconds: reapMin.trim() ? Math.round(Number(reapMin) * 60) : null,
         max_fanout: maxFanout.trim() ? Number(maxFanout) : null,
@@ -1010,6 +1050,13 @@ function CreateFleetModal({ apiUrl, tenantToken, defaultReap, defaultMaxFanout, 
             <label className="flex items-center gap-2 text-sm text-gray-700"><input type="checkbox" checked={grantSvc} onChange={e => setGrantSvc(e.target.checked)} className="w-4 h-4" /> Service management (systemctl)</label>
             <label className="flex items-center gap-2 text-sm text-gray-700"><input type="checkbox" checked={grantDocker} onChange={e => setGrantDocker(e.target.checked)} className="w-4 h-4" /> Docker access</label>
           </div>
+        </div>
+        <div>
+          <label className="block text-sm font-medium text-gray-700 mb-1.5">Write protection</label>
+          <label className="flex items-start gap-2 text-sm text-gray-700">
+            <input type="checkbox" checked={sandboxAck} onChange={e => setSandboxAck(e.target.checked)} className="w-4 h-4 mt-0.5" />
+            <span>Members have no kernel write protection - let them run <code className="font-mono text-xs">readonly</code>/<code className="font-mono text-xs">approved</code> commands anyway instead of blocking them. Every member inherits this. <strong>Leave off for a normal Linux fleet</strong> - protection (Landlock) ships in Linux 5.13+ (check a host with <code className="font-mono text-xs">uname -r</code>). Turn it on only if the hosts are macOS or an older kernel; unsure? Leave it off and enroll one - it reports its status, then flip this if needed.</span>
+          </label>
         </div>
         <div>
           <label className="block text-sm font-medium text-gray-700 mb-1.5">Tags <span className="font-normal text-gray-400">(inherited by every member)</span></label>
@@ -1087,13 +1134,14 @@ function EditFleetModal({ apiUrl, tenantToken, defaultReap, defaultMaxFanout, fl
   const [wavePolicy, setWavePolicy] = useState<FleetWavePolicy>(fleet.wave_policy || {});
   const [grantSvc, setGrantSvc] = useState(!!fleet.grant_service_mgmt);
   const [grantDocker, setGrantDocker] = useState(!!fleet.grant_docker);
+  const [sandboxAck, setSandboxAck] = useState(!!fleet.sandbox_ack);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const grantsChanged = grantSvc !== !!fleet.grant_service_mgmt || grantDocker !== !!fleet.grant_docker;
 
   const body = (): FleetUpdateBody => ({
     mode, tags: serializePairs(tagPairs),
-    grant_service_mgmt: grantSvc, grant_docker: grantDocker,
+    grant_service_mgmt: grantSvc, grant_docker: grantDocker, sandbox_ack: sandboxAck,
     reap_after_seconds: reapMin.trim() ? Math.round(Number(reapMin) * 60) : null,
     max_fanout: maxFanout.trim() ? Number(maxFanout) : null,
     wave_policy: Object.keys(wavePolicy).length ? wavePolicy : null,
@@ -1139,6 +1187,13 @@ function EditFleetModal({ apiUrl, tenantToken, defaultReap, defaultMaxFanout, fl
               Grants are baked into the host at install, so this can't be flipped on running members remotely. Saving takes you to <strong>rotate the join token</strong> - the grant change is committed there, together with the new launch-template command. Existing members will show a <strong>grant mismatch</strong> until you re-provision them and <strong>reconcile</strong>.
             </p>
           )}
+        </div>
+        <div>
+          <label className="block text-sm font-medium text-gray-700 mb-1.5">Write protection</label>
+          <label className="flex items-start gap-2 text-sm text-gray-700">
+            <input type="checkbox" checked={sandboxAck} onChange={e => setSandboxAck(e.target.checked)} className="w-4 h-4 mt-0.5" />
+            <span>Allow members without kernel write protection (macOS, or Linux older than 5.13) to run <code className="font-mono text-xs">readonly</code>/<code className="font-mono text-xs">approved</code> commands anyway instead of blocking them. Inherited - takes effect fleet-wide on the next member sync (no re-provisioning). Members that <em>do</em> have protection ignore this and keep it.</span>
+          </label>
         </div>
         <div>
           <label className="block text-sm font-medium text-gray-700 mb-1">Reap members after <span className="font-normal text-gray-400">(minutes; blank = default {reapPhrase(defaultReap)})</span></label>

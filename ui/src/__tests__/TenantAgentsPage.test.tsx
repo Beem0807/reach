@@ -366,6 +366,14 @@ describe('Sudo notice in ReissueModal', () => {
     await user.click(permissionCheckbox('Grant Docker access'));
     await waitFor(() => expect(extraGrantText()).not.toBeInTheDocument());
   });
+
+  it('hides host-only grants and sudo notice for a k8s agent, shows RBAC note', async () => {
+    await openReissue({ ...BASE_AGENT, type: 'k8s' });
+    expect(screen.queryByText('Grant Docker access')).not.toBeInTheDocument();
+    expect(screen.queryByText('Grant systemctl / service management access')).not.toBeInTheDocument();
+    expect(sudoNotice()).not.toBeInTheDocument();
+    expect(screen.getByText(/kubernetes rbac/i)).toBeInTheDocument();
+  });
 });
 
 describe('TenantAgentsPage rendering', () => {
@@ -543,5 +551,70 @@ describe('Agent type column and filter', () => {
     expect(await screen.findByText('Running as root')).toBeInTheDocument();
     expect(screen.getByTitle(/non-root/i)).toHaveTextContent('n/a');
     expect(screen.getByText(/Reflects policy mode/i)).toBeInTheDocument();
+  });
+});
+
+describe('AgentDetailModal - filesystem sandbox', () => {
+  it('shows write protection On for a capable host', async () => {
+    renderPage([{ ...BASE_AGENT, landlock_status: 'active' }]);
+    fireEvent.click(await screen.findByText('myhost.local'));
+    expect(await screen.findByText(/blocked by the kernel/i)).toBeInTheDocument();
+  });
+
+  it('warns and offers to allow when there is no write protection', async () => {
+    renderPage([{ ...BASE_AGENT, mode: 'approved', landlock_status: 'unavailable', sandbox_ack: false }]);
+    fireEvent.click(await screen.findByText('myhost.local'));
+    expect(await screen.findByText(/commands held - no write protection/i)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /allow without protection/i })).toBeInTheDocument();
+  });
+
+  it('allowing asks for confirmation first, then calls the API', async () => {
+    const spy = vi.spyOn(api, 'acknowledgeSandbox').mockResolvedValue({ agent_id: 'agent_abc', sandbox_ack: true });
+    renderPage([{ ...BASE_AGENT, landlock_status: 'unavailable', sandbox_ack: false }]);
+    fireEvent.click(await screen.findByText('myhost.local'));
+    fireEvent.click(await screen.findByRole('button', { name: /allow without protection/i }));
+    // A confirmation dialog appears - the API is NOT called yet.
+    expect(await screen.findByText(/without kernel write protection/i)).toBeInTheDocument();
+    expect(spy).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: /allow without protection/i }));
+    await waitFor(() => expect(spy).toHaveBeenCalledWith(CONFIG.apiUrl, CONFIG.tenantToken, 'agent_abc', true));
+  });
+
+  it('shows the allowed state with a require-protection action', async () => {
+    renderPage([{ ...BASE_AGENT, landlock_status: 'unavailable', sandbox_ack: true }]);
+    fireEvent.click(await screen.findByText('myhost.local'));
+    expect(await screen.findByText(/running without protection/i)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /require protection/i })).toBeInTheDocument();
+  });
+
+  it('treats macOS (unsupported) like unavailable - offers to allow with macOS wording', async () => {
+    renderPage([{ ...BASE_AGENT, landlock_status: 'unsupported', sandbox_ack: false }]);
+    fireEvent.click(await screen.findByText('myhost.local'));
+    expect(await screen.findByText(/macOS has no kernel write protection/i)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /allow without protection/i })).toBeInTheDocument();
+  });
+
+  it('flags "blocked" in the list for a host with no write protection', async () => {
+    renderPage([
+      { ...BASE_AGENT, agent_id: 'a1', hostname: 'linux-old', landlock_status: 'unavailable' },
+      { ...BASE_AGENT, agent_id: 'a2', hostname: 'linux-ok', landlock_status: 'active' },
+    ]);
+    await screen.findByText('linux-old');
+    // The unprotected host is flagged 'blocked'; the protected one is not.
+    expect(screen.getAllByText(/^blocked$/i).length).toBe(1);
+  });
+
+  it('a fleet member routes the write-protection exception to its fleet (no per-agent action)', async () => {
+    renderPage([{ ...BASE_AGENT, fleet_id: 'fleet_x', landlock_status: 'unavailable', sandbox_ack: false }]);
+    fireEvent.click(await screen.findByText('myhost.local'));
+    expect(await screen.findByText(/fleet member/i)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /allow without protection/i })).not.toBeInTheDocument();
+  });
+
+  it('create form: choosing macOS warns it runs without write protection', async () => {
+    renderPage([BASE_AGENT]);
+    fireEvent.click(await screen.findByRole('button', { name: /New agent/i }));
+    fireEvent.click(await screen.findByRole('button', { name: 'macOS' }));
+    expect(screen.getByText(/no kernel write protection/i)).toBeInTheDocument();
   });
 });

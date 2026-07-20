@@ -4,11 +4,53 @@ import { listPlatformAuditLogs, listTenantAuditLogs, listTenants } from '../api'
 import { Spinner } from '../components/Spinner';
 import { DataTable } from '../components/DataTable';
 import { RefreshButton } from '../components/RefreshButton';
+import { Modal } from '../components/Modal';
 
 function fmtDate(iso: string) {
   return new Date(iso).toLocaleString(undefined, {
     month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit',
   });
+}
+
+// A `datetime-local` value ("YYYY-MM-DDTHH:MM", local time) -> UTC ISO for the API. Empty
+// (or a bare date, from an older filter) is handled: a bare date becomes the day's start.
+function toUtcIso(local: string): string | undefined {
+  if (!local) return undefined;
+  const v = local.includes('T') ? local : `${local}T00:00`;   // tolerate a plain date
+  const d = new Date(v);
+  return isNaN(d.getTime()) ? undefined : d.toISOString();
+}
+
+// CSV export columns (metadata is JSON-encoded into a single cell). tenant_id is only
+// included in platform mode (a tenant admin's export is scoped to their own tenant).
+const CSV_COLUMNS: { key: keyof AuditLog; header: string }[] = [
+  { key: 'created_at', header: 'timestamp' },
+  { key: 'action', header: 'action' },
+  { key: 'actor_name', header: 'actor_name' },
+  { key: 'actor_role', header: 'actor_role' },
+  { key: 'actor_id', header: 'actor_id' },
+  { key: 'resource_type', header: 'resource_type' },
+  { key: 'resource_id', header: 'resource_id' },
+  { key: 'ip_address', header: 'ip_address' },
+  { key: 'tenant_id', header: 'tenant_id' },
+  { key: 'log_id', header: 'log_id' },
+  { key: 'metadata', header: 'metadata' },
+];
+
+// Every cell is quoted and embedded quotes are doubled, so commas/newlines/quotes in
+// metadata can never break the columns. A leading =/+/-/@ is prefixed with a quote to
+// defang spreadsheet formula injection.
+function csvCell(v: unknown): string {
+  let s = v == null ? '' : typeof v === 'object' ? JSON.stringify(v) : String(v);
+  if (/^[=+\-@]/.test(s)) s = `'${s}`;
+  return `"${s.replace(/"/g, '""')}"`;
+}
+
+function logsToCsv(logs: AuditLog[], includeTenant: boolean): string {
+  const cols = CSV_COLUMNS.filter(c => c.key !== 'tenant_id' || includeTenant);
+  const header = cols.map(c => c.header).join(',');
+  const rows = logs.map(l => cols.map(c => csvCell(l[c.key])).join(','));
+  return [header, ...rows].join('\r\n');
 }
 
 const ACTION_COLOR: Record<string, string> = {
@@ -57,6 +99,8 @@ const ACTION_COLOR: Record<string, string> = {
   'agent.rotation_requested': 'bg-amber-50 text-amber-700',
   'agent.capability_detected': 'bg-amber-50 text-amber-700',
   'agent.capability_acknowledged': 'bg-emerald-50 text-emerald-700',
+  'agent.sandbox_acknowledged': 'bg-amber-50 text-amber-700',
+  'agent.sandbox_ack_revoked': 'bg-emerald-50 text-emerald-700',
   'agent.mode_changed': 'bg-purple-50 text-purple-700',
   'approval.requested': 'bg-amber-50 text-amber-700',
   'approval.approved': 'bg-emerald-50 text-emerald-700',
@@ -268,8 +312,8 @@ export function AuditLogsPage({ mode, apiUrl, token }: Props) {
       cursorRef.current = undefined;
     }
     const f = filterRefs.current;
-    if (f.since) params.since = `${f.since}T00:00:00Z`;
-    if (f.until) params.until = `${f.until}T23:59:59Z`;
+    const since = toUtcIso(f.since); if (since) params.since = since;
+    const until = toUtcIso(f.until); if (until) params.until = until;
     if (f.action) params.action = f.action;
     if (f.actor) params.actor = f.actor;
     if (f.resource) params.resource = f.resource;
@@ -317,6 +361,9 @@ export function AuditLogsPage({ mode, apiUrl, token }: Props) {
     load(true);
   }
 
+  // Export opens a modal to pick a date range, then downloads the whole range as CSV.
+  const [showExport, setShowExport] = useState(false);
+
   return (
     <div className="min-h-full bg-slate-50">
       {/* Page header */}
@@ -335,7 +382,17 @@ export function AuditLogsPage({ mode, apiUrl, token }: Props) {
               </p>
             </div>
           </div>
-          <RefreshButton onClick={() => load(true)} loading={loading} />
+          <div className="flex items-center gap-2.5">
+            <button
+              onClick={() => setShowExport(true)}
+              title="Choose a date range and download it as CSV"
+              className="inline-flex items-center gap-2 rounded-lg bg-white/10 hover:bg-white/20 ring-1 ring-white/20 text-white text-sm font-medium px-3 py-1.5 transition-colors"
+            >
+              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3" /></svg>
+              Export CSV
+            </button>
+            <RefreshButton onClick={() => load(true)} loading={loading} />
+          </div>
         </div>
       </div>
 
@@ -393,18 +450,20 @@ export function AuditLogsPage({ mode, apiUrl, token }: Props) {
         />
         <div className="flex items-center gap-1.5">
           <input
-            type="date"
+            type="datetime-local"
             value={filterSince}
+            max={filterUntil || undefined}
             onChange={e => setFilterSince(e.target.value)}
-            title="From date"
+            title="From date & time (local)"
             className="text-sm border border-gray-300 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-orange-400"
           />
           <span className="text-gray-400 text-xs">to</span>
           <input
-            type="date"
+            type="datetime-local"
             value={filterUntil}
+            min={filterSince || undefined}
             onChange={e => setFilterUntil(e.target.value)}
-            title="To date"
+            title="To date & time (local)"
             className="text-sm border border-gray-300 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-orange-400"
           />
         </div>
@@ -507,6 +566,139 @@ export function AuditLogsPage({ mode, apiUrl, token }: Props) {
         </>
       )}
       </div>
+
+      {showExport && (
+        <ExportModal
+          mode={mode}
+          apiUrl={apiUrl}
+          token={token}
+          filters={filterRefs.current}
+          onClose={() => setShowExport(false)}
+        />
+      )}
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Export modal: pick a date range, download the whole range as CSV (no row cap).
+// ---------------------------------------------------------------------------
+
+interface ExportFilters { action: string; actor: string; resource: string; ip: string; tenant: string; since: string; until: string; }
+
+function ExportModal({ mode, apiUrl, token, filters, onClose }: {
+  mode: 'tenant' | 'platform';
+  apiUrl: string;
+  token: string;
+  filters: ExportFilters;
+  onClose: () => void;
+}) {
+  // Pre-fill the range from any date filter already applied on the page.
+  const [from, setFrom] = useState(filters.since);
+  const [to, setTo] = useState(filters.until);
+  const [busy, setBusy] = useState(false);
+  const [fetched, setFetched] = useState(0);
+  const [error, setError] = useState('');
+
+  const otherFilters = [
+    filters.action && `action: ${filters.action}`,
+    filters.actor && `actor: ${filters.actor}`,
+    filters.resource && `resource: ${filters.resource}`,
+    filters.ip && `ip: ${filters.ip}`,
+    filters.tenant && `tenant: ${filters.tenant}`,
+  ].filter(Boolean) as string[];
+
+  const doExport = async () => {
+    if (from && to && new Date(from) > new Date(to)) { setError('The "from" time must be on or before the "to" time.'); return; }
+    setBusy(true); setError(''); setFetched(0);
+    try {
+      const base: Record<string, string> = { limit: '200' };
+      const since = toUtcIso(from); if (since) base.since = since;
+      const until = toUtcIso(to); if (until) base.until = until;
+      if (filters.action) base.action = filters.action;
+      if (filters.actor) base.actor = filters.actor;
+      if (filters.resource) base.resource = filters.resource;
+      if (filters.ip) base.ip = filters.ip;
+      if (filters.tenant) base.tenant = filters.tenant;
+
+      // Page through the ENTIRE range - no row cap. Guard only against a non-advancing
+      // cursor so a broken backend can't spin forever.
+      const all: AuditLog[] = [];
+      let cursor: string | undefined;
+      let first = true;
+      const seen = new Set<string>();
+      while (first || cursor) {
+        first = false;
+        if (cursor) { if (seen.has(cursor)) break; seen.add(cursor); }
+        const params = cursor ? { ...base, cursor } : base;
+        const r = mode === 'platform'
+          ? await listPlatformAuditLogs(apiUrl, token, params)
+          : await listTenantAuditLogs(apiUrl, token, params);
+        all.push(...r.logs);
+        setFetched(all.length);
+        cursor = r.next_cursor;
+      }
+
+      if (all.length === 0) { setError('No audit logs match this range - nothing to export.'); return; }
+
+      const csv = logsToCsv(all, mode === 'platform');
+      const blob = new Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8;' });  // BOM for Excel
+      const stamp = new Date().toISOString().slice(0, 10);
+      const safe = (s: string) => s.replace('T', '_').replace(/:/g, '');   // filename-safe datetime
+      const range = (from || to) ? `_${from ? safe(from) : 'start'}-to-${to ? safe(to) : 'now'}` : '_all';
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `reach-audit-logs-${mode}${range}_${stamp}.csv`;
+      document.body.appendChild(a); a.click(); a.remove();
+      URL.revokeObjectURL(url);
+      onClose();
+    } catch {
+      setError('Failed to export audit logs. Please try again.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const field = 'w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-500/40 focus:border-orange-500';
+
+  return (
+    <Modal title="Export audit logs" onClose={busy ? () => {} : onClose}>
+      <div className="space-y-4">
+        <p className="text-sm text-slate-500">
+          Choose a start and end date &amp; time. Every matching event in that range is downloaded
+          as a single CSV - there is no row limit, so a wide range may take a moment.
+        </p>
+        <div className="grid grid-cols-2 gap-3">
+          <label className="block">
+            <span className="text-xs font-semibold text-slate-600">From</span>
+            <input type="datetime-local" value={from} max={to || undefined} onChange={e => setFrom(e.target.value)} disabled={busy} className={field} />
+          </label>
+          <label className="block">
+            <span className="text-xs font-semibold text-slate-600">To</span>
+            <input type="datetime-local" value={to} min={from || undefined} onChange={e => setTo(e.target.value)} disabled={busy} className={field} />
+          </label>
+        </div>
+        <p className="text-[11px] text-slate-400">Leave both blank to export the entire history. Times are in your local timezone.</p>
+        {otherFilters.length > 0 && (
+          <p className="text-[11px] text-slate-500 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2">
+            The filters applied on the page also apply to this export - {otherFilters.join(', ')}.
+          </p>
+        )}
+        {busy && <p className="text-xs text-slate-500 flex items-center gap-2"><Spinner className="w-3.5 h-3.5" /> Fetched {fetched.toLocaleString()} rows…</p>}
+        {error && <p className="text-sm text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2">{error}</p>}
+        <div className="flex justify-end gap-3 pt-1">
+          <button onClick={onClose} disabled={busy} className="text-sm text-slate-500 hover:text-slate-700 px-3 py-2 disabled:opacity-50">Cancel</button>
+          <button
+            onClick={doExport}
+            disabled={busy}
+            className="inline-flex items-center gap-2 bg-orange-600 hover:bg-orange-700 text-white text-sm font-semibold px-4 py-2 rounded-lg disabled:opacity-60 transition-colors shadow-sm"
+          >
+            {busy && <Spinner className="w-4 h-4" />}
+            {busy ? 'Exporting…' : 'Download CSV'}
+          </button>
+        </div>
+      </div>
+    </Modal>
   );
 }

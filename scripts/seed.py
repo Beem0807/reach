@@ -196,6 +196,7 @@ def make_agents(tenant_id: str) -> list[dict]:
             "grant_docker":            True,
             "service_mgmt_detected":   True,
             "docker_detected":         True,
+            "landlock_status":         "active",  # Linux + Landlock: writes kernel-enforced
         },
         # 2. ACTIVE - wild mode, running as root, rotation requested, no fleet
         {
@@ -223,6 +224,9 @@ def make_agents(tenant_id: str) -> list[dict]:
             "grant_docker":            False,
             "service_mgmt_detected":   True,
             "docker_detected":         True,
+            # macOS host: no Landlock, acknowledged at create so it runs unsandboxed (wild here anyway).
+            "landlock_status":         "unsupported",
+            "sandbox_ack":             True,
         },
         # 3. ACTIVE - readonly mode, staging fleet member. Has service-mgmt granted while
         #    the staging fleet grants none, so it shows GRANT DRIFT on an active host
@@ -252,6 +256,10 @@ def make_agents(tenant_id: str) -> list[dict]:
             "grant_docker":            False,
             "service_mgmt_detected":   True,
             "docker_detected":         False,
+            # Linux kernel WITHOUT Landlock and not acknowledged: readonly/approved FAIL CLOSED.
+            # The console shows the red warning + an Acknowledge action for this agent.
+            "landlock_status":         "unavailable",
+            "sandbox_ack":             False,
         },
         # 4. CREATED - awaiting install (no hostname/fingerprint/agent token yet).
         #    Must be a standalone host: a CREATED agent holds an install token and
@@ -462,6 +470,11 @@ def make_agents(tenant_id: str) -> list[dict]:
             "grant_docker":            False,
             "service_mgmt_detected":   True,
             "docker_detected":         False,
+            # Standalone host on a Linux kernel too old for Landlock and NOT acknowledged:
+            # fail-closed, so readonly/approved commands are held (blocked). Shows the neutral
+            # "blocked" badge on a standalone agent (no fleet to inherit an ack from).
+            "landlock_status":         "unavailable",
+            "sandbox_ack":             False,
         },
     ]
 
@@ -498,6 +511,9 @@ def make_fleets(tenant_id: str) -> list[dict]:
             "mode":                       "readonly",
             "grant_service_mgmt":         False,
             "grant_docker":               False,
+            # Fleet-level sandbox acknowledgement: these hosts run an old kernel (no Landlock),
+            # so members run readonly/approved unsandboxed instead of failing closed.
+            "sandbox_ack":                True,
             "tags":                       ["env:staging", "role:worker"],
             "join_token_hash":            _hmac("fleet_" + secrets.token_urlsafe(24)),
             "prev_join_token_hash":       None,

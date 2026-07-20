@@ -14,6 +14,15 @@ import (
 	"time"
 )
 
+// TestMain runs the suite as if the sandbox exception is acknowledged, so readonly/approved
+// execution tests actually run (unsandboxed, directly - which works on any OS). landlockCapable
+// stays false (its real value off-Linux), so no test triggers the Linux-only /proc/self/exe
+// re-exec. Tests that specifically exercise fail-closed flip unsandboxedAck off themselves.
+func TestMain(m *testing.M) {
+	unsandboxedAck = true
+	os.Exit(m.Run())
+}
+
 // ---------------------------------------------------------------------------
 // truncate
 // ---------------------------------------------------------------------------
@@ -1244,4 +1253,74 @@ func TestTouchHealthFile(t *testing.T) {
 	}
 	// Empty path is a no-op (no panic, nothing created).
 	touchHealthFile("")
+}
+
+// ---------------------------------------------------------------------------
+// Landlock / fail-closed sandbox policy
+// ---------------------------------------------------------------------------
+
+func TestSandboxDecision(t *testing.T) {
+	cases := []struct {
+		mode           string
+		capable, acked bool
+		want           sbDecision
+	}{
+		{"wild", false, false, sbRun},            // wild never needs the sandbox
+		{"wild", true, false, sbRun},
+		{"readonly", true, false, sbSandbox},     // Linux + Landlock -> sandboxed
+		{"approved", true, false, sbSandbox},
+		{"readonly", false, false, sbBlock},      // no sandbox, not acknowledged -> fail closed
+		{"approved", false, false, sbBlock},      // (macOS, or Linux without Landlock)
+		{"readonly", false, true, sbUnsandboxed}, // acknowledged -> run unsandboxed
+		{"approved", false, true, sbUnsandboxed},
+		{"readonly", true, true, sbSandbox},      // capable wins over the ack
+	}
+	for _, c := range cases {
+		if got := sandboxDecision(c.mode, c.capable, c.acked); got != c.want {
+			t.Errorf("sandboxDecision(%q, capable=%v, acked=%v) = %v, want %v", c.mode, c.capable, c.acked, got, c.want)
+		}
+	}
+}
+
+func TestDetectLandlockReturnsValidStatus(t *testing.T) {
+	switch got := detectLandlock(); got {
+	case "active", "unavailable", "unsupported":
+	default:
+		t.Errorf("detectLandlock() = %q, want one of active|unavailable|unsupported", got)
+	}
+}
+
+func TestExecuteCommandFailsClosedWithoutSandbox(t *testing.T) {
+	// No kernel sandbox and not acknowledged -> readonly/approved must be blocked, not run.
+	unsandboxedAck = false
+	defer func() { unsandboxedAck = true }()
+	for _, mode := range []string{"readonly", "approved"} {
+		res := executeCommand("echo hi", mode, false)
+		if !res.Blocked || res.ExitCode != 126 {
+			t.Errorf("%s: expected blocked/126, got blocked=%v exit=%d", mode, res.Blocked, res.ExitCode)
+		}
+		if !strings.Contains(strings.ToLower(res.Stderr), "write protection") {
+			t.Errorf("%s: expected a write-protection block message, got %q", mode, res.Stderr)
+		}
+	}
+}
+
+func TestExecuteCommandRunsWhenAcknowledged(t *testing.T) {
+	// Acknowledged (TestMain default) -> readonly runs unsandboxed and produces output.
+	res := executeCommand("echo hi", "readonly", false)
+	if res.Blocked {
+		t.Fatalf("acknowledged: expected to run, got blocked: %q", res.Stderr)
+	}
+	if !strings.Contains(res.Stdout, "hi") {
+		t.Errorf("expected output 'hi', got %q", res.Stdout)
+	}
+}
+
+func TestWildAlwaysRunsRegardlessOfSandbox(t *testing.T) {
+	unsandboxedAck = false
+	defer func() { unsandboxedAck = true }()
+	res := executeCommand("echo wild", "wild", false)
+	if res.Blocked {
+		t.Errorf("wild must run without a sandbox, got blocked: %q", res.Stderr)
+	}
 }

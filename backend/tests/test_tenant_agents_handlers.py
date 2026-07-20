@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 from handlers.tenant_agents import (
     handle_acknowledge_capability,
+    handle_acknowledge_sandbox,
     handle_create_tenant_agent,
     handle_get_agent_history,
     handle_list_agent_versions,
@@ -65,6 +66,27 @@ class TestHandleCreateTenantAgent:
     def test_invalid_mode_returns_400(self):
         r, _ = self._call(body={"mode": "supermode"})
         assert r["statusCode"] == 400
+
+    def test_mode_defaults_to_readonly(self):
+        # Omitting mode creates a safe read-only agent, never one that runs writes.
+        r, ar = self._call(body={})
+        assert r["statusCode"] == 201
+        assert ar.create.call_args[0][0]["mode"] == "readonly"
+        assert json.loads(r["body"])["mode"] == "readonly"
+
+    def test_mac_os_pre_acknowledges_sandbox(self):
+        # macOS has no Landlock, so choosing it at create pre-acknowledges unsandboxed execution.
+        r, ar = self._call(body={"type": "host", "os": "mac"})
+        assert r["statusCode"] == 201
+        assert ar.create.call_args[0][0]["sandbox_ack"] is True
+
+    def test_linux_os_does_not_pre_acknowledge(self):
+        r, ar = self._call(body={"type": "host", "os": "linux"})
+        assert ar.create.call_args[0][0]["sandbox_ack"] is False
+
+    def test_no_os_defaults_no_sandbox_ack(self):
+        r, ar = self._call(body={})
+        assert ar.create.call_args[0][0]["sandbox_ack"] is False
 
     def test_success_returns_201_with_install_commands(self):
         r, _ = self._call(body={"mode": "wild"})
@@ -603,6 +625,21 @@ class TestInstallCommandFlags:
         assert kwargs["grant_docker"] is True
         assert kwargs["grant_service_mgmt"] is True
 
+    def test_reissue_forces_grants_off_for_k8s(self):
+        # Docker / service-mgmt grants are host-only; a k8s reissue ignores them even if sent
+        # (mirrors create-agent and the console reissue modal).
+        with _auth(), \
+             patch("handlers.tenant_agents.agents_repo") as ar, \
+             patch("handlers.tenant_agents.agent_history_repo"):
+            ar.get.return_value = {**_AGENT_CREATED, "type": "k8s"}
+            ar.reissue_install_token.return_value = None
+            handle_reissue_tenant_install_token(
+                AGENT_ID, {"grant_docker": True, "grant_service_mgmt": True}, TOKEN, API_URL,
+            )
+        _, kwargs = ar.reissue_install_token.call_args
+        assert kwargs["grant_docker"] is False
+        assert kwargs["grant_service_mgmt"] is False
+
     def test_reissue_sudo_when_grant_docker(self):
         with _auth(), \
              patch("handlers.tenant_agents.agents_repo") as ar, \
@@ -852,6 +889,65 @@ class TestHandleAcknowledgeCapability:
         assert body["acknowledged"] is True
         assert body["agent_id"] == AGENT_ID
         assert body["capability"] == "docker"
+
+
+# ---------------------------------------------------------------------------
+# handle_acknowledge_sandbox - the Landlock fail-closed exception
+# ---------------------------------------------------------------------------
+
+_HOST_AGENT = {**_AGENT_ACTIVE, "type": "host", "hostname": "myhost", "landlock_status": "unavailable"}
+
+
+class TestHandleAcknowledgeSandbox:
+    def _call(self, body=None, agent=_HOST_AGENT, user=_ADMIN):
+        with _auth(user), \
+             patch("handlers.tenant_agents.agents_repo") as ar, \
+             patch("handlers.tenant_agents.audit") as mock_audit:
+            ar.get.return_value = agent
+            r = handle_acknowledge_sandbox(AGENT_ID, body if body is not None else {"acknowledged": True}, TOKEN)
+        return r, ar, mock_audit
+
+    def test_unauthorized(self):
+        with patch("handlers.tenant_agents._verify_tenant_token", return_value=None):
+            r = handle_acknowledge_sandbox(AGENT_ID, {"acknowledged": True}, TOKEN)
+        assert r["statusCode"] == 401
+
+    def test_developer_forbidden(self):
+        r, _, _ = self._call(user=_DEV)
+        assert r["statusCode"] == 403
+
+    def test_agent_not_found_returns_404(self):
+        r, _, _ = self._call(agent=None)
+        assert r["statusCode"] == 404
+
+    def test_k8s_agent_rejected(self):
+        r, ar, _ = self._call(agent={**_HOST_AGENT, "type": "k8s"})
+        assert r["statusCode"] == 400
+        ar.set_sandbox_ack.assert_not_called()
+
+    def test_acknowledge_sets_ack_true(self):
+        r, ar, _ = self._call({"acknowledged": True})
+        assert r["statusCode"] == 200
+        ar.set_sandbox_ack.assert_called_once_with(AGENT_ID, True)
+        assert json.loads(r["body"])["sandbox_ack"] is True
+
+    def test_revoke_sets_ack_false(self):
+        r, ar, _ = self._call({"acknowledged": False})
+        assert r["statusCode"] == 200
+        ar.set_sandbox_ack.assert_called_once_with(AGENT_ID, False)
+        assert json.loads(r["body"])["sandbox_ack"] is False
+
+    def test_defaults_to_acknowledge_when_omitted(self):
+        r, ar, _ = self._call({})
+        ar.set_sandbox_ack.assert_called_once_with(AGENT_ID, True)
+
+    def test_acknowledge_audits(self):
+        _, _, mock_audit = self._call({"acknowledged": True})
+        assert mock_audit.write.call_args[0][0] == "agent.sandbox_acknowledged"
+
+    def test_revoke_audits_distinct_action(self):
+        _, _, mock_audit = self._call({"acknowledged": False})
+        assert mock_audit.write.call_args[0][0] == "agent.sandbox_ack_revoked"
 
 
 # ---------------------------------------------------------------------------

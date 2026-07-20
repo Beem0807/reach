@@ -169,6 +169,20 @@ class AgentRepo:
             ExpressionAttributeValues={":b": binaries},
         )
 
+    def set_landlock_status(self, agent_id: str, status: str) -> None:
+        _TABLE_AGENTS.update_item(
+            Key={"agent_id": agent_id},
+            UpdateExpression="SET landlock_status = :s",
+            ExpressionAttributeValues={":s": status},
+        )
+
+    def set_sandbox_ack(self, agent_id: str, acknowledged: bool) -> None:
+        _TABLE_AGENTS.update_item(
+            Key={"agent_id": agent_id},
+            UpdateExpression="SET sandbox_ack = :a",
+            ExpressionAttributeValues={":a": acknowledged},
+        )
+
     def acknowledge_k8s_permissions(self, agent_id: str, perm_hash: str, acked_permissions: Optional[dict] = None) -> None:
         _TABLE_AGENTS.update_item(
             Key={"agent_id": agent_id},

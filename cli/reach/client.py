@@ -148,9 +148,17 @@ class ReachClient:
         resp.raise_for_status()
         return resp.json()
 
-    def create_approval(self, command: str, agent_id: Optional[str] = None,
-                        fleet_id: Optional[str] = None, duration: Optional[str] = None) -> dict:
-        body: dict = {"command": command}
+    def create_approval(self, command: Optional[str] = None, agent_id: Optional[str] = None,
+                        fleet_id: Optional[str] = None, duration: Optional[str] = None,
+                        k8s_rule: Optional[dict] = None, host_rule: Optional[dict] = None) -> dict:
+        # k8s agents require a structured rule; hosts take a bare command string.
+        body: dict = {}
+        if command is not None:
+            body["command"] = command
+        if k8s_rule is not None:
+            body["k8s_rule"] = k8s_rule
+        if host_rule is not None:
+            body["host_rule"] = host_rule
         if agent_id:
             body["agent_id"] = agent_id
         if fleet_id:

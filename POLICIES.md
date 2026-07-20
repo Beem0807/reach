@@ -24,7 +24,7 @@ Shell-chained commands are checked segment by segment - `ls && rm file.txt` is b
 
 On Linux, readonly mode enforcement is backed by Landlock (a kernel sandbox) on the agent. Commands run in a sandboxed subprocess that cannot write outside `/tmp`, providing defence-in-depth beyond the pattern-based check.
 
-On macOS, Landlock is not available. Readonly mode relies entirely on the server-side blocked-command list - the server rejects blocked writes before they are queued, so the agent never receives them.
+Where there is **no kernel sandbox** - an old or locked-down Linux kernel without Landlock, or **macOS** (Landlock is Linux-only) - the agent **fails closed**: `readonly`/`approved` commands are blocked rather than run unprotected, so a misclassified command can't slip past the pattern check onto the filesystem. An operator can **acknowledge the exception** in the console (audited, revocable) to run unsandboxed anyway, and creating an agent as macOS pre-acknowledges it. See [SECURITY.md](SECURITY.md) for the full fail-closed behavior.
 
 ## Approved mode
 
@@ -34,9 +34,9 @@ Reads are always allowed - you do not need to add them to any list. Write and de
 
 1. When a command is submitted, the server classifies it as a write or read (`is_write: true/false`). A **write** is parsed into an `argv` (`{bin, args}`) and will run with `execve` (**no shell**); a **read** runs as-is (freeform shell). A write that uses shell operators (`| ; && $() > *`) can't be structured, so it is **refused in approved mode** (unapprovable).
 2. The agent checks whether the write's `argv` matches an approved **host rule** `{bin, args[]}` (each arg a literal or `*`).
-   - **Rule match** - runs directly (write explicitly permitted).
-   - **Not approved, Linux** - runs under Landlock; the write is kernel-blocked, the agent returns a structured error, and the backend creates a pending approval record.
-   - **Not approved, macOS** - no Landlock; a write that matches no rule is refused immediately and a pending record is created. Reads always run.
+   - **Rule match** - runs directly (write explicitly permitted; no sandbox needed).
+   - **Not approved, kernel sandbox active (Linux + Landlock)** - the write runs under Landlock and is kernel-blocked; the agent returns a structured error and the backend creates a pending approval record to review.
+   - **Not approved, no kernel sandbox (macOS or old Linux)** - if the host is **acknowledged** (running unsandboxed), an unmatched write is refused up-front, a pending record is created, and reads run. If it is **not** acknowledged the agent **fails closed**: the command is blocked and **no** pending approval is raised - approving can't satisfy a sandbox that isn't there, so the fix is to acknowledge the host or move it to a Landlock kernel. (The agent tags the block reason so the backend skips the spurious request.)
 3. An operator or admin reviews pending approvals and approves or denies them in the tenant console under **Approvals**.
 4. Once approved, the rule feeds the agent's allowlist on the next sync and the write runs.
 

@@ -1914,9 +1914,26 @@ def approvals_request(
     agent_id = cfg_module.resolve_agent(
         agent) if agent else cfg_module.require("default_agent_id")
 
+    # k8s agents can't be approved with a bare command string - the backend wants a
+    # structured rule (a k8s_rule for kubectl, a host_rule for a non-kubectl tool like
+    # helm). Derive it client-side so the command form works here too.
     try:
-        r = client.create_approval(
-            command, agent_id=agent_id, duration=duration)
+        is_k8s = (client.get_agent(agent_id).get("type") or "host") == "k8s"
+    except requests.RequestException as e:
+        _http_die(e)
+
+    try:
+        if is_k8s:
+            from .kubectl import command_to_k8s_approval
+            k8s_rule, host_rule, err = command_to_k8s_approval(command)
+            if err:
+                _die(f"can't approve on a k8s agent: {err}")
+            r = client.create_approval(
+                agent_id=agent_id, duration=duration,
+                k8s_rule=k8s_rule, host_rule=host_rule)
+        else:
+            r = client.create_approval(
+                command, agent_id=agent_id, duration=duration)
     except requests.RequestException as e:
         _http_die(e)
 

@@ -47,6 +47,15 @@ class TestCreateFleet:
         r, _ = self._call(user=_DEV)
         assert r["statusCode"] == 403
 
+    def test_sandbox_ack_stored_when_set(self):
+        r, fr = self._call(body={"name": "mac-fleet", "sandbox_ack": True})
+        assert r["statusCode"] == 201
+        assert fr.create.call_args[0][0]["sandbox_ack"] is True
+
+    def test_sandbox_ack_defaults_false(self):
+        r, fr = self._call(body={"name": "web-asg"})
+        assert fr.create.call_args[0][0]["sandbox_ack"] is False
+
     def test_max_fanout_over_tenant_cap_rejected(self):
         # Tenant fanout_cap defaults to 25 here; a fleet can only lower it, never raise it.
         r, fr = self._call(body={"name": "web-asg", "max_fanout": 50})
@@ -225,6 +234,11 @@ class TestUpdateFleet:
         r, fr = self._call({"grant_docker": True, "grant_service_mgmt": False})
         assert r["statusCode"] == 200
         assert fr.update_settings.call_args[0][1] == {"grant_docker": True, "grant_service_mgmt": False}
+
+    def test_edit_sandbox_ack(self):
+        r, fr = self._call({"sandbox_ack": True})
+        assert r["statusCode"] == 200
+        assert fr.update_settings.call_args[0][1] == {"sandbox_ack": True}
 
     def test_grant_edit_not_pushed_to_members(self):
         # Unlike mode/tags, grants are baked into the host install and must NOT be

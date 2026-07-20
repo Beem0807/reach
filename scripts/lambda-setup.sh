@@ -162,7 +162,7 @@ json_get() {
 
 request_json() {
   local method="$1" url="$2" body="${3:-}"
-  shift 3 || true
+  shift $(( $# < 3 ? $# : 3 )) # drop method/url/body; leave extra curl args (robust if body/args omitted)
   local tmp; tmp="$(mktemp)"
   local code
   if [[ -n "$body" ]]; then
@@ -175,6 +175,26 @@ request_json() {
     echo "[ERROR] API request failed: $method $url (HTTP $code)" >&2
     cat "$tmp" >&2; echo "" >&2
     rm -f "$tmp"; exit 1
+  fi
+  cat "$tmp"; rm -f "$tmp"
+}
+
+# Like request_json, but NEVER aborts: on a transport error (e.g. the freshly-deployed API
+# still warming up) or a non-2xx response it prints nothing and returns 1, so a caller can
+# retry instead of crashing through jq/errexit. Used for the agent-creation step.
+request_json_soft() {
+  local method="$1" url="$2" body="${3:-}"
+  shift $(( $# < 3 ? $# : 3 ))
+  local tmp; tmp="$(mktemp)"
+  local code
+  if [[ -n "$body" ]]; then
+    code=$(curl -sS --max-time 20 -o "$tmp" -w "%{http_code}" -X "$method" "$url" "$@" -d "$body" 2>/dev/null || true)
+  else
+    code=$(curl -sS --max-time 20 -o "$tmp" -w "%{http_code}" -X "$method" "$url" "$@" 2>/dev/null || true)
+  fi
+  code="${code:-000}"
+  if [[ "$code" -lt 200 || "$code" -ge 300 ]]; then
+    rm -f "$tmp"; return 1
   fi
   cat "$tmp"; rm -f "$tmp"
 }
@@ -501,7 +521,8 @@ SETUP_PASSWORD=$(prompt_password)
 echo ""
 CREATE_AGENT=$(prompt_yes_no "Create an agent?" "Y")
 AGENT_TYPE="host"
-AGENT_MODE="wild"
+AGENT_MODE="readonly"
+AGENT_OS="linux"
 GRANT_SERVICE_MGMT="false"
 GRANT_DOCKER="false"
 if [[ "$CREATE_AGENT" == "true" ]]; then
@@ -518,26 +539,54 @@ if [[ "$CREATE_AGENT" == "true" ]]; then
     esac
   done
   echo ""
-  echo "    wild     - run any command"
-  echo "    readonly - read-only commands only"
-  echo "    approved - require approval for write commands"
+  echo "    readonly - read-only commands only (safe default)"
+  echo "    approved - reads run; write commands need approval"
+  echo "    wild     - run any command (personal/dev boxes only)"
   echo ""
   while true; do
-    read -rp "  Agent mode [wild]: " AGENT_MODE < /dev/tty
-    AGENT_MODE="${AGENT_MODE:-wild}"
+    read -rp "  Agent mode [readonly]: " AGENT_MODE < /dev/tty
+    AGENT_MODE="${AGENT_MODE:-readonly}"
     case "$AGENT_MODE" in
       wild|readonly|approved) break ;;
-      *) echo "    Enter wild, readonly, or approved." ;;
+      *) echo "    Enter readonly, approved, or wild." ;;
     esac
   done
   # Docker / service-management grants are host-only; k8s access is governed by RBAC.
   if [[ "$AGENT_TYPE" == "host" ]]; then
-    echo ""
-    echo "  Agent permissions (applied to the install command):"
-    GRANT_SERVICE_MGMT=$(prompt_yes_no "Grant systemctl/service management access?" "N")
-    GRANT_DOCKER=$(prompt_yes_no "Grant Docker access?" "N")
-    if [[ "$GRANT_SERVICE_MGMT" == "true" || "$GRANT_DOCKER" == "true" ]]; then
-      echo "  Note: the install command will require sudo (elevated access needs root)."
+    # macOS has no kernel write protection (Landlock is Linux-only), so a Mac agent would run
+    # readonly/approved UNSANDBOXED. Don't pre-acknowledge that silently: confirm it, and if they
+    # decline, offer to skip the agent rather than create one that runs without write protection.
+    while true; do
+      read -rp "  Host OS [linux/mac] (default: linux): " AGENT_OS < /dev/tty
+      AGENT_OS="${AGENT_OS:-linux}"
+      case "$AGENT_OS" in
+        linux) break ;;
+        mac|macos|darwin)
+          AGENT_OS="mac"
+          echo "    macOS has no kernel write protection: in readonly/approved this agent would"
+          echo "    run UNSANDBOXED (filesystem writes are not blocked)."
+          if [[ "$(prompt_yes_no "Proceed and run this Mac agent unsandboxed?" "N")" == "true" ]]; then
+            echo "    Acknowledged - the Mac agent will run readonly/approved unsandboxed."
+            break
+          fi
+          if [[ "$(prompt_yes_no "Skip creating the agent?" "Y")" == "true" ]]; then
+            CREATE_AGENT="false"
+            echo "    Skipped - no agent will be created."
+            break
+          fi
+          # Declined both: fall through and re-ask (they can choose linux instead).
+          ;;
+        *) echo "    Enter linux or mac." ;;
+      esac
+    done
+    if [[ "$CREATE_AGENT" == "true" ]]; then
+      echo ""
+      echo "  Agent permissions (applied to the install command):"
+      GRANT_SERVICE_MGMT=$(prompt_yes_no "Grant systemctl/service management access?" "N")
+      GRANT_DOCKER=$(prompt_yes_no "Grant Docker access?" "N")
+      if [[ "$GRANT_SERVICE_MGMT" == "true" || "$GRANT_DOCKER" == "true" ]]; then
+        echo "  Note: the install command will require sudo (elevated access needs root)."
+      fi
     fi
   fi
 fi
@@ -697,13 +746,25 @@ INSTALL_AGENT=""
 if [[ "$CREATE_AGENT" == "true" ]]; then
   # The bootstrap agent always installs the latest version; pin a specific
   # version per-agent in the console at create time if you need to.
-  AGENT_RESP=$(request_json POST "$API_URL/tenant/agents" \
-    "$(mkjson type "$AGENT_TYPE" mode "$AGENT_MODE" grant_service_mgmt "$GRANT_SERVICE_MGMT" grant_docker "$GRANT_DOCKER")" \
-    -H "Authorization: Bearer $USER_TOKEN" \
-    -H "Content-Type: application/json")
-  AGENT_ID=$(echo "$AGENT_RESP" | json_get '.agent_id')
+  # The freshly-deployed API (API Gateway + Lambda) can be briefly unavailable while it warms
+  # up or DNS propagates, so create with a few automatic retries and fail cleanly on repeated
+  # failure instead of aborting through jq/errexit.
+  AGENT_RESP=""
+  for attempt in 1 2 3; do
+    AGENT_RESP=$(request_json_soft POST "$API_URL/tenant/agents" \
+      "$(mkjson type "$AGENT_TYPE" mode "$AGENT_MODE" os "$AGENT_OS" grant_service_mgmt "$GRANT_SERVICE_MGMT" grant_docker "$GRANT_DOCKER")" \
+      -H "Authorization: Bearer $USER_TOKEN" \
+      -H "Content-Type: application/json") || AGENT_RESP=""
+    AGENT_ID=$(printf '%s' "$AGENT_RESP" | json_get '.agent_id // empty' 2>/dev/null || true)
+    [[ -n "$AGENT_ID" ]] && break
+    if [[ "$attempt" -lt 3 ]]; then
+      info "Agent creation attempt $attempt/3 failed (API warming up); retrying in 3s..."
+      sleep 3
+    fi
+  done
+  [[ -n "$AGENT_ID" ]] || fail "Agent creation failed against $API_URL. Response: ${AGENT_RESP:-<none>}"
   # host agents return commands.agent (install.sh); k8s agents return commands.helm.
-  INSTALL_AGENT=$(echo "$AGENT_RESP" | json_get '.commands.helm // .commands.agent // empty')
+  INSTALL_AGENT=$(printf '%s' "$AGENT_RESP" | json_get '.commands.helm // .commands.agent // empty' 2>/dev/null || true)
   ok "Agent:    $AGENT_ID"
 fi
 

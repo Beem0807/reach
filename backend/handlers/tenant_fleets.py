@@ -19,6 +19,7 @@ import shared.audit as audit
 from shared.access import can_access_fleet, can_write_fleet
 from shared.auth import FLEET_TOKEN_PREFIX, _hmac_token, _verify_tenant_token
 from shared.settings import effective_settings, validate_fleet_wave_policy, wave_policy_exceeds_cap
+from shared.waves import resolve_policy
 from shared.exceptions import NameTakenError
 from shared.response import _err, _iso, _iso_offset, _now, _ok
 from shared.store import agent_history_repo, agents_repo, approvals_repo, fleets_repo, tenants_repo
@@ -71,6 +72,7 @@ def _fleet_view(fleet: dict, member_count: Optional[int] = None) -> dict:
         "mode": fleet.get("mode"),
         "grant_service_mgmt": bool(fleet.get("grant_service_mgmt")),
         "grant_docker": bool(fleet.get("grant_docker")),
+        "sandbox_ack": bool(fleet.get("sandbox_ack")),
         "tags": list(fleet.get("tags") or []),
         "status": fleet.get("status"),
         "reap_after_seconds": fleet.get("reap_after_seconds"),
@@ -150,6 +152,10 @@ def handle_create_fleet(body: dict, raw_token: str, api_url: str) -> dict:
         return _err(cap_err)
     grant_service_mgmt = bool(body.get("grant_service_mgmt", False))
     grant_docker = bool(body.get("grant_docker", False))
+    # Fleet-level acknowledgement: members that lack a kernel sandbox (old Linux kernel, or
+    # macOS) run readonly/approved unsandboxed instead of failing closed. Set it here when you
+    # know the fleet's hosts can't provide Landlock - members can't be acknowledged one-by-one.
+    sandbox_ack = bool(body.get("sandbox_ack", False))
     tags = body.get("tags") or []
     tag_err = validate_tags(tags)
     if tag_err:
@@ -166,6 +172,7 @@ def handle_create_fleet(body: dict, raw_token: str, api_url: str) -> dict:
             "mode": mode,
             "grant_service_mgmt": grant_service_mgmt,
             "grant_docker": grant_docker,
+            "sandbox_ack": sandbox_ack,
             "tags": tags,
             "join_token_hash": _hmac_token(raw_join_token),
             "status": "ACTIVE",
@@ -241,6 +248,7 @@ def handle_list_fleets(raw_token: str, q: Optional[str] = None,
     # Grouped aggregation (one query, tiny result) so the console never loads every
     # member just to show active/inactive/mismatch counts on the fleet list.
     stats = _fleet_stats(fleets, agents_repo.fleet_member_groups(user["tenant_id"]))
+    _tenant = tenants_repo.get(user["tenant_id"])
     result: dict = {
         "fleets": [
             {**_fleet_view(f, member_count=counts.get(f["fleet_id"], 0)),
@@ -253,7 +261,13 @@ def handle_list_fleets(raw_token: str, q: Optional[str] = None,
         # The reap interval a fleet inherits when it doesn't set its own.
         "default_reap_after_seconds": DEFAULT_REAP_AFTER_SECONDS,
         # The fan-out blast-radius cap a fleet inherits (tenant setting) when max_fanout is unset.
-        "default_max_fanout": effective_settings(tenants_repo.get(user["tenant_id"]))["fanout_cap"],
+        "default_max_fanout": effective_settings(_tenant)["fanout_cap"],
+        # The staged-rollout strategy a fleet inherits per read/write when it doesn't override it
+        # (tenant fleet-default merged over the platform default), so the console can show it.
+        "default_wave_policy": {
+            "read":  resolve_policy(False, _tenant, "fleet"),
+            "write": resolve_policy(True, _tenant, "fleet"),
+        },
     }
     if limit is not None:
         result.update(total=total, limit=limit, offset=offset)
@@ -298,6 +312,10 @@ def handle_update_fleet(fleet_id: str, body: dict, raw_token: str) -> dict:
         fields["grant_service_mgmt"] = bool(body.get("grant_service_mgmt"))
     if "grant_docker" in body:
         fields["grant_docker"] = bool(body.get("grant_docker"))
+    # Sandbox acknowledgement is inherited by members on sync (not baked into install), so
+    # toggling it takes effect fleet-wide on the next poll - no re-provisioning needed.
+    if "sandbox_ack" in body:
+        fields["sandbox_ack"] = bool(body.get("sandbox_ack"))
     if "reap_after_seconds" in body:
         reap = _coerce_reap(body)
         if reap == "invalid":

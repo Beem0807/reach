@@ -119,7 +119,10 @@ def handle_create_tenant_agent(body: dict, raw_token: str, api_url: str) -> dict
     if not _require_role(user, "operator"):
         return _err("forbidden", 403)
 
-    mode = body.get("mode", "wild").strip()
+    # Default to the safest mode: a new agent can look but not touch until an operator
+    # deliberately opts into `approved` (writes need sign-off) or `wild` (unrestricted).
+    # Defaults become deployments, so we never default to executing writes.
+    mode = body.get("mode", "readonly").strip()
     if mode not in VALID_MODES:
         return _err("mode must be wild, readonly, or approved")
 
@@ -145,6 +148,13 @@ def handle_create_tenant_agent(body: dict, raw_token: str, api_url: str) -> dict
         grant_service_mgmt = bool(body.get("grant_service_mgmt", False))
         grant_docker = bool(body.get("grant_docker", False))
 
+    # Host OS hint (host-only): macOS has no kernel filesystem sandbox (Landlock is Linux-only),
+    # so a macOS agent fails closed in readonly/approved. When the creator says it's macOS we
+    # pre-acknowledge the exception so it runs unsandboxed from the start (audited; revocable).
+    sandbox_ack = False
+    if agent_type != "k8s" and (body.get("os") or "").strip().lower() in ("mac", "macos", "darwin"):
+        sandbox_ack = True
+
     agent_id = "agent_" + secrets.token_urlsafe(12)
     raw_install_token = INSTALL_TOKEN_PREFIX + secrets.token_urlsafe(32)
     expires_at = _now() + INSTALL_TOKEN_TTL
@@ -160,6 +170,7 @@ def handle_create_tenant_agent(body: dict, raw_token: str, api_url: str) -> dict
         "install_token_expires_at": expires_at,
         "grant_service_mgmt": grant_service_mgmt,
         "grant_docker": grant_docker,
+        "sandbox_ack": sandbox_ack,
         "created_at": _iso(),
     })
 
@@ -194,7 +205,8 @@ def handle_create_tenant_agent(body: dict, raw_token: str, api_url: str) -> dict
         resource_id=agent_id,
         metadata={"mode": mode, "type": agent_type, "version": version or "latest",
                   "grant_service_mgmt": grant_service_mgmt,
-                  "grant_docker": grant_docker, "granted_user_ids": granted_user_ids},
+                  "grant_docker": grant_docker, "granted_user_ids": granted_user_ids,
+                  "sandbox_ack": sandbox_ack},
     )
     logger.info("Created agent=%s type=%s tenant=%s by user=%s", agent_id, agent_type, user["tenant_id"], user.get("user_id"))
     return _ok({
@@ -222,8 +234,15 @@ def handle_reissue_tenant_install_token(agent_id: str, body: dict, raw_token: st
         return _err("fleet agents enroll via the fleet join token; reissue is not available", 409)
 
     force = bool(body.get("force", False))
-    grant_service_mgmt = bool(body.get("grant_service_mgmt", False))
-    grant_docker = bool(body.get("grant_docker", False))
+    # Docker / service-mgmt grants are host-only (k8s access is RBAC-driven), so force them
+    # off for k8s agents - mirroring create-agent, and matching the console's reissue modal
+    # which doesn't offer them for k8s.
+    if (agent.get("type") or "host") == "k8s":
+        grant_service_mgmt = False
+        grant_docker = False
+    else:
+        grant_service_mgmt = bool(body.get("grant_service_mgmt", False))
+        grant_docker = bool(body.get("grant_docker", False))
     version = (body.get("version") or "").strip() or None
     if version and version.lower() != "latest" and valid_version(version) is None:
         return _err("invalid version")
@@ -524,6 +543,38 @@ def handle_acknowledge_capability(agent_id: str, body: dict, raw_token: str) -> 
     return _ok({"agent_id": agent_id, "capability": capability, "acknowledged": True})
 
 
+def handle_acknowledge_sandbox(agent_id: str, body: dict, raw_token: str) -> dict:
+    """Acknowledge - or revoke - running readonly/approved WITHOUT the Landlock kernel sandbox on
+    a host agent whose kernel lacks it. Acknowledged (`{"acknowledged": true}`) tells the agent to
+    run unsandboxed (fail open, at the operator's explicit risk) instead of failing closed;
+    `false` reverts to fail-closed. Host-only (k8s has no Landlock). Delivered on the next sync."""
+    user = _verify_tenant_token(raw_token)
+    if not user:
+        return _err("unauthorized", 401)
+    if not _require_role(user, "operator"):
+        return _err("forbidden", 403)
+    agent = _get_agent(agent_id, user)
+    if not agent:
+        return _err("agent not found", 404)
+    if (agent.get("type") or "host") == "k8s":
+        return _err("the sandbox exception is host-only - k8s agents don't use Landlock", 400)
+    acknowledged = bool(body.get("acknowledged", True))
+    agents_repo.set_sandbox_ack(agent_id, acknowledged)
+    audit.write(
+        "agent.sandbox_acknowledged" if acknowledged else "agent.sandbox_ack_revoked",
+        tenant_id=user["tenant_id"],
+        actor_id=user.get("user_id", ""),
+        actor_name=user.get("username") or user.get("user_id", ""),
+        actor_role=user.get("role", ""),
+        resource_type="agent",
+        resource_id=agent_id,
+        metadata={"acknowledged": acknowledged, "hostname": agent.get("hostname"),
+                  "landlock_status": agent.get("landlock_status")},
+    )
+    logger.info("Sandbox ack=%s for agent=%s by user=%s", acknowledged, agent_id, user.get("user_id"))
+    return _ok({"agent_id": agent_id, "sandbox_ack": acknowledged})
+
+
 def handle_get_agent_history(agent_id: str, raw_token: str) -> dict:
     user = _verify_tenant_token(raw_token)
     if not user:
@@ -652,6 +703,19 @@ def acknowledge_capability_handler(event, context):
     except json.JSONDecodeError:
         return _err("invalid JSON body")
     return handle_acknowledge_capability(agent_id, body, token)
+
+
+def acknowledge_sandbox_handler(event, context):
+    import json
+    token = _token(event)
+    if not token:
+        return _err("missing Authorization header", 401)
+    agent_id = (event.get("pathParameters") or {}).get("agent_id", "")
+    try:
+        body = json.loads(event.get("body") or "{}")
+    except json.JSONDecodeError:
+        return _err("invalid JSON body")
+    return handle_acknowledge_sandbox(agent_id, body, token)
 
 
 def agent_history_handler(event, context):

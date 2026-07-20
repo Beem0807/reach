@@ -7,7 +7,7 @@ from typing import Optional
 import shared.audit as audit
 from shared.auth import _bearer, _verify_agent_token
 from shared.response import _err, _iso, _now, _ok
-from shared.store import agent_history_repo, agents_repo, approvals_repo, jobs_repo
+from shared.store import agent_history_repo, agents_repo, approvals_repo, fleets_repo, jobs_repo
 
 TOKEN_MAX_AGE_DAYS = 30
 
@@ -140,6 +140,13 @@ def handle_agent_sync(body: dict, raw_token: str) -> dict:
         if binaries and binaries != (agent.get("k8s_allowed_binaries") or []):
             agents_repo.set_k8s_allowed_binaries(agent_id, binaries)
 
+    # Host agents report their filesystem-sandbox capability (Landlock). Store it when it
+    # changes so the console can surface when readonly/approved writes aren't kernel-enforced.
+    landlock_status = body.get("landlock_status")
+    if isinstance(landlock_status, str) and landlock_status in ("active", "unavailable", "unsupported"):
+        if landlock_status != agent.get("landlock_status"):
+            agents_repo.set_landlock_status(agent_id, landlock_status)
+
     pending_jobs = jobs_repo.get_pending_for_agent(agent_id)
     approved_host_rules: list = []
     if any(j.get("mode") == "approved" for j in pending_jobs):
@@ -173,6 +180,18 @@ def handle_agent_sync(body: dict, raw_token: str) -> dict:
     resp: dict = {"jobs": jobs_payload, "next_poll_seconds": next_poll}
     if agent.get("rotation_requested"):
         resp["rotate_token"] = True
+    # Host mode: tell the agent whether an operator acknowledged running readonly/approved
+    # WITHOUT the Landlock sandbox, so it runs unsandboxed instead of failing closed. Fleet
+    # members inherit the FLEET's acknowledgement (members churn, so it can't be per-agent);
+    # standalone agents use their own.
+    fleet_id = agent.get("fleet_id")
+    if fleet_id:
+        fleet = fleets_repo.get(fleet_id)
+        sandbox_acked = bool(fleet and fleet.get("sandbox_ack"))
+    else:
+        sandbox_acked = bool(agent.get("sandbox_ack"))
+    if sandbox_acked:
+        resp["unsandboxed_acknowledged"] = True
     return _ok(resp)
 
 

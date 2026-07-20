@@ -176,6 +176,8 @@ export interface Agent {
   k8s_permissions_drift?: boolean;
   k8s_permissions_reported?: boolean;
   k8s_allowed_binaries?: string[] | null;
+  landlock_status?: 'active' | 'unavailable' | 'unsupported' | null;   // host filesystem sandbox
+  sandbox_ack?: boolean;   // admin acknowledged running readonly/approved without the sandbox
   mode: 'wild' | 'readonly' | 'approved';
   access_level: 'open' | 'elevated' | 'managed' | 'restricted';
   writable?: boolean;  // whether the requesting user may run write commands (read-only grant → false)
@@ -207,6 +209,7 @@ export interface Fleet {
   mode: 'wild' | 'readonly' | 'approved';
   grant_service_mgmt: boolean;
   grant_docker: boolean;
+  sandbox_ack?: boolean;   // members run readonly/approved unsandboxed when they lack Landlock
   tags?: string[];
   status: 'ACTIVE' | 'REVOKED';
   reap_after_seconds?: number | null;

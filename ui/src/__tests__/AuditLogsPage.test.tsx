@@ -454,3 +454,59 @@ describe('AuditLogsPage - tenant column', () => {
     expect(screen.queryByText('Tenant')).not.toBeInTheDocument();
   });
 });
+
+// ---------------------------------------------------------------------------
+// CSV export
+// ---------------------------------------------------------------------------
+
+describe('AuditLogsPage - CSV export', () => {
+  it('opens a modal with From/To date & time pickers', async () => {
+    const { container } = renderTenant();
+    await waitFor(() => expect(api.listTenantAuditLogs).toHaveBeenCalled());
+    fireEvent.click(screen.getByRole('button', { name: /export csv/i }));
+    expect(await screen.findByText('Export audit logs')).toBeInTheDocument();
+    expect(screen.getByText('From')).toBeInTheDocument();
+    expect(screen.getByText('To')).toBeInTheDocument();
+    // datetime-local pickers (not date-only) so a precise time window can be exported.
+    expect(container.querySelectorAll('input[type="datetime-local"]').length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('downloads the whole range as a CSV, paginating without a row cap', async () => {
+    // Two pages (a next_cursor forces a second request) then the tail.
+    vi.spyOn(api, 'listTenantAuditLogs')
+      .mockResolvedValueOnce({ logs: [LOG_LOGIN] })                       // mount
+      .mockResolvedValueOnce({ logs: [LOG_LOGIN], next_cursor: 'c1' })    // export page 1
+      .mockResolvedValueOnce({ logs: [LOG_TENANT] });                     // export page 2 (no cursor)
+    const blobs: Blob[] = [];
+    const origCreate = URL.createObjectURL;
+    const origRevoke = URL.revokeObjectURL;
+    URL.createObjectURL = vi.fn((b: Blob) => { blobs.push(b); return 'blob:x'; }) as never;
+    URL.revokeObjectURL = vi.fn() as never;
+
+    renderTenant();
+    await waitFor(() => expect(api.listTenantAuditLogs).toHaveBeenCalled());
+    fireEvent.click(screen.getByRole('button', { name: /export csv/i }));
+    fireEvent.click(await screen.findByRole('button', { name: /download csv/i }));
+
+    await waitFor(() => expect(blobs.length).toBe(1));
+    const text = await blobs[0].text();
+    expect(text).toContain('timestamp,action,actor_name');   // header row
+    expect(text).toContain('user.login');                    // page 1
+    expect(text).toContain('tenant.created');                // page 2 - followed the cursor
+    // Export paginates with the max page size, not the on-screen 20; the modal closes on success.
+    expect(api.listTenantAuditLogs).toHaveBeenCalledWith('http://api', 'tok', expect.objectContaining({ limit: '200' }));
+    await waitFor(() => expect(screen.queryByText('Export audit logs')).not.toBeInTheDocument());
+
+    URL.createObjectURL = origCreate;
+    URL.revokeObjectURL = origRevoke;
+  });
+
+  it('shows a message in the modal when the range has nothing to export', async () => {
+    vi.spyOn(api, 'listTenantAuditLogs').mockResolvedValue({ logs: [] });
+    renderTenant();
+    await waitFor(() => expect(api.listTenantAuditLogs).toHaveBeenCalled());
+    fireEvent.click(screen.getByRole('button', { name: /export csv/i }));
+    fireEvent.click(await screen.findByRole('button', { name: /download csv/i }));
+    expect(await screen.findByText(/nothing to export/i)).toBeInTheDocument();
+  });
+});

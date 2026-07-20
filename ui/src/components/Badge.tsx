@@ -14,11 +14,12 @@ const CONFIG: Record<string, BadgeConfig> = {
   wild:      { cls: 'bg-orange-50 text-orange-700 ring-orange-600/20',   dot: 'bg-orange-400' },
   readonly:  { cls: 'bg-sky-50 text-sky-700 ring-sky-600/20',            dot: 'bg-sky-400' },
   approved:  { cls: 'bg-emerald-50 text-emerald-700 ring-emerald-600/20',dot: 'bg-emerald-500' },
-  // Access level
-  open:       { cls: 'bg-gray-50 text-gray-600 ring-gray-500/20',        dot: 'bg-gray-400' },
+  // Access level - colored by privilege/risk: open (wild+root) is the most dangerous,
+  // restricted (readonly, non-root) is the safest/most locked-down.
+  open:       { cls: 'bg-red-50 text-red-600 ring-red-600/20',           dot: 'bg-red-500' },
   elevated:   { cls: 'bg-amber-50 text-amber-700 ring-amber-600/20',     dot: 'bg-amber-400' },
   managed:    { cls: 'bg-violet-50 text-violet-700 ring-violet-600/20',  dot: 'bg-violet-500' },
-  restricted: { cls: 'bg-red-50 text-red-600 ring-red-600/20',           dot: 'bg-red-500' },
+  restricted: { cls: 'bg-emerald-50 text-emerald-700 ring-emerald-600/20', dot: 'bg-emerald-500' },
   // Approval status
   pending:   { cls: 'bg-amber-50 text-amber-700 ring-amber-600/20',      dot: 'bg-amber-400' },
   denied:    { cls: 'bg-red-50 text-red-600 ring-red-600/20',            dot: 'bg-red-500' },

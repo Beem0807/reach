@@ -295,6 +295,52 @@ class TestAgentSync:
         ar = self._sync_allowlist(_VALID_BODY)
         ar.set_k8s_allowed_binaries.assert_not_called()
 
+    def test_landlock_status_stored_when_changed(self):
+        ar = self._sync_allowlist({**_VALID_BODY, "landlock_status": "unavailable"})
+        ar.set_landlock_status.assert_called_once_with(AGENT_ID, "unavailable")
+
+    def test_landlock_status_not_rewritten_when_unchanged(self):
+        agent = {**_AGENT_ACTIVE, "landlock_status": "active"}
+        ar = self._sync_allowlist({**_VALID_BODY, "landlock_status": "active"}, agent=agent)
+        ar.set_landlock_status.assert_not_called()
+
+    def test_landlock_status_invalid_value_ignored(self):
+        ar = self._sync_allowlist({**_VALID_BODY, "landlock_status": "bogus"})
+        ar.set_landlock_status.assert_not_called()
+
+    def test_sync_sends_unsandboxed_acknowledged_when_acked(self):
+        r = self._call(agent={**_AGENT_ACTIVE, "sandbox_ack": True})
+        assert json.loads(r["body"]).get("unsandboxed_acknowledged") is True
+
+    def test_sync_omits_unsandboxed_acknowledged_when_not_acked(self):
+        r = self._call(agent={**_AGENT_ACTIVE, "sandbox_ack": False})
+        assert "unsandboxed_acknowledged" not in json.loads(r["body"])
+
+    def test_fleet_member_inherits_fleet_sandbox_ack(self):
+        # A member's own sandbox_ack is ignored; the FLEET's acknowledgement governs (members churn).
+        member = {**_AGENT_ACTIVE, "fleet_id": "fleet_a", "sandbox_ack": False}
+        with patch("handlers.agent_sync._verify_agent_token", return_value=member), \
+             patch("handlers.agent_sync.agents_repo"), \
+             patch("handlers.agent_sync.approvals_repo"), \
+             patch("handlers.agent_sync.jobs_repo") as jr, \
+             patch("handlers.agent_sync.fleets_repo") as fr:
+            jr.get_pending_for_agent.return_value = []
+            fr.get.return_value = {"sandbox_ack": True}
+            r = handle_agent_sync(_VALID_BODY, "tok")
+        assert json.loads(r["body"]).get("unsandboxed_acknowledged") is True
+
+    def test_fleet_member_not_acked_when_fleet_not_acked(self):
+        member = {**_AGENT_ACTIVE, "fleet_id": "fleet_a", "sandbox_ack": True}  # own flag ignored
+        with patch("handlers.agent_sync._verify_agent_token", return_value=member), \
+             patch("handlers.agent_sync.agents_repo"), \
+             patch("handlers.agent_sync.approvals_repo"), \
+             patch("handlers.agent_sync.jobs_repo") as jr, \
+             patch("handlers.agent_sync.fleets_repo") as fr:
+            jr.get_pending_for_agent.return_value = []
+            fr.get.return_value = {"sandbox_ack": False}
+            r = handle_agent_sync(_VALID_BODY, "tok")
+        assert "unsandboxed_acknowledged" not in json.loads(r["body"])
+
 
 # ---------------------------------------------------------------------------
 # _audit_capability_changes

@@ -321,3 +321,37 @@ class TestAgentJobResult:
             jr.get.return_value = job
             handle_agent_job_result(JOB_ID, {**_VALID_BODY, "blocked": True, "status": "FAILED"}, "tok")
         apr.create.assert_not_called()
+
+    def test_sandbox_unavailable_block_does_not_raise_approval(self):
+        # Fail-closed (no kernel write protection) is not fixable by approving the command,
+        # so a "sandbox_unavailable" block must NOT create a pending request - otherwise a
+        # blocked read lands in Pending, implying approval would unblock it (it wouldn't).
+        job = {**_JOB_RUNNING, "tenant_id": "tenant_1", "command": "uname -a", "created_by": "user_1"}
+        with patch("handlers.agent_job_result._verify_agent_token", return_value=_AGENT), \
+             patch("handlers.agent_job_result.jobs_repo") as jr, \
+             patch("handlers.agent_job_result.approvals_repo") as apr, \
+             patch("handlers.agent_job_result.users_repo"):
+            jr.get.return_value = job
+            handle_agent_job_result(
+                JOB_ID,
+                {**_VALID_BODY, "blocked": True, "block_reason": "sandbox_unavailable", "status": "FAILED"},
+                "tok")
+        apr.create.assert_not_called()
+
+    def test_approval_required_block_still_raises(self):
+        # The default (empty or "approval_required") block reason is an approvable write - a
+        # pending request IS raised so an operator can permit it.
+        job = {**_JOB_RUNNING, "tenant_id": "tenant_1", "command": "rm -rf /tmp/x", "created_by": "user_1"}
+        with patch("handlers.agent_job_result._verify_agent_token", return_value=_AGENT), \
+             patch("handlers.agent_job_result.jobs_repo") as jr, \
+             patch("handlers.agent_job_result.approvals_repo") as apr, \
+             patch("handlers.agent_job_result.users_repo") as ur:
+            jr.get.return_value = job
+            apr.list_by_agent.return_value = []
+            apr.exists_pending.return_value = False
+            ur.get.return_value = None
+            handle_agent_job_result(
+                JOB_ID,
+                {**_VALID_BODY, "blocked": True, "block_reason": "approval_required", "status": "FAILED"},
+                "tok")
+        apr.create.assert_called_once()

@@ -45,7 +45,7 @@ Now ask your AI agent to run something - or check it yourself:
 reach exec -- hostname
 ```
 
-That's it: your AI agent has **controlled, audited** access to the machine - no SSH, no VPN, no open ports. Setup **asks you to pick the mode** (`wild`/`readonly`/`approved`, default `wild` for a frictionless local try); when you point Reach at anything real, choose - or later switch to - **`approved` mode** (**Agents → [agent] → Policy**) so writes stop for sign-off - that's the posture up top. On AWS instead? Swap step 1 for `lambda-setup.sh`. Docker, Kubernetes, and production hardening are in [SELF_HOSTING.md](SELF_HOSTING.md).
+That's it: your AI agent has **controlled, audited** access to the machine - no SSH, no VPN, no open ports. Setup **asks you to pick the mode** and **defaults to `readonly`** (safe: the agent can look but not touch) - a new agent never runs writes by default. For real operations, choose **`approved`** (**Agents → [agent] → Policy**) so reads run and writes stop for sign-off - that's the posture up top; `wild` (unrestricted) is opt-in for personal/dev boxes. On AWS instead? Swap step 1 for `lambda-setup.sh`. Docker, Kubernetes, and production hardening are in [SELF_HOSTING.md](SELF_HOSTING.md).
 
 ---
 
@@ -204,7 +204,7 @@ Use **`approved`** mode on production machines (set it when creating the agent, 
 
 ## Observability
 
-- **Audit log** (built-in) - every action recorded: logins, agent lifecycle (create/revoke/rotate/unreachable/recover/reap), fleet operations (create/rotate/revoke/detach), policy changes, approvals. Tenant-scoped or platform-wide, in the console or via the API (`GET /tenant/audit-logs`).
+- **Audit log** (built-in) - every action recorded: logins, agent lifecycle (create/revoke/rotate/unreachable/recover/reap), fleet operations (create/rotate/revoke/detach), policy changes, approvals. Tenant-scoped or platform-wide, filterable by action/actor/resource/IP and **date range**, in the console (with **CSV export** - pick a date range and download the entire range, no row limit) or via the API (`GET /tenant/audit-logs`).
 - **Prometheus metrics** (opt-in, Kubernetes agents) - `--set metrics.enabled=true` exposes `/metrics` (job/sync/blocked counters, leadership) with a `ServiceMonitor` and a `NetworkPolicy` locking the port to your Prometheus namespace. Off by default. See [agent/README.md → Metrics](agent/README.md#metrics-opt-in).
 
 ---

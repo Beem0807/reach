@@ -62,6 +62,8 @@ def _project(a: dict, user: dict) -> dict:
         "k8s_permissions": a.get("k8s_permissions"),  # RBAC snapshot for the detail view (k8s only)
         "k8s_permissions_acked": a.get("k8s_permissions_acked"),  # acknowledged baseline, for the drift diff
         "k8s_allowed_binaries": a.get("k8s_allowed_binaries"),  # self-reported exec allowlist; warns on approving a binary the agent won't run
+        "landlock_status": a.get("landlock_status"),  # host filesystem-sandbox capability (active/unavailable/unsupported)
+        "sandbox_ack": bool(a.get("sandbox_ack")),    # admin acknowledged running without the sandbox
         "tags": a.get("tags") or [],
         "grant_service_mgmt": a.get("grant_service_mgmt", False),
         "grant_docker": a.get("grant_docker", False),

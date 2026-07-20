@@ -1536,6 +1536,19 @@ Resources:
             Path: /tenant/agents/{agent_id}/acknowledge-capability
             Method: POST
 
+  TenantAcknowledgeSandboxFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-tenant-acknowledge-sandbox
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.tenant_agents.acknowledge_sandbox_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /tenant/agents/{agent_id}/acknowledge-sandbox
+            Method: POST
+
   TenantAgentHistoryFunction:
     Type: AWS::Serverless::Function
     Properties:

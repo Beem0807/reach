@@ -146,9 +146,9 @@ Common locations: Claude Code `.claude/settings.json` (project) or `~/.claude.js
 | `reach fleets run <batch-id>` | Per-member results of one fan-out run; drill into any with `reach job <id>` |
 | `reach fleets approvals list [<id\|name>] [--pending\|--denied\|--expired]` | A fleet's approval records (shared by every member) |
 | `reach fleets approvals request <id\|name> <cmd> [--duration <d>]` | Request/pre-approve a command for the whole fleet |
-| **Approvals** (standalone agents; host: command, k8s: structured rule) | |
+| **Approvals** (standalone agents) | |
 | `reach approvals list [--agent <id\|alias>] [--pending\|--denied\|--expired]` | Effective approved commands/rules, or your own records by status (fleets: `reach fleets approvals list`) |
-| `reach approvals request <cmd> [--agent <id>] [--duration <d>]` | Request/pre-approve for a **standalone agent** (fleets: `reach fleets approvals request`) |
+| `reach approvals request <cmd> [--agent <id>] [--duration <d>]` | Request/pre-approve for a **standalone agent** (fleets: `reach fleets approvals request`). Give a plain command for either agent type: for a **k8s** agent the CLI structures it into the rule the backend requires (`kubectl …` → a `verb/resource/namespace/name` rule, a non-kubectl tool like `helm` → a `{bin, args[]}` rule) |
 | `reach approvals approve <approval-id> [--duration <d>]` | Approve a pending request - agent **or** fleet, by id (operator+) |
 | `reach approvals deny <approval-id>` | Deny a pending request - agent **or** fleet, by id (operator+) |
 | **AI integration** | |

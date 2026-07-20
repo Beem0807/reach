@@ -41,6 +41,8 @@ def handle_get_agent(agent_id: str, raw_token: str) -> dict:
         "k8s_permissions_acked": agent.get("k8s_permissions_acked"),
         "k8s_permissions_drift": agent.get("k8s_permissions_drift", False),
         "k8s_allowed_binaries": agent.get("k8s_allowed_binaries"),
+        "landlock_status": agent.get("landlock_status"),
+        "sandbox_ack": bool(agent.get("sandbox_ack")),
     })
 
 

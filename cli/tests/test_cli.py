@@ -1395,11 +1395,49 @@ class TestAgentsShow:
 class TestApprovalsMutations:
     def test_request_for_agent(self):
         mock_client = MagicMock()
+        mock_client.get_agent.return_value = {"type": "host"}
         mock_client.create_approval.return_value = {"approval_id": "appr_1", "status": "pending"}
         with _mock_cfg(), patch("reach.main.ReachClient", return_value=mock_client):
             result = runner.invoke(app, ["approvals", "request", "docker ps", "--agent", "agent_a"])
         assert result.exit_code == 0
         mock_client.create_approval.assert_called_once_with("docker ps", agent_id="agent_a", duration=None)
+
+    def test_request_k8s_derives_kubectl_rule(self):
+        # A k8s agent can't take a bare command string; the CLI derives a k8s_rule.
+        mock_client = MagicMock()
+        mock_client.get_agent.return_value = {"type": "k8s"}
+        mock_client.create_approval.return_value = {"approval_id": "appr_1", "status": "approved"}
+        with _mock_cfg(), patch("reach.main.ReachClient", return_value=mock_client):
+            result = runner.invoke(app, ["approvals", "request",
+                                         "kubectl delete pod foo -n reach", "--agent", "agent_k"])
+        assert result.exit_code == 0
+        mock_client.create_approval.assert_called_once_with(
+            agent_id="agent_k", duration=None,
+            k8s_rule={"verb": "delete", "resource": "pods", "namespace": "reach", "name": "foo"},
+            host_rule=None)
+
+    def test_request_k8s_nonkubectl_derives_host_rule(self):
+        mock_client = MagicMock()
+        mock_client.get_agent.return_value = {"type": "k8s"}
+        mock_client.create_approval.return_value = {"approval_id": "appr_1", "status": "approved"}
+        with _mock_cfg(), patch("reach.main.ReachClient", return_value=mock_client):
+            result = runner.invoke(app, ["approvals", "request",
+                                         "helm upgrade reach ./chart", "--agent", "agent_k"])
+        assert result.exit_code == 0
+        mock_client.create_approval.assert_called_once_with(
+            agent_id="agent_k", duration=None,
+            k8s_rule=None,
+            host_rule={"bin": "helm", "args": ["upgrade", "reach", "./chart"]})
+
+    def test_request_k8s_read_command_errors_client_side(self):
+        # A read has no approvable write - fail in the CLI, never hit the backend.
+        mock_client = MagicMock()
+        mock_client.get_agent.return_value = {"type": "k8s"}
+        with _mock_cfg(), patch("reach.main.ReachClient", return_value=mock_client):
+            result = runner.invoke(app, ["approvals", "request",
+                                         "kubectl get pods", "--agent", "agent_k"])
+        assert result.exit_code != 0
+        mock_client.create_approval.assert_not_called()
 
     def test_request_has_no_fleet_flag(self):
         # Fleet approval requests are a separate command under `reach fleets approvals`.

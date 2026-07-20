@@ -16,6 +16,7 @@ import {
   setTenantAgentMode,
   setTenantAgentTags,
   acknowledgeCapability,
+  acknowledgeSandbox,
   listAgentHistory,
 } from '../api';
 import { Modal } from '../components/Modal';
@@ -183,6 +184,7 @@ type ModalState =
   | { type: 'confirm-remove'; agent: Agent }
   | { type: 'rotate'; agent: Agent }
   | { type: 'detach-fleet'; agent: Agent }
+  | { type: 'confirm-sandbox'; agent: Agent; acknowledged: boolean }
   | { type: 'run-agent'; agent: Agent }
   | null;
 
@@ -284,6 +286,7 @@ export function TenantAgentsPage({ config, focusAgentId, backFleetId, onBackToFl
       setError((e as Error).message);
     }
   };
+
 
   const fleetById = useMemo(() => new Map(fleets.map(f => [f.fleet_id, f])), [fleets]);
   const fleetLabel = (id?: string | null) => id ? (fleetById.get(id)?.name ?? id) : '';
@@ -583,6 +586,23 @@ export function TenantAgentsPage({ config, focusAgentId, backFleetId, onBackToFl
                       <span className="font-semibold text-gray-900 text-sm group-hover:text-indigo-600 transition-colors">
                         {a.hostname ?? <span className="text-gray-400 font-normal italic">unclaimed</span>}
                       </span>
+                      {a.type !== 'k8s' && (a.landlock_status === 'unavailable' || a.landlock_status === 'unsupported') && (
+                        (a.fleet_id ? fleetById.get(a.fleet_id)?.sandbox_ack : a.sandbox_ack) ? (
+                          <span
+                            title="No kernel write protection - readonly/approved run without it (allowed). Open the agent for details."
+                            className="inline-flex items-center text-[10px] font-semibold uppercase tracking-wide text-amber-700 bg-amber-50 border border-amber-200 px-1.5 py-0.5 rounded shrink-0"
+                          >
+                            unprotected
+                          </span>
+                        ) : (
+                          <span
+                            title="No kernel write protection, and not allowed to run without it - readonly/approved commands are held (blocked). This is the safe default. Open the agent (or its fleet) to allow running without protection."
+                            className="inline-flex items-center text-[10px] font-semibold uppercase tracking-wide text-slate-600 bg-slate-100 border border-slate-200 px-1.5 py-0.5 rounded shrink-0"
+                          >
+                            blocked
+                          </span>
+                        )
+                      )}
                     </div>
                   </td>
                   <td className="px-4 py-3">
@@ -698,6 +718,7 @@ export function TenantAgentsPage({ config, focusAgentId, backFleetId, onBackToFl
             onClose={() => setModal(null)}
             onAction={setModal}
             onAcknowledge={isOperator ? cap => handleAcknowledge(modal.agent, cap) : undefined}
+            onAcknowledgeSandbox={isOperator ? ack => setModal({ type: 'confirm-sandbox', agent: modal.agent, acknowledged: ack }) : undefined}
           />
         )}
 
@@ -821,6 +842,22 @@ export function TenantAgentsPage({ config, focusAgentId, backFleetId, onBackToFl
             }}
           />
         )}
+
+        {modal?.type === 'confirm-sandbox' && (
+          <ConfirmModal
+            title={modal.acknowledged ? 'Allow running without protection' : 'Require write protection'}
+            danger={modal.acknowledged}
+            message={modal.acknowledged
+              ? `Allow "${modal.agent.hostname ?? modal.agent.agent_id}" to run readonly/approved commands WITHOUT kernel write protection. Filesystem writes will no longer be blocked by the kernel - only the write classifier gates them. This is audited and can be reversed later.`
+              : `Stop allowing "${modal.agent.hostname ?? modal.agent.agent_id}" to run without write protection. If it has none, readonly/approved commands will be blocked again until you allow it.`}
+            confirmLabel={modal.acknowledged ? 'Allow without protection' : 'Require protection'}
+            onClose={() => setModal(null)}
+            onConfirm={async () => {
+              await acknowledgeSandbox(apiUrl, tenantToken, modal.agent.agent_id, modal.acknowledged);
+              closeAndReload();
+            }}
+          />
+        )}
       </div>
     </div>
   );
@@ -830,8 +867,70 @@ export function TenantAgentsPage({ config, focusAgentId, backFleetId, onBackToFl
 // Agent detail modal
 // ---------------------------------------------------------------------------
 
+// Host write-protection (the Landlock kernel sandbox) status. Without it, readonly/approved
+// commands are blocked until an operator allows running without protection - a deliberate,
+// audited, reversible choice.
+function SandboxStatusCard({ agent, isOperator, onAcknowledge }: {
+  agent: Agent; isOperator: boolean; onAcknowledge?: (acknowledged: boolean) => void;
+}) {
+  const st = agent.landlock_status;
+  const acked = !!agent.sandbox_ack;
+  // A fleet member inherits the FLEET's setting (its own flag is ignored on sync), so it's
+  // neither allowed nor blocked here - it's managed on the fleet.
+  const fleetMember = !!agent.fleet_id;
+  // Both "unavailable" (Linux without Landlock) and "unsupported" (macOS) mean no kernel write
+  // protection, so readonly/approved are blocked unless the operator allows running without it.
+  const noSandbox = st === 'unavailable' || st === 'unsupported';
+  const fixHint = st === 'unsupported'
+    ? 'macOS has no kernel write protection (the Landlock sandbox is Linux-only).'
+    : "This host's kernel is too old for write protection (needs Linux 5.13+ with Landlock).";
+  return (
+    <div className="bg-gray-50 rounded-lg px-3 py-2.5">
+      <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-1.5">Write protection</p>
+      {st == null && <p className="text-xs text-gray-400">Not yet reported - the agent checks for write protection on its first sync.</p>}
+      {st === 'active' && (
+        <p className="text-xs text-emerald-700 flex items-center gap-1.5">
+          <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 shrink-0" />
+          <span><strong>On</strong> - in <code className="font-mono">readonly</code>/<code className="font-mono">approved</code> mode, filesystem writes are blocked by the kernel.</span>
+        </p>
+      )}
+      {noSandbox && fleetMember && (
+        <p className="text-xs text-amber-800 flex items-start gap-1.5 bg-amber-50 border border-amber-200 rounded-md px-2 py-1.5">
+          <span className="w-1.5 h-1.5 rounded-full bg-amber-500 shrink-0 mt-1" />
+          <span>{fixHint} It has no write protection. This is a <strong>fleet member</strong>, so whether it may run without protection is set on its <strong>fleet</strong> (Fleets → its fleet → Write protection) and inherited by every member - it can't be set per-agent.</span>
+        </p>
+      )}
+      {noSandbox && !fleetMember && (
+        <div className="space-y-2">
+          {acked ? (
+            <p className="text-xs text-amber-800 flex items-start gap-1.5 bg-amber-50 border border-amber-200 rounded-md px-2 py-1.5">
+              <span className="w-1.5 h-1.5 rounded-full bg-amber-500 shrink-0 mt-1" />
+              <span><strong>Running without protection (allowed).</strong> {fixHint} So in <code className="font-mono">readonly</code>/<code className="font-mono">approved</code> mode, commands run with <strong>no</strong> kernel write protection - only the write classifier gates them. (<code className="font-mono">wild</code> mode never uses it, so this only affects <code className="font-mono">readonly</code>/<code className="font-mono">approved</code>.)</span>
+            </p>
+          ) : (
+            <p className="text-xs text-slate-700 flex items-start gap-1.5 bg-slate-100 border border-slate-200 rounded-md px-2 py-1.5">
+              <span className="w-1.5 h-1.5 rounded-full bg-slate-400 shrink-0 mt-1" />
+              <span><strong>Commands held - no write protection <span className="font-normal text-slate-500">(the safe default)</span>.</strong> {fixHint} Without it, a command the classifier calls a "read" could still write, so <strong>all</strong> <code className="font-mono">readonly</code>/<code className="font-mono">approved</code> commands are blocked rather than run unprotected. Allow running without protection to let them through (at your own risk){st === 'unavailable' ? ', or move to a Linux kernel 5.13+ with Landlock' : ''}.</span>
+            </p>
+          )}
+          {isOperator && onAcknowledge && (
+            <button
+              onClick={() => onAcknowledge(!acked)}
+              className={acked
+                ? 'text-xs font-medium text-gray-600 hover:text-white hover:bg-gray-600 border border-gray-300 px-2.5 py-1 rounded-md transition-colors'
+                : 'text-xs font-semibold text-white bg-amber-600 hover:bg-amber-700 px-2.5 py-1 rounded-md transition-colors'}
+            >
+              {acked ? 'Require protection' : 'Allow without protection'}
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function AgentDetailModal({
-  apiUrl, token, agent, isOperator, backToFleet, onClose, onAction, onAcknowledge,
+  apiUrl, token, agent, isOperator, backToFleet, onClose, onAction, onAcknowledge, onAcknowledgeSandbox,
 }: {
   apiUrl: string;
   token: string;
@@ -841,6 +940,7 @@ function AgentDetailModal({
   onClose: () => void;
   onAction: (s: ModalState) => void;
   onAcknowledge?: (capability: 'docker' | 'service_mgmt' | 'k8s_permissions') => void;
+  onAcknowledgeSandbox?: (acknowledged: boolean) => void;
 }) {
   const [tab, setTab] = useState<'info' | 'history'>('info');
   const [history, setHistory] = useState<AgentHistory[]>([]);
@@ -986,6 +1086,10 @@ function AgentDetailModal({
                   <p className="text-xs text-gray-400">Not yet reported - the agent sends its allowlist on first sync.</p>
                 )}
               </div>
+            )}
+
+            {agent.type !== 'k8s' && (
+              <SandboxStatusCard agent={agent} isOperator={isOperator} onAcknowledge={onAcknowledgeSandbox} />
             )}
 
             {(agent.tags ?? []).length > 0 && (
@@ -1253,7 +1357,11 @@ function CreateAgentModal({
   onCreated: (result: unknown) => void;
 }) {
   const [agentType, setAgentType] = useState<'host' | 'k8s'>('host');
-  const [mode, setMode] = useState<Mode>('wild');
+  // Safe default: a new agent is read-only until an operator opts into approved/wild.
+  const [mode, setMode] = useState<Mode>('readonly');
+  // Host OS: macOS has no kernel write protection (Landlock is Linux-only), so a macOS agent's
+  // readonly/approved commands would be blocked. Choosing macOS pre-allows running without it.
+  const [hostOs, setHostOs] = useState<'linux' | 'mac'>('linux');
   const [grantSvc, setGrantSvc] = useState(false);
   const [grantDocker, setGrantDocker] = useState(false);
   // Installable versions for the picked type; '' means the default "Latest".
@@ -1316,6 +1424,7 @@ function CreateAgentModal({
         grantWrite,
         version || undefined,
         grantRead,
+        isK8s ? undefined : hostOs,
       );
       const tags = serializePairs(tagPairs);
       if (tags.length > 0) {
@@ -1458,6 +1567,24 @@ function CreateAgentModal({
             </label>
           </div>
         </div>
+        )}
+
+        {/* Host OS - drives the filesystem-sandbox pre-acknowledgement (macOS has no Landlock). */}
+        {agentType === 'host' && (
+          <div>
+            <p className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-2.5">Host OS</p>
+            <div className="inline-flex rounded-lg border border-gray-300 p-0.5 text-sm font-medium">
+              <button type="button" onClick={() => setHostOs('linux')} className={`px-3 py-1 rounded-md transition-colors ${hostOs === 'linux' ? 'bg-indigo-600 text-white' : 'text-gray-600 hover:text-gray-900'}`}>Linux</button>
+              <button type="button" onClick={() => setHostOs('mac')} className={`px-3 py-1 rounded-md transition-colors ${hostOs === 'mac' ? 'bg-indigo-600 text-white' : 'text-gray-600 hover:text-gray-900'}`}>macOS</button>
+            </div>
+            {hostOs === 'mac' ? (
+              <p className="mt-2 text-[11px] text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-2.5 py-2">
+                macOS has no kernel write protection (Landlock is Linux-only), so <code className="font-mono">readonly</code>/<code className="font-mono">approved</code> commands run <strong>without it</strong> - writes are gated by the classifier, not the kernel. Creating it <strong>allows this now</strong> so it runs without interruption; change it later under the agent's <strong>Write protection</strong>.
+              </p>
+            ) : (
+              <p className="mt-1.5 text-[11px] text-gray-400">A Linux kernel &ge; 5.13 blocks writes in the kernel (Landlock). Pick macOS only for a Mac host - it will run without that protection.</p>
+            )}
+          </div>
         )}
 
         {/* Sudo notice (host install only) */}
@@ -1643,6 +1770,7 @@ function ReissueModal({
   onClose: () => void;
   onDone: (result: ReissueResult) => void;
 }) {
+  const isK8s = agent.type === 'k8s';
   const [force, setForce] = useState(false);
   const [grantSvc, setGrantSvc] = useState(agent.grant_service_mgmt ?? false);
   const [grantDocker, setGrantDocker] = useState(agent.grant_docker ?? false);
@@ -1652,7 +1780,13 @@ function ReissueModal({
   const submit = async () => {
     setLoading(true); setError('');
     try {
-      const result = await reissueTenantInstallToken(apiUrl, token, agent.agent_id, force || undefined, grantSvc, grantDocker);
+      // Docker / service-mgmt grants are host-only; the backend ignores them for k8s
+      // (access is controlled by RBAC in the Helm chart), so don't send them.
+      const result = await reissueTenantInstallToken(
+        apiUrl, token, agent.agent_id, force || undefined,
+        isK8s ? undefined : grantSvc,
+        isK8s ? undefined : grantDocker,
+      );
       onDone(result);
     } catch (e) {
       setError((e as Error).message);
@@ -1667,25 +1801,40 @@ function ReissueModal({
           A new install token will be generated for <strong>{agent.hostname ?? agent.agent_id}</strong>.
           The previous token will be invalidated.
         </p>
-        <div className="space-y-2">
-          <label className="flex items-center gap-2 text-sm text-gray-700 cursor-pointer">
-            <input type="checkbox" checked={grantSvc} onChange={e => setGrantSvc(e.target.checked)} className="w-4 h-4" />
-            <span>Grant systemctl / service management access</span>
-          </label>
-          <label className="flex items-center gap-2 text-sm text-gray-700 cursor-pointer">
-            <input type="checkbox" checked={grantDocker} onChange={e => setGrantDocker(e.target.checked)} className="w-4 h-4" />
-            <span>Grant Docker access</span>
-          </label>
-        </div>
-        <div className="flex items-start gap-2.5 bg-amber-50 border border-amber-200 rounded-xl px-3.5 py-3 text-xs text-amber-800">
-          <svg className="w-4 h-4 shrink-0 mt-0.5 text-amber-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-            <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126z" />
-          </svg>
-          <span>
-            The install command requires <strong>sudo</strong> - the agent installs to system directories.
-            {(grantDocker || grantSvc) && ' Docker and service management grants also configure group membership and sudoers rules.'}
-          </span>
-        </div>
+        {isK8s ? (
+          <div className="flex items-start gap-2.5 bg-sky-50 border border-sky-200 rounded-xl px-3.5 py-3 text-xs text-sky-800">
+            <svg className="w-4 h-4 shrink-0 mt-0.5 text-sky-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M9 12.75L11.25 15 15 9.75M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+            </svg>
+            <span>
+              Access is controlled by <strong>Kubernetes RBAC</strong> in the Helm chart
+              (<code>clusterAccess</code>) - Docker and service-management grants don't apply.
+              Re-run <code>helm upgrade</code> with the new token; no sudo needed.
+            </span>
+          </div>
+        ) : (
+          <>
+            <div className="space-y-2">
+              <label className="flex items-center gap-2 text-sm text-gray-700 cursor-pointer">
+                <input type="checkbox" checked={grantSvc} onChange={e => setGrantSvc(e.target.checked)} className="w-4 h-4" />
+                <span>Grant systemctl / service management access</span>
+              </label>
+              <label className="flex items-center gap-2 text-sm text-gray-700 cursor-pointer">
+                <input type="checkbox" checked={grantDocker} onChange={e => setGrantDocker(e.target.checked)} className="w-4 h-4" />
+                <span>Grant Docker access</span>
+              </label>
+            </div>
+            <div className="flex items-start gap-2.5 bg-amber-50 border border-amber-200 rounded-xl px-3.5 py-3 text-xs text-amber-800">
+              <svg className="w-4 h-4 shrink-0 mt-0.5 text-amber-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126z" />
+              </svg>
+              <span>
+                The install command requires <strong>sudo</strong> - the agent installs to system directories.
+                {(grantDocker || grantSvc) && ' Docker and service management grants also configure group membership and sudoers rules.'}
+              </span>
+            </div>
+          </>
+        )}
         {agent.status === 'ACTIVE' && (
           <label className="flex items-start gap-2 text-sm text-gray-700 cursor-pointer">
             <input type="checkbox" checked={force} onChange={e => setForce(e.target.checked)} className="mt-0.5" />

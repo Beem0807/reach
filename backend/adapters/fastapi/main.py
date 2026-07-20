@@ -30,6 +30,7 @@ from handlers.tenant_users import (
 from handlers.tenant_tokens import handle_create_api_token, handle_list_api_tokens, handle_revoke_api_token, handle_rename_api_token, handle_revoke_all_user_tokens
 from handlers.tenant_agents import (
     handle_acknowledge_capability,
+    handle_acknowledge_sandbox,
     handle_create_tenant_agent,
     handle_reissue_tenant_install_token,
     handle_revoke_tenant_agent,
@@ -1112,6 +1113,19 @@ async def tenant_acknowledge_capability(agent_id: str, request: Request):
     except Exception:
         return JSONResponse({"error": "invalid JSON body"}, status_code=400)
     return _resp(handle_acknowledge_capability(agent_id, body, token))
+
+
+@app.post("/tenant/agents/{agent_id}/acknowledge-sandbox")
+@limiter.limit("60/minute")
+async def tenant_acknowledge_sandbox(agent_id: str, request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    return _resp(handle_acknowledge_sandbox(agent_id, body, token))
 
 
 @app.put("/tenant/agents/{agent_id}/policy/mode")
