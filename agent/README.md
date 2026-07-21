@@ -11,7 +11,7 @@ It runs in one of two modes, auto-detected at startup:
 |---|---|---|
 | Install | `install.sh` → systemd / launchd | Helm → Deployment |
 | Identity | machine fingerprint | cluster fingerprint (one per cluster) |
-| Executes | shell commands via `bash`, Landlock-sandboxed | `kubectl` (+ filters), **no shell** |
+| Executes | reads via `bash`; approved writes as structured `argv` with `execve` (**no shell**); Landlock-sandboxed | `kubectl` (+ filters), **no shell** |
 | Access bound by | policy mode + grants + Landlock | policy mode + **RBAC** + allowlist |
 | Token stored | `/etc/reach-agent/config.json` | a Kubernetes Secret (nothing on disk) |
 
@@ -279,6 +279,8 @@ on that machine. On a host `reach_agent_is_leader` is always `1` (no election).
 The endpoint is read-only (counters, no secrets), but it **is** an inbound port -
 a deviation from the outbound-only model. Keep the default NetworkPolicy on. See
 [SECURITY.md](../SECURITY.md#optional-metrics-endpoint).
+
+> **Not the backend's `/metrics`.** These `reach_agent_*` metrics come from the **agent** process (opt-in via `REACH_METRICS_ADDR`). The **backend** serves a separate `/metrics` with `reach_backend_*` metrics - see [SELF_HOSTING.md → Backend metrics](../SELF_HOSTING.md#backend-metrics-metrics).
 
 ---
 

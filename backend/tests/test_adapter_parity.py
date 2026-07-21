@@ -19,9 +19,9 @@ decorators by regex, the SAM template by pairing each ``Path:`` with the
 
 Two differences are intentional and encoded explicitly below:
 
-  1. ``GET /`` and ``GET /health`` are FastAPI-only. On Lambda the root and
-     health/liveness concerns are handled by API Gateway / CloudFront, not by an
-     application route.
+  1. ``GET /``, ``GET /health`` and ``GET /metrics`` are FastAPI-only. On Lambda the
+     root and health/liveness concerns are handled by API Gateway / CloudFront, and
+     metrics go to CloudWatch rather than a Prometheus pull endpoint.
   2. Lambda routes approve+deny through one combined ``PUT
      /tenant/approvals/{approval_id}/{action}`` handler; FastAPI splits it into
      ``.../approve`` and ``.../deny``. Functionally identical -- clients hit the
@@ -78,9 +78,12 @@ def _lambda_routes() -> set:
 # --- intentional, documented differences -----------------------------------
 
 # FastAPI-only application routes (handled by infra, not app code, on Lambda).
+# /metrics is a Prometheus PULL endpoint, which doesn't fit Lambda's ephemeral model
+# (metrics there go to CloudWatch), so it's exposed only by the container backend.
 FASTAPI_ONLY = {
     ("GET", "/"),
     ("GET", "/health"),
+    ("GET", "/metrics"),
 }
 
 # Lambda's combined approval-review route and the concrete FastAPI equivalents.

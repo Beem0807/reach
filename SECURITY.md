@@ -104,6 +104,8 @@ What it does and does not expose:
 
 If your posture is "no inbound ports, ever," leave it unset (the default on both host and k8s) and instead rely on the metrics the agent already reports to the backend through its outbound sync. See [agent/README.md → Metrics](agent/README.md#metrics-opt-in).
 
+**The backend has its own, separate `/metrics`.** The container backend (FastAPI) exposes `reach_backend_*` metrics at `GET /metrics` - HTTP request/latency counters and process stats, **always on** (the backend is a server, so this is not an inbound-port deviation the way the agent's is). Like the agent's, it is **read-only and carries no secrets** - no tokens, request bodies, or command output - so it is **unauthenticated by default**; restrict it to your monitoring network or set **`METRICS_TOKEN`** to require `Authorization: Bearer <token>`. The **opt-in domain gauges** (`METRICS_DOMAIN_GAUGES=true`) additionally reveal deployment scale (agent / fleet / tenant counts), so enable them only once the endpoint is locked down. Not exposed on Lambda (metrics there go to CloudWatch). See [SELF_HOSTING.md → Backend metrics](SELF_HOSTING.md#backend-metrics-metrics).
+
 ---
 
 ## Secret redaction in command output
@@ -217,6 +219,7 @@ An attacker with **agent config file access on the remote machine**:
 **Network**
 - Deploy the backend behind HTTPS with a valid TLS certificate. The agent verifies TLS by default.
 - Do not expose the backend admin endpoints publicly if avoidable - restrict `/admin/*` routes by IP or put them behind a private load balancer.
+- Restrict `GET /metrics` to your monitoring network (or set `METRICS_TOKEN`). It exposes no secrets, but it is unauthenticated by default and - especially with `METRICS_DOMAIN_GAUGES` on - reveals operational/deployment-scale data you may not want public.
 - The backend ships with permissive CORS (`allow_origins=["*"]`). This is low-risk because every authenticated endpoint uses a `Authorization: Bearer` token rather than cookies, so a third-party site cannot ride a logged-in user's session. If you want defense-in-depth, restrict allowed origins to your console's domain at the reverse proxy.
 - Rate limiting keys off the client IP for unauthenticated endpoints. If you front the backend with a proxy or load balancer, ensure it sets `X-Forwarded-For` correctly so per-IP limits apply to the real client.
 

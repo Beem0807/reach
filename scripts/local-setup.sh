@@ -367,6 +367,13 @@ write_compose_file() {
   local chart_repo_env=""
   [[ -n "${RELEASES_CHART_REPO:-}" ]] && chart_repo_env="
       RELEASES_CHART_REPO: \"${RELEASES_CHART_REPO}\""
+  # Optional Prometheus metrics config (see SELF_HOSTING.md). Emitted only when set, so the
+  # default local stack keeps /metrics open (localhost-only) with domain gauges off.
+  local metrics_env=""
+  [[ -n "${METRICS_TOKEN:-}" ]] && metrics_env="${metrics_env}
+      METRICS_TOKEN: \"${METRICS_TOKEN}\""
+  [[ -n "${METRICS_DOMAIN_GAUGES:-}" ]] && metrics_env="${metrics_env}
+      METRICS_DOMAIN_GAUGES: \"${METRICS_DOMAIN_GAUGES}\""
   cat > "$COMPOSE_FILE" <<EOF
 services:
   db:
@@ -391,7 +398,7 @@ services:
       ADMIN_PASSWORD: "$ADMIN_PASSWORD"
       DATABASE_URL: postgresql://reach:reach@db:5432/reach
       STORAGE_BACKEND: postgres
-      AUDIT_RETENTION_DAYS: "$AUDIT_RETENTION_DAYS"${chart_repo_env}
+      AUDIT_RETENTION_DAYS: "$AUDIT_RETENTION_DAYS"${chart_repo_env}${metrics_env}
     depends_on:
       db:
         condition: service_healthy
@@ -421,6 +428,8 @@ SESSION_SIGNING_KEY=${SESSION_SIGNING_KEY}
 ADMIN_PASSWORD=${ADMIN_PASSWORD}
 AUDIT_RETENTION_DAYS=${AUDIT_RETENTION_DAYS}
 RELEASES_CHART_REPO=${RELEASES_CHART_REPO:-}
+METRICS_TOKEN=${METRICS_TOKEN:-}
+METRICS_DOMAIN_GAUGES=${METRICS_DOMAIN_GAUGES:-}
 TENANT_ID=${TENANT_ID:-}
 TENANT_NAME=${SETUP_TENANT:-${TENANT_NAME:-}}
 USERNAME=${SETUP_USERNAME:-${USERNAME:-}}

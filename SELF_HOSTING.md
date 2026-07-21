@@ -175,10 +175,42 @@ per-fleet `max_fanout` may lower it further.
 | `RELEASES_S3_BASE` | `https://reach-releases.s3.amazonaws.com` | Base URL for agent binary and install-script downloads (host agents) and the default Helm chart repo (k8s agents). Point this at your own mirror if you host the artifacts yourself. |
 | `RELEASES_CHART_REPO` | `<RELEASES_S3_BASE>/charts/reach-agent` | Helm chart repo URL used in the generated k8s `helm install` command (`helm repo add reach <this>`). Override if you host the chart repo elsewhere (e.g. gh-pages or an OCI registry base). |
 | `RATE_LIMIT_STORAGE_URI` | `memory://` | Where API rate-limit counters live. In-memory is per-process - correct for a single instance. Set to a shared store (e.g. `redis://host:6379`) when running more than one backend replica. See [Running multiple replicas](#running-multiple-replicas). |
+| `METRICS_TOKEN` | _(unset)_ | Optional bearer token guarding `GET /metrics` (Prometheus). **Unset = open** (the endpoint exposes only read-only operational counters, no secrets); set it to require `Authorization: Bearer <token>` and otherwise restrict `/metrics` to your monitoring network. Metrics are **per-process** - with multiple replicas, scrape each one (labels distinguish them). |
+| `METRICS_DOMAIN_GAUGES` | _(unset)_ | Set `true` to also export **deployment-scale gauges** (`reach_backend_agents{status}`, `reach_backend_fleets`, `reach_backend_tenants`, `reach_backend_pending_approvals`). **Off by default** - these reveal how big the deployment is, so enable them only once `/metrics` is locked down (`METRICS_TOKEN` or network-restricted). Aggregate across all tenants, no per-tenant labels. With multiple replicas these are global (same on every replica) - see [Metrics across replicas](#metrics-across-replicas). |
+| `METRICS_GAUGE_REFRESH_SECONDS` | `60` | How often the opt-in domain gauges are recomputed (min `10`). They refresh on this schedule, never per scrape, so scrape frequency doesn't add DB load. |
 
 The agent / chart **version is chosen per agent at create time** in the console - a dropdown lists the published versions (discovered live from `RELEASES_S3_BASE`/the chart repo) and defaults to the latest. There is no global version pin to configure; if discovery is unreachable the dropdown simply offers **Latest**. The setup scripts prompt only for `RELEASES_CHART_REPO` (when self-hosting the chart repo); empty derives it from `RELEASES_S3_BASE`.
 
 On first startup, Alembic runs `alembic upgrade head` automatically and creates all tables. Subsequent restarts apply any pending migrations from new versions. The image supports `linux/amd64` and `linux/arm64` - works on AWS Graviton, Raspberry Pi, and Apple Silicon without extra flags.
+
+### Backend metrics (`/metrics`)
+
+The container backend exposes Prometheus metrics at **`GET /metrics`** (text exposition format). Point your scraper at it. It's **open by default** but carries only read-only operational counters - no tokens, request bodies, or command output - so restrict it to your monitoring network or set `METRICS_TOKEN` to require `Authorization: Bearer <token>`. Rate-limited at `120/min` per IP (≈30× a normal scrape rate, so scraping is never throttled). **Container/FastAPI only** - not exposed on Lambda (metrics there go to CloudWatch).
+
+**Always exported:**
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `reach_backend_http_requests_total` | counter | `method`, `path`, `status` | HTTP requests handled |
+| `reach_backend_http_request_duration_seconds` | histogram | `method`, `path` | Request latency (buckets + `_sum` + `_count`) |
+| `reach_backend_http_requests_in_progress` | gauge | `method` | In-flight requests |
+| `reach_backend_info` | gauge (`1`) | `version` | Running backend version |
+| `reach_backend_start_timestamp_seconds` | gauge | - | Process start time (unix). `time() - this` = uptime; a drop = a restart |
+| `process_*`, `python_info`, `python_gc_*` | various | - | Standard client collectors (CPU, memory, FDs, GC) |
+
+Label values are **bounded** (cardinality-safe): `path` is the **route template** (`/jobs/{job_id}`), a mount prefix (`/ui`), or `<unmatched>` for genuine 404s - never a raw URL; `method` is a standard HTTP verb or `OTHER`; `status` is the HTTP code.
+
+**Opt-in domain gauges** (`METRICS_DOMAIN_GAUGES=true` - reveal deployment scale, so lock the endpoint down first). Aggregate across all tenants (no per-tenant labels); refreshed on a schedule (`METRICS_GAUGE_REFRESH_SECONDS`, default 60), **not per scrape:**
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `reach_backend_agents` | gauge | `status` | Agents by status (`ACTIVE`/`INACTIVE`/`CREATED`/`REVOKED`/`DELETED`), all tenants |
+| `reach_backend_fleets` | gauge | - | Fleets, all tenants |
+| `reach_backend_tenants` | gauge | - | Tenants (workspaces) |
+| `reach_backend_pending_approvals` | gauge | - | Pending approval requests, all tenants |
+| `reach_backend_gauge_refresh_errors_total` | counter | - | Failed gauge-refresh cycles (a bad refresh never crashes the scheduler) |
+
+Counters reset on restart - that's normal; the history lives in your Prometheus server and `rate()`/`increase()` handle resets. Domain gauges self-heal (they re-derive from the DB on the first refresh after a restart). With multiple replicas, mind how you aggregate - see [Metrics across replicas](#metrics-across-replicas). The agent has its **own** separate `/metrics` (Prometheus counters for jobs/syncs/leadership); see [SECURITY.md → Optional metrics endpoint](SECURITY.md#optional-metrics-endpoint).
 
 ### Running multiple replicas
 
@@ -198,6 +230,13 @@ Notes:
 - The bundled image already includes the Redis client; you only need a reachable Redis (managed ElastiCache/MemoryDB, or your own).
 - `limits` (the rate-limit backend) also supports `redis+sentinel://`, `memcached://`, and `mongodb://` URIs.
 - **Alternative:** rate limit at a single ingress instead of in the app - nginx `limit_req`, an ALB/API Gateway, or Cloudflare. That moves the shared-state problem to one chokepoint and removes the Redis dependency, at the cost of not keying off the API token the way the app does.
+
+#### Metrics across replicas
+
+`/metrics` is **per-process, in-memory** - each replica holds its own counters, and a restart resets them to zero (the history lives in your Prometheus server, and `rate()`/`increase()` handle counter resets, so nothing is actually lost). Scrape **every** replica (Prometheus distinguishes them by the `instance` label), and mind how you aggregate:
+
+- **HTTP and `process_*`/`python_*` metrics are per-replica** - each replica serves different traffic - so **`sum`** across replicas as usual (e.g. `sum(rate(reach_backend_http_requests_total[5m]))`).
+- **Domain gauges are global** (`reach_backend_agents`, `_fleets`, `_tenants`, `_pending_approvals`): every replica computes them from the **same database**, so all replicas report the **same** number. **Do not `sum`** them - you'd multiply by the replica count. Use **`max by (job)`** (or `avg`) instead. There's no cross-replica dedup (the backend has no leader election), so each replica independently runs the refresh - if that DB cost matters at high replica counts, raise `METRICS_GAUGE_REFRESH_SECONDS` or enable the gauges on only one instance.
 - This applies only to the Docker/FastAPI deployment. On Lambda, throttling is handled by API Gateway, not by the app.
 
 **2. Put a reverse proxy in front (nginx, Caddy, ALB, etc.) for TLS.**
@@ -410,7 +449,7 @@ For automation see `GET`/`PUT /tenant/users/{user_id}/agents` in [API.md](API.md
 
 Agents come in two **types**, chosen when you create the agent (**Agents → New agent → Host / Kubernetes**):
 
-- **Host** - a machine or VM. Installed with the `curl … install.sh …` command (see [README → Add a machine](README.md#add-a-machine)).
+- **Host** - a machine or VM. Installed with the `curl … install.sh …` command the console generates.
 - **Kubernetes** - a cluster. Installed with the `helm install …` command the console generates.
 
 A Kubernetes agent is **one logical agent per cluster**: it derives a stable identity from the `kube-system` namespace UID, so any number of replicas appear as a single agent, with a `Lease` electing one active leader. Install it from the published Helm repo (the console generates this, pre-filled; it adds `--version` only when you pick a specific version at create time, otherwise it installs the latest chart):
@@ -520,7 +559,7 @@ A **fleet** is a reusable join token for a group of interchangeable host agents 
 
 **Decommission.** **Revoke** a fleet to stop new enrollment - choose to **keep** members (detached into standalone agents) or **remove** them. A revoked fleet can then be **deleted**. To pull a single host out, **detach** it (Fleets → [fleet] → member → Remove from fleet); it becomes a standalone agent you manage individually.
 
-**From the CLI.** Fleets are *created* in the console, but you can drive them from the CLI: `reach fleets list` / `show <fleet>`, `reach fleets agents <fleet>` (members), `reach fleets exec <fleet> -- <cmd>` (fan out to every member, confirms first), `reach fleets jobs`/`runs`/`run` (fleet-wide job & run history), and `reach fleets approvals list`/`request`. Set a default fleet with `reach fleets use <fleet>`. See [cli/README.md](cli/README.md).
+**From the CLI.** Fleets are *managed* in the console - including launching a fan-out over all members (with a dry-run preview + confirm) - but you can also drive them from the CLI: `reach fleets list` / `show <fleet>`, `reach fleets agents <fleet>` (members), `reach fleets exec <fleet> -- <cmd>` (fan out to every member, confirms first), `reach fleets jobs`/`runs`/`run` (fleet-wide job & run history), and `reach fleets approvals list`/`request`. Set a default fleet with `reach fleets use <fleet>`. See [cli/README.md](cli/README.md).
 
 ---
 
@@ -821,7 +860,7 @@ Command output is bounded at two independent points, so a job result is always s
 1. **Agent** - each of `stdout`/`stderr` is capped to `REACH_MAX_OUTPUT_BYTES` (default 50 KB) **as it streams**. Capture stops retaining once the cap is hit but the command runs to completion (or the timeout), so agent memory stays bounded regardless of how much the command emits.
 2. **Backend (on ingest)** - re-caps each stream to **50 KB** as defence-in-depth and to stay well under the DynamoDB 400 KB item ceiling, then applies [secret redaction](SECURITY.md).
 
-When either side drops bytes, the result carries **two signals**: the inline `\n[TRUNCATED]` marker at the end of the output, and structured booleans **`stdout_truncated` / `stderr_truncated`** on the job (see [API.md](API.md#jobs)). The CLI (`reach exec`, `reach job <id>`), the tenant console Jobs view, and the MCP `exec_command`/`get_job` tools all surface the flag, so an operator or AI agent knows the output is partial rather than silently reasoning on a cut-off result. There is **no streaming** channel - results are delivered whole (and bounded) when the job reaches a terminal state.
+When either side drops bytes, the result carries **two signals**: the inline `\n[TRUNCATED]` marker at the end of the output, and structured booleans **`stdout_truncated` / `stderr_truncated`** on the job (see [API.md](API.md#user-cli-endpoints)). The CLI (`reach exec`, `reach job <id>`), the tenant console Jobs view, and the MCP `exec_command`/`get_job` tools all surface the flag, so an operator or AI agent knows the output is partial rather than silently reasoning on a cut-off result. There is **no streaming** channel - results are delivered whole (and bounded) when the job reaches a terminal state.
 
 ---
 

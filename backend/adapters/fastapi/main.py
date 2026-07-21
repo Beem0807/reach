@@ -2,13 +2,23 @@ import json
 import logging
 import os
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Optional
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+
+from adapters.fastapi.metrics import (
+    PrometheusMiddleware,
+    enable_domain_gauges,
+    metrics_authorized,
+    refresh_domain_gauges,
+    render_metrics,
+    set_build_info,
+)
 from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
@@ -136,9 +146,30 @@ async def _rate_limit_handler(request: Request, exc: RateLimitExceeded) -> JSONR
 scheduler = AsyncIOScheduler()
 
 
+def _domain_gauges_enabled() -> bool:
+    return os.getenv("METRICS_DOMAIN_GAUGES", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _gauge_refresh_seconds() -> int:
+    try:
+        return max(10, int(os.getenv("METRICS_GAUGE_REFRESH_SECONDS", "60")))
+    except ValueError:
+        return 60
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     scheduler.add_job(handle_heartbeat_check, "interval", minutes=1, id="heartbeat")
+    # Opt-in domain gauges (deployment-scale counts). Off by default; refreshed on a schedule
+    # - never per scrape - and populated once immediately so they aren't empty until the first tick.
+    if _domain_gauges_enabled():
+        enable_domain_gauges()
+        secs = _gauge_refresh_seconds()
+        scheduler.add_job(
+            refresh_domain_gauges, "interval", seconds=secs,
+            id="metrics_gauges", next_run_time=datetime.now(),
+        )
+        logger.info("Domain metrics gauges enabled (refresh every %ss)", secs)
     scheduler.start()
     logger.info("Heartbeat scheduler started (every 1 minute)")
     yield
@@ -153,7 +184,11 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
 )
+# Added last, so it's the OUTERMOST middleware and times the whole request. Uses the shared
+# ASGI scope, so the route template resolved downstream is available when it records.
+app.add_middleware(PrometheusMiddleware)
 app.state.limiter = limiter
+set_build_info(app.version)
 app.add_exception_handler(RateLimitExceeded, _rate_limit_handler)
 
 # Docker image copies built UI assets to ui_dist; local dev uses ui/dist directly
@@ -1317,3 +1352,19 @@ async def root(request: Request):
 @limiter.limit("120/minute")
 async def health(request: Request):
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Prometheus metrics
+# ---------------------------------------------------------------------------
+
+@app.get("/metrics")
+@limiter.limit("120/minute")
+async def metrics(request: Request):
+    # Open by default (read-only operational counters, no secrets); set METRICS_TOKEN to
+    # require `Authorization: Bearer <token>`. Generous limit (~30x a normal scrape rate) so
+    # real scraping is never throttled, but the open-by-default endpoint can't be hammered.
+    if not metrics_authorized(request.headers.get("authorization", "")):
+        return Response(status_code=401)
+    body, content_type = render_metrics()
+    return Response(content=body, media_type=content_type)

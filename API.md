@@ -283,10 +283,11 @@ Every endpoint is rate limited in the **Docker / FastAPI** deployment (via `slow
 
 **Meta endpoints:**
 
-| Endpoint      | Rate limit     | Notes                    |
-| ------------- | -------------- | ------------------------ |
-| `GET /health` | 120/min per IP | Liveness/readiness probe |
-| `GET /`       | 120/min per IP | 301 redirect to `/ui/`   |
+| Endpoint       | Rate limit     | Notes                    |
+| -------------- | -------------- | ------------------------ |
+| `GET /health`  | 120/min per IP | Liveness/readiness probe |
+| `GET /`        | 120/min per IP | 301 redirect to `/ui/`   |
+| `GET /metrics` | 120/min per IP | Prometheus exposition (container backend only). HTTP RED metrics per **route template** (`reach_backend_http_requests_total{method,path,status}`, `..._request_duration_seconds`, `..._requests_in_progress`) plus `reach_backend_info` and the client's `process_*`/`python_*` collectors. **Read-only counters, no secrets** - restrict it to your monitoring network, or set `METRICS_TOKEN` to require `Authorization: Bearer <token>` (401 otherwise). The `120/min` limit is ~30x a normal scrape rate, so real scraping is never throttled. **Opt-in domain gauges** (`METRICS_DOMAIN_GAUGES=true`, default off): deployment-scale counts `reach_backend_agents{status}`, `reach_backend_fleets`, `reach_backend_tenants`, `reach_backend_pending_approvals` - aggregate (no per-tenant labels), refreshed by a background job (not per scrape). Not exposed on Lambda (metrics go to CloudWatch). |
 
 Exceeding a limit returns `429 {"error": "rate limit exceeded"}`. The agent's sync loop treats 429 as a transient error and retries on the next poll interval. Clients should back off and retry; the limits are sized so normal CLI, console, and agent usage never hits them.
 
