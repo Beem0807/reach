@@ -213,6 +213,81 @@ class TestExpiresLabelInvalidDate:
 
 
 # ---------------------------------------------------------------------------
+# _wild_window_label - temporary-wild countdown suffix
+# ---------------------------------------------------------------------------
+
+class TestWildWindowLabel:
+    def _at(self, offset_s):
+        from datetime import datetime, timedelta, timezone
+        return (datetime.now(tz=timezone.utc) + timedelta(seconds=offset_s)).isoformat()
+
+    def test_non_wild_is_empty(self):
+        from reach.main import _wild_window_label
+        assert _wild_window_label({"mode": "approved", "mode_expires_at": self._at(3600)}) == ""
+
+    def test_permanent_wild_is_empty(self):
+        from reach.main import _wild_window_label
+        assert _wild_window_label({"mode": "wild"}) == ""
+
+    def test_open_window_shows_remaining_and_revert(self):
+        from reach.main import _wild_window_label
+        out = _wild_window_label({"mode": "wild", "mode_expires_at": self._at(3 * 3600 + 120),
+                                  "mode_revert_to": "approved"})
+        assert "⏱" in out and "3h" in out and "approved" in out
+
+    def test_elapsed_window_shows_reverting(self):
+        from reach.main import _wild_window_label
+        out = _wild_window_label({"mode": "wild", "mode_expires_at": self._at(-10),
+                                  "mode_revert_to": "readonly"})
+        assert "reverting" in out and "readonly" in out
+
+    def test_defaults_revert_to_readonly(self):
+        from reach.main import _wild_window_label
+        out = _wild_window_label({"mode": "wild", "mode_expires_at": self._at(7200)})
+        assert "readonly" in out
+
+    def test_invalid_date_is_empty(self):
+        from reach.main import _wild_window_label
+        assert _wild_window_label({"mode": "wild", "mode_expires_at": "bogus"}) == ""
+
+
+class TestFmtTs:
+    def test_empty_is_dash(self):
+        from reach.main import _fmt_ts
+        assert _fmt_ts(None) == "-"
+        assert _fmt_ts("") == "-"
+
+    def test_unparseable_returns_raw(self):
+        from reach.main import _fmt_ts
+        assert _fmt_ts("not-a-date") == "not-a-date"
+
+    def test_utc_converted_to_local_with_tz_label(self):
+        from datetime import datetime, timezone
+        from reach.main import _fmt_ts
+        # A known UTC instant renders as the machine's local wall-clock for that instant + a label.
+        iso = "2026-07-26T04:06:00+00:00"
+        expected_local = datetime.fromisoformat(iso).astimezone()
+        out = _fmt_ts(iso)
+        assert out.startswith(expected_local.strftime("%Y-%m-%d %H:%M:%S"))
+        assert len(out) > len(expected_local.strftime("%Y-%m-%d %H:%M:%S"))  # has a tz label appended
+
+    def test_with_tz_false_omits_label(self):
+        from datetime import datetime, timezone
+        from reach.main import _fmt_ts
+        iso = "2026-07-26T04:06:00+00:00"
+        expected = datetime.fromisoformat(iso).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+        assert _fmt_ts(iso, with_tz=False) == expected
+
+    def test_naive_iso_treated_as_utc(self):
+        from datetime import datetime, timezone
+        from reach.main import _fmt_ts
+        # A stored value without an offset must be read as UTC (not local), then converted.
+        naive = "2026-07-26T04:06:00"
+        aware = "2026-07-26T04:06:00+00:00"
+        assert _fmt_ts(naive, with_tz=False) == _fmt_ts(aware, with_tz=False)
+
+
+# ---------------------------------------------------------------------------
 # reach agent-init - interactive choice (lines 558-564)
 # ---------------------------------------------------------------------------
 

@@ -645,7 +645,7 @@ class TestMeHandler:
 class TestHeartbeatHandler:
     def test_delegates_and_returns_result(self):
         from handlers.heartbeat import heartbeat_handler
-        result = {"marked_inactive": 2, "reaped_members": 0, "expired_jobs": 1, "expired_approvals": 0, "deleted_approvals": 0, "deleted_jobs": 0, "deleted_runs": 0, "deleted_audit_logs": 0, "deleted_agent_history": 0}
+        result = {"marked_inactive": 2, "reaped_members": 0, "expired_jobs": 1, "expired_approvals": 0, "reverted_modes": 0, "reverted_fleet_modes": 0, "deleted_approvals": 0, "deleted_jobs": 0, "deleted_runs": 0, "deleted_audit_logs": 0, "deleted_agent_history": 0}
         with patch("handlers.heartbeat.handle_heartbeat_check", return_value=result):
             r = heartbeat_handler({}, None)
         assert r == result

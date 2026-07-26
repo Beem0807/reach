@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import type { TenantConfig, Job, Agent, Fleet, FleetRun, RunStatus } from '../types';
+import { formatTs, useTimezone } from '../timezone';
 import { listTenantJobs, listTenantAgents, listFleets, listFleetRuns, listTagRuns, getRun, pauseRun, resumeRun, cancelRun } from '../api';
 import { Badge } from '../components/Badge';
 import { Spinner } from '../components/Spinner';
@@ -13,7 +14,7 @@ import { RefreshButton } from '../components/RefreshButton';
 
 function fmtDate(iso?: string) {
   if (!iso) return '-';
-  return new Date(iso).toLocaleString(undefined, {
+  return formatTs(iso, {
     month: 'short', day: 'numeric',
     hour: '2-digit', minute: '2-digit', second: '2-digit',
   });
@@ -32,6 +33,7 @@ type Scope = 'jobs' | 'fleet-runs' | 'tag-runs';
 const STANDALONE = '__standalone__';
 
 export function TenantJobsPage({ config }: { config: TenantConfig }) {
+  useTimezone();  // subscribe so a timezone toggle reflows this page's timestamps
   const { apiUrl, tenantToken } = config;
   const [scope, setScope] = useState<Scope>('jobs');
   const [jobs, setJobs] = useState<Job[]>([]);
@@ -49,6 +51,7 @@ export function TenantJobsPage({ config }: { config: TenantConfig }) {
   // Filters: an agent or a fleet for jobs; runs are always fleet-scoped.
   const [agentFilter, setAgentFilter] = useState('');
   const [fleetFilter, setFleetFilter] = useState('');
+  const [statusFilter, setStatusFilter] = useState('');
   // Command search (jobs scope) - explicit, applied on the Search button / Enter.
   const [search, setSearch] = useState('');
   const [query, setQuery] = useState('');
@@ -91,6 +94,7 @@ export function TenantJobsPage({ config }: { config: TenantConfig }) {
     if (fleetFilter && fleetFilter !== STANDALONE) params.fleet_id = fleetFilter;
     else if (agentFilter) params.agent_id = agentFilter;
     if (query) params.q = query;
+    if (statusFilter) params.status = statusFilter;
     if (cursor) params.cursor = cursor;
     listTenantJobs(apiUrl, tenantToken, params)
       .then(r => {
@@ -101,7 +105,7 @@ export function TenantJobsPage({ config }: { config: TenantConfig }) {
       })
       .catch(e => setError(e.message))
       .finally(() => setLoading(false));
-  }, [apiUrl, tenantToken, scope, agentFilter, fleetFilter, query]);
+  }, [apiUrl, tenantToken, scope, agentFilter, fleetFilter, query, statusFilter]);
 
   // Any filter/scope/search change re-creates `load` → reset to page 1 and fetch it.
   useEffect(() => { setPageCursors([undefined]); setPageIdx(0); load(undefined); }, [load]);
@@ -157,9 +161,9 @@ export function TenantJobsPage({ config }: { config: TenantConfig }) {
 
   return (
     <div className="min-h-full bg-slate-50">
-      <div className="bg-gradient-to-r from-emerald-700 to-emerald-600 px-8 py-5">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-4">
+      <div className="bg-gradient-to-r from-emerald-700 to-emerald-600 px-4 sm:px-8 py-5">
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+          <div className="flex items-center gap-4 min-w-0">
             <div className="w-10 h-10 rounded-xl bg-white/10 ring-1 ring-white/20 flex items-center justify-center shrink-0">
               <svg className="w-5 h-5 text-white" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
                 <path strokeLinecap="round" strokeLinejoin="round" d="M6.75 7.5l3 2.25-3 2.25m4.5 0h3m-9 8.25h13.5A2.25 2.25 0 0021 18V6a2.25 2.25 0 00-2.25-2.25H5.25A2.25 2.25 0 003 6v12a2.25 2.25 0 002.25 2.25z" />
@@ -170,7 +174,7 @@ export function TenantJobsPage({ config }: { config: TenantConfig }) {
               <p className="text-sm text-emerald-200">Command execution history for your tenant</p>
             </div>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             {scope === 'jobs' && !loading && jobs.length > 0 && (
               <>
                 {runningCount > 0 && (
@@ -199,7 +203,7 @@ export function TenantJobsPage({ config }: { config: TenantConfig }) {
         </div>
       </div>
 
-      <div className="px-8 py-6 space-y-4">
+      <div className="px-4 sm:px-8 py-6 space-y-4">
         {/* Scope toggle: individual jobs vs fan-out runs (runs are fleet-only). */}
         <div className="flex items-center gap-3 flex-wrap">
           <div className="inline-flex rounded-lg border border-gray-300 bg-white shadow-sm overflow-hidden">
@@ -242,19 +246,32 @@ export function TenantJobsPage({ config }: { config: TenantConfig }) {
               ))}
             </select>
           )}
-          {(agentFilter || fleetFilter) && (
-            <button onClick={() => { setAgentFilter(''); setFleetFilter(''); }} className="text-sm text-indigo-600 hover:text-indigo-800">Clear</button>
+          {/* Status filter (jobs scope only) */}
+          {scope === 'jobs' && (
+            <select
+              value={statusFilter}
+              onChange={e => setStatusFilter(e.target.value)}
+              className="border border-gray-300 rounded-lg px-3 py-1.5 text-sm bg-white shadow-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+            >
+              <option value="">All statuses</option>
+              {['SUCCEEDED', 'FAILED', 'RUNNING', 'PENDING', 'REJECTED', 'EXPIRED'].map(s => (
+                <option key={s} value={s}>{s.charAt(0) + s.slice(1).toLowerCase()}</option>
+              ))}
+            </select>
+          )}
+          {(agentFilter || fleetFilter || statusFilter) && (
+            <button onClick={() => { setAgentFilter(''); setFleetFilter(''); setStatusFilter(''); }} className="text-sm text-indigo-600 hover:text-indigo-800">Clear</button>
           )}
 
           {/* Command search (jobs scope only). Explicit: fires only on the button / Enter. */}
           {scope === 'jobs' && (
-            <div className="flex items-center gap-2 ml-auto">
+            <div className="flex items-center gap-2 w-full sm:w-auto sm:ml-auto">
               <input
                 value={search}
                 onChange={e => setSearch(e.target.value)}
                 onKeyDown={e => { if (e.key === 'Enter') applySearch(); }}
                 placeholder="Search command…"
-                className="border border-gray-300 rounded-lg px-3 py-1.5 text-sm bg-white shadow-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                className="flex-1 sm:flex-none min-w-0 border border-gray-300 rounded-lg px-3 py-1.5 text-sm bg-white shadow-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
               />
               <button onClick={applySearch} className="text-sm text-white bg-slate-800 hover:bg-slate-700 rounded-lg px-3 py-1.5">Search</button>
               {query && (
@@ -396,7 +413,8 @@ function RunsTable({ runs, loading, needFleet, showTag, emptyText, onOpen }: {
   return (
     <div className={`bg-white rounded-xl border border-gray-200 shadow-sm overflow-hidden relative ${loading ? 'opacity-60 pointer-events-none' : ''}`}>
       {loading && <div className="absolute inset-0 flex items-center justify-center z-10"><Spinner /></div>}
-      <table className="w-full text-sm">
+      <div className="overflow-x-auto">
+      <table className="w-full text-sm min-w-[640px]">
         <thead>
           <tr className="border-b border-gray-200">
             {[...(showTag ? ['Tag'] : []), 'Command', 'State', 'When', 'By', 'Members', 'OK', 'Failed', 'Pending', 'Run ID'].map(h => (
@@ -429,6 +447,7 @@ function RunsTable({ runs, loading, needFleet, showTag, emptyText, onOpen }: {
           ))}
         </tbody>
       </table>
+      </div>
     </div>
   );
 }
@@ -465,6 +484,10 @@ function RunDetailModal({ run, config, scopeLabel, onClose, onOpenJob }: {
   const [loading, setLoading] = useState(true);
   const [acting, setActing] = useState(false);
   const [actionErr, setActionErr] = useState<string | null>(null);
+  // A run control (pause/resume/cancel) requires an explicit confirm step before it fires.
+  const [pendingAction, setPendingAction] = useState<
+    { fn: (u: string, t: string, id: string) => Promise<unknown>; label: string; prompt: string; danger?: boolean } | null
+  >(null);
 
   const load = useCallback(() => {
     return Promise.all([
@@ -526,19 +549,31 @@ function RunDetailModal({ run, config, scopeLabel, onClose, onOpenJob }: {
               <WaveInfo label="Progress" value={`Wave ${curWave} of ${status.wave_total}`} />
               {status.staged > 0 && <span className="text-indigo-600 font-medium">{status.staged} held</span>}
             </div>
-            {controllable && (
+            {controllable && (pendingAction ? (
+              // Two-step confirmation, inline (avoids stacking a modal over this one).
+              <div className="flex flex-wrap items-center gap-2 pt-0.5 text-xs">
+                <span className="text-gray-700">{pendingAction.prompt}</span>
+                <button disabled={acting}
+                  onClick={async () => { await act(pendingAction.fn); setPendingAction(null); }}
+                  className={`font-semibold px-2.5 py-1 rounded text-white disabled:opacity-50 ${pendingAction.danger ? 'bg-red-600 hover:bg-red-700' : 'bg-indigo-600 hover:bg-indigo-700'}`}>
+                  {pendingAction.label}
+                </button>
+                <button disabled={acting} onClick={() => setPendingAction(null)}
+                  className="font-medium px-2.5 py-1 rounded border border-gray-300 text-gray-600 hover:bg-gray-50 disabled:opacity-50">Back</button>
+              </div>
+            ) : (
               <div className="flex items-center gap-1.5 pt-0.5">
                 {state === 'paused' ? (
-                  <button disabled={acting} onClick={() => act(resumeRun)}
+                  <button disabled={acting} onClick={() => setPendingAction({ fn: resumeRun, label: 'Resume', prompt: 'Release the next wave to the remaining hosts?' })}
                     className="text-xs font-medium px-2.5 py-1 rounded bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-50">Resume next wave</button>
                 ) : (
-                  <button disabled={acting} onClick={() => act(pauseRun)}
+                  <button disabled={acting} onClick={() => setPendingAction({ fn: pauseRun, label: 'Pause', prompt: 'Pause the rollout after the current wave?' })}
                     className="text-xs font-medium px-2.5 py-1 rounded bg-amber-500 text-white hover:bg-amber-600 disabled:opacity-50">Pause</button>
                 )}
-                <button disabled={acting} onClick={() => act(cancelRun)}
+                <button disabled={acting} onClick={() => setPendingAction({ fn: cancelRun, label: 'Cancel run', prompt: 'Cancel this run? Held/pending waves will not be dispatched.', danger: true })}
                   className="text-xs font-medium px-2.5 py-1 rounded border border-red-200 text-red-600 hover:bg-red-50 disabled:opacity-50">Cancel</button>
               </div>
-            )}
+            ))}
           </div>
         )}
         {actionErr && <p className="text-xs text-red-600">{actionErr}</p>}
@@ -598,6 +633,7 @@ function RunDetailModal({ run, config, scopeLabel, onClose, onOpenJob }: {
             ) : (
               <>
                 <div className="border border-gray-100 rounded-lg overflow-hidden">
+                  <div className="overflow-x-auto">
                   <table className="w-full text-sm">
                     <thead><tr className="bg-gray-50 border-b border-gray-100">
                       {['Member', 'Status', 'Exit', 'Duration'].map(h => <th key={h} className="text-left px-3 py-2 text-[11px] font-semibold text-gray-500 uppercase">{h}</th>)}
@@ -613,6 +649,7 @@ function RunDetailModal({ run, config, scopeLabel, onClose, onOpenJob }: {
                       ))}
                     </tbody>
                   </table>
+                  </div>
                 </div>
                 <p className="text-[11px] text-gray-400">Click a member to see its full output.</p>
               </>
@@ -647,6 +684,45 @@ function IdRow({ label, id }: { label: string; id: string }) {
         <span className="text-[11px] font-mono text-gray-500 truncate" title={id}>{id}</span>
         <CopyButton text={id} className="opacity-0 group-hover/idr:opacity-100 transition-opacity shrink-0 !px-1.5 !py-0.5 text-[10px]" />
       </div>
+    </div>
+  );
+}
+
+// Renders a job's stdout/stderr. Output from an approved **sensitive read** is stored
+// unredacted (approving it authorized seeing the secret), so it's hidden behind a click-to-
+// reveal control - a secret shouldn't sit on screen during a screen-share or in scrollback.
+function OutputBlock({ label, text, truncated, sensitive, color }: {
+  label: string; text: string; truncated?: boolean; sensitive?: boolean; color: string;
+}) {
+  const [revealed, setRevealed] = useState(false);
+  return (
+    <div>
+      <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-1.5">
+        {label}
+        {truncated && (
+          <span className="ml-2 text-amber-600 normal-case tracking-normal font-semibold">⚠ truncated</span>
+        )}
+        {sensitive && (
+          <span className="ml-2 text-amber-600 normal-case tracking-normal font-semibold">🔒 sensitive</span>
+        )}
+      </p>
+      {sensitive && !revealed ? (
+        <div className="text-xs bg-gray-950 rounded-xl px-4 py-3 flex items-center justify-between gap-3">
+          <span className="text-gray-400 italic">Hidden - output of an approved sensitive read (contains secrets).</span>
+          <button onClick={() => setRevealed(true)}
+                  className="shrink-0 text-amber-300 hover:text-amber-200 font-semibold border border-amber-700/50 rounded-md px-2.5 py-1">
+            Reveal
+          </button>
+        </div>
+      ) : (
+        <pre className={`text-xs bg-gray-950 ${color} rounded-xl px-4 py-3 overflow-auto whitespace-pre-wrap max-h-56`}>{text}</pre>
+      )}
+      {sensitive && revealed && (
+        <button onClick={() => setRevealed(false)}
+                className="mt-1 text-[10px] text-gray-400 hover:text-gray-600 font-semibold uppercase tracking-wide">
+          Hide
+        </button>
+      )}
     </div>
   );
 }
@@ -696,26 +772,12 @@ function JobDetailModal({ job, fleetName, onClose, onBack }: {
         </div>
 
         {job.stdout && (
-          <div>
-            <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-1.5">
-              stdout
-              {job.stdout_truncated && (
-                <span className="ml-2 text-amber-600 normal-case tracking-normal font-semibold">⚠ truncated</span>
-              )}
-            </p>
-            <pre className="text-xs bg-gray-950 text-emerald-400 rounded-xl px-4 py-3 overflow-auto whitespace-pre-wrap max-h-56">{job.stdout}</pre>
-          </div>
+          <OutputBlock label="stdout" text={job.stdout} truncated={job.stdout_truncated}
+                       sensitive={job.sensitive} color="text-emerald-400" />
         )}
         {job.stderr && (
-          <div>
-            <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-1.5">
-              stderr
-              {job.stderr_truncated && (
-                <span className="ml-2 text-amber-600 normal-case tracking-normal font-semibold">⚠ truncated</span>
-              )}
-            </p>
-            <pre className="text-xs bg-gray-950 text-red-400 rounded-xl px-4 py-3 overflow-auto whitespace-pre-wrap max-h-56">{job.stderr}</pre>
-          </div>
+          <OutputBlock label="stderr" text={job.stderr} truncated={job.stderr_truncated}
+                       sensitive={job.sensitive} color="text-red-400" />
         )}
         {!job.stdout && !job.stderr && (
           <p className="text-sm text-gray-400 text-center py-4">No output captured</p>

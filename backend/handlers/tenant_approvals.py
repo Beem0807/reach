@@ -8,6 +8,7 @@ import shared.audit as audit
 from shared.access import (accessible_agent_ids, can_access_agent, can_access_fleet,
                            can_write_agent, can_write_fleet, is_agent_restricted)
 from shared.auth import _bearer, _verify_tenant_token
+from shared.explain import explain_approval
 from shared.policy import (
     has_shell_operators,
     host_rule_to_command,
@@ -207,6 +208,7 @@ def handle_tenant_list_all_approvals(query: dict, raw_token: str) -> dict:
     )
     _ac: dict = {}
     _fc: dict = {}
+    _member_counts = fleets_repo.member_counts(user["tenant_id"]) if any(a.get("fleet_id") for a in approvals) else {}
     def _labels(a: dict) -> dict:
         if a.get("fleet_id"):
             fid = a["fleet_id"]
@@ -217,7 +219,15 @@ def handle_tenant_list_all_approvals(query: dict, raw_token: str) -> dict:
         if aid not in _ac:
             _ac[aid] = (agents_repo.get(aid) or {}).get("hostname") if aid else None
         return {"scope": "agent", "agent_hostname": _ac[aid], "fleet_name": None}
-    enriched = [{**a, **_labels(a)} for a in approvals]
+    def _enrich(a: dict) -> dict:
+        labels = _labels(a)
+        exp = explain_approval(
+            a,
+            member_count=_member_counts.get(a["fleet_id"]) if a.get("fleet_id") else None,
+            target_label=labels.get("fleet_name") or labels.get("agent_hostname"),
+        )
+        return {**a, **labels, "explanation": exp}
+    enriched = [_enrich(a) for a in approvals]
     return _ok({"approvals": enriched, "total": total, "limit": limit, "offset": offset})
 
 

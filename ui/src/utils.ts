@@ -10,6 +10,16 @@ export function relTime(iso?: string): string {
   return `${Math.floor(s / 86400)}d ago`;
 }
 
+// Compact "time remaining until a future timestamp" (e.g. "3h", "2d", "now").
+export function untilTime(iso?: string | null): string {
+  if (!iso) return '';
+  const s = Math.floor((new Date(iso).getTime() - Date.now()) / 1000);
+  if (s <= 0) return 'now';
+  if (s < 3600) return `${Math.max(1, Math.floor(s / 60))}m`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h`;
+  return `${Math.floor(s / 86400)}d`;
+}
+
 export function tenantInitials(name: string): string {
   return name.split(/\s+/).slice(0, 2).map(w => w[0]?.toUpperCase() ?? '').join('') || '?';
 }
@@ -46,13 +56,25 @@ export function tenantPalette(id: string): string[] {
 // divergence the operator accepted.
 export function grantsSignature(agent: Agent, fleet: Fleet): string {
   const b = (x?: boolean) => (x ? '1' : '0');
-  return `${b(agent.grant_service_mgmt)}${b(agent.grant_docker)}-${b(fleet.grant_service_mgmt)}${b(fleet.grant_docker)}`;
+  return `${b(agent.grant_service_mgmt)}${b(agent.grant_docker)}`
+       + `${b(agent.service_mgmt_detected)}${b(agent.docker_detected)}`
+       + `-${b(fleet.grant_service_mgmt)}${b(fleet.grant_docker)}`;
 }
 
 // A member's grants *mismatch* the fleet when they differ from the fleet's desired grants.
 export function memberGrantsMismatched(agent: Agent, fleet: Fleet): boolean {
   return !!agent.grant_service_mgmt !== !!fleet.grant_service_mgmt
       || !!agent.grant_docker !== !!fleet.grant_docker;
+}
+
+// Capabilities the host *reports running* that the fleet does NOT grant - the host has
+// more access than the fleet's policy. Can't be reconciled remotely (re-provision or
+// accept), unlike a grant-record mismatch. Returns the human labels, or [].
+export function memberOutOfBand(agent: Agent, fleet: Fleet): string[] {
+  const oob: string[] = [];
+  if (agent.service_mgmt_detected && !fleet.grant_service_mgmt) oob.push('service management');
+  if (agent.docker_detected && !fleet.grant_docker) oob.push('docker');
+  return oob;
 }
 
 // True when the operator has *accepted* this member's mismatch for its current grants vs
@@ -62,8 +84,13 @@ export function memberMismatchAccepted(agent: Agent, fleet: Fleet): boolean {
   return !!agent.grants_exception && agent.grants_exception === grantsSignature(agent, fleet);
 }
 
-// A member is *flagged* (needs resolving: reconcile or accept) when it mismatches the
-// fleet and the divergence hasn't been accepted.
-export function memberMismatchFlagged(agent: Agent, fleet: Fleet): boolean {
-  return memberGrantsMismatched(agent, fleet) && !memberMismatchAccepted(agent, fleet);
+// A member is *flagged* (needs resolving: reconcile / re-provision / accept) when it
+// mismatches the fleet's grants OR the host reports an out-of-band capability, and the
+// divergence hasn't been accepted.
+export function memberNeedsAttention(agent: Agent, fleet: Fleet): boolean {
+  return (memberGrantsMismatched(agent, fleet) || memberOutOfBand(agent, fleet).length > 0)
+      && !memberMismatchAccepted(agent, fleet);
 }
+
+// Back-compat alias: the flag now also covers out-of-band detection, not just grant records.
+export const memberMismatchFlagged = memberNeedsAttention;

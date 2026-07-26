@@ -83,6 +83,26 @@ describe('TenantJobsPage', () => {
     expect(await screen.findByText('No jobs found')).toBeInTheDocument();
   });
 
+  it('shows ordinary job output directly', async () => {
+    mockApis({ jobs: [JOB] });   // docker ps, not sensitive
+    render(<TenantJobsPage config={CONFIG} />);
+    fireEvent.click(await screen.findByText('docker ps'));
+    expect(await screen.findByText('CONTAINER ID')).toBeInTheDocument();
+  });
+
+  it('masks a sensitive job\'s output behind a reveal button', async () => {
+    const secret = 'AKIAIOSFODNN7EXAMPLE';
+    mockApis({ jobs: [{ ...JOB, command: 'cat /home/u/.ssh/id_rsa', sensitive: true, stdout: secret }] });
+    render(<TenantJobsPage config={CONFIG} />);
+    fireEvent.click(await screen.findByText('cat /home/u/.ssh/id_rsa'));
+    // hidden by default - the secret is not on screen
+    await screen.findByText(/Hidden/i);
+    expect(screen.queryByText(secret)).not.toBeInTheDocument();
+    // reveal shows it
+    fireEvent.click(screen.getByRole('button', { name: /reveal/i }));
+    expect(screen.getByText(secret)).toBeInTheDocument();
+  });
+
   it('filters by agent on selection', async () => {
     const { jobsSpy } = mockApis({ jobs: [JOB] });
     render(<TenantJobsPage config={CONFIG} />);
@@ -94,6 +114,18 @@ describe('TenantJobsPage', () => {
 
     await waitFor(() =>
       expect(jobsSpy).toHaveBeenCalledWith(CONFIG.apiUrl, CONFIG.tenantToken, { agent_id: 'agent_1' }),
+    );
+  });
+
+  it('filters by status on selection', async () => {
+    const { jobsSpy } = mockApis({ jobs: [JOB] });
+    render(<TenantJobsPage config={CONFIG} />);
+    await screen.findByText('docker ps');
+    // combobox[0] = fleet, [1] = agent, [2] = status (jobs scope, no fleet).
+    const combos = screen.getAllByRole('combobox');
+    fireEvent.change(combos[2], { target: { value: 'FAILED' } });
+    await waitFor(() =>
+      expect(jobsSpy).toHaveBeenCalledWith(CONFIG.apiUrl, CONFIG.tenantToken, { status: 'FAILED' }),
     );
   });
 
@@ -164,6 +196,29 @@ describe('TenantJobsPage', () => {
     fireEvent.change(combos[0], { target: { value: 'fleet_1' } });
     expect(await screen.findByText('systemctl restart app')).toBeInTheDocument();
     expect(runsSpy).toHaveBeenCalledWith(CONFIG.apiUrl, CONFIG.tenantToken, 'fleet_1', {});
+  });
+
+  it('confirms before cancelling a run', async () => {
+    mockApis({ tagRuns: [{ run_id: 'batch_t', tag: 'env:prod', command: 'systemctl status nginx', created_at: '2026-06-20T10:00:00Z', members: 2, ok: 1, failed: 0, pending: 1 }] });
+    vi.spyOn(api, 'getRun').mockResolvedValue({
+      run_id: 'batch_t', command: 'systemctl status nginx', state: 'running',
+      counts: { ok: 1, failed: 0, pending: 1, running: 1 }, total: 2, terminal: false,
+      dispatched: 1, skipped_count: 0, skipped: [], failures: [],
+      rollout: { waves: [1, 1], mode: 'manual', on_failure: 'stop' },
+      current_wave: 0, wave_total: 2, staged: 1,
+    });
+    const cancelSpy = vi.spyOn(api, 'cancelRun').mockResolvedValue({} as never);
+    render(<TenantJobsPage config={CONFIG} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Tag runs' }));
+    fireEvent.click(await screen.findByText('systemctl status nginx'));   // open the run modal
+
+    // Clicking Cancel opens a confirm step - it must NOT fire the mutation yet.
+    fireEvent.click(await screen.findByRole('button', { name: 'Cancel' }));
+    expect(await screen.findByText(/Cancel this run\?/)).toBeInTheDocument();
+    expect(cancelSpy).not.toHaveBeenCalled();
+    // Confirming fires it.
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel run' }));
+    await waitFor(() => expect(cancelSpy).toHaveBeenCalledWith(CONFIG.apiUrl, CONFIG.tenantToken, 'batch_t'));
   });
 
   it('Tag runs scope lists standalone fan-out runs (no fleet needed)', async () => {

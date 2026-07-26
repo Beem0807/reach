@@ -20,7 +20,8 @@ from shared.auth import _bearer, _verify_tenant_token
 from shared.fanout import deterministic_run_id, new_run_row, order_and_limit, parse_max_targets, run_summary_view
 from shared.settings import effective_settings
 from shared.waves import assign_waves, plan_waves, resolve_policy
-from shared.policy import _is_blocked, _is_readonly_blocked, is_k8s_command_approved, is_k8s_write, needs_shell, to_argv
+from shared.policy import (_is_blocked, _is_readonly_blocked, is_k8s_command_approved,
+                           is_k8s_secret_read, is_k8s_write, is_sensitive_read, needs_shell, to_argv)
 from shared.response import _err, _iso, _now, _ok
 from shared.store import agents_repo, approvals_repo, jobs_repo, runs_repo, tenants_repo
 
@@ -88,6 +89,10 @@ def handle_fanout_by_tag(body: dict, raw_token: str, ip: str = "") -> dict:
     now = _now()
     is_k8s = want_type == "k8s"
     is_write = is_k8s_write(command) if is_k8s else _is_readonly_blocked(command)
+    # A sensitive read (secrets/credentials) is gated like a write - approvable, blocked in
+    # readonly, run in wild - so fold it into is_write to reuse the fan-out write path.
+    if not is_write and (is_sensitive_read(command) or is_k8s_secret_read(command)):
+        is_write = True
     # Host writes are structured: a plain write becomes an argv (run with execve, no
     # shell) so the agent can match it against host rules; a write with shell operators
     # can't be structured (argv is None) - it runs freeform in `wild` but is unapprovable,

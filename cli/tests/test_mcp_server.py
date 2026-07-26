@@ -517,3 +517,45 @@ class TestTagRuns:
             r = m.list_tag_run("batch_t")
         assert r["jobs"][0]["job_id"] == "j1"
         client.list_jobs.assert_called_once_with(run_id="batch_t", limit=100)
+
+
+class TestConfigTools:
+    def test_set_alias(self):
+        with patch.object(m.cfg_module, "resolve_agent", return_value="agent_x"), \
+             patch.object(m.cfg_module, "set_alias") as sa:
+            out = m.set_alias("prod", "agent_x")
+        assert out == {"alias": "prod", "agent_id": "agent_x"}
+        sa.assert_called_once_with("prod", "agent_x")
+
+    def test_set_alias_resolves_existing_alias(self):
+        with patch.object(m.cfg_module, "resolve_agent", return_value="agent_real"), \
+             patch.object(m.cfg_module, "set_alias") as sa:
+            m.set_alias("p2", "prod")
+        sa.assert_called_once_with("p2", "agent_real")
+
+    def test_remove_alias(self):
+        with patch.object(m.cfg_module, "remove_alias", return_value=True):
+            assert m.remove_alias("prod") == {"alias": "prod", "removed": True}
+        with patch.object(m.cfg_module, "remove_alias", return_value=False):
+            assert m.remove_alias("nope") == {"alias": "nope", "removed": False}
+
+    def test_use_agent_sets_default(self):
+        with patch.object(m.cfg_module, "resolve_agent", return_value="agent_x"), \
+             patch.object(m.cfg_module, "load_profile", return_value={}), \
+             patch.object(m.cfg_module, "save_profile") as sp, \
+             patch.object(m, "_client", side_effect=Exception("not configured")):
+            out = m.use_agent("prod")
+        assert out["default_agent_id"] == "agent_x"
+        assert sp.call_args[0][0]["default_agent_id"] == "agent_x"
+        assert "note" in out  # couldn't verify without a client
+
+    def test_use_agent_includes_agent_details(self):
+        client = MagicMock()
+        client.get_agent.return_value = {"hostname": "h", "mode": "approved",
+                                         "type": "host", "status": "ACTIVE"}
+        with patch.object(m.cfg_module, "resolve_agent", return_value="agent_x"), \
+             patch.object(m.cfg_module, "load_profile", return_value={}), \
+             patch.object(m.cfg_module, "save_profile"), \
+             patch.object(m, "_client", return_value=(client, "agent_x")):
+            out = m.use_agent("prod")
+        assert out["agent"]["mode"] == "approved"

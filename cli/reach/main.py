@@ -222,7 +222,7 @@ def whoami():
         console.print(f"[bold]Username:[/bold]  {data.get('username')}")
     if data.get('role'):
         console.print(f"[bold]Role:[/bold]      {data.get('role')}")
-    console.print(f"[bold]Created:[/bold]   {data.get('created_at') or '-'}")
+    console.print(f"[bold]Created:[/bold]   {_fmt_ts(data.get("created_at"))}")
 
 
 # ---------------------------------------------------------------------------
@@ -254,9 +254,9 @@ def status():
     table.add_row("Version", agent.get("agent_version") or "-")
     table.add_row("Fingerprint", (agent.get(
         "machine_fingerprint") or "-")[:24] + "...")
-    table.add_row("Claimed at", agent.get("claimed_at") or "-")
-    table.add_row("Last heartbeat", agent.get("last_heartbeat_at") or "-")
-    table.add_row("Mode", agent.get("mode") or "-")
+    table.add_row("Claimed at", _fmt_ts(agent.get("claimed_at")))
+    table.add_row("Last heartbeat", _fmt_ts(agent.get("last_heartbeat_at")))
+    table.add_row("Mode", (agent.get("mode") or "-") + _wild_window_label(agent))
     table.add_row("Access level", agent.get("access_level") or "-")
     if agent.get("writable") is False:
         table.add_row(
@@ -342,7 +342,7 @@ def agents_list(
             alias_label,
             _status_color(a.get("status", "")),
             _type_label(a.get("type")),
-            _mode_colors.get(mode, mode),
+            _mode_colors.get(mode, mode) + _wild_window_label(a),
             access_cell,
             a.get("hostname") or "-",
         ]
@@ -350,7 +350,7 @@ def agents_list(
             tags = a.get("tags") or []
             row.append(
                 ", ".join(f"[dim]{t}[/dim]" for t in tags) if tags else "-")
-        row.append(a.get("claimed_at") or "-")
+        row.append(_fmt_ts(a.get("claimed_at"), with_tz=False))
         table.add_row(*row)
 
     console.print(table)
@@ -390,7 +390,7 @@ def agents_show(agent_id: str = typer.Argument(..., help="Agent ID or alias")):
     table.add_row("Version", agent.get("agent_version") or "-")
     if agent.get("fleet_id"):
         table.add_row("Fleet", f"[magenta]{agent.get('fleet_id')}[/magenta]")
-    table.add_row("Mode", agent.get("mode") or "-")
+    table.add_row("Mode", (agent.get("mode") or "-") + _wild_window_label(agent))
     table.add_row("Access level", agent.get("access_level") or "-")
     if agent.get("writable") is False:
         table.add_row(
@@ -398,8 +398,8 @@ def agents_show(agent_id: str = typer.Argument(..., help="Agent ID or alias")):
     tags = agent.get("tags") or []
     table.add_row("Tags", ", ".join(
         f"[dim]{t}[/dim]" for t in tags) if tags else "-")
-    table.add_row("Claimed at", agent.get("claimed_at") or "-")
-    table.add_row("Last heartbeat", agent.get("last_heartbeat_at") or "-")
+    table.add_row("Claimed at", _fmt_ts(agent.get("claimed_at")))
+    table.add_row("Last heartbeat", _fmt_ts(agent.get("last_heartbeat_at")))
     console.print(table)
 
 
@@ -486,7 +486,7 @@ def fleets_list():
             f"[magenta]{f.get('name') or '-'}[/magenta]",
             f["fleet_id"],
             _status_color(f.get("status", "")),
-            _FLEET_MODE_COLORS.get(mode, mode),
+            _FLEET_MODE_COLORS.get(mode, mode) + _wild_window_label(f),
             str(f.get("member_count", 0)),
             access,
         )
@@ -526,7 +526,7 @@ def fleets_show(fleet: Optional[str] = typer.Argument(None, help="Fleet id or na
     table.add_row("Name", f"[magenta]{fleet_obj.get('name') or '-'}[/magenta]")
     table.add_row("Fleet ID", fleet_obj["fleet_id"])
     table.add_row("Status", _status_color(fleet_obj.get("status", "")))
-    table.add_row("Mode", _FLEET_MODE_COLORS.get(mode, mode))
+    table.add_row("Mode", _FLEET_MODE_COLORS.get(mode, mode) + _wild_window_label(fleet_obj))
     table.add_row("Members", members_cell)
     table.add_row("Your access", "[cyan]read-only[/cyan]" if fleet_obj.get(
         "writable") is False else "[green]read-write[/green]")
@@ -569,7 +569,7 @@ def fleets_agents(fleet: Optional[str] = typer.Argument(None, help="Fleet id or 
         table.add_row(
             a.get("agent_id", ""),
             _status_color(a.get("status", "")),
-            _FLEET_MODE_COLORS.get(mode, mode),
+            _FLEET_MODE_COLORS.get(mode, mode) + _wild_window_label(a),
             a.get("hostname") or "-",
             a.get("agent_version") or "-",
         )
@@ -885,7 +885,7 @@ def fleets_jobs(
     table.add_column("Duration", justify="right")
     table.add_column("Batch", no_wrap=True)
     for j in items:
-        created = (j.get("created_at") or "")[:19].replace("T", " ")
+        created = _fmt_ts(j.get("created_at"), with_tz=False)
         dur = j.get("duration_ms")
         batch = j.get("run_id")
         table.add_row(
@@ -942,7 +942,7 @@ def fleets_runs(
     table.add_column("Fail", justify="right")
     table.add_column("Pending", justify="right")
     for r in runs:
-        created = (r.get("created_at") or "")[:19].replace("T", " ")
+        created = _fmt_ts(r.get("created_at"), with_tz=False)
         fail = r.get("failed", 0)
         pend = r.get("pending", 0)
         table.add_row(
@@ -1047,7 +1047,7 @@ def runs_main(
     table.add_column("Fail", justify="right")
     table.add_column("Pending", justify="right")
     for r in items:
-        created = (r.get("created_at") or "")[:19].replace("T", " ")
+        created = _fmt_ts(r.get("created_at"), with_tz=False)
         fail = r.get("failed", 0)
         pend = r.get("pending", 0)
         table.add_row(
@@ -1671,7 +1671,7 @@ def jobs(
         aid = j.get("agent_id", "")
         alias = id_to_alias.get(aid)
         agent_label = f"[cyan]{alias}[/cyan]" if alias else aid
-        created = (j.get("created_at") or "")[:19].replace("T", " ")
+        created = _fmt_ts(j.get("created_at"), with_tz=False)
         dur = j.get("duration_ms")
         dur_label = f"{dur}ms" if dur is not None else "-"
         table.add_row(
@@ -1772,6 +1772,52 @@ def _expires_label(record: dict) -> str:
         return f"[dim]{raw[:19].replace('T', ' ')}[/dim]"
 
 
+def _wild_window_label(record: dict) -> str:
+    """Compact suffix for a temporary-wild mode: ` ⏱ 3h → readonly` (leading space), or ``
+    when the record isn't in a bounded wild window. Mirrors the console's countdown badge."""
+    from datetime import datetime, timezone
+    if record.get("mode") != "wild":
+        return ""
+    raw = record.get("mode_expires_at")
+    if not raw:
+        return ""   # permanent wild
+    revert = record.get("mode_revert_to") or "readonly"
+    try:
+        exp = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    now = datetime.now(tz=timezone.utc)
+    if exp <= now:
+        return f" [dim](reverting → {revert})[/dim]"
+    secs = int((exp - now).total_seconds())
+    if secs < 3600:
+        rem = f"{max(1, secs // 60)}m"
+    elif secs < 86400:
+        rem = f"{secs // 3600}h"
+    else:
+        rem = f"{secs // 86400}d"
+    return f" [yellow]⏱ {rem} → {revert}[/yellow]"
+
+
+def _fmt_ts(iso, with_tz: bool = True) -> str:
+    """Render a stored UTC timestamp in the operator's LOCAL timezone (storage is always UTC;
+    the CLI displays local, labeled). '-' for empty; the raw value if it can't be parsed."""
+    if not iso:
+        return "-"
+    from datetime import datetime, timezone
+    try:
+        dt = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+    except ValueError:
+        return str(iso)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)     # stored values are UTC even if unqualified
+    local = dt.astimezone()                       # -> the machine's local zone
+    out = local.strftime("%Y-%m-%d %H:%M:%S")
+    if with_tz:
+        out += " " + (local.strftime("%Z") or "local")
+    return out
+
+
 approvals_app = typer.Typer(
     help="View approval records for an agent.", no_args_is_help=True)
 app.add_typer(approvals_app, name="approvals")
@@ -1860,8 +1906,7 @@ def approvals_list(
             st = rec.get("status", "")
             style = _STATUS_STYLE.get(st, "")
             a.append(f"[{style}]{st}[/{style}]" if style else st)
-        at = (rec.get("reviewed_at") or rec.get(
-            "created_at") or "")[:19].replace("T", " ")
+        at = _fmt_ts(rec.get("reviewed_at") or rec.get("created_at"), with_tz=False)
         return a + [at, _expires_label(rec)]
 
     def _render(group: list, kind: str) -> None:

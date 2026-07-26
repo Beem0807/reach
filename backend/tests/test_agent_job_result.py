@@ -355,3 +355,51 @@ class TestAgentJobResult:
                 {**_VALID_BODY, "blocked": True, "block_reason": "approval_required", "status": "FAILED"},
                 "tok")
         apr.create.assert_called_once()
+
+
+class TestSensitiveReadRedaction:
+    _SECRET = "cred AKIAIOSFODNN7EXAMPLE end"
+
+    def _stored(self, command, stdout, k8s=False):
+        agent = {**_AGENT, "type": "k8s" if k8s else "host"}
+        job = {**_JOB_RUNNING, "command": command}
+        with patch("handlers.agent_job_result._verify_agent_token", return_value=agent), \
+             patch("handlers.agent_job_result.jobs_repo") as jr, \
+             patch("handlers.agent_job_result.approvals_repo"), \
+             patch("handlers.agent_job_result.users_repo"):
+            jr.get.return_value = job
+            captured = {}
+            jr.set_result.side_effect = lambda jid, res: captured.update(res)
+            handle_agent_job_result(JOB_ID, {**_VALID_BODY, "stdout": stdout}, "tok")
+            return captured
+
+    def test_normal_command_output_is_redacted(self):
+        out = self._stored("cat README.md", self._SECRET)
+        assert "AKIAIOSFODNN7EXAMPLE" not in out["stdout"]
+
+    def test_approved_sensitive_read_not_redacted(self):
+        # It only produced output because it was approved (or wild) - i.e. someone authorized
+        # seeing this secret - so redacting would defeat the point.
+        out = self._stored("cat /home/u/.ssh/id_rsa", self._SECRET)
+        assert "AKIAIOSFODNN7EXAMPLE" in out["stdout"]
+
+    def test_k8s_secret_read_not_redacted(self):
+        out = self._stored("kubectl get secret db -o yaml", self._SECRET, k8s=True)
+        assert "AKIAIOSFODNN7EXAMPLE" in out["stdout"]
+
+
+class TestBlockedIsRejected:
+    def test_blocked_command_stored_as_rejected(self):
+        captured = {}
+        with patch("handlers.agent_job_result._verify_agent_token", return_value=_AGENT), \
+             patch("handlers.agent_job_result.jobs_repo") as jr, \
+             patch("handlers.agent_job_result.approvals_repo") as apr, \
+             patch("handlers.agent_job_result.users_repo"):
+            jr.get.return_value = {**_JOB_RUNNING, "command": "cat x", "tenant_id": "t"}
+            apr.list_by_agent.return_value = []
+            apr.exists_pending.return_value = False
+            jr.set_result.side_effect = lambda jid, res: captured.update(res)
+            # agent reports FAILED/exit126 for a block; the handler must store REJECTED
+            handle_agent_job_result(JOB_ID, {**_VALID_BODY, "status": "FAILED",
+                                             "exit_code": 126, "blocked": True}, "tok")
+        assert captured["status"] == "REJECTED"

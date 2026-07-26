@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, type ReactNode } from 'react';
+import { useMediaQuery } from './hooks/useMediaQuery';
 import { useConfig } from './hooks/useConfig';
 import { useTenantConfig } from './hooks/useTenantConfig';
 import { setUnauthorizedHandler } from './api';
@@ -9,6 +10,7 @@ import { TenantsPage } from './pages/TenantsPage';
 import { UsersPage } from './pages/UsersPage';
 import { AuditLogsPage } from './pages/AuditLogsPage';
 import { TenantApp } from './TenantApp';
+import { TimezoneProvider, TimezoneToggle } from './timezone';
 
 type Page = 'tenants' | 'users' | 'audit-logs';
 
@@ -74,15 +76,19 @@ function ChevronIcon({ dir }: { dir: 'left' | 'right' }) {
 }
 
 function Sidebar({
-  page, onNavigate, onSignOut,
+  page, onNavigate, onSignOut, isDesktop, mobileOpen, onCloseMobile,
 }: {
   page: Page;
   onNavigate: (p: Page) => void;
   onSignOut: () => void;
+  isDesktop: boolean;
+  mobileOpen: boolean;
+  onCloseMobile: () => void;
 }) {
   const [collapsed, setCollapsed] = useState(() => {
     try { return localStorage.getItem('sidebar_collapsed') === 'true'; } catch { return false; }
   });
+  const showCollapsed = collapsed && isDesktop;   // the thin rail is desktop-only
 
   const toggle = () => {
     const next = !collapsed;
@@ -91,10 +97,14 @@ function Sidebar({
   };
 
   return (
-    <aside className={`${collapsed ? 'w-16' : 'w-56'} bg-slate-950 flex flex-col shrink-0 border-r border-slate-800 transition-all duration-200`}>
+    <aside className={`
+      ${showCollapsed ? 'w-16' : 'w-56'} bg-slate-950 flex flex-col border-r border-slate-800 transition-transform duration-200
+      fixed inset-y-0 left-0 z-40 md:static md:z-auto md:translate-x-0 md:shrink-0
+      ${mobileOpen ? 'translate-x-0' : '-translate-x-full'}
+    `}>
       {/* Logo + collapse toggle */}
-      <div className={`${collapsed ? 'px-2 py-4 flex-col gap-2' : 'px-5 py-5'} border-b border-slate-800/60 flex items-center`}>
-        {collapsed ? (
+      <div className={`${showCollapsed ? 'px-2 py-4 flex-col gap-2' : 'px-5 py-5'} border-b border-slate-800/60 flex items-center`}>
+        {showCollapsed ? (
           <div className="flex flex-col items-center gap-2 w-full">
             <div className="w-7 h-7 rounded-lg bg-indigo-500 flex items-center justify-center">
               <span className="text-white text-xs font-bold tracking-tight">R</span>
@@ -114,9 +124,10 @@ function Sidebar({
                 <p className="text-slate-500 text-[11px] mt-0.5">Console</p>
               </div>
             </div>
-            <button onClick={toggle} title="Collapse sidebar" className="ml-2 text-slate-500 hover:text-slate-300 p-1 rounded-md hover:bg-slate-800 transition-colors shrink-0">
+            <button onClick={toggle} title="Collapse sidebar" className="hidden md:inline-flex ml-2 text-slate-500 hover:text-slate-300 p-1 rounded-md hover:bg-slate-800 transition-colors shrink-0">
               <ChevronIcon dir="left" />
             </button>
+            <button onClick={onCloseMobile} title="Close menu" aria-label="Close menu" className="md:hidden inline-flex ml-2 text-slate-400 hover:text-slate-100 p-1 rounded-md hover:bg-slate-800 transition-colors shrink-0 text-lg leading-none">✕</button>
           </>
         )}
       </div>
@@ -125,22 +136,30 @@ function Sidebar({
       <nav className="flex-1 px-2 py-3 overflow-y-auto">
         <div className="space-y-0.5">
           {ADMIN_NAV.map(item => (
-            <NavButton key={item.id} item={item} active={page === item.id} onClick={() => onNavigate(item.id)} collapsed={collapsed} />
+            <NavButton key={item.id} item={item} active={page === item.id} onClick={() => onNavigate(item.id)} collapsed={showCollapsed} />
           ))}
         </div>
       </nav>
 
       {/* Sign out */}
-      <div className="px-2 py-3 border-t border-slate-800/60">
+      <div className="px-2 py-3 border-t border-slate-800/60 space-y-1">
+        {showCollapsed ? (
+          <div className="flex justify-center py-1.5"><TimezoneToggle dark compact /></div>
+        ) : (
+          <div className="px-3 py-1.5 flex items-center justify-between gap-2">
+            <span className="text-slate-500 text-[10px] font-semibold uppercase tracking-wider">Times</span>
+            <TimezoneToggle dark />
+          </div>
+        )}
         <button
           onClick={onSignOut}
-          title={collapsed ? 'Sign out' : undefined}
-          className={`w-full flex items-center py-2 rounded-md text-sm font-medium text-slate-400 hover:bg-slate-800 hover:text-slate-100 transition-all duration-100 ${collapsed ? 'justify-center px-2' : 'gap-3 px-3 text-left'}`}
+          title={showCollapsed ? 'Sign out' : undefined}
+          className={`w-full flex items-center py-2 rounded-md text-sm font-medium text-slate-400 hover:bg-slate-800 hover:text-slate-100 transition-all duration-100 ${showCollapsed ? 'justify-center px-2' : 'gap-3 px-3 text-left'}`}
         >
           <svg className="w-[18px] h-[18px] shrink-0" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor">
             <path strokeLinecap="round" strokeLinejoin="round" d="M15.75 9V5.25A2.25 2.25 0 0013.5 3h-6a2.25 2.25 0 00-2.25 2.25v13.5A2.25 2.25 0 007.5 21h6a2.25 2.25 0 002.25-2.25V15M12 9l-3 3m0 0l3 3m-3-3h12.75" />
           </svg>
-          {!collapsed && 'Sign out'}
+          {!showCollapsed && 'Sign out'}
         </button>
       </div>
     </aside>
@@ -196,6 +215,9 @@ export default function App() {
     return 'chooser';
   });
   const [page, setPage] = useState<Page>('tenants');
+  const isDesktop = useMediaQuery('(min-width: 768px)');
+  const [mobileNav, setMobileNav] = useState(false);
+  const navigate = (p: Page) => { setPage(p); setMobileNav(false); };
 
   useEffect(() => {
     setUnauthorizedHandler(() => {
@@ -239,15 +261,32 @@ export default function App() {
         />
       );
     }
+    const label = ADMIN_NAV.find(n => n.id === page)?.label ?? 'reach';
     return (
+      <TimezoneProvider>
       <div className="flex h-screen bg-gray-50 overflow-hidden">
-        <Sidebar page={page} onNavigate={setPage} onSignOut={() => { clearPlatformConfig(); setMode('chooser'); }} />
-        <main className="flex-1 overflow-y-auto">
-          {page === 'tenants'    && <TenantsPage   config={platformConfig} />}
-          {page === 'users'      && <UsersPage     config={platformConfig} />}
-          {page === 'audit-logs' && <AuditLogsPage mode="platform" apiUrl={platformConfig.apiUrl} token={platformConfig.adminToken} />}
-        </main>
+        {mobileNav && !isDesktop && (
+          <div className="fixed inset-0 z-30 bg-black/50 md:hidden" onClick={() => setMobileNav(false)} />
+        )}
+        <Sidebar page={page} onNavigate={navigate} onSignOut={() => { clearPlatformConfig(); setMode('chooser'); }}
+          isDesktop={isDesktop} mobileOpen={mobileNav} onCloseMobile={() => setMobileNav(false)} />
+        <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
+          <div className="md:hidden flex items-center gap-3 px-4 h-14 bg-slate-950 border-b border-slate-800 shrink-0">
+            <button onClick={() => setMobileNav(true)} aria-label="Open menu" className="text-slate-300 hover:text-white p-1.5 -ml-1.5 rounded-md hover:bg-slate-800 transition-colors">
+              <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" strokeWidth={1.75} stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M3.75 6.75h16.5M3.75 12h16.5m-16.5 5.25h16.5" />
+              </svg>
+            </button>
+            <span className="text-white font-semibold text-sm">{label}</span>
+          </div>
+          <main className="flex-1 overflow-y-auto min-w-0">
+            {page === 'tenants'    && <TenantsPage   config={platformConfig} />}
+            {page === 'users'      && <UsersPage     config={platformConfig} />}
+            {page === 'audit-logs' && <AuditLogsPage mode="platform" apiUrl={platformConfig.apiUrl} token={platformConfig.adminToken} />}
+          </main>
+        </div>
       </div>
+      </TimezoneProvider>
     );
   }
 

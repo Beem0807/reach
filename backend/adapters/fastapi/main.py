@@ -61,6 +61,7 @@ from handlers.tenant_fleets import (
     handle_delete_fleet,
     handle_remove_fleet_member,
     handle_resolve_fleet_grants,
+    handle_get_fleet_history,
 )
 from handlers.tenant_approvals import (
     handle_list_my_pending,
@@ -378,7 +379,8 @@ async def list_jobs(request: Request):
         limit = max(1, min(int(qs.get("limit", 20)), 100))
     except (ValueError, TypeError):
         limit = 20
-    return _resp(handle_list_jobs(token, agent_filter, limit, cursor, fleet_id=fleet_filter, run_id=batch_filter, q=qs.get("q")))
+    return _resp(handle_list_jobs(token, agent_filter, limit, cursor, fleet_id=fleet_filter, run_id=batch_filter,
+                                  q=qs.get("q"), status=qs.get("status")))
 
 
 @app.get("/jobs/{job_id}")
@@ -1185,6 +1187,15 @@ async def tenant_agent_history(agent_id: str, request: Request):
     # Delegate to the shared handler so tenant-boundary + per-user agent scope are
     # enforced consistently with the Lambda adapter.
     return _resp(handle_get_agent_history(agent_id, token))
+
+
+@app.get("/tenant/fleets/{fleet_id}/history")
+@limiter.limit("120/minute")
+async def tenant_fleet_history(fleet_id: str, request: Request):
+    token = _token(request)
+    if not token:
+        return JSONResponse({"error": "missing Authorization header"}, status_code=401)
+    return _resp(handle_get_fleet_history(fleet_id, token))
 
 
 # ---------------------------------------------------------------------------

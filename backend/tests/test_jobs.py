@@ -461,6 +461,33 @@ class TestListJobs:
         assert len(jobs) == 1
         assert jobs[0]["job_id"] == "job_1"
 
+    def test_status_filter_narrows_and_is_case_insensitive(self):
+        jobs = [
+            {**_JOB, "job_id": "j1", "status": "SUCCEEDED"},
+            {**_JOB, "job_id": "j2", "status": "FAILED"},
+            {**_JOB, "job_id": "j3", "status": "SUCCEEDED"},
+        ]
+        with patch("handlers.list_jobs._verify_tenant_token", return_value=USER), \
+             patch("handlers.list_jobs.jobs_repo") as jr, \
+             patch("handlers.list_jobs.agents_repo") as agr:
+            jr.list_by_tenant.return_value = jobs
+            agr.get.return_value = _AGENT_ACTIVE
+            r = handle_list_jobs("tok", None, 20, status="failed")   # case-insensitive
+        ids = [j["job_id"] for j in json.loads(r["body"])["jobs"]]
+        assert ids == ["j2"]
+
+    def test_status_filter_does_not_cursor_paginate(self):
+        # A status-filtered result is materialized in one window (like a search).
+        jobs = [{**_JOB, "job_id": f"j{i}", "status": "SUCCEEDED"} for i in range(3)]
+        with patch("handlers.list_jobs._verify_tenant_token", return_value=USER), \
+             patch("handlers.list_jobs.jobs_repo") as jr, \
+             patch("handlers.list_jobs.agents_repo") as agr:
+            jr.list_by_tenant.return_value = jobs
+            agr.get.return_value = _AGENT_ACTIVE
+            r = handle_list_jobs("tok", None, 2, status="SUCCEEDED")
+        body = json.loads(r["body"])
+        assert len(body["jobs"]) == 2 and "next_cursor" not in body
+
     def test_no_next_cursor_on_partial_page(self):
         r = self._call([_JOB], limit=20)
         assert "next_cursor" not in json.loads(r["body"])

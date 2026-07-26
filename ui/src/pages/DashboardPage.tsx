@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import type { Agent, Approval, AuditLog, Job, TenantConfig } from '../types';
+import { formatTs, useTimezone } from '../timezone';
 import { listTenantAgents, listAllTenantApprovals, listTenantAuditLogs, listTenantJobs } from '../api';
 import { Spinner } from '../components/Spinner';
 import { RefreshButton } from '../components/RefreshButton';
@@ -20,7 +21,7 @@ const JOB_STATUS_STYLE: Record<Job['status'], string> = {
 };
 
 function fmtDate(iso: string) {
-  return new Date(iso).toLocaleString(undefined, {
+  return formatTs(iso, {
     month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit',
   });
 }
@@ -143,6 +144,7 @@ function AgentHealthBar({ agents }: { agents: Agent[] }) {
 // ---------------------------------------------------------------------------
 
 export function DashboardPage({ config }: { config: TenantConfig }) {
+  useTimezone();  // subscribe so a timezone toggle reflows this page's timestamps
   const { apiUrl, tenantToken } = config;
   // Admins get the tenant-wide audit feed; operators (who can't read audit logs) get
   // a jobs-based view instead.
@@ -220,9 +222,9 @@ export function DashboardPage({ config }: { config: TenantConfig }) {
   return (
     <div className="min-h-full bg-slate-50">
       {/* Header */}
-      <div className="bg-gradient-to-r from-slate-800 to-slate-700 px-8 py-5">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-4">
+      <div className="bg-gradient-to-r from-slate-800 to-slate-700 px-4 sm:px-8 py-5">
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+          <div className="flex items-center gap-4 min-w-0">
             <div className="w-10 h-10 rounded-xl bg-white/10 ring-1 ring-white/20 flex items-center justify-center shrink-0">
               <svg className="w-5 h-5 text-white" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
                 <path strokeLinecap="round" strokeLinejoin="round" d="M3.75 6A2.25 2.25 0 016 3.75h2.25A2.25 2.25 0 0110.5 6v2.25a2.25 2.25 0 01-2.25 2.25H6a2.25 2.25 0 01-2.25-2.25V6zM3.75 15.75A2.25 2.25 0 016 13.5h2.25a2.25 2.25 0 012.25 2.25V18a2.25 2.25 0 01-2.25 2.25H6A2.25 2.25 0 013.75 18v-2.25zM13.5 6a2.25 2.25 0 012.25-2.25H18A2.25 2.25 0 0120.25 6v2.25A2.25 2.25 0 0118 10.5h-2.25a2.25 2.25 0 01-2.25-2.25V6zM13.5 15.75a2.25 2.25 0 012.25-2.25H18a2.25 2.25 0 012.25 2.25V18A2.25 2.25 0 0118 20.25h-2.25A2.25 2.25 0 0113.5 18v-2.25z" />
@@ -237,7 +239,7 @@ export function DashboardPage({ config }: { config: TenantConfig }) {
         </div>
       </div>
 
-      <div className="px-8 py-6 space-y-5">
+      <div className="px-4 sm:px-8 py-6 space-y-5">
 
         {/* Stat cards */}
         <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">

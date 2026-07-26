@@ -1562,6 +1562,19 @@ Resources:
             Path: /tenant/agents/{agent_id}/history
             Method: GET
 
+  TenantFleetHistoryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-tenant-fleet-history
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.tenant_fleets.fleet_history_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /tenant/fleets/{fleet_id}/history
+            Method: GET
+
   # -----------------------------------------------------------------------
   # Tenant admin - approval management endpoints
   # -----------------------------------------------------------------------

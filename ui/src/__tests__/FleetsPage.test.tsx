@@ -134,7 +134,7 @@ describe('FleetsPage grant mismatch', () => {
     await screen.findByText('web-asg');
     // Expand to reveal member rows; the mismatched member has a per-row "reconcile".
     fireEvent.click(screen.getByText('web-asg').closest('tr')!);
-    const rowAck = await screen.findByRole('button', { name: 'reconcile' });
+    const rowAck = await screen.findByRole('button', { name: 'resolve' });
     fireEvent.click(rowAck);
     // Modal targets just that agent (a2).
     const confirm = await screen.findByRole('button', { name: /Reconcile a2/ });
@@ -149,16 +149,27 @@ describe('FleetsPage grant mismatch', () => {
     render(<FleetsPage config={CONFIG} />);
     await screen.findByText('web-asg');
     fireEvent.click(screen.getByText('web-asg').closest('tr')!);
-    fireEvent.click(await screen.findByRole('button', { name: 'reconcile' }));   // opens the resolve modal
+    fireEvent.click(await screen.findByRole('button', { name: 'resolve' }));   // opens the resolve modal
     fireEvent.click(await screen.findByRole('button', { name: 'Accept as-is' }));
     await waitFor(() =>
       expect(acceptSpy).toHaveBeenCalledWith(CONFIG.apiUrl, CONFIG.tenantToken, 'fleet_1', 'a2'),
     );
   });
 
+  it('flags an out-of-band member (host detects a capability the fleet does not grant)', async () => {
+    const fleetNoDocker: Fleet = { ...FLEET, grant_docker: false };
+    const oob = member('a1', { grant_docker: false, docker_detected: true });  // grant matches, host runs docker
+    mockApis([oob], [fleetNoDocker]);
+    render(<FleetsPage config={CONFIG} />);
+    await screen.findByText('web-asg');
+    fireEvent.click(screen.getByText('web-asg').closest('tr')!);
+    expect(await screen.findByText(/out-of-band/)).toBeInTheDocument();
+    expect(screen.getByText(/detected: docker/)).toBeInTheDocument();
+  });
+
   it('does not flag a member whose mismatch is accepted (signature matches)', async () => {
-    // FLEET wants sm+dk. a2 has sm on, dk off -> signature "10-11"; accepted for it.
-    mockApis([member('a1'), member('a2', { grant_docker: false, grants_exception: '10-11' })]);
+    // FLEET wants sm+dk. a2 has sm on, dk off, detects neither -> signature "1000-11"; accepted.
+    mockApis([member('a1'), member('a2', { grant_docker: false, grants_exception: '1000-11' })]);
     render(<FleetsPage config={CONFIG} />);
     await screen.findByText('web-asg');
     expect(screen.queryByText(/grant mismatch/)).not.toBeInTheDocument();
@@ -215,7 +226,7 @@ describe('FleetsPage role gating', () => {
     // Mismatch is still visible (read), but the per-row reconcile action is not.
     fireEvent.click(screen.getByText('web-asg').closest('tr')!);
     expect(await screen.findByText(/1 grant mismatch/)).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: 'reconcile' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'resolve' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /Reconcile all/ })).not.toBeInTheDocument();
   });
 
@@ -285,14 +296,65 @@ describe('FleetsPage grant edit -> rotate gating', () => {
     expect(rotateSpy).not.toHaveBeenCalled();
   });
 
-  it('a non-grant edit saves directly without the rotate step', async () => {
+  it('a non-grant edit goes through a review step before saving', async () => {
     const { updateSpy, rotateSpy } = mockApis([member('a1')]);
     render(<FleetsPage config={CONFIG} />);
     await openEdit();
-    // Change mode only (no grant change) -> button stays "Save".
+    // Change mode only (no grant change) -> "Review changes", not a direct save.
     fireEvent.click(screen.getByRole('button', { name: 'wild' }));
-    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    fireEvent.click(screen.getByRole('button', { name: /Review changes/ }));
+    // The review lists the change and hasn't saved yet.
+    expect(await screen.findByText(/Review changes -/)).toBeInTheDocument();
+    expect(updateSpy).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: /Confirm & save/ }));
     await waitFor(() => expect(updateSpy).toHaveBeenCalled());
     expect(rotateSpy).not.toHaveBeenCalled();
+  });
+
+  it('can cancel from the review step without saving', async () => {
+    const { updateSpy } = mockApis([member('a1')]);
+    render(<FleetsPage config={CONFIG} />);
+    await openEdit();
+    fireEvent.click(screen.getByRole('button', { name: 'wild' }));
+    fireEvent.click(screen.getByRole('button', { name: /Review changes/ }));
+    // Back returns to the edit form (still no save); Cancel would close entirely.
+    fireEvent.click(await screen.findByRole('button', { name: /Back to edit/ }));
+    expect(screen.getByText('Execution mode')).toBeInTheDocument();
+    expect(updateSpy).not.toHaveBeenCalled();
+  });
+
+  it('arms a temporary wild window on the fleet with a duration', async () => {
+    const { updateSpy } = mockApis([member('a1')]);
+    render(<FleetsPage config={CONFIG} />);
+    await openEdit();
+    // Pick wild -> the duration picker appears; choose "4 hours", review, then confirm.
+    fireEvent.click(screen.getByRole('button', { name: 'wild' }));
+    fireEvent.click(screen.getByRole('button', { name: '4 hours' }));
+    fireEvent.click(screen.getByRole('button', { name: /Review changes/ }));
+    fireEvent.click(await screen.findByRole('button', { name: /Confirm & save/ }));
+    await waitFor(() => expect(updateSpy).toHaveBeenCalled());
+    expect(updateSpy.mock.calls[0][3]).toMatchObject({ mode: 'wild', duration: '4h' });
+  });
+});
+
+describe('FleetsPage history', () => {
+  it('lazy-loads the fleet edit timeline when History is expanded', async () => {
+    mockApis([member('a1')]);
+    const histSpy = vi.spyOn(api, 'listFleetHistory').mockResolvedValue({
+      history: [
+        { kind: 'edit', action: 'fleet.updated', note: 'updated: mode', by: 'alice', created_at: '2026-07-10T00:00:00Z' },
+        { kind: 'edit', action: 'fleet.created', note: 'fleet created (approved mode)', by: 'alice', created_at: '2026-07-01T00:00:00Z' },
+      ],
+    });
+    render(<FleetsPage config={CONFIG} />);
+    await screen.findByText('web-asg');
+    // Open the fleet detail modal.
+    fireEvent.click(await screen.findByRole('button', { name: 'web-asg' }));
+    // History is not fetched until the History tab is opened.
+    expect(histSpy).not.toHaveBeenCalled();
+    fireEvent.click(await screen.findByRole('button', { name: /history/i }));
+    await waitFor(() => expect(histSpy).toHaveBeenCalledWith(CONFIG.apiUrl, CONFIG.tenantToken, 'fleet_1'));
+    expect(await screen.findByText('updated: mode')).toBeInTheDocument();
+    expect(screen.getByText('fleet created (approved mode)')).toBeInTheDocument();
   });
 });

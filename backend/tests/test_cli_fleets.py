@@ -98,6 +98,20 @@ class TestListFleetAgents:
         assert {a["agent_id"] for a in body["agents"]} == {"agent_m1", "agent_m2"}
         assert body["fleet_name"] == "web-asg"
 
+    def test_member_temporary_wild_schedule_in_projection(self):
+        # A member carrying a (fleet-propagated) temporary-wild window must surface it in the
+        # list projection so the CLI/console can render the countdown - regression guard.
+        pa, pf, par, pj, agents, fleet = _patch()
+        member = {**_M1, "mode": "wild",
+                  "mode_expires_at": "2026-07-26T06:10:04+00:00", "mode_revert_to": "readonly"}
+        with pa, pf as fr, par as ar, pj:
+            fr.get.return_value = fleet
+            ar.list_by_fleet.return_value = [member]
+            r = handle_cli_list_fleet_agents(FLEET_ID, TOKEN)
+        a = json.loads(r["body"])["agents"][0]
+        assert a["mode_expires_at"] == "2026-07-26T06:10:04+00:00"
+        assert a["mode_revert_to"] == "readonly"
+
     def test_queries_by_fleet_index_not_tenant_scan(self):
         # Members are fetched via the fleet_id index, never by scanning all of a
         # tenant's agents - the scale fix for large fleets.

@@ -515,11 +515,14 @@ def _evt(headers=None, body=None, path=None):
 # ---------------------------------------------------------------------------
 
 class TestHandleSetTenantAgentMode:
-    def _call(self, mode="wild", agent=_AGENT_ACTIVE, user=_ADMIN):
+    def _call(self, mode="wild", agent=_AGENT_ACTIVE, user=_ADMIN, duration=None):
+        body = {"mode": mode}
+        if duration is not None:
+            body["duration"] = duration
         with _auth(user), patch("handlers.tenant_agents.agents_repo") as ar:
             ar.get.return_value = agent
             ar.update_policy.return_value = None
-            r = handle_set_tenant_agent_mode(AGENT_ID, {"mode": mode}, TOKEN)
+            r = handle_set_tenant_agent_mode(AGENT_ID, body, TOKEN)
         return r, ar
 
     def test_unauthorized(self):
@@ -545,12 +548,39 @@ class TestHandleSetTenantAgentMode:
         r, ar = self._call(mode="readonly")
         assert r["statusCode"] == 200
         assert json.loads(r["body"])["mode"] == "readonly"
-        ar.update_policy.assert_called_once_with(AGENT_ID, "readonly")
+        ar.update_policy.assert_called_once_with(AGENT_ID, "readonly", mode_expires_at=None, mode_revert_to=None)
 
     def test_all_valid_modes_accepted(self):
         for mode in ("wild", "readonly", "approved"):
             r, _ = self._call(mode=mode)
             assert r["statusCode"] == 200
+
+    def test_temporary_wild_sets_expiry_and_revert(self):
+        # From approved -> wild for 4h: schedule an expiry and a revert to approved.
+        agent = {**_AGENT_ACTIVE, "mode": "approved"}
+        r, ar = self._call(mode="wild", agent=agent, duration="4h")
+        assert r["statusCode"] == 200
+        body = json.loads(r["body"])
+        assert body["mode"] == "wild" and body["mode_expires_at"] and body["mode_revert_to"] == "approved"
+        call = ar.update_policy.call_args
+        assert call[0] == (AGENT_ID, "wild")
+        assert call[1]["mode_expires_at"] and call[1]["mode_revert_to"] == "approved"
+
+    def test_permanent_wild_clears_schedule(self):
+        r, ar = self._call(mode="wild")  # no duration -> permanent
+        assert r["statusCode"] == 200
+        assert json.loads(r["body"])["mode_expires_at"] is None
+        ar.update_policy.assert_called_once_with(AGENT_ID, "wild", mode_expires_at=None, mode_revert_to=None)
+
+    def test_invalid_duration_rejected(self):
+        r, _ = self._call(mode="wild", duration="banana")
+        assert r["statusCode"] == 400
+
+    def test_duration_ignored_for_non_wild(self):
+        # A duration on readonly/approved is a no-op (no schedule set).
+        r, ar = self._call(mode="readonly", duration="4h")
+        assert r["statusCode"] == 200
+        ar.update_policy.assert_called_once_with(AGENT_ID, "readonly", mode_expires_at=None, mode_revert_to=None)
 
 
 # ---------------------------------------------------------------------------
@@ -835,6 +865,21 @@ class TestHandleAcknowledgeCapability:
         assert r["statusCode"] == 400
         assert "capability" in json.loads(r["body"])["error"]
 
+    def test_fleet_member_docker_ack_rejected(self):
+        # A member's grants are fleet-managed; per-agent ack (which sets a grant) would
+        # diverge from the fleet and loop with reconcile. Rejected with 409.
+        member = {**_AGENT_WITH_DOCKER, "fleet_id": "fleet_x"}
+        r, ar, _ = self._call("docker", agent=member)
+        assert r["statusCode"] == 409
+        assert "fleet" in json.loads(r["body"])["error"].lower()
+        ar.update_grants.assert_not_called()
+
+    def test_fleet_member_service_mgmt_ack_rejected(self):
+        member = {**_AGENT_WITH_DOCKER, "fleet_id": "fleet_x"}
+        r, ar, _ = self._call("service_mgmt", agent=member)
+        assert r["statusCode"] == 409
+        ar.update_grants.assert_not_called()
+
     def test_empty_capability_returns_400(self):
         r, _, _ = self._call("")
         assert r["statusCode"] == 400
@@ -1056,25 +1101,43 @@ class TestHandleGetAgentHistory:
             r = handle_get_agent_history(AGENT_ID, TOKEN)
         assert r["statusCode"] == 404
 
-    def test_success_returns_history(self):
+    def test_success_merges_status_and_edits(self):
+        # Status transitions come from agent_history; edits come from the audit log,
+        # merged into one newest-first timeline with a `kind` on each entry.
         records = [
-            {"from_status": "ACTIVE", "to_status": "INACTIVE", "triggered_by": "heartbeat"},
-            {"from_status": "INACTIVE", "to_status": "ACTIVE", "triggered_by": "sync"},
+            {"from_status": "ACTIVE", "to_status": "INACTIVE", "triggered_by": "heartbeat",
+             "created_at": "2026-07-01T00:00:00Z"},
+        ]
+        audit = [
+            {"action": "agent.mode_changed", "actor_name": "alice",
+             "event_metadata": {"from_mode": "restricted", "to_mode": "approved"},
+             "created_at": "2026-07-05T00:00:00Z"},
+            {"action": "agent.heartbeat", "created_at": "2026-07-06T00:00:00Z"},  # not an edit -> dropped
         ]
         with _auth(), patch("handlers.tenant_agents.agents_repo") as ar, \
-             patch("handlers.tenant_agents.agent_history_repo") as hr:
+             patch("handlers.tenant_agents.agent_history_repo") as hr, \
+             patch("handlers.tenant_agents.audit_repo") as aur:
             ar.get.return_value = _AGENT_ACTIVE
             hr.list_by_agent.return_value = records
+            aur.list_by_tenant.return_value = audit
             r = handle_get_agent_history(AGENT_ID, TOKEN)
         assert r["statusCode"] == 200
-        assert json.loads(r["body"])["history"] == records
+        hist = json.loads(r["body"])["history"]
+        # newest-first: the edit (Jul 5) before the status transition (Jul 1); heartbeat dropped
+        assert [e["kind"] for e in hist] == ["edit", "status"]
+        assert hist[0]["action"] == "agent.mode_changed"
+        assert hist[0]["by"] == "alice"
+        assert "restricted" in hist[0]["note"] and "approved" in hist[0]["note"]
+        assert hist[1]["to_status"] == "INACTIVE"
         hr.list_by_agent.assert_called_once_with(AGENT_ID, limit=50)
 
     def test_empty_history_returns_empty_list(self):
         with _auth(), patch("handlers.tenant_agents.agents_repo") as ar, \
-             patch("handlers.tenant_agents.agent_history_repo") as hr:
+             patch("handlers.tenant_agents.agent_history_repo") as hr, \
+             patch("handlers.tenant_agents.audit_repo") as aur:
             ar.get.return_value = _AGENT_ACTIVE
             hr.list_by_agent.return_value = []
+            aur.list_by_tenant.return_value = []
             r = handle_get_agent_history(AGENT_ID, TOKEN)
         assert r["statusCode"] == 200
         assert json.loads(r["body"])["history"] == []
@@ -1082,11 +1145,53 @@ class TestHandleGetAgentHistory:
     def test_developer_role_can_view_history(self):
         # History is not admin-gated; any tenant member who can see the agent can read it.
         with _auth(_DEV), patch("handlers.tenant_agents.agents_repo") as ar, \
-             patch("handlers.tenant_agents.agent_history_repo") as hr:
+             patch("handlers.tenant_agents.agent_history_repo") as hr, \
+             patch("handlers.tenant_agents.audit_repo") as aur:
             ar.get.return_value = _AGENT_ACTIVE
             hr.list_by_agent.return_value = []
+            aur.list_by_tenant.return_value = []
             r = handle_get_agent_history(AGENT_ID, TOKEN)
         assert r["statusCode"] == 200
+
+    def test_fleet_member_shows_inherited_fleet_edits(self):
+        # A fleet member's timeline folds in the fleet's inherited edits (kind=fleet),
+        # but only those since the agent joined the fleet.
+        member = {**_AGENT_ACTIVE, "fleet_id": "fleet_x", "created_at": "2026-07-01T00:00:00Z"}
+
+        def audit_side_effect(tenant_id, limit=100, resource=None):
+            if resource == "fleet_x":
+                return [
+                    {"action": "fleet.updated", "actor_name": "alice",
+                     "event_metadata": {"mode": "approved"}, "created_at": "2026-07-05T00:00:00Z"},
+                    {"action": "fleet.updated", "actor_name": "alice",  # before join -> dropped
+                     "event_metadata": {"mode": "restricted"}, "created_at": "2026-06-01T00:00:00Z"},
+                ]
+            return []  # agent-scoped audit
+
+        with _auth(), patch("handlers.tenant_agents.agents_repo") as ar, \
+             patch("handlers.tenant_agents.agent_history_repo") as hr, \
+             patch("handlers.tenant_agents.audit_repo") as aur:
+            ar.get.return_value = member
+            hr.list_by_agent.return_value = []
+            aur.list_by_tenant.side_effect = audit_side_effect
+            r = handle_get_agent_history(AGENT_ID, TOKEN)
+        assert r["statusCode"] == 200
+        hist = json.loads(r["body"])["history"]
+        assert len(hist) == 1  # pre-join fleet edit filtered out
+        assert hist[0]["kind"] == "fleet"
+        assert hist[0]["note"].startswith("via fleet")
+
+    def test_standalone_agent_has_no_fleet_entries(self):
+        with _auth(), patch("handlers.tenant_agents.agents_repo") as ar, \
+             patch("handlers.tenant_agents.agent_history_repo") as hr, \
+             patch("handlers.tenant_agents.audit_repo") as aur:
+            ar.get.return_value = {**_AGENT_ACTIVE, "fleet_id": None}
+            hr.list_by_agent.return_value = []
+            aur.list_by_tenant.return_value = []
+            r = handle_get_agent_history(AGENT_ID, TOKEN)
+        assert r["statusCode"] == 200
+        # only the agent-scoped audit query runs; no fleet lookup
+        assert aur.list_by_tenant.call_count == 1
 
 
 # ---------------------------------------------------------------------------

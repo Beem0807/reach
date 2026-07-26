@@ -84,16 +84,24 @@ export interface UserAccessScope {
   readonly_fleet_ids: string[] | null;
 }
 
-export interface AgentHistory {
-  history_id: string;
-  agent_id: string;
-  tenant_id: string;
+// One merged timeline entry. `status` = an agent status transition (from the
+// agent_history repo); `edit` = a deliberate change from the audit log (mode,
+// tags, acks, fleet ops). The two record types have different retentions by
+// design, so an entry may be an edit long after its surrounding status
+// transitions have aged out.
+export interface HistoryEntry {
+  kind: 'status' | 'edit' | 'fleet';
   from_status?: string;
-  to_status: string;
-  triggered_by?: string;
+  to_status?: string;
+  action?: string;
   note?: string;
-  created_at: string;
+  by?: string;
+  created_at?: string;
 }
+
+// Back-compat aliases: agent and fleet history share the merged shape.
+export type AgentHistory = HistoryEntry;
+export type FleetHistory = HistoryEntry;
 
 export interface ApiToken {
   token_id: string;
@@ -179,6 +187,8 @@ export interface Agent {
   landlock_status?: 'active' | 'unavailable' | 'unsupported' | null;   // host filesystem sandbox
   sandbox_ack?: boolean;   // admin acknowledged running readonly/approved without the sandbox
   mode: 'wild' | 'readonly' | 'approved';
+  mode_expires_at?: string | null;   // temporary wild: when it auto-reverts
+  mode_revert_to?: string | null;    // mode it reverts to at expiry
   access_level: 'open' | 'elevated' | 'managed' | 'restricted';
   writable?: boolean;  // whether the requesting user may run write commands (read-only grant → false)
   claimed_at?: string;
@@ -207,6 +217,10 @@ export interface Fleet {
   name: string;
   type: 'host';
   mode: 'wild' | 'readonly' | 'approved';
+  // Temporary-wild schedule: when mode is wild and this is set, the fleet auto-reverts to
+  // mode_revert_to at mode_expires_at (and re-propagates to members). Null on a permanent mode.
+  mode_expires_at?: string | null;
+  mode_revert_to?: string | null;
   grant_service_mgmt: boolean;
   grant_docker: boolean;
   sandbox_ack?: boolean;   // members run readonly/approved unsandboxed when they lack Landlock
@@ -272,6 +286,16 @@ export interface Approval {
   created_at: string;
   reviewed_at?: string;
   reviewed_by?: string;
+  // Computed by the backend: the human-readable consequences of granting this (reusable) rule
+  // - what it ALSO permits, its blast radius, and a transparent risk verdict with its reasons.
+  explanation?: ApprovalExplanation;
+}
+
+export interface ApprovalExplanation {
+  summary: string;
+  facts: { label: string; value: string; wide?: boolean }[];  // wide = a wildcard-widened scope
+  risk: 'low' | 'medium' | 'high';
+  risk_factors: string[];
 }
 
 export interface Job {
@@ -291,6 +315,7 @@ export interface Job {
   stderr?: string;
   stdout_truncated?: boolean;   // output was capped (agent-side and/or on ingest)
   stderr_truncated?: boolean;
+  sensitive?: boolean;          // approved sensitive read - output stored unredacted; mask in UI
   created_at: string;
   started_at?: string;
   completed_at?: string;

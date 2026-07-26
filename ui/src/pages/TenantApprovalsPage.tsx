@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import type { TenantConfig, Approval, Agent, Fleet, K8sRule, HostRule } from '../types';
+import type { TenantConfig, Approval, ApprovalExplanation, Agent, Fleet, K8sRule, HostRule } from '../types';
 import {
   listAllTenantApprovals, listTenantApprovals, approveTenantApproval, denyTenantApproval,
   deleteTenantApproval, tenantPreApprove, tenantPreApproveRule, tenantPreApproveHostRule, tenantPreApproveFleetHostRule,
@@ -9,6 +9,7 @@ import { Modal } from '../components/Modal';
 import { Spinner } from '../components/Spinner';
 import { RefreshButton } from '../components/RefreshButton';
 import { CopyButton } from '../components/CopyButton';
+import { formatTs, useTimezone } from '../timezone';
 import { ApprovalTarget, ApprovalScope } from '../components/ApprovalTarget';
 import { K8sRuleForm, EMPTY_RULE } from '../components/K8sRuleForm';
 import { HostRuleForm, EMPTY_HOST_RULE } from '../components/HostRuleForm';
@@ -64,20 +65,18 @@ function Pager({ page, total, onPage }: { page: number; total: number; onPage: (
   );
 }
 
+const TS_OPTS: Intl.DateTimeFormatOptions = {
+  month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit',
+};
+
 function fmtDate(iso: string) {
-  return new Date(iso).toLocaleString(undefined, {
-    month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit',
-  });
+  return formatTs(iso, TS_OPTS);
 }
 
 function fmtExpiry(iso?: string) {
   if (!iso) return 'permanent';
-  const d = new Date(iso);
-  if (d.getTime() < Date.now()) return 'expired';
-  return d.toLocaleString(undefined, {
-    month: 'short', day: 'numeric',
-    hour: '2-digit', minute: '2-digit', second: '2-digit',
-  });
+  if (new Date(iso).getTime() < Date.now()) return 'expired';
+  return formatTs(iso, TS_OPTS);
 }
 
 const STATUS_STYLE: Record<string, string> = {
@@ -117,6 +116,7 @@ function ScopeToggle({ value, onChange }: { value: ApprovalScopeKind; onChange: 
 }
 
 export function TenantApprovalsPage({ config }: { config: TenantConfig }) {
+  useTimezone();  // subscribe so a timezone toggle reflows this page's timestamps
   const isOperator = config.role === 'admin' || config.role === 'operator';
 
   return isOperator
@@ -196,9 +196,9 @@ function DeveloperApprovalsView({ config }: { config: TenantConfig }) {
 
   return (
     <div className="min-h-full bg-slate-50">
-      <div className="bg-gradient-to-r from-indigo-700 to-indigo-600 px-8 py-5">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-4">
+      <div className="bg-gradient-to-r from-indigo-700 to-indigo-600 px-4 sm:px-8 py-5">
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+          <div className="flex items-center gap-4 min-w-0">
             <div className="w-10 h-10 rounded-xl bg-white/10 ring-1 ring-white/20 flex items-center justify-center shrink-0">
               <svg className="w-5 h-5 text-white" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
                 <path strokeLinecap="round" strokeLinejoin="round" d="M9 12.75L11.25 15 15 9.75m-3-7.036A11.959 11.959 0 013.598 6 11.99 11.99 0 003 9.749c0 5.592 3.824 10.29 9 11.623 5.176-1.332 9-6.03 9-11.622 0-1.31-.21-2.571-.598-3.751h-.152c-3.196 0-6.1-1.248-8.25-3.285z" />
@@ -209,7 +209,7 @@ function DeveloperApprovalsView({ config }: { config: TenantConfig }) {
               <p className="text-sm text-indigo-200">Your pending requests, and approved commands on your agents</p>
             </div>
           </div>
-          <div className="flex items-center gap-3">
+          <div className="flex flex-wrap items-center gap-3">
             <RefreshButton onClick={load} loading={loading} />
             <button
               onClick={() => setShowModal(true)}
@@ -221,7 +221,7 @@ function DeveloperApprovalsView({ config }: { config: TenantConfig }) {
         </div>
       </div>
 
-      <div className="px-8 py-6 space-y-4">
+      <div className="px-4 sm:px-8 py-6 space-y-4">
         {error && (
           <div className="flex items-center gap-2 text-sm text-red-700 bg-red-50 border border-red-200 rounded-lg px-4 py-3">
             <span className="shrink-0">⚠</span> {error}
@@ -287,7 +287,7 @@ function DeveloperApprovalsView({ config }: { config: TenantConfig }) {
               onChange={e => setSearch(e.target.value)}
               onKeyDown={e => e.key === 'Enter' && applySearch()}
               placeholder={kindFilter === 'k8s' ? 'Search verb, resource, namespace…' : 'Search command, agent…'}
-              className="w-64 border border-gray-300 rounded-lg pl-8 pr-7 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent shadow-sm"
+              className="w-full sm:w-64 border border-gray-300 rounded-lg pl-8 pr-7 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent shadow-sm"
             />
             {search && (
               <button onClick={() => { setSearch(''); if (appliedSearch) { setAppliedSearch(''); setPage(0); } }} className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 text-sm">✕</button>
@@ -311,7 +311,8 @@ function DeveloperApprovalsView({ config }: { config: TenantConfig }) {
           <div className="flex justify-center py-20"><Spinner /></div>
         ) : (
           <div className="bg-white rounded-xl border border-gray-200 shadow-sm overflow-hidden">
-            <table className="w-full text-sm">
+            <div className="overflow-x-auto">
+            <table className="w-full text-sm min-w-[560px]">
               <thead>
                 <tr className="border-b border-gray-200 bg-gray-50">
                   {devTh('Command / rule', 0)}
@@ -373,6 +374,7 @@ function DeveloperApprovalsView({ config }: { config: TenantConfig }) {
                 })}
               </tbody>
             </table>
+            </div>
             <Pager page={page} total={total} onPage={setPage} />
           </div>
         )}
@@ -435,6 +437,7 @@ function OperatorApprovalsView({ config }: { config: TenantConfig }) {
   const loadSeqRef = useRef(0);
 
   type ModalState =
+    | { type: 'detail'; approval: Approval }
     | { type: 'approve'; approval: Approval }
     | { type: 'update-duration'; approval: Approval }
     | { type: 'deny'; approval: Approval }
@@ -519,22 +522,35 @@ function OperatorApprovalsView({ config }: { config: TenantConfig }) {
     }
   };
 
+  // Optimistic, targeted update: a single approve/deny/delete acts on an item in the
+  // current tab, so drop it from the list here (it moves to another status) and adjust the
+  // tab-count badges, instead of refetching the whole page.
+  const removeFromTab = (id: string, movedTo?: StatusTab) => {
+    setApprovals(prev => prev.filter(a => a.approval_id !== id));
+    setTabCounts(prev => {
+      const next = { ...prev };
+      if (next[tab] != null) next[tab] = Math.max(0, next[tab]! - 1);
+      if (movedTo && next[movedTo] != null) next[movedTo] = next[movedTo]! + 1;
+      return next;
+    });
+  };
+
   const doApprove = async (id: string, duration?: string) => {
     await approveTenantApproval(apiUrl, tenantToken, id, duration);
     setModal(null);
-    reload();
+    removeFromTab(id, 'approved');
   };
 
   const doDeny = async (id: string) => {
     await denyTenantApproval(apiUrl, tenantToken, id);
     setModal(null);
-    reload();
+    removeFromTab(id, 'denied');
   };
 
   const doDelete = async (id: string) => {
     await deleteTenantApproval(apiUrl, tenantToken, id);
     setModal(null);
-    setApprovals(prev => prev.filter(a => a.approval_id !== id));
+    removeFromTab(id);
   };
 
   const doAddApproval = async (agentId: string, payload: { command?: string; rule?: K8sRule; host_rule?: HostRule }, duration?: string) => {
@@ -585,9 +601,9 @@ function OperatorApprovalsView({ config }: { config: TenantConfig }) {
 
   return (
     <div className="min-h-full bg-slate-50">
-      <div className="bg-gradient-to-r from-indigo-700 to-indigo-600 px-8 py-5">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-4">
+      <div className="bg-gradient-to-r from-indigo-700 to-indigo-600 px-4 sm:px-8 py-5">
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+          <div className="flex items-center gap-4 min-w-0">
             <div className="w-10 h-10 rounded-xl bg-white/10 ring-1 ring-white/20 flex items-center justify-center shrink-0">
               <svg className="w-5 h-5 text-white" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
                 <path strokeLinecap="round" strokeLinejoin="round" d="M9 12.75L11.25 15 15 9.75m-3-7.036A11.959 11.959 0 013.598 6 11.99 11.99 0 003 9.749c0 5.592 3.824 10.29 9 11.623 5.176-1.332 9-6.03 9-11.622 0-1.31-.21-2.571-.598-3.751h-.152c-3.196 0-6.1-1.248-8.25-3.285z" />
@@ -598,7 +614,7 @@ function OperatorApprovalsView({ config }: { config: TenantConfig }) {
               <p className="text-sm text-indigo-200">Review and manage command approval requests</p>
             </div>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             {tabCounts.pending != null && (
               <span className="inline-flex items-center gap-1.5 bg-amber-500/20 border border-amber-400/30 text-amber-200 text-xs font-semibold px-3 py-1.5 rounded-lg">
                 <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse shrink-0" />
@@ -629,7 +645,7 @@ function OperatorApprovalsView({ config }: { config: TenantConfig }) {
         </div>
       </div>
 
-      <div className="px-8 py-6 space-y-4">
+      <div className="px-4 sm:px-8 py-6 space-y-4">
         <div className="flex gap-1 border-b border-gray-200">
           {TABS.map(t => (
             <button
@@ -721,7 +737,7 @@ function OperatorApprovalsView({ config }: { config: TenantConfig }) {
               onChange={e => setSearch(e.target.value)}
               onKeyDown={e => e.key === 'Enter' && applySearch()}
               placeholder={scopeKind === 'fleet' ? 'Search command, fleet…' : kindFilter === 'k8s' ? 'Search verb, resource, namespace…' : 'Search command, agent…'}
-              className="w-64 border border-gray-300 rounded-lg pl-8 pr-7 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent shadow-sm"
+              className="w-full sm:w-64 border border-gray-300 rounded-lg pl-8 pr-7 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent shadow-sm"
             />
             {search && (
               <button onClick={() => { setSearch(''); if (appliedSearch) { setAppliedSearch(''); setPage(0); } }} className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 text-sm">✕</button>
@@ -807,7 +823,8 @@ function OperatorApprovalsView({ config }: { config: TenantConfig }) {
                 Approval ID
               </button>
             </div>
-            <table className="w-full text-sm">
+            <div className="overflow-x-auto">
+            <table className="w-full text-sm min-w-[560px]">
               <thead>
                 <tr className="border-b border-gray-200 bg-gray-50">
                   {tab === 'pending' && (
@@ -822,6 +839,7 @@ function OperatorApprovalsView({ config }: { config: TenantConfig }) {
                     </th>
                   )}
                   {opTh('Command / rule', 0)}
+                  <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wider whitespace-nowrap">Risk</th>
                   {opTh(scopeKind === 'fleet' ? 'Fleet' : 'Agent', 1)}
                   {opTh('Requested by', 2)}
                   {opTh('Created', 3)}
@@ -870,7 +888,8 @@ function OperatorApprovalsView({ config }: { config: TenantConfig }) {
                   </tr>
                 ) : approvals.map(a => {
                   return (
-                  <tr key={a.approval_id} className={`hover:bg-slate-50/80 transition-colors group ${tab === 'pending' && selectedIds.has(a.approval_id) ? 'bg-indigo-50/40' : ''}`}>
+                  <tr key={a.approval_id} onClick={() => setModal({ type: 'detail', approval: a })}
+                    className={`hover:bg-slate-50/80 transition-colors group cursor-pointer ${tab === 'pending' && selectedIds.has(a.approval_id) ? 'bg-indigo-50/40' : ''}`}>
                     {tab === 'pending' && (
                       <td className="w-10 pl-4 pr-2 py-3.5">
                         <input
@@ -884,6 +903,11 @@ function OperatorApprovalsView({ config }: { config: TenantConfig }) {
                     )}
                     <td className="px-4 py-3.5 max-w-[360px]">
                       <ApprovalTarget approval={a} />
+                    </td>
+                    <td className="px-4 py-3.5" onClick={e => e.stopPropagation()}>
+                      {a.explanation
+                        ? <RiskCell e={a.explanation} />
+                        : <span className="text-xs text-gray-300">-</span>}
                     </td>
                     <td className="px-4 py-3.5">
                       <ApprovalScope approval={a} />
@@ -917,7 +941,7 @@ function OperatorApprovalsView({ config }: { config: TenantConfig }) {
                     {showApprovalId && (
                       <td className="px-4 py-3.5 font-mono text-xs text-gray-400 whitespace-nowrap">{a.approval_id}</td>
                     )}
-                    <td className="px-4 py-3.5">
+                    <td className="px-4 py-3.5" onClick={e => e.stopPropagation()}>
                       <div className="flex items-center gap-1.5 justify-end whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity">
                         {tab === 'pending' && (
                           <>
@@ -965,6 +989,7 @@ function OperatorApprovalsView({ config }: { config: TenantConfig }) {
                 })}
               </tbody>
             </table>
+            </div>
             <Pager page={page} total={total} onPage={setPage} />
           </div>
         )}
@@ -978,6 +1003,10 @@ function OperatorApprovalsView({ config }: { config: TenantConfig }) {
           onClose={() => setBulkModal(null)}
           onConfirm={bulkModal === 'approve' ? doBulkApprove : doBulkDeny}
         />
+      )}
+
+      {modal?.type === 'detail' && (
+        <ApprovalDetailModal approval={modal.approval} onClose={() => setModal(null)} />
       )}
 
       {modal?.type === 'deny' && (
@@ -1204,6 +1233,84 @@ function RequestApprovalModal({
 // ---------------------------------------------------------------------------
 // Operator modals (approve, deny, expire, delete, add)
 // ---------------------------------------------------------------------------
+
+const RISK_COLOR: Record<string, string> = {
+  high: 'bg-red-100 text-red-700 border-red-200',
+  medium: 'bg-amber-100 text-amber-700 border-amber-200',
+  low: 'bg-emerald-100 text-emerald-700 border-emerald-200',
+};
+
+// Compact risk pill, shown on each approval row for at-a-glance triage.
+function RiskChip({ risk, className = '' }: { risk: 'low' | 'medium' | 'high'; className?: string }) {
+  return (
+    <span className={`text-[9px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded border ${RISK_COLOR[risk]} ${className}`}>
+      {risk}
+    </span>
+  );
+}
+
+// "What this permits" - the computed consequences of granting a (reusable) approval rule:
+// the action, everything it ALSO permits (wildcard-widened scope in amber), blast radius, and
+// a transparent risk verdict that names its own reasons. See backend shared/explain.py.
+function ExplanationBlock({ e }: { e: ApprovalExplanation }) {
+  return (
+    <div className="rounded-lg border border-gray-200 bg-white p-3 space-y-2">
+      <div className="flex items-center justify-between gap-2">
+        <p className="text-xs font-semibold text-gray-700">What this permits</p>
+        <span className={`text-[10px] font-bold uppercase tracking-wide px-2 py-0.5 rounded-full border ${RISK_COLOR[e.risk]}`}>
+          {e.risk} risk
+        </span>
+      </div>
+      <dl className="space-y-1">
+        {e.facts.map((f, i) => (
+          <div key={i} className="flex items-baseline justify-between gap-3 text-xs">
+            <dt className="text-gray-500 shrink-0">{f.label}</dt>
+            <dd className={`text-right font-medium break-all ${f.wide ? 'text-amber-700' : 'text-gray-800'}`}>{f.value}</dd>
+          </div>
+        ))}
+      </dl>
+      {e.risk_factors.length > 0 && (
+        <p className="text-[11px] text-gray-500 border-t border-gray-100 pt-1.5">
+          <span className="font-medium capitalize">{e.risk}</span> because: {e.risk_factors.join(' · ')}
+        </p>
+      )}
+    </div>
+  );
+}
+
+// Risk pill for the table's Risk column: hovering reveals the full explanation popover, and
+// clicking the row opens the same detail. Keeps triage fast without opening every approval.
+function RiskCell({ e }: { e: ApprovalExplanation }) {
+  return (
+    <div className="relative inline-block group/risk">
+      <RiskChip risk={e.risk} />
+      <div className="pointer-events-none absolute z-30 left-0 top-full mt-1 w-72 opacity-0 invisible group-hover/risk:opacity-100 group-hover/risk:visible transition-opacity shadow-xl rounded-lg">
+        <ExplanationBlock e={e} />
+      </div>
+    </div>
+  );
+}
+
+// Read-only detail opened by clicking an approval row - shows the command and the full
+// "what this permits" explanation. The approve/deny actions stay on the row, not here.
+function ApprovalDetailModal({ approval, onClose }: { approval: Approval; onClose: () => void }) {
+  return (
+    <Modal title="Approval detail" onClose={onClose}>
+      <div className="space-y-4">
+        <div className="bg-gray-50 rounded-lg p-3 border border-gray-100 space-y-2">
+          <div>
+            <p className="text-xs font-medium text-gray-400 uppercase tracking-wider mb-1.5">Command</p>
+            <code className="text-sm text-gray-800 break-all font-mono block bg-white border border-gray-200 rounded px-3 py-2">{approval.command}</code>
+          </div>
+          <p className="text-xs text-gray-500">{approval.fleet_name ?? approval.agent_hostname ?? approval.agent_id}</p>
+        </div>
+        {approval.explanation
+          ? <ExplanationBlock e={approval.explanation} />
+          : <p className="text-sm text-gray-400">No explanation available for this approval.</p>}
+      </div>
+    </Modal>
+  );
+}
 
 function ApproveModal({
   approval, title = 'Approve command', showNow = false, onClose, onApprove,

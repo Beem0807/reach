@@ -1324,3 +1324,47 @@ func TestWildAlwaysRunsRegardlessOfSandbox(t *testing.T) {
 		t.Errorf("wild must run without a sandbox, got blocked: %q", res.Stderr)
 	}
 }
+
+func TestArgvReadsSensitivePath(t *testing.T) {
+	sensitive := []string{
+		"/home/u/.ssh/id_rsa", ".env", "app/.env.production", "/etc/shadow",
+		"/home/u/.aws/credentials", "/proc/self/environ", "/etc/reach-agent/config.json", "server.pem",
+	}
+	for _, p := range sensitive {
+		if !argvReadsSensitivePath([]string{"cat", p}) {
+			t.Errorf("expected sensitive: cat %s", p)
+		}
+	}
+	for _, p := range []string{"README.md", "myfile.env", "notes.txt"} {
+		if argvReadsSensitivePath([]string{"cat", p}) {
+			t.Errorf("expected NOT sensitive: cat %s", p)
+		}
+	}
+}
+
+func TestExecuteStructuredBlocksUnapprovedSensitiveRead(t *testing.T) {
+	saved := unsandboxedAck
+	unsandboxedAck = true // isolate the sensitive-read gate from fail-closed
+	defer func() { unsandboxedAck = saved }()
+	res := executeStructured([]string{"cat", "/etc/shadow"}, "approved", true, nil)
+	if !res.Blocked {
+		t.Fatalf("expected an unapproved sensitive read to be blocked, got %+v", res)
+	}
+	if !strings.Contains(strings.ToLower(res.Stderr), "approval required") {
+		t.Errorf("expected an approval-required block, got %q", res.Stderr)
+	}
+}
+
+func TestArgvIsKubectlSecretRead(t *testing.T) {
+	for _, c := range []string{"kubectl get secret db", "kubectl describe secrets",
+		"kubectl get secret/db -n x", "/usr/local/bin/kubectl get secret db -o yaml"} {
+		if !argvReadsSensitivePath(strings.Fields(c)) {
+			t.Errorf("expected sensitive (kubectl secret read): %s", c)
+		}
+	}
+	for _, c := range []string{"kubectl get pods", "kubectl delete secret x", "kubectl get secretstore"} {
+		if argvReadsSensitivePath(strings.Fields(c)) {
+			t.Errorf("expected NOT sensitive: %s", c)
+		}
+	}
+}

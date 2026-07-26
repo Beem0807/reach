@@ -155,6 +155,43 @@ def get_context() -> dict:
 
 
 @mcp.tool()
+def use_agent(agent_id: str) -> dict:
+    """Set the default agent for subsequent commands (LOCAL config only - no auth/tenant change).
+
+    Accepts an agent ID or an existing alias. Equivalent to `reach agents use`. After this,
+    exec_command/list_history/etc. with no agent_id target this agent.
+    """
+    resolved = cfg_module.resolve_agent(agent_id)
+    data = cfg_module.load_profile()
+    data["default_agent_id"] = resolved
+    cfg_module.save_profile(data)
+    result: dict = {"default_agent_id": resolved}
+    try:
+        client, _ = _client()
+        a = client.get_agent(resolved)
+        result["agent"] = {"hostname": a.get("hostname"), "mode": a.get("mode"),
+                           "type": a.get("type"), "status": a.get("status")}
+    except Exception:
+        result["note"] = "set, but could not verify the agent (check it exists and is accessible)"
+    return result
+
+
+@mcp.tool()
+def set_alias(alias: str, agent_id: str) -> dict:
+    """Map a short alias to an agent (LOCAL config only). `agent_id` may be an ID or an existing
+    alias. Equivalent to `reach alias set`. Use the alias anywhere an agent_id is accepted."""
+    resolved = cfg_module.resolve_agent(agent_id)
+    cfg_module.set_alias(alias, resolved)
+    return {"alias": alias, "agent_id": resolved}
+
+
+@mcp.tool()
+def remove_alias(alias: str) -> dict:
+    """Remove an alias (LOCAL config only). Equivalent to `reach alias remove`."""
+    return {"alias": alias, "removed": cfg_module.remove_alias(alias)}
+
+
+@mcp.tool()
 def whoami() -> dict:
     """Return the current authenticated user and tenant."""
     client, _ = _client()

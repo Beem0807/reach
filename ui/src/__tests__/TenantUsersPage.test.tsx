@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { TenantUsersPage } from '../pages/TenantUsersPage';
 import type { TenantUser, Agent, Fleet, TenantConfig, UserAccessScope } from '../types';
@@ -228,13 +228,19 @@ describe('AccessModal', () => {
     expect(arg.readwrite_agent_ids).not.toContain('*');
   });
 
-  it('preserves an existing custom grant on save', async () => {
+  it('disables Save until changed, and preserves an existing grant on save', async () => {
     const saveSpy = vi.spyOn(api, 'setUserAgentAccess').mockResolvedValue(emptyScope(BASE_USER.user_id));
     await openModal({ ...emptyScope(BASE_USER.user_id), readonly_agent_ids: ['agent_111'] });
+    // No change yet -> Save is disabled (no-op guard).
+    expect(screen.getByRole('button', { name: /save access/i })).toBeDisabled();
+    // Grant a different agent (agent_222 = host-beta.local) R/W; the existing readonly on
+    // agent_111 must be preserved in the saved payload.
+    const row = screen.getByText('host-beta.local').closest('div')!.parentElement as HTMLElement;
+    fireEvent.click(within(row).getByRole('button', { name: 'R/W' }));
     fireEvent.click(screen.getByRole('button', { name: /save access/i }));
     await waitFor(() => expect(saveSpy).toHaveBeenCalledWith(
       CONFIG.apiUrl, CONFIG.tenantToken, BASE_USER.user_id,
-      expect.objectContaining({ readonly_agent_ids: ['agent_111'], readwrite_agent_ids: [] }),
+      expect.objectContaining({ readonly_agent_ids: ['agent_111'], readwrite_agent_ids: ['agent_222'] }),
     ));
   });
 

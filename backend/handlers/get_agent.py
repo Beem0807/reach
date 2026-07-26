@@ -2,6 +2,7 @@ import logging
 
 from shared.access import can_access_agent, can_write_agent
 from shared.auth import _bearer, _verify_tenant_token
+from shared.mode import revert_expired_mode
 from shared.response import _err, _ok
 from shared.store import agents_repo
 
@@ -17,6 +18,7 @@ def handle_get_agent(agent_id: str, raw_token: str) -> dict:
     agent = agents_repo.get(agent_id)
     if not agent or agent.get("status") == "DELETED" or not can_access_agent(user, agent):
         return _err("not found", 404)
+    agent = revert_expired_mode(agent)   # show the real current mode if a wild window elapsed
 
     return _ok({
         "agent_id": agent["agent_id"],
@@ -30,6 +32,8 @@ def handle_get_agent(agent_id: str, raw_token: str) -> dict:
         "active_until": agent.get("active_until"),
         "type": agent.get("type"),
         "mode": agent.get("mode", "wild"),
+        "mode_expires_at": agent.get("mode_expires_at"),
+        "mode_revert_to": agent.get("mode_revert_to"),
         "access_level": agent.get("access_level") or "open",
         "writable": can_write_agent(user, agent),
         "tags": agent.get("tags") or [],

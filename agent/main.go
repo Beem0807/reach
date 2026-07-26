@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	stdsync "sync"
@@ -810,6 +811,54 @@ func hostRuleMatches(argv []string, rule HostRule) bool {
 	return true
 }
 
+// sensitiveReadPatterns match reads of secrets/credentials that a plain read would exfiltrate.
+// Kept in sync with the backend's SENSITIVE_READ_PATTERNS (shared/policy.py). RE2 has no
+// lookbehind, so the .env pattern uses a leading char-class instead.
+var sensitiveReadPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)/etc/g?shadow\b`),
+	regexp.MustCompile(`(?i)\.ssh/`),
+	regexp.MustCompile(`(?i)\bid_(rsa|dsa|ecdsa|ed25519)\b`),
+	regexp.MustCompile(`(?i)\.aws/(credentials|config)\b`),
+	regexp.MustCompile(`(?i)\.config/gcloud\b`),
+	regexp.MustCompile(`(?i)\.azure/`),
+	regexp.MustCompile(`(?i)\.kube/config\b`),
+	regexp.MustCompile(`(?i)(^|[\s/'"=])\.env(\.[\w-]+)?\b`),
+	regexp.MustCompile(`(?i)/proc/(self|\d+)/environ\b`),
+	regexp.MustCompile(`(?i)\.(pem|p12|pfx)\b`),
+	regexp.MustCompile(`(?i)\.(netrc|pgpass|npmrc)\b`),
+	regexp.MustCompile(`(?i)\.docker/config\.json\b`),
+	regexp.MustCompile(`(?i)/etc/reach-agent/`),
+}
+
+// argvReadsSensitivePath reports whether the structured command reads a sensitive path, or is
+// a `kubectl get/describe secret(s)` (sensitive on a host that runs kubectl, too).
+func argvReadsSensitivePath(argv []string) bool {
+	joined := strings.Join(argv, " ")
+	for _, re := range sensitiveReadPatterns {
+		if re.MatchString(joined) {
+			return true
+		}
+	}
+	return argvIsKubectlSecretRead(argv)
+}
+
+// argvIsKubectlSecretRead: `kubectl get|describe secret[s] …` (a Secret read via kubectl).
+func argvIsKubectlSecretRead(argv []string) bool {
+	if len(argv) == 0 || (argv[0] != "kubectl" && !strings.HasSuffix(argv[0], "/kubectl")) {
+		return false
+	}
+	verb := ""
+	for _, a := range argv[1:] {
+		if a == "get" || a == "describe" {
+			verb = a
+		} else if verb != "" && (a == "secret" || a == "secrets" ||
+			strings.HasPrefix(a, "secret/") || strings.HasPrefix(a, "secrets/")) {
+			return true
+		}
+	}
+	return false
+}
+
 func isHostArgvApproved(argv []string, rules []HostRule) bool {
 	for _, r := range rules {
 		if hostRuleMatches(argv, r) {
@@ -849,6 +898,15 @@ func executeStructured(argv []string, mode string, isWrite bool, rules []HostRul
 
 	// Approved only by a structured host rule (JSON) - no command-string matching.
 	approvedWrite := mode == "approved" && isHostArgvApproved(argv, rules)
+
+	// A sensitive READ (SSH keys, cloud creds, .env, the agent's own token) is NOT stopped by
+	// Landlock - it blocks writes, not reads - so if it isn't approved we refuse it here and
+	// raise it for approval. This is the agent-side half of the sensitive-read gate (the backend
+	// also gates at submission; readonly is refused before dispatch; wild runs freeform via
+	// executeCommand and never reaches here).
+	if mode == "approved" && !approvedWrite && argvReadsSensitivePath(argv) {
+		return blockedResult(display, start)
+	}
 
 	// Fail closed like executeCommand - but an explicitly approved structured write needs no
 	// sandbox (fixed argv, no shell), so it always runs regardless of Landlock.

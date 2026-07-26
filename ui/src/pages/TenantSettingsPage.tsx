@@ -116,9 +116,9 @@ export function TenantSettingsPage({ config }: { config: TenantConfig }) {
   return (
     <div className="min-h-full bg-slate-50">
       {/* Page header */}
-      <div className="bg-gradient-to-r from-sky-700 to-sky-600 px-8 py-5">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-4">
+      <div className="bg-gradient-to-r from-sky-700 to-sky-600 px-4 sm:px-8 py-5">
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+          <div className="flex items-center gap-4 min-w-0">
             <div className="w-10 h-10 rounded-xl bg-white/10 ring-1 ring-white/20 flex items-center justify-center shrink-0">
               <svg className="w-5 h-5 text-white" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
                 <path strokeLinecap="round" strokeLinejoin="round" d="M9.594 3.94c.09-.542.56-.94 1.11-.94h2.593c.55 0 1.02.398 1.11.94l.213 1.281c.063.374.313.686.645.87.074.04.147.083.22.127.325.196.72.257 1.075.124l1.217-.456a1.125 1.125 0 011.37.49l1.296 2.247a1.125 1.125 0 01-.26 1.431l-1.003.827c-.293.24-.438.613-.431.992a6.759 6.759 0 010 .255c-.007.378.138.75.43.99l1.005.828c.424.35.534.954.26 1.43l-1.298 2.247a1.125 1.125 0 01-1.369.491l-1.217-.456c-.355-.133-.75-.072-1.076.124a6.57 6.57 0 01-.22.128c-.331.183-.581.495-.644.869l-.213 1.28c-.09.543-.56.941-1.11.941h-2.594c-.55 0-1.019-.398-1.11-.94l-.213-1.281c-.062-.374-.312-.686-.644-.87a6.52 6.52 0 01-.22-.127c-.325-.196-.72-.257-1.076-.124l-1.217.456a1.125 1.125 0 01-1.369-.49l-1.297-2.247a1.125 1.125 0 01.26-1.431l1.004-.827c.292-.24.437-.613.43-.992a6.932 6.932 0 010-.255c.007-.378-.138-.75-.43-.99l-1.004-.828a1.125 1.125 0 01-.26-1.43l1.297-2.247a1.125 1.125 0 011.37-.491l1.216.456c.356.133.751.072 1.076-.124.072-.044.146-.086.22-.128.332-.183.582-.495.644-.869l.214-1.281z" />
@@ -134,29 +134,29 @@ export function TenantSettingsPage({ config }: { config: TenantConfig }) {
         </div>
       </div>
 
-      <div className="px-8 py-6 max-w-3xl">
+      <div className="px-4 sm:px-8 py-6 max-w-5xl">
         {loading && !data ? (
           <div className="flex justify-center py-16"><Spinner /></div>
         ) : (
           <>
-            <div className="bg-white rounded-xl border border-slate-200 shadow-sm divide-y divide-slate-100">
+            {/* Retention windows + fan-out cap, as a card grid so each setting owns its own
+                block and the row uses the full width instead of a narrow single column. */}
+            <div className="grid gap-4 sm:grid-cols-2">
               {FIELDS.map(f => (
-                <div key={f.key} className="px-6 py-4 flex items-start justify-between gap-6">
-                  <div className="min-w-0">
-                    <div className="flex items-center gap-2">
-                      <label htmlFor={f.key} className="text-sm font-semibold text-slate-800">{f.label}</label>
-                      {isOverridden(f.key)
-                        ? <span className="text-[10px] font-semibold uppercase tracking-wide bg-amber-100 text-amber-700 px-1.5 py-0.5 rounded">Custom</span>
-                        : <span className="text-[10px] font-semibold uppercase tracking-wide bg-slate-100 text-slate-500 px-1.5 py-0.5 rounded">Default</span>}
-                    </div>
-                    <p className="text-xs text-slate-500 mt-1">{f.help}</p>
-                    {data && (
-                      <p className="text-[11px] text-slate-400 mt-1">
-                        Platform default: {data.defaults[f.key]} {f.unit} · allowed {data.bounds[f.key][0]}–{data.bounds[f.key][1]}
-                      </p>
-                    )}
+                <div key={f.key} className="bg-white rounded-xl border border-slate-200 shadow-sm px-5 py-4 flex flex-col">
+                  <div className="flex items-center gap-2">
+                    <label htmlFor={f.key} className="text-sm font-semibold text-slate-800">{f.label}</label>
+                    {isOverridden(f.key)
+                      ? <span className="text-[10px] font-semibold uppercase tracking-wide bg-amber-100 text-amber-700 px-1.5 py-0.5 rounded">Custom</span>
+                      : <span className="text-[10px] font-semibold uppercase tracking-wide bg-slate-100 text-slate-500 px-1.5 py-0.5 rounded">Default</span>}
                   </div>
-                  <div className="flex items-center gap-2 shrink-0">
+                  <p className="text-xs text-slate-500 mt-1">{f.help}</p>
+                  {data && (
+                    <p className="text-[11px] text-slate-400 mt-1">
+                      Platform default: {data.defaults[f.key]} {f.unit} · allowed {data.bounds[f.key][0]}–{data.bounds[f.key][1]}
+                    </p>
+                  )}
+                  <div className="flex items-center gap-2 mt-3 pt-3 border-t border-slate-100">
                     <input
                       id={f.key}
                       type="number"
@@ -166,20 +166,16 @@ export function TenantSettingsPage({ config }: { config: TenantConfig }) {
                       onChange={e => setValues(prev => ({ ...prev, [f.key]: e.target.value }))}
                       className="w-24 border border-slate-300 rounded-lg px-3 py-1.5 text-sm text-right focus:outline-none focus:ring-2 focus:ring-sky-500/40 focus:border-sky-500"
                     />
-                    <span className="text-xs text-slate-400 w-10">{f.unit}</span>
-                    {/* Fixed-width slot so the input/unit stay column-aligned whether or not
-                        the (custom-only) reset link is shown. */}
-                    <div className="w-12 text-left">
-                      {data && values[f.key] !== String(data.defaults[f.key]) && (
-                        <button
-                          onClick={() => resetToDefault(f.key)}
-                          title="Reset to platform default"
-                          className="text-xs text-slate-400 hover:text-sky-600 underline decoration-dotted"
-                        >
-                          reset
-                        </button>
-                      )}
-                    </div>
+                    <span className="text-xs text-slate-400">{f.unit}</span>
+                    {data && values[f.key] !== String(data.defaults[f.key]) && (
+                      <button
+                        onClick={() => resetToDefault(f.key)}
+                        title="Reset to platform default"
+                        className="ml-auto text-xs text-slate-400 hover:text-sky-600 underline decoration-dotted"
+                      >
+                        reset
+                      </button>
+                    )}
                   </div>
                 </div>
               ))}

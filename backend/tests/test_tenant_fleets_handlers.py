@@ -11,6 +11,9 @@ from handlers.tenant_fleets import (
     handle_revoke_fleet,
     handle_delete_fleet,
     handle_remove_fleet_member,
+    handle_get_fleet_history,
+    fleet_history_handler,
+    _fleet_history_note,
 )
 
 TENANT_ID = "tenant_1"
@@ -75,6 +78,23 @@ class TestCreateFleet:
     def test_invalid_mode(self):
         r, _ = self._call(body={"name": "x", "mode": "bogus"})
         assert r["statusCode"] == 400
+
+    def test_temporary_wild_at_creation_sets_schedule(self):
+        r, fr = self._call(body={"name": "bg", "mode": "wild", "duration": "4h"})
+        assert r["statusCode"] == 201
+        created = fr.create.call_args[0][0]
+        assert created["mode"] == "wild" and created["mode_expires_at"] is not None
+        assert created["mode_revert_to"] == "readonly"   # new fleet has no prior mode
+
+    def test_permanent_wild_at_creation_leaves_schedule_unset(self):
+        r, fr = self._call(body={"name": "bg", "mode": "wild"})
+        created = fr.create.call_args[0][0]
+        assert created["mode_expires_at"] is None and created["mode_revert_to"] is None
+
+    def test_invalid_duration_at_creation_rejected(self):
+        r, fr = self._call(body={"name": "bg", "mode": "wild", "duration": "banana"})
+        assert r["statusCode"] == 400
+        fr.create.assert_not_called()
 
     def test_bad_reap(self):
         r, _ = self._call(body={"name": "x", "reap_after_seconds": "soon"})
@@ -151,10 +171,11 @@ class TestListFleets:
         assert f["mismatch_count"] == 3   # 2 docker + 1 svc; revoked ignored
 
     def test_accepted_exception_excluded_from_mismatch_count(self):
-        # sm=T,dk=T vs fleet (sm=T,dk=F) mismatches, but the exception "11-10" matches
-        # the (member,fleet) signature -> accepted -> not counted.
+        # sm=T,dk=T vs fleet (sm=T,dk=F) mismatches, but the exception matches the full
+        # signature (grants+detected vs fleet) -> accepted -> not counted.
         groups = [{"fleet_id": FLEET_ID, "status": "ACTIVE", "grant_service_mgmt": True,
-                   "grant_docker": True, "grants_exception": "11-10", "count": 4}]
+                   "grant_docker": True, "service_mgmt_detected": True, "docker_detected": True,
+                   "grants_exception": "1111-10", "count": 4}]
         with _auth(), patch("handlers.tenant_fleets.fleets_repo") as fr, \
              patch("handlers.tenant_fleets.agents_repo") as ar:
             fr.list_by_tenant.return_value = [_FLEET]
@@ -228,7 +249,31 @@ class TestUpdateFleet:
 
     def test_edit_mode_and_name(self):
         r, fr = self._call({"mode": "wild", "name": "renamed"})
-        assert fr.update_settings.call_args[0][1] == {"name": "renamed", "mode": "wild"}
+        # A plain (permanent) wild also clears any prior temporary-wild schedule fleet-wide.
+        assert fr.update_settings.call_args[0][1] == {
+            "name": "renamed", "mode": "wild", "mode_expires_at": None, "mode_revert_to": None}
+
+    def test_temporary_wild_sets_schedule_and_propagates(self):
+        fleet = {**_FLEET, "mode": "approved"}
+        with _auth(_ADMIN), patch("handlers.tenant_fleets.fleets_repo") as fr, \
+             patch("handlers.tenant_fleets.agents_repo") as ar:
+            fr.get.side_effect = [fleet, {**fleet, "mode": "wild"}]
+            fr.member_counts.return_value = {FLEET_ID: 0}
+            r = handle_update_fleet(FLEET_ID, {"mode": "wild", "duration": "4h"}, TOKEN)
+        assert r["statusCode"] == 200
+        fields = fr.update_settings.call_args[0][1]
+        assert fields["mode"] == "wild" and fields["mode_expires_at"] is not None
+        assert fields["mode_revert_to"] == "approved"   # falls back to the previous mode
+        # The schedule rides the propagation to members.
+        assert ar.set_mode_by_fleet.call_args.kwargs["mode_expires_at"] == fields["mode_expires_at"]
+        assert ar.set_mode_by_fleet.call_args.kwargs["mode_revert_to"] == "approved"
+
+    def test_invalid_duration_rejected(self):
+        with _auth(_ADMIN), patch("handlers.tenant_fleets.fleets_repo") as fr, \
+             patch("handlers.tenant_fleets.agents_repo"):
+            fr.get.return_value = {**_FLEET, "mode": "approved"}
+            r = handle_update_fleet(FLEET_ID, {"mode": "wild", "duration": "banana"}, TOKEN)
+        assert r["statusCode"] == 400
 
     def test_edit_grants_persisted(self):
         r, fr = self._call({"grant_docker": True, "grant_service_mgmt": False})
@@ -239,6 +284,41 @@ class TestUpdateFleet:
         r, fr = self._call({"sandbox_ack": True})
         assert r["statusCode"] == 200
         assert fr.update_settings.call_args[0][1] == {"sandbox_ack": True}
+
+    def test_audits_only_changed_fields_with_from_to(self):
+        # The UI sends the whole settings object; only mode actually differs from _FLEET
+        # (which is already mode=approved, grant_docker=False). The audit must record
+        # just the changed field, as {from, to} - not every field present in the body.
+        body = {"mode": "wild", "grant_docker": False}
+        with _auth(), patch("handlers.tenant_fleets.fleets_repo") as fr, \
+             patch("handlers.tenant_fleets._audit") as aud:
+            fr.get.side_effect = [_FLEET, {**_FLEET, **body}]
+            fr.member_counts.return_value = {FLEET_ID: 0}
+            r = handle_update_fleet(FLEET_ID, body, TOKEN)
+        assert r["statusCode"] == 200
+        assert aud.call_args[0][3] == {"mode": {"from": "approved", "to": "wild"}}
+
+    def test_no_effective_change_skips_audit(self):
+        # Body re-sends the same values -> nothing changed -> no fleet.updated event.
+        body = {"mode": "approved", "grant_docker": False}
+        with _auth(), patch("handlers.tenant_fleets.fleets_repo") as fr, \
+             patch("handlers.tenant_fleets._audit") as aud:
+            fr.get.side_effect = [_FLEET, _FLEET]
+            fr.member_counts.return_value = {FLEET_ID: 0}
+            r = handle_update_fleet(FLEET_ID, body, TOKEN)
+        assert r["statusCode"] == 200
+        aud.assert_not_called()
+
+    def test_history_note_renders_from_to(self):
+        assert _fleet_history_note("fleet.updated", {"mode": {"from": "restricted", "to": "approved"}}) \
+            == "updated - mode: restricted → approved"
+        assert _fleet_history_note("fleet.updated", {"tags": {"from": ["env:staging"], "to": ["env:staging", "tier:db"]}}) \
+            == "updated - tags: env:staging → env:staging, tier:db"
+        # A big nested value (wave_policy) isn't inlined.
+        assert _fleet_history_note("fleet.updated", {"wave_policy": {"from": None, "to": {"read": {}}}}) \
+            == "updated - wave policy updated"
+        # Legacy flat shape (value only, no `from`) still renders.
+        assert _fleet_history_note("fleet.updated", {"mode": "wild"}) == "updated - mode → wild"
 
     def test_grant_edit_not_pushed_to_members(self):
         # Unlike mode/tags, grants are baked into the host install and must NOT be
@@ -270,12 +350,39 @@ class TestUpdateFleet:
         assert r["statusCode"] == 404
 
 
+class TestOutOfBandHelpers:
+    def test_detection_flag_and_acceptance(self):
+        from handlers.tenant_fleets import (_member_out_of_band, _member_needs_attention,
+                                            _grants_signature, _member_grants_mismatched)
+        fleet = {"grant_service_mgmt": False, "grant_docker": False}
+        m = {"grant_service_mgmt": False, "grant_docker": False,
+             "service_mgmt_detected": False, "docker_detected": True}  # host runs docker
+        # No grant-record mismatch, but out-of-band on docker -> needs attention.
+        assert _member_grants_mismatched(m, fleet) is False
+        assert _member_out_of_band(m, fleet) == ["docker"]
+        assert _member_needs_attention(m, fleet) is True
+        # Accepting pins the full signature -> no longer needs attention.
+        accepted = {**m, "grants_exception": _grants_signature(m, fleet)}
+        assert _member_needs_attention(accepted, fleet) is False
+        # If the host is later re-provisioned (docker gone), the acceptance is moot and the
+        # member is in order regardless.
+        gone = {**accepted, "docker_detected": False}
+        assert _member_out_of_band(gone, fleet) == []
+        assert _member_needs_attention(gone, fleet) is False
+        # A newly detected capability re-flags even under the old acceptance.
+        new_cap = {**accepted, "service_mgmt_detected": True}
+        assert _member_needs_attention(new_cap, fleet) is True
+
+
 class TestReconcileFleetGrants:
     from handlers.tenant_fleets import handle_acknowledge_fleet_grants as _ack
 
     # sm_det/dk_det = whether the host *reports* the capability. Reconcile is verified
-    # against detection, so a host must report a capability the fleet grants ON.
-    def _member(self, aid, sm, dk, sm_det=True, dk_det=True, exc=None):
+    # against detection: a host must report a capability the fleet grants ON (backing gap),
+    # and a capability the host reports that the fleet does NOT grant is out-of-band
+    # (accept-only). Defaults match _FLEET's grants (sm on, docker off) so a member is
+    # "clean" unless a test deliberately introduces a gap or an out-of-band capability.
+    def _member(self, aid, sm, dk, sm_det=True, dk_det=False, exc=None):
         return {"agent_id": aid, "tenant_id": TENANT_ID, "fleet_id": FLEET_ID,
                 "status": "ACTIVE", "grant_service_mgmt": sm, "grant_docker": dk,
                 "service_mgmt_detected": sm_det, "docker_detected": dk_det,
@@ -341,7 +448,7 @@ class TestReconcileFleetGrants:
     def test_blocks_member_whose_host_lacks_the_granted_capability(self):
         # Fleet wants docker; member mismatched (docker off) and the host does NOT
         # report docker -> must be blocked, not silently reconciled.
-        member = self._member("a1", False, False, dk_det=False)
+        member = self._member("a1", False, False, sm_det=False, dk_det=False)
         r, ar = self._call([member], fleet=self._WANTS_DOCKER)
         body = json.loads(r["body"])
         assert body["reconciled"] == 0
@@ -351,35 +458,108 @@ class TestReconcileFleetGrants:
 
     def test_reconciles_when_host_reports_the_capability(self):
         # Same mismatch, but the host now reports docker (re-provisioned) -> reconciled.
-        member = self._member("a1", False, False, dk_det=True)
+        member = self._member("a1", False, False, sm_det=False, dk_det=True)
         r, ar = self._call([member], fleet=self._WANTS_DOCKER)
         body = json.loads(r["body"])
         assert body["reconciled"] == 1 and body["blocked"] == []
         ar.update_grants.assert_called_once_with("a1", grant_service_mgmt=False, grant_docker=True)
 
-    def test_removing_a_grant_is_never_blocked(self):
-        # Fleet wants docker OFF; member has it on (mismatch). Removing a grant needs no
-        # detection, so it reconciles even though the host still reports docker.
+    def test_fully_blocked_reconcile_records_no_history(self):
+        # Nothing was reconciled (host can't back the grant) -> no fleet.grants_reconciled
+        # event, so history never falsely shows "reconciled".
+        from handlers.tenant_fleets import handle_acknowledge_fleet_grants
+        member = self._member("a1", False, False, sm_det=False, dk_det=False)
+        with _auth(), patch("handlers.tenant_fleets.fleets_repo") as fr, \
+             patch("handlers.tenant_fleets.agents_repo") as ar, \
+             patch("handlers.tenant_fleets._audit") as aud:
+            fr.get.return_value = self._WANTS_DOCKER
+            ar.list_by_fleet.return_value = [member]
+            r = handle_acknowledge_fleet_grants(FLEET_ID, TOKEN)
+        assert json.loads(r["body"])["reconciled"] == 0
+        aud.assert_not_called()
+
+    def test_partial_reconcile_records_history_with_count(self):
+        # One reconciled, one blocked -> a single event carrying the real count.
+        from handlers.tenant_fleets import handle_acknowledge_fleet_grants
+        members = [self._member("a1", False, False, sm_det=False, dk_det=True),    # reconciled
+                   self._member("a2", False, False, sm_det=False, dk_det=False)]   # blocked
+        with _auth(), patch("handlers.tenant_fleets.fleets_repo") as fr, \
+             patch("handlers.tenant_fleets.agents_repo") as ar, \
+             patch("handlers.tenant_fleets._audit") as aud:
+            fr.get.return_value = self._WANTS_DOCKER
+            ar.list_by_fleet.return_value = members
+            handle_acknowledge_fleet_grants(FLEET_ID, TOKEN)
+        aud.assert_called_once()
+        assert aud.call_args[0][0] == "fleet.grants_reconciled"
+        assert aud.call_args[0][3]["reconciled"] == 1
+
+    def test_reconciled_note_shows_count(self):
+        # Multiple reconciled -> count form.
+        assert _fleet_history_note("fleet.grants_reconciled", {"reconciled": 3}) == "3 member grants reconciled"
+        # A single member -> name it.
+        assert _fleet_history_note("fleet.grants_reconciled", {"reconciled": 1, "hosts": ["ip-10-0-1-12"]}) \
+            == "grants reconciled: ip-10-0-1-12"
+
+    def test_single_agent_reconcile_records_hostname(self):
+        # Reconciling one member records its hostname so history names it, not just a count.
+        from handlers.tenant_fleets import handle_acknowledge_fleet_grants
+        member = {**self._member("a1", False, False, sm_det=False, dk_det=True), "hostname": "ip-10-0-1-12"}
+        with _auth(), patch("handlers.tenant_fleets.fleets_repo") as fr, \
+             patch("handlers.tenant_fleets.agents_repo") as ar, \
+             patch("handlers.tenant_fleets._audit") as aud:
+            fr.get.return_value = self._WANTS_DOCKER
+            ar.list_by_fleet.return_value = [member]
+            handle_acknowledge_fleet_grants(FLEET_ID, TOKEN, agent_id="a1")
+        meta = aud.call_args[0][3]
+        assert meta["reconciled"] == 1 and meta["hosts"] == ["ip-10-0-1-12"]
+
+    def test_removing_a_grant_is_blocked_when_host_still_reports_it(self):
+        # Fleet wants docker OFF; member has it on AND the host still reports docker.
+        # Flipping the grant record off won't strip the socket, so it's OUT-OF-BAND ->
+        # blocked (accept-as-is or re-provision), not silently reconciled into that state.
         fleet_off = {**_FLEET, "grant_service_mgmt": False, "grant_docker": False}
-        member = self._member("a1", False, True, dk_det=True)
+        member = self._member("a1", False, True, sm_det=False, dk_det=True)
         r, ar = self._call([member], fleet=fleet_off)
         body = json.loads(r["body"])
-        assert body["reconciled"] == 1 and body["blocked"] == []
+        assert body["reconciled"] == 0
+        assert [b["agent_id"] for b in body["blocked"]] == ["a1"]
+        assert "docker" in body["blocked"][0]["reason"]
+        ar.update_grants.assert_not_called()
+
+    def test_removing_a_grant_reconciles_when_host_no_longer_reports_it(self):
+        # Same, but the host no longer reports docker (re-provisioned) -> clean removal.
+        fleet_off = {**_FLEET, "grant_service_mgmt": False, "grant_docker": False}
+        member = self._member("a1", False, True, sm_det=False, dk_det=False)
+        r, ar = self._call([member], fleet=fleet_off)
+        assert json.loads(r["body"])["reconciled"] == 1
 
     def test_mixed_reconcile_some_blocked(self):
         members = [
-            self._member("ok", False, False, dk_det=True),    # host reports docker -> reconciled
-            self._member("no", False, False, dk_det=False),   # host lacks docker -> blocked
+            self._member("ok", False, False, sm_det=False, dk_det=True),    # host reports docker -> reconciled
+            self._member("no", False, False, sm_det=False, dk_det=False),   # host lacks docker -> blocked
         ]
         r, ar = self._call(members, fleet=self._WANTS_DOCKER)
         body = json.loads(r["body"])
         assert body["reconciled"] == 1 and [b["agent_id"] for b in body["blocked"]] == ["no"]
         assert [c.args[0] for c in ar.update_grants.call_args_list] == ["ok"]
 
+    def test_out_of_band_member_is_blocked_not_reconciled(self):
+        # Fleet grants nothing (sm=off, dk=off) but the host reports docker -> out-of-band.
+        # The grant record already matches the fleet, so there's nothing to reconcile; it's
+        # accept-only, surfaced as blocked with an out-of-band reason.
+        bare = {**_FLEET, "grant_service_mgmt": False, "grant_docker": False}
+        member = self._member("a1", False, False, sm_det=False, dk_det=True)  # host runs docker
+        r, ar = self._call([member], fleet=bare)
+        body = json.loads(r["body"])
+        assert body["reconciled"] == 0
+        assert [b["agent_id"] for b in body["blocked"]] == ["a1"]
+        assert "docker" in body["blocked"][0]["reason"] and "doesn't grant" in body["blocked"][0]["reason"]
+        ar.update_grants.assert_not_called()
+
     def test_reconcile_all_leaves_accepted_members_alone(self):
-        # An accepted-as-is member (exception matches the (member,fleet) signature
-        # "00-01") is an intentional exception - a bulk reconcile skips it.
-        members = [self._member("acc", False, False, dk_det=True, exc="00-01")]
+        # An accepted-as-is member (exception matches the full signature, incl. detected
+        # bits) is an intentional exception - a bulk reconcile skips it.
+        members = [self._member("acc", False, False, sm_det=False, dk_det=True, exc="0001-01")]
         r, ar = self._call(members, fleet=self._WANTS_DOCKER)
         assert json.loads(r["body"])["reconciled"] == 0
         ar.update_grants.assert_not_called()
@@ -409,51 +589,98 @@ class TestAcceptFleetGrantMismatch:
         r, ar = self._call([self._member("m", False, False)])
         body = json.loads(r["body"])
         assert body["accepted"] == 1
-        ar.set_grants_exception.assert_called_once_with("m", "00-01")   # (member, fleet) signature
+        ar.set_grants_exception.assert_called_once_with("m", "0000-01")   # grants+detected vs fleet
         # It does NOT touch the member's real grants.
         ar.update_grants.assert_not_called()
+
+    def test_accepts_out_of_band_member(self):
+        # Host reports docker the fleet doesn't grant (grant record already matches the
+        # fleet) -> out-of-band, accept-only. Accepting records the full signature.
+        from handlers.tenant_fleets import handle_accept_fleet_grant_mismatch
+        bare = {**_FLEET, "grant_service_mgmt": False, "grant_docker": False}
+        member = {"agent_id": "a1", "tenant_id": TENANT_ID, "fleet_id": FLEET_ID, "status": "ACTIVE",
+                  "grant_service_mgmt": False, "grant_docker": False,
+                  "service_mgmt_detected": False, "docker_detected": True, "grants_exception": None}
+        with _auth(), patch("handlers.tenant_fleets.fleets_repo") as fr, \
+             patch("handlers.tenant_fleets.agents_repo") as ar, \
+             patch("handlers.tenant_fleets.audit"):
+            fr.get.return_value = bare
+            ar.list_by_fleet.return_value = [member]
+            r = handle_accept_fleet_grant_mismatch(FLEET_ID, TOKEN)
+        assert json.loads(r["body"])["accepted"] == 1
+        # grants "00" + detected "01" + "-" + fleet "00"
+        ar.set_grants_exception.assert_called_once_with("a1", "0001-00")
+
+    def test_single_accept_records_hostname(self):
+        from handlers.tenant_fleets import handle_accept_fleet_grant_mismatch
+        member = {**self._member("m", False, False), "hostname": "ip-10-0-1-12"}
+        with _auth(), patch("handlers.tenant_fleets.fleets_repo") as fr, \
+             patch("handlers.tenant_fleets.agents_repo") as ar, \
+             patch("handlers.tenant_fleets._audit") as aud:
+            fr.get.return_value = self._WANTS_DOCKER
+            ar.list_by_fleet.return_value = [member]
+            handle_accept_fleet_grant_mismatch(FLEET_ID, TOKEN, agent_id="m")
+        assert aud.call_args[0][0] == "fleet.grant_mismatch_accepted"
+        assert aud.call_args[0][3]["accepted"] == 1 and aud.call_args[0][3]["hosts"] == ["ip-10-0-1-12"]
+
+    def test_nothing_accepted_records_no_history(self):
+        from handlers.tenant_fleets import handle_accept_fleet_grant_mismatch
+        member = self._member("match", False, True)   # already matches -> not flagged
+        with _auth(), patch("handlers.tenant_fleets.fleets_repo") as fr, \
+             patch("handlers.tenant_fleets.agents_repo") as ar, \
+             patch("handlers.tenant_fleets._audit") as aud:
+            fr.get.return_value = self._WANTS_DOCKER
+            ar.list_by_fleet.return_value = [member]
+            handle_accept_fleet_grant_mismatch(FLEET_ID, TOKEN)
+        aud.assert_not_called()
+
+    def test_accepted_note_forms(self):
+        assert _fleet_history_note("fleet.grant_mismatch_accepted", {"accepted": 1, "hosts": ["ip-10-0-1-12"]}) \
+            == "grant mismatch accepted: ip-10-0-1-12"
+        assert _fleet_history_note("fleet.grant_mismatch_accepted", {"accepted": 3}) \
+            == "grant mismatch accepted for 3 members"
 
     def test_ignores_matching_and_already_accepted(self):
         members = [
             self._member("match", False, True),               # already matches fleet -> not flagged
-            self._member("acc", False, False, exc="00-01"),   # accepted for current signature
+            self._member("acc", False, False, exc="0000-01"),   # accepted for current signature
         ]
         r, ar = self._call(members)
         assert json.loads(r["body"])["accepted"] == 0
         ar.set_grants_exception.assert_not_called()
 
     def test_stale_acceptance_reflags_after_fleet_change(self):
-        # Accepted against old signature "00-01"; fleet now wants service-mgmt too, so the
-        # fleet part becomes "11" and the member is flagged again -> re-accepted at "00-11".
+        # Accepted against old signature; fleet now wants service-mgmt too, so the fleet
+        # part becomes "11" and the member is flagged again -> re-accepted at "0000-11".
         fleet_11 = {**_FLEET, "grant_service_mgmt": True, "grant_docker": True}
-        r, ar = self._call([self._member("m", False, False, exc="00-01")], fleet=fleet_11)
+        r, ar = self._call([self._member("m", False, False, exc="0000-01")], fleet=fleet_11)
         assert json.loads(r["body"])["accepted"] == 1
-        ar.set_grants_exception.assert_called_once_with("m", "00-11")
+        ar.set_grants_exception.assert_called_once_with("m", "0000-11")
 
     def test_member_grant_change_reflags_stale_acceptance(self):
-        # Q1: accepted at "00-01"; the member's OWN grant later changed (service-mgmt on),
-        # so its part is now "10" and it still differs from the fleet. The old exception no
-        # longer matches -> flagged again -> re-accepted at the new signature "10-01".
-        r, ar = self._call([self._member("m", True, False, exc="00-01")], fleet=self._WANTS_DOCKER)
+        # Accepted at an old signature; the member's OWN grant later changed (service-mgmt
+        # on), so its grant part is now "10" and it still differs from the fleet. The old
+        # exception no longer matches -> flagged again -> re-accepted at "1000-01".
+        r, ar = self._call([self._member("m", True, False, exc="0000-01")], fleet=self._WANTS_DOCKER)
         assert json.loads(r["body"])["accepted"] == 1
-        ar.set_grants_exception.assert_called_once_with("m", "10-01")
+        ar.set_grants_exception.assert_called_once_with("m", "1000-01")
 
     def test_member_matching_fleet_is_never_flagged_even_with_stale_exception(self):
         # The member's grants now EQUAL the fleet's (fleet wants docker; member has it).
-        # There is no mismatch, so it's not flagged - a leftover exception ("00-00" from
+        # There is no mismatch, so it's not flagged - a leftover exception ("0000-00" from
         # an earlier divergence) is simply dormant and never consulted.
-        r, ar = self._call([self._member("m", False, True, exc="00-00")])
+        r, ar = self._call([self._member("m", False, True, exc="0000-00")])
         assert json.loads(r["body"])["accepted"] == 0
         ar.set_grants_exception.assert_not_called()
 
     def test_service_then_docker_scenario_reflags(self):
-        # Fleet grants nothing. Host gained service-mgmt, accepted at "10-00". Host then
-        # also gained docker (member now "11") -> current signature "11-00" != "10-00", so
-        # it comes back out of the exception and is flagged/re-acceptable at "11-00".
+        # Fleet grants nothing. Host gained service-mgmt, accepted at an old signature. Host
+        # then also gained docker (member grants now "11") -> current signature "1100-00" no
+        # longer matches, so it comes out of the exception and is re-acceptable at "1100-00".
         bare = {**_FLEET, "grant_service_mgmt": False, "grant_docker": False}
-        r, ar = self._call([self._member("m", True, True, exc="10-00")], fleet=bare)
+        r, ar = self._call([self._member("m", True, True, exc="1000-00")], fleet=bare)
         assert json.loads(r["body"])["accepted"] == 1
-        ar.set_grants_exception.assert_called_once_with("m", "11-00")
+        ar.set_grants_exception.assert_called_once_with("m", "1100-00")
 
     def test_single_agent(self):
         r, ar = self._call([self._member("m", False, False)], agent_id="m")
@@ -518,7 +745,7 @@ class TestResolveFleetGrants:
         r, ar = self._call("accept", [self._member("m", False, False)])
         body = json.loads(r["body"])
         assert body["accepted"] == 1
-        ar.set_grants_exception.assert_called_once_with("m", "00-01")
+        ar.set_grants_exception.assert_called_once_with("m", "0000-01")
         ar.update_grants.assert_not_called()
 
     def test_invalid_resolution_400(self):
@@ -689,3 +916,46 @@ class TestRemoveFleetMember:
             ar.get.return_value = {**self._AGENT, "tenant_id": "other"}
             r = handle_remove_fleet_member(FLEET_ID, "agent_m", TOKEN)
         assert r["statusCode"] == 404
+
+
+class TestFleetHistory:
+    def test_unauthorized(self):
+        with patch("handlers.tenant_fleets._verify_tenant_token", return_value=None):
+            r = handle_get_fleet_history(FLEET_ID, TOKEN)
+        assert r["statusCode"] == 401
+
+    def test_fleet_not_found_returns_404(self):
+        with _auth(), patch("handlers.tenant_fleets.fleets_repo") as fr:
+            fr.get.return_value = None
+            r = handle_get_fleet_history(FLEET_ID, TOKEN)
+        assert r["statusCode"] == 404
+
+    def test_other_tenant_returns_404(self):
+        with _auth(), patch("handlers.tenant_fleets.fleets_repo") as fr:
+            fr.get.return_value = {**_FLEET, "tenant_id": "other"}
+            r = handle_get_fleet_history(FLEET_ID, TOKEN)
+        assert r["statusCode"] == 404
+
+    def test_returns_edit_timeline_newest_first(self):
+        audit = [
+            {"action": "fleet.created", "actor_name": "alice", "event_metadata": {"mode": "approved"},
+             "created_at": "2026-07-01T00:00:00Z"},
+            {"action": "fleet.member_detached", "actor_name": "alice",
+             "event_metadata": {"hostname": "web-3"}, "created_at": "2026-07-10T00:00:00Z"},
+            {"action": "job.submitted", "created_at": "2026-07-11T00:00:00Z"},  # not a fleet edit -> dropped
+        ]
+        with _auth(), patch("handlers.tenant_fleets.fleets_repo") as fr, \
+             patch("handlers.tenant_fleets.audit_repo") as aur:
+            fr.get.return_value = _FLEET
+            aur.list_by_tenant.return_value = audit
+            r = handle_get_fleet_history(FLEET_ID, TOKEN)
+        assert r["statusCode"] == 200
+        hist = json.loads(r["body"])["history"]
+        assert [e["action"] for e in hist] == ["fleet.member_detached", "fleet.created"]
+        assert all(e["kind"] == "edit" for e in hist)
+        assert "web-3" in hist[0]["note"]
+        aur.list_by_tenant.assert_called_once_with(TENANT_ID, limit=100, resource=FLEET_ID)
+
+    def test_wrapper_missing_auth_returns_401(self):
+        r = fleet_history_handler({"headers": {}, "pathParameters": {"fleet_id": FLEET_ID}}, None)
+        assert r["statusCode"] == 401

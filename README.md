@@ -1,8 +1,8 @@
 # reach
 
-**Let AI agents operate your production machines - safely.** Reads run freely; every _write_ is **blocked and queued for a human to approve** before it touches anything. No SSH, no VPN, no open ports.
+**Let AI agents operate your production machines - safely.** Reads run; every _write_ is **blocked and queued for a human to approve** before it touches anything. No SSH, no VPN, no open ports.
 
-The one idea: on a production agent, an AI (or any automation) can look at everything, but it cannot change anything until a person approves the exact action.
+The one idea: on a production agent, an AI (or any automation) can inspect everything the agent can reach, but it cannot change anything until a person approves the exact action.
 
 ```bash
 # your agent asks to do something destructive on prod...
@@ -19,7 +19,7 @@ $ reach exec --agent prod -- kubectl delete pods --all -n payments
   Status: SUCCEEDED
 ```
 
-You approve a **rule**, not a command string - so an approved action can't be extended (`… | tee /etc/x`, `… && rm -rf`) to smuggle something past it. That's the difference between "AI on prod" being a liability and being something you can sleep next to.
+You approve a **rule**, not a command string - so an approved action can't be extended (`… | tee /etc/x`, `… && rm -rf`) to smuggle something past it. That's the difference between "AI on prod" being a liability and a system you can operate with confidence.
 
 ## ⚡ 2-minute Quick Start
 
@@ -134,13 +134,13 @@ Each agent runs in one of three modes (set in the tenant console or via the API)
 
 - **`approved`** ← the production mode - reads run; every write runs only if it matches a rule a human pre-approved for that agent, otherwise it's blocked and queued for review. This is the whole point of Reach.
 - **`readonly`** - only reads run; any write/delete/restart/install is blocked. For a locked-down "look but don't touch" agent.
-- **`wild`** - runs almost anything; only a catastrophic/abuse set (`rm -rf /`, `mkfs`, privileged escapes, reverse shells) is always blocked. For personal/dev boxes where you're the sole user.
+- **`wild`** - runs almost anything; only a fixed set of known catastrophic/abuse patterns (`rm -rf /`, `mkfs`, privileged escapes, reverse shells) is always blocked. For personal/dev boxes where you're the sole user.
 
 Host and Kubernetes agents share these modes but enforce them differently - agent-side Landlock vs backend-side gating. Approvals are structured rules on both: host `{bin, args[]}` (positional `*`, trailing `...`), k8s `{verb, resource, namespace, name}`. Full detail (enforcement model, structured rules, `access_level`): **[POLICIES.md](POLICIES.md)**.
 
 ## Safety
 
-Controlled execution by design: no inbound ports, outbound-HTTPS-only agents, a default command timeout, a **catastrophic-command blocklist** enforced server-side in every mode (`rm -rf /`, fork bombs, privileged escapes, exfiltration, reverse shells), and a full audit trail. Kubernetes agents add no-shell + a `kubectl` allowlist bounded by cluster RBAC. Full blocklist, threat model, and enforcement: **[SECURITY.md](SECURITY.md)** · **[POLICIES.md](POLICIES.md)**.
+Controlled execution by design: no inbound ports, outbound-HTTPS-only agents, a default command timeout, a **catastrophic-command blocklist** enforced server-side in every mode (`rm -rf /`, fork bombs, privileged escapes, known credential-access & exfiltration patterns, reverse shells), and a full audit trail. **Sensitive reads** (SSH keys, `.env`, `kubectl get secret`) are gated like writes - blocked in `readonly`, approval-required in `approved` - and command output is **redacted** for recognizable secrets (an approved secret read is shown unredacted, since approving *is* the authorization to see it). Kubernetes agents add no-shell + a `kubectl` allowlist bounded by cluster RBAC. Full model: **[SECURITY.md](SECURITY.md)** · **[POLICIES.md](POLICIES.md)**.
 
 ## Observability
 

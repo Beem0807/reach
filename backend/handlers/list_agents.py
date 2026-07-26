@@ -3,6 +3,7 @@ from typing import Optional
 
 from shared.access import can_access_agent, can_write_agent
 from shared.auth import _bearer, _verify_tenant_token
+from shared.mode import revert_expired_mode
 from shared.response import _err, _ok
 from shared.store import agents_repo, fleets_repo
 
@@ -25,7 +26,12 @@ def _clear_matched_grant_exceptions(tenant_id: str, rows: list) -> None:
             continue
         matches = (bool(a.get("grant_service_mgmt")) == bool(fl.get("grant_service_mgmt"))
                    and bool(a.get("grant_docker")) == bool(fl.get("grant_docker")))
-        if matches:
+        # An accepted OUT-OF-BAND exception (host reports a capability the fleet doesn't
+        # grant) must survive even though the grant records match - clearing it would
+        # instantly re-flag. Only drop the exception when the member is fully in order.
+        out_of_band = ((a.get("service_mgmt_detected") and not fl.get("grant_service_mgmt"))
+                       or (a.get("docker_detected") and not fl.get("grant_docker")))
+        if matches and not out_of_band:
             agents_repo.set_grants_exception(a["agent_id"], None)
             a["grants_exception"] = None
 
@@ -52,6 +58,8 @@ def _project(a: dict, user: dict) -> dict:
         "fleet_id": a.get("fleet_id"),
         "type": a.get("type"),
         "mode": a.get("mode", "wild"),
+        "mode_expires_at": a.get("mode_expires_at"),   # temporary wild: when it reverts
+        "mode_revert_to": a.get("mode_revert_to"),
         "access_level": a.get("access_level") or "open",
         # Whether *this* user may run write commands on the agent (read-only
         # grant → false). Separate from the agent's own mode/access_level.
@@ -104,7 +112,9 @@ def handle_list_agents(raw_token: str, tag: Optional[str] = None, q: Optional[st
 
     # Base set: non-deleted agents this user may access. Both the tag facet and the
     # filters below derive from this, so options and results stay within their reach.
-    visible = [a for a in rows if a.get("status") != "DELETED" and can_access_agent(user, a)]
+    # Any elapsed temporary-wild window is reverted here so the list shows the real mode.
+    visible = [revert_expired_mode(a) for a in rows
+               if a.get("status") != "DELETED" and can_access_agent(user, a)]
 
     tags_wanted = {t.strip() for t in (tag or "").split(",") if t.strip()}
     ql = (q or "").strip().lower() or None

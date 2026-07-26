@@ -14,6 +14,14 @@ Reach still rejects a small set of commands in wild mode - those that are catast
 
 For production machines, use **Approved** mode and explicitly allowlist the write operations Reach is allowed to perform.
 
+### Temporary (break-glass) wild
+
+When you switch an agent to wild you can bound it to a **window** - `1h`, `2h`, `4h`, `1d`, `1w`, or a custom `<n>h`/`<n>d`/`<n>w` (capped at 30 days) - instead of leaving it permanently open. At expiry the agent auto-reverts to the mode it had **before** (`readonly`/`approved`, defaulting to `readonly`), so a break-glass session can't be forgotten and left wide open. Choose **Permanent** to keep the old behaviour.
+
+The revert applies in two layers. **Lazily**, the fall-back mode is applied the moment the agent is read (console/API list or detail) or a job is created against it - and **no wild job ever runs after `mode_expires_at`**, because create-job evaluates the revert before classifying the command (this is the safety guarantee). Separately, the **hourly heartbeat sweep** converges any expired-but-untouched agent so the store and audit trail don't carry a phantom `wild` row until someone next reads it. Either way the system-triggered revert is recorded in the audit log as `agent.mode_reverted` (`actor = system`). In the console the mode badge shows a `⏱` countdown to the revert, and the agent detail shows `temporary · reverts to X in Yh`.
+
+**Fleets** work the same way. Setting a fleet to wild with a `duration` arms the window on the **fleet** (the policy source members inherit) and propagates it to every current member; a machine that joins mid-window inherits the *remaining* window, so it auto-reverts in lock-step. At expiry the fleet reverts to its previous mode, re-propagates that to members, and records `fleet.mode_reverted`. Enforcement is the same two layers - lazily on fan-out and fleet reads (no wild fan-out runs past the window), plus the hourly sweep - so a break-glass window across a whole fleet can't be left open by accident.
+
 ## Readonly mode
 
 Readonly mode blocks any command that writes, deletes, installs, or mutates system state. This includes: file writes and deletes, process kills, service restarts, reboots and shutdowns, package managers, container mutations (`docker run/stop/rm`), firewall changes, user management, IaC destroys (`terraform destroy`, `pulumi destroy`), and cloud destructive operations (`aws ec2 terminate-instances`, `gcloud instances delete`).
@@ -28,7 +36,7 @@ Where there is **no kernel sandbox** - an old or locked-down Linux kernel withou
 
 ## Approved mode
 
-Reads are always allowed - you do not need to add them to any list. Write and destructive operations (anything blocked in readonly mode) are only permitted if they match an approved **structured rule** for this agent.
+Ordinary reads are always allowed - you do not need to add them to any list. Write and destructive operations (anything blocked in readonly mode) are only permitted if they match an approved **structured rule** for this agent. **Sensitive reads** - commands that read secrets/credentials - are the exception: they're gated like writes (see [Sensitive reads](#sensitive-reads)).
 
 **How it works (host agents):**
 
@@ -46,6 +54,24 @@ For a member of a **fleet**, approvals are **fleet-scoped** rather than per-agen
 
 A host rule matches the argv **positionally** - bin equal, arity equal, each arg equal or `*` (a single-argument wildcard): approving `{bin: systemctl, args: [restart, *]}` permits `systemctl restart nginx` and `systemctl restart web-01`, but not `systemctl stop nginx`. Arity is fixed unless the rule ends in `...` - a **trailing variadic wildcard** that matches zero or more remaining args - so `{bin: helm, args: [list, ...]}` covers `helm list`, `helm list prod`, and `helm list -n prod --all` alike, while `helm list *` still requires exactly one arg. This mirrors the k8s rule model below. A command string submitted for approval (e.g. from the CLI) is structured into this same rule, or rejected if it can't be - every host approval is a structured rule, never a raw command string.
 
+### Approval explainability
+
+Because an approved rule is **reusable**, what it permits is almost always broader than the one command that triggered it - a `*` arg means "any service", a fleet approval applies to *every* member, a k8s `name: ""` means "any pod". So the console explains the **consequences of the rule**, not just the triggering command. Each approval carries a computed `explanation`: the plain-English action ("Restart a service"), the widened scope highlighted (`Allowed service: Any`), the blast radius (`delete all pods in payments`, or `48 fleet members`), whether it's reusable, when it expires, and a **risk** verdict (`low`/`medium`/`high`) that **names its own reasons** (`high · wildcard scope + 48 targets + never expires`) rather than showing an opaque label. It's derived server-side (`shared/explain.py`) and shown in the console's **Risk** column (with the full breakdown on hover / row-click) so an operator sees what they're actually granting.
+
+#### Risk scoring
+
+The verdict is a small, **transparent, conservative** additive score - deliberately simple so its reasons are legible and it's easy to tune (all weights live in one function, `_risk()` in `shared/explain.py`). Each contributing factor adds points and appears verbatim in the `risk_factors` list shown to the operator:
+
+| Factor | Detected from | Points |
+|---|---|---|
+| **Changes or destroys state** | a destructive verb (`restart`/`stop`/`delete`/`remove`/`drop`/…) or standalone bin (`rm`/`reboot`/`kill`/…), or any k8s write verb | +2 |
+| **Wildcard scope** (permits more than the triggering command) | a host `*` / trailing `...` arg, or a k8s `*` in `resource`/`namespace`/`name` | +2 |
+| **Exposes secrets** | the rule reads a sensitive path (SSH keys, `.env`, cloud creds, …) or k8s `secrets` - detected from the rule, not a stored flag | +2 |
+| **Blast radius** | fleet **target count**: `+2` at ≥10 members, `+1` at 2-9, `0` for a single agent | +1/+2 |
+| **Never expires** | `expires_at` is unset (a standing, permanent grant) | +1 |
+
+The total maps to a level: **`high` ≥ 4 · `medium` 2-3 · `low` 0-1**. So a single destructive-but-narrow action (e.g. `systemctl restart nginx` on one agent, 7-day expiry) scores 2 → `medium`; widen it with a `*` (+2) or point it at a fleet of ≥10 (+2) and it reaches 4 → `high`, while making it never-expire (+1) only edges it to 3, still `medium`. The scoring is intentionally biased upward - it's a prompt to look closer, not a guarantee of safety - and the factors are always shown so the operator can judge the specifics, not just the label.
+
 **Approvals from the CLI:**
 
 ```bash
@@ -62,6 +88,16 @@ reach fleets approvals request <fleet> "<cmd>"  # request / pre-approve for the 
 ```
 
 The output adapts to the agent type: **host** agents show the structured rule as `bin / args` columns; **Kubernetes** agents show it as `verb / resource / namespace / name` columns (with `✱` for wildcard fields). `--pending`, `--denied`, and `--expired` show only your own records; expired entries are visually marked so you can see why a command stopped working. `approve`/`deny` act on an approval **id** and work for both agent and fleet approvals.
+
+## Sensitive reads
+
+A read is "safe" in the model above - but a read can still **exfiltrate** (`cat ~/.ssh/id_rsa`, `cat .env`, `kubectl get secret x -o yaml`). So reads that touch **secrets/credentials** are gated **like writes**:
+
+- **`readonly`** - rejected (no approval path).
+- **`approved`** - needs an operator-approved rule, exactly like a write. This is the deliberate, audited way to permit reading a specific secret for troubleshooting: an operator approves e.g. `cat ~/.ssh/id_rsa` (a `{bin, args[]}` rule) or `kubectl get secret db` (a `{verb: get, resource: secrets, …}` rule), and then it runs.
+- **`wild`** - runs.
+
+**Approving *is* the authorization to see it**, so an approved sensitive read's output is stored **unredacted** (ordinary output is still scrubbed by [secret redaction](SECURITY.md#secret-redaction-in-command-output)). Enforced at the backend (submission) **and** the agent (Landlock blocks writes, not reads, so the agent refuses unapproved sensitive reads itself). Detection is best-effort by path/command; the agent's non-root OS identity and k8s RBAC (default `view` can't read Secrets) are the harder floors underneath. Full model: [SECURITY.md → Sensitive reads](SECURITY.md#sensitive-reads).
 
 ## Host vs Kubernetes enforcement
 
@@ -90,7 +126,7 @@ For Kubernetes agents a rule is a poor fit for text prefix - `kubectl create pod
 { "verb": "delete", "resource": "pods", "namespace": "team-a", "name": "*" }
 ```
 
-- Any field may be `*` (matches anything). `verb` is required and must be a write verb - a single verb like `delete`/`scale`, a compound "double verb" like `rollout restart` or `auth reconcile`, or `*`. Reads are always allowed and never need approval.
+- Any field may be `*` (matches anything). `verb` is required and must be a write verb - a single verb like `delete`/`scale`, a compound "double verb" like `rollout restart` or `auth reconcile`, or `*`. Ordinary reads are always allowed and never need approval (sensitive reads are gated - see [Sensitive reads](#sensitive-reads)).
 - A submitted `kubectl` write is permitted when some approved rule matches **every** field (equal or `*`). So one rule - "`delete pods` in `team-a`, any name" - covers every pod delete there, without re-approving each object.
 - When an unapproved write is blocked, the backend **derives** the rule from the command onto the pending request, so the operator reviews (and can widen to `*`) verb/resource/namespace/name. Operators can also author rules directly.
 - Pipes and flags are handled: each `kubectl` write stage is checked; read stages and filters (`| jq`) pass; flags like `-n`, `-l`, `--from-literal=k=v` don't confuse parsing; anything unparseable stays blocked (never over-approved).
@@ -119,7 +155,7 @@ These are factual descriptors, not risk scores. An `open` agent in a personal de
 
 Policy modes bound *what an agent may run*. A separate layer bounds *which users may see and drive which agents*.
 
-**Roles** (per tenant user): `developer` submits jobs and requests/views approvals; `operator` adds reviewing and managing approvals and agents; `admin` adds managing users, tags, policy, and audit logs.
+**Roles** (per tenant user): `developer` submits jobs, requests/views approvals, and sees **only the jobs it created**; `operator` adds reviewing and managing approvals and agents, and sees **all** jobs on agents it can access; `admin` adds managing users, tags, policy, and audit logs. (Job output can carry sensitive data, so a developer's view is scoped to its own jobs; operators/admins keep the full reviewing view.)
 
 **Agent scoping.** On top of role, non-admin users are scoped to a subset of agents/fleets, granted as **read-only** or **read-write** (`readwrite_*` / `readonly_*` lists for agents and fleets). Non-admins have **no access by default**. Read access (the union of all grants) is enforced the same way everywhere - an out-of-scope agent is invisible in the agent list, and any job, approval, or job-history call for it returns "not found". A **read-only** grant additionally rejects write commands (and approval creation) with `403` in any mode - it narrows, but never bypasses, the agent's own policy mode. There is **no wildcard**: only admins are tenant-wide, and granting a non-admin "all agents" lists every id explicitly (so new agents aren't auto-included). Fleet members are granted via their **fleet**, not by individual agent id (their ids churn as the autoscaler scales).
 

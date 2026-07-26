@@ -176,6 +176,37 @@ describe('operator view rendering', () => {
     expect(denyButtons.length).toBe(2);
   });
 
+  it('shows a Risk column and opens the explanation on row click (not the approve modal)', async () => {
+    const withExplanation: Approval = {
+      ...APPROVAL_2,
+      explanation: {
+        summary: 'Restart a service (any)',
+        facts: [
+          { label: 'Requested action', value: 'Restart a service' },
+          { label: 'Allowed service', value: 'Any', wide: true },
+          { label: 'Targets', value: 'myhost.local' },
+          { label: 'Reusable', value: 'Yes' },
+          { label: 'Expires', value: 'Never', wide: true },
+        ],
+        risk: 'high',
+        risk_factors: ['changes or destroys state', 'wildcard scope (permits more than the triggering command)'],
+      },
+    };
+    renderOperator([withExplanation]);
+    const cmd = await screen.findByText('systemctl restart nginx');
+    // A Risk column header + a risk chip on the row.
+    expect(screen.getByRole('columnheader', { name: 'Risk' })).toBeInTheDocument();
+    // The explanation exists in the row's hover popover already (CSS-hidden until hover).
+    expect(screen.getAllByText('What this permits').length).toBeGreaterThanOrEqual(1);
+    // Clicking the row (not an action button) opens the read-only detail with the explanation.
+    fireEvent.click(cmd);
+    expect(await screen.findByText('Approval detail')).toBeInTheDocument();   // the detail modal, unique title
+    expect(screen.getAllByText('Allowed service').length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText(/wildcard scope/i).length).toBeGreaterThanOrEqual(1);
+    // It is NOT the approve modal.
+    expect(screen.queryByRole('button', { name: /Approve now/i })).not.toBeInTheDocument();
+  });
+
   it('switches to fleet scope: queries with scope=fleet and shows the fleet picker', async () => {
     vi.spyOn(api, 'listTenantAgents').mockResolvedValue({ agents: [] });
     vi.spyOn(api, 'listFleets').mockResolvedValue({

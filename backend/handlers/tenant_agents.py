@@ -1,15 +1,17 @@
 """Tenant admin: manage agents within the tenant."""
 import logging
 import os
+import re
 import secrets
 from typing import Optional
 
 import shared.audit as audit
 from shared.access import can_access_agent, is_agent_restricted
 from shared.auth import INSTALL_TOKEN_PREFIX, _hmac_token, _verify_tenant_token
+from shared.mode import mode_duration_expiry
 from shared.policy import compute_access_level
 from shared.response import _err, _iso, _iso_offset, _now, _ok
-from shared.store import agent_history_repo, agents_repo, approvals_repo, users_repo
+from shared.store import agent_history_repo, agents_repo, approvals_repo, audit_repo, users_repo
 from shared.tags import validate_tags
 from shared.versions import available_versions, valid_version
 
@@ -470,6 +472,10 @@ def handle_request_agent_rotation(agent_id: str, raw_token: str) -> dict:
     return _ok({"agent_id": agent_id, "rotation_requested": True})
 
 
+# Duration parsing lives in shared.mode (shared with the fleet set-mode handler).
+_mode_expiry = mode_duration_expiry
+
+
 def handle_set_tenant_agent_mode(agent_id: str, body: dict, raw_token: str) -> dict:
     user = _verify_tenant_token(raw_token)
     if not user:
@@ -485,8 +491,22 @@ def handle_set_tenant_agent_mode(agent_id: str, body: dict, raw_token: str) -> d
     if agent.get("fleet_id"):
         return _err("fleet agents inherit mode from the fleet; change it on the fleet instead", 409)
     prev_mode = agent.get("mode")
-    agents_repo.update_policy(agent_id, mode)
-    if prev_mode != mode:
+
+    # A `duration` (only meaningful for wild) makes it a TEMPORARY escape hatch that
+    # auto-reverts to the previous mode when it elapses. Any non-wild mode, or wild with no
+    # duration, is permanent - update_policy(None, None) clears any prior schedule.
+    expires_at = None
+    revert_to = None
+    if mode == "wild":
+        ok, expires_at = _mode_expiry(str(body.get("duration") or ""))
+        if not ok:
+            return _err("invalid duration (use e.g. 1h, 4h, 1d, 1w, or 'permanent')")
+        if expires_at:
+            # Fall back to the previous safe mode (or readonly if it was already wild).
+            revert_to = prev_mode if prev_mode in ("readonly", "approved") else "readonly"
+
+    agents_repo.update_policy(agent_id, mode, mode_expires_at=expires_at, mode_revert_to=revert_to)
+    if prev_mode != mode or expires_at:
         audit.write(
             "agent.mode_changed",
             tenant_id=user["tenant_id"],
@@ -495,10 +515,12 @@ def handle_set_tenant_agent_mode(agent_id: str, body: dict, raw_token: str) -> d
             actor_role=user.get("role", ""),
             resource_type="agent",
             resource_id=agent_id,
-            metadata={"from_mode": prev_mode, "to_mode": mode, "hostname": agent.get("hostname")},
+            metadata={"from_mode": prev_mode, "to_mode": mode, "hostname": agent.get("hostname"),
+                      **({"expires_at": expires_at, "revert_to": revert_to} if expires_at else {})},
         )
-    logger.info("Set agent=%s mode=%s by user=%s", agent_id, mode, user.get("user_id"))
-    return _ok({"agent_id": agent_id, "mode": mode})
+    logger.info("Set agent=%s mode=%s%s by user=%s", agent_id, mode,
+                f" until {expires_at} (revert {revert_to})" if expires_at else "", user.get("user_id"))
+    return _ok({"agent_id": agent_id, "mode": mode, "mode_expires_at": expires_at, "mode_revert_to": revert_to})
 
 
 def handle_acknowledge_capability(agent_id: str, body: dict, raw_token: str) -> dict:
@@ -513,6 +535,12 @@ def handle_acknowledge_capability(agent_id: str, body: dict, raw_token: str) -> 
     capability = body.get("capability", "").strip()
     if capability not in ("docker", "service_mgmt", "k8s_permissions"):
         return _err("capability must be docker, service_mgmt, or k8s_permissions")
+    # docker/service_mgmt acks set an INDIVIDUAL host grant. Fleet members inherit their
+    # grants from the fleet, so acking one here would immediately diverge from the fleet
+    # and re-raise a grant mismatch (reconcile → ack → mismatch → reconcile loop). Grants
+    # for members are resolved on the fleet (reconcile / accept), not per-agent.
+    if agent.get("fleet_id") and capability in ("docker", "service_mgmt"):
+        return _err("fleet agents inherit grants from the fleet; manage them on the fleet instead", 409)
     if capability == "docker":
         agents_repo.update_grants(agent_id, grant_docker=True)
         label = "Docker"
@@ -575,6 +603,65 @@ def handle_acknowledge_sandbox(agent_id: str, body: dict, raw_token: str) -> dic
     return _ok({"agent_id": agent_id, "sandbox_ack": acknowledged})
 
 
+# Agent-timeline EDITS (audit-log side). These are NOT status transitions - those already live
+# in agent_history - so merging the two never double-lists an event.
+_AGENT_EDIT_ACTIONS = {
+    "agent.mode_changed", "agent.mode_reverted", "agent.tags_changed", "agent.sandbox_acknowledged",
+    "agent.sandbox_ack_revoked", "agent.capability_acknowledged", "agent.rotation_requested",
+}
+
+
+def _agent_edit_note(action: str, meta: dict) -> str:
+    meta = meta or {}
+    if action == "agent.mode_changed":
+        base = f"mode {meta.get('from_mode')} → {meta.get('to_mode')}"
+        if meta.get("expires_at"):
+            base += f" (temporary; reverts to {meta.get('revert_to')})"
+        return base
+    if action == "agent.mode_reverted":
+        return f"mode auto-reverted wild → {meta.get('to_mode')} (temporary window ended)"
+    if action == "agent.tags_changed":
+        def _fmt(t):
+            return ", ".join(str(x) for x in t) if t else "none"
+        return f"tags: {_fmt(meta.get('from'))} → {_fmt(meta.get('to'))}"
+    if action == "agent.sandbox_acknowledged":
+        return "write protection: allowed to run unsandboxed"
+    if action == "agent.sandbox_ack_revoked":
+        return "write protection: re-required (fail-closed)"
+    if action == "agent.capability_acknowledged":
+        return f"capability acknowledged: {meta.get('capability') or meta.get('label') or ''}".strip()
+    if action == "agent.rotation_requested":
+        return "token rotation requested"
+    return action.replace("agent.", "").replace("_", " ")
+
+
+# Fleet config changes a member *inherits* from its fleet (recorded on the fleet,
+# not the agent). Surfaced on a member's timeline as `kind: fleet`, read-time, so
+# a member's history explains its inherited state without any duplication.
+_FLEET_INHERITED_ACTIONS = {"fleet.updated"}
+
+
+def _merge_history(status_rows: list, audit_rows: list, edit_actions: set, note_fn, limit=50) -> list:
+    """One timeline: status transitions (from a *_history repo) + edit events (from the audit
+    log), normalized and sorted newest-first. Edits carry the actor + a human note.
+    Pass limit=None to skip the final slice (caller sorts/slices after adding more entries)."""
+    entries = [
+        {"kind": "status", "from_status": h.get("from_status"), "to_status": h.get("to_status"),
+         "note": h.get("note"), "by": h.get("triggered_by"), "created_at": h.get("created_at")}
+        for h in status_rows
+    ]
+    for a in audit_rows:
+        if a.get("action") in edit_actions:
+            entries.append({
+                "kind": "edit", "action": a.get("action"),
+                "note": note_fn(a.get("action"), a.get("event_metadata") or a.get("metadata")),
+                "by": a.get("actor_name") or a.get("actor_id"),
+                "created_at": a.get("created_at"),
+            })
+    entries.sort(key=lambda e: e.get("created_at") or "", reverse=True)
+    return entries if limit is None else entries[:limit]
+
+
 def handle_get_agent_history(agent_id: str, raw_token: str) -> dict:
     user = _verify_tenant_token(raw_token)
     if not user:
@@ -582,8 +669,26 @@ def handle_get_agent_history(agent_id: str, raw_token: str) -> dict:
     agent = _get_agent(agent_id, user)
     if not agent:
         return _err("agent not found", 404)
-    history = agent_history_repo.list_by_agent(agent_id, limit=50)
-    return _ok({"history": history})
+    # One timeline: status transitions + edit events (mode/tags/grants/acks) from the audit log.
+    status_rows = agent_history_repo.list_by_agent(agent_id, limit=50)
+    audit_rows = audit_repo.list_by_tenant(user["tenant_id"], limit=100, resource=agent_id)
+    entries = _merge_history(status_rows, audit_rows, _AGENT_EDIT_ACTIONS, _agent_edit_note, limit=None)
+    # A fleet member inherits config from its fleet; fold in the fleet's inherited
+    # edits since this agent joined so the member's timeline explains its state.
+    fleet_id = agent.get("fleet_id")
+    if fleet_id:
+        from handlers.tenant_fleets import _fleet_history_note  # lazy: avoids an import cycle
+        joined = agent.get("created_at") or ""
+        fleet_audit = audit_repo.list_by_tenant(user["tenant_id"], limit=100, resource=fleet_id)
+        entries += [
+            {"kind": "fleet", "action": a.get("action"),
+             "note": "via fleet - " + _fleet_history_note(a.get("action"), a.get("event_metadata") or a.get("metadata")),
+             "by": a.get("actor_name") or a.get("actor_id"), "created_at": a.get("created_at")}
+            for a in fleet_audit
+            if a.get("action") in _FLEET_INHERITED_ACTIONS and (a.get("created_at") or "") >= joined
+        ]
+        entries.sort(key=lambda e: e.get("created_at") or "", reverse=True)
+    return _ok({"history": entries[:50]})
 
 
 def handle_list_agent_versions(agent_type: str, raw_token: str) -> dict:

@@ -18,11 +18,12 @@ from typing import Optional
 import shared.audit as audit
 from shared.access import can_access_fleet, can_write_fleet
 from shared.auth import FLEET_TOKEN_PREFIX, _hmac_token, _verify_tenant_token
+from shared.mode import mode_duration_expiry, revert_expired_fleet_mode
 from shared.settings import effective_settings, validate_fleet_wave_policy, wave_policy_exceeds_cap
 from shared.waves import resolve_policy
 from shared.exceptions import NameTakenError
 from shared.response import _err, _iso, _iso_offset, _now, _ok
-from shared.store import agent_history_repo, agents_repo, approvals_repo, fleets_repo, tenants_repo
+from shared.store import agent_history_repo, agents_repo, approvals_repo, audit_repo, fleets_repo, tenants_repo
 from shared.tags import former_fleet_tag, validate_tags
 from handlers.tenant_agents import _build_install_commands, _require_role
 
@@ -70,6 +71,9 @@ def _fleet_view(fleet: dict, member_count: Optional[int] = None) -> dict:
         "name": fleet.get("name"),
         "type": "host",
         "mode": fleet.get("mode"),
+        # Temporary-wild schedule (null on a permanent mode).
+        "mode_expires_at": fleet.get("mode_expires_at"),
+        "mode_revert_to": fleet.get("mode_revert_to"),
         "grant_service_mgmt": bool(fleet.get("grant_service_mgmt")),
         "grant_docker": bool(fleet.get("grant_docker")),
         "sandbox_ack": bool(fleet.get("sandbox_ack")),
@@ -109,7 +113,8 @@ def _get_owned_fleet(fleet_id: str, user: dict) -> Optional[dict]:
     fleet = fleets_repo.get(fleet_id)
     if not fleet or fleet.get("tenant_id") != user["tenant_id"] or not can_access_fleet(user, fleet):
         return None
-    return fleet
+    # Converge an elapsed temporary-wild window before anyone reads/acts on the fleet.
+    return revert_expired_fleet_mode(fleet)
 
 
 def _audit(action: str, user: dict, fleet_id: str, meta: dict) -> None:
@@ -138,6 +143,16 @@ def handle_create_fleet(body: dict, raw_token: str, api_url: str) -> dict:
     mode = (body.get("mode") or "readonly").strip()
     if mode not in VALID_MODES:
         return _err("mode must be wild, readonly, or approved")
+    # Optional temporary-wild window at creation: `duration` (only for wild) auto-reverts the
+    # fleet to readonly when it elapses. Permanent (no duration) leaves the schedule unset.
+    mode_expires_at = None
+    mode_revert_to = None
+    if mode == "wild":
+        ok, mode_expires_at = mode_duration_expiry(str(body.get("duration") or ""))
+        if not ok:
+            return _err("invalid duration (use e.g. 1h, 4h, 1d, 1w, or 'permanent')")
+        if mode_expires_at:
+            mode_revert_to = "readonly"   # a brand-new fleet has no prior mode to fall back to
     reap = _coerce_reap(body)
     if reap == "invalid":
         return _err("reap_after_seconds must be a positive integer")
@@ -170,6 +185,8 @@ def handle_create_fleet(body: dict, raw_token: str, api_url: str) -> dict:
             "tenant_id": user["tenant_id"],
             "name": name,
             "mode": mode,
+            "mode_expires_at": mode_expires_at,
+            "mode_revert_to": mode_revert_to,
             "grant_service_mgmt": grant_service_mgmt,
             "grant_docker": grant_docker,
             "sandbox_ack": sandbox_ack,
@@ -185,7 +202,8 @@ def handle_create_fleet(body: dict, raw_token: str, api_url: str) -> dict:
     except NameTakenError:
         return _err("a fleet with that name already exists", 409)
 
-    _audit("fleet.created", user, fleet_id, {"name": name, "mode": mode})
+    _audit("fleet.created", user, fleet_id, {"name": name, "mode": mode,
+           **({"expires_at": mode_expires_at, "revert_to": mode_revert_to} if mode_expires_at else {})})
     logger.info("Created fleet=%s name=%s tenant=%s", fleet_id, name, user["tenant_id"])
 
     fleet = fleets_repo.get(fleet_id)
@@ -215,8 +233,7 @@ def _fleet_stats(fleets: list, groups: list) -> dict:
             s["active"] += cnt
         elif status == "INACTIVE":
             s["inactive"] += cnt
-        if status in ("ACTIVE", "INACTIVE") and _member_grants_mismatched(g, fl) \
-                and g.get("grants_exception") != _grants_signature(g, fl):
+        if status in ("ACTIVE", "INACTIVE") and _member_needs_attention(g, fl):
             s["mismatch"] += cnt
     return stats
 
@@ -233,7 +250,8 @@ def handle_list_fleets(raw_token: str, q: Optional[str] = None,
     # Access-scoped: admins (tenant-wide) see every fleet; a scoped operator/developer
     # sees only the fleets granted to them (read-write or read-only). This is what
     # feeds the console's fleet dropdowns, so they mirror the caller's access.
-    fleets = [f for f in fleets_repo.list_by_tenant(user["tenant_id"]) if can_access_fleet(user, f)]
+    fleets = [revert_expired_fleet_mode(f)
+              for f in fleets_repo.list_by_tenant(user["tenant_id"]) if can_access_fleet(user, f)]
     ql = (q or "").strip().lower() or None
     if ql:
         fleets = [f for f in fleets
@@ -297,6 +315,19 @@ def handle_update_fleet(fleet_id: str, body: dict, raw_token: str) -> dict:
         if mode not in VALID_MODES:
             return _err("mode must be wild, readonly, or approved")
         fields["mode"] = mode
+        # A `duration` (only meaningful for wild) makes it a TEMPORARY escape hatch that
+        # auto-reverts to the previous mode when it elapses. Any non-wild mode, or wild with
+        # no duration, is permanent - the None schedule clears any prior expiry fleet-wide.
+        fields["mode_expires_at"] = None
+        fields["mode_revert_to"] = None
+        if mode == "wild":
+            ok, expires_at = mode_duration_expiry(str(body.get("duration") or ""))
+            if not ok:
+                return _err("invalid duration (use e.g. 1h, 4h, 1d, 1w, or 'permanent')")
+            if expires_at:
+                prev_mode = fleet.get("mode")
+                fields["mode_expires_at"] = expires_at
+                fields["mode_revert_to"] = prev_mode if prev_mode in ("readonly", "approved") else "readonly"
     if "tags" in body:
         tags = body.get("tags") or []
         tag_err = validate_tags(tags)
@@ -348,14 +379,21 @@ def handle_update_fleet(fleet_id: str, body: dict, raw_token: str) -> dict:
     except NameTakenError:
         return _err("a fleet with that name already exists", 409)
 
-    # Mode and tags are inherited, so an edit propagates to every current member.
+    # Mode and tags are inherited, so an edit propagates to every current member. The
+    # temporary-wild schedule rides along, so members stay in lock-step with the fleet.
     if "mode" in fields:
-        agents_repo.set_mode_by_fleet(fleet_id, fields["mode"])
+        agents_repo.set_mode_by_fleet(fleet_id, fields["mode"],
+                                      mode_expires_at=fields.get("mode_expires_at"),
+                                      mode_revert_to=fields.get("mode_revert_to"))
     if "tags" in fields:
         agents_repo.set_tags_by_fleet(fleet_id, fields["tags"])
 
-    _audit("fleet.updated", user, fleet_id, {k: v for k, v in fields.items()})
-    logger.info("Updated fleet=%s fields=%s", fleet_id, list(fields))
+    # Record only the fields that actually changed, each as {from, to} - the UI sends the
+    # whole settings object, so auditing every present key would report untouched fields.
+    changes = {k: {"from": fleet.get(k), "to": v} for k, v in fields.items() if fleet.get(k) != v}
+    if changes:
+        _audit("fleet.updated", user, fleet_id, changes)
+    logger.info("Updated fleet=%s changed=%s", fleet_id, list(changes))
     updated = fleets_repo.get(fleet_id)
     counts = fleets_repo.member_counts(user["tenant_id"])
     return _ok(_fleet_view(updated, member_count=counts.get(fleet_id, 0)))
@@ -508,14 +546,33 @@ def _member_grants_mismatched(agent: dict, fleet: dict) -> bool:
 
 
 def _grants_signature(agent: dict, fleet: dict) -> str:
-    """A compact signature of the **(member grants, fleet grants)** pair. A member's
-    accepted mismatch exception stores this, so acceptance is scoped to the *exact*
-    divergence the operator saw: it auto-invalidates (re-flags) if EITHER the fleet's
-    grants OR the member's own grants change afterwards (e.g. a capability-acknowledge
-    flips a member grant to a new value that still differs from the fleet)."""
+    """A compact signature of the member's **(grants, detected capabilities)** vs the
+    **fleet's grants**. A member's accepted exception stores this, so acceptance is scoped
+    to the *exact* divergence the operator saw and auto-invalidates (re-flags) if ANY of
+    those change afterwards - the fleet's grants, the member's own grants, or what the
+    host now reports (e.g. docker was actually removed, or newly detected).
+
+    Format: `{grant_sm}{grant_dk}{det_sm}{det_dk}-{fleet_sm}{fleet_dk}`. Detected bits are
+    included so accepting an **out-of-band** capability (host reports it, fleet doesn't
+    grant it) re-flags once the host stops reporting it (re-provisioned)."""
     b = lambda x: "1" if x else "0"
-    return (b(agent.get("grant_service_mgmt")) + b(agent.get("grant_docker")) + "-"
+    return (b(agent.get("grant_service_mgmt")) + b(agent.get("grant_docker"))
+            + b(agent.get("service_mgmt_detected")) + b(agent.get("docker_detected")) + "-"
             + b(fleet.get("grant_service_mgmt")) + b(fleet.get("grant_docker")))
+
+
+def _member_out_of_band(agent: dict, fleet: dict) -> list:
+    """Capabilities the host **reports running** that the fleet does **not** grant - the
+    host has more access than the fleet's policy (e.g. reconciled the grant off, but the
+    docker socket is still present). Distinct from a grant *record* mismatch: this can't
+    be reconciled remotely (you'd re-provision the host), so it's accept-only. Returns the
+    human labels of the out-of-band capabilities, or []."""
+    oob = []
+    if agent.get("service_mgmt_detected") and not fleet.get("grant_service_mgmt"):
+        oob.append("service management")
+    if agent.get("docker_detected") and not fleet.get("grant_docker"):
+        oob.append("docker")
+    return oob
 
 
 def _member_mismatch_accepted(agent: dict, fleet: dict) -> bool:
@@ -525,10 +582,17 @@ def _member_mismatch_accepted(agent: dict, fleet: dict) -> bool:
     return bool(agent.get("grants_exception")) and agent.get("grants_exception") == _grants_signature(agent, fleet)
 
 
-def _member_mismatch_flagged(agent: dict, fleet: dict) -> bool:
-    """A member is *flagged* when its grants mismatch the fleet and the divergence
-    hasn't been accepted - i.e. it still needs resolving (reconcile or accept)."""
-    return _member_grants_mismatched(agent, fleet) and not _member_mismatch_accepted(agent, fleet)
+def _member_needs_attention(agent: dict, fleet: dict) -> bool:
+    """A member is *flagged* on the fleet when its grants mismatch the fleet **or** the
+    host reports an out-of-band capability the fleet doesn't grant, and the divergence
+    hasn't been accepted - i.e. it still needs resolving (reconcile / re-provision / accept).
+    """
+    return ((_member_grants_mismatched(agent, fleet) or bool(_member_out_of_band(agent, fleet)))
+            and not _member_mismatch_accepted(agent, fleet))
+
+
+# Back-compat alias: the flag now also covers out-of-band detection, not just grant records.
+_member_mismatch_flagged = _member_needs_attention
 
 
 def _grants_backing_gap(agent: dict, fleet: dict) -> Optional[str]:
@@ -581,9 +645,19 @@ def handle_acknowledge_fleet_grants(fleet_id: str, raw_token: str, agent_id: Opt
             return _err("agent not found in this fleet", 404)
     reconciled = 0
     blocked: list = []
+    reconciled_hosts: list = []
     for a in members:
         # Accepted exceptions are intentional - a bulk reconcile leaves them alone.
-        if not _member_mismatch_flagged(a, fleet):
+        if not _member_needs_attention(a, fleet):
+            continue
+        # Out-of-band: the host reports a capability the fleet doesn't grant. Reconcile
+        # aligns the grant RECORD, but it can't strip a capability the host actually has -
+        # that needs re-provisioning. So it's accept-only, reported as blocked.
+        oob = _member_out_of_band(a, fleet)
+        if oob:
+            blocked.append({"agent_id": a["agent_id"], "hostname": a.get("hostname"),
+                            "reason": f"host reports {', '.join(oob)} the fleet doesn't grant - "
+                                      "re-provision to remove it, or accept as-is"})
             continue
         gap = _grants_backing_gap(a, fleet)
         if gap:
@@ -594,10 +668,16 @@ def handle_acknowledge_fleet_grants(fleet_id: str, raw_token: str, agent_id: Opt
         if a.get("grants_exception"):
             agents_repo.set_grants_exception(a["agent_id"], None)   # matched now - no exception
         reconciled += 1
+        reconciled_hosts.append(a.get("hostname") or a["agent_id"])
 
-    _audit("fleet.grants_reconciled", user, fleet_id,
-           {"reconciled": reconciled, "blocked": len(blocked), "agent_id": agent_id,
-            "grant_service_mgmt": sm, "grant_docker": dk})
+    # Only record the reconcile in history when at least one member was actually
+    # reconciled. If every candidate was blocked (host doesn't report the capability
+    # yet), nothing changed - recording "grants reconciled" would be a false positive.
+    # Capture the reconciled hostnames (capped) so the note can name a single member.
+    if reconciled:
+        _audit("fleet.grants_reconciled", user, fleet_id,
+               {"reconciled": reconciled, "blocked": len(blocked), "agent_id": agent_id,
+                "hosts": reconciled_hosts[:5], "grant_service_mgmt": sm, "grant_docker": dk})
     logger.info("Reconciled fleet=%s grants: %d member(s), %d blocked%s",
                 fleet_id, reconciled, len(blocked), f" (agent={agent_id})" if agent_id else "")
     return _ok({"fleet_id": fleet_id, "reconciled": reconciled, "blocked": blocked,
@@ -628,15 +708,20 @@ def handle_accept_fleet_grant_mismatch(fleet_id: str, raw_token: str, agent_id: 
         if not members:
             return _err("agent not found in this fleet", 404)
     accepted = 0
+    accepted_hosts: list = []
     for a in members:
         if _member_mismatch_flagged(a, fleet):
             # Signature captures this member's grants + the fleet's, so the acceptance
             # only holds for this exact divergence.
             agents_repo.set_grants_exception(a["agent_id"], _grants_signature(a, fleet))
             accepted += 1
+            accepted_hosts.append(a.get("hostname") or a["agent_id"])
 
-    _audit("fleet.grant_mismatch_accepted", user, fleet_id,
-           {"accepted": accepted, "agent_id": agent_id})
+    # Only record when something was actually accepted; capture the hostnames (capped) so
+    # a single-member acceptance names it in history rather than a bare count.
+    if accepted:
+        _audit("fleet.grant_mismatch_accepted", user, fleet_id,
+               {"accepted": accepted, "agent_id": agent_id, "hosts": accepted_hosts[:5]})
     logger.info("Accepted fleet=%s grant mismatch for %d member(s)%s",
                 fleet_id, accepted, f" (agent={agent_id})" if agent_id else "")
     return _ok({"fleet_id": fleet_id, "accepted": accepted, "agent_id": agent_id})
@@ -659,6 +744,96 @@ def handle_resolve_fleet_grants(fleet_id: str, raw_token: str, resolution: Optio
     if resolution == "accept":
         return handle_accept_fleet_grant_mismatch(fleet_id, raw_token, agent_id=agent_id)
     return _err('resolution must be "reconcile" or "accept"')
+
+
+# Fleet timeline. Fleets have no status-history table (they don't churn like agents), so the
+# timeline is built purely from the fleet's audit events - lifecycle + edits (mode/tags/grants).
+_FLEET_HISTORY_ACTIONS = {
+    "fleet.created", "fleet.updated", "fleet.mode_reverted", "fleet.token_rotated", "fleet.revoked",
+    "fleet.deleted", "fleet.member_detached", "fleet.grants_reconciled",
+    "fleet.grant_mismatch_accepted",
+}
+
+
+def _fmt_setting_val(v) -> str:
+    """Render a settings value compactly for a history note."""
+    if v is None:
+        return "default"
+    if isinstance(v, bool):
+        return "on" if v else "off"
+    if isinstance(v, list):
+        return ", ".join(str(x) for x in v) if v else "none"
+    if isinstance(v, dict):
+        return "custom"
+    return str(v)
+
+
+def _fleet_history_note(action: str, meta: dict) -> str:
+    meta = meta or {}
+    if action == "fleet.created":
+        return f"fleet created ({meta.get('mode', '')} mode)".strip()
+    if action == "fleet.updated":
+        parts = []
+        for k, v in meta.items():
+            if k == "hostname":
+                continue
+            label = k.replace("_", " ")
+            if isinstance(v, dict) and "to" in v:  # {from, to} diff shape
+                frm, to = v.get("from"), v.get("to")
+                if isinstance(frm, dict) or isinstance(to, dict):  # e.g. wave_policy - too big to inline
+                    parts.append(f"{label} updated")
+                else:
+                    parts.append(f"{label}: {_fmt_setting_val(frm)} → {_fmt_setting_val(to)}")
+            elif isinstance(v, dict):
+                parts.append(f"{label} updated")
+            else:  # legacy flat shape (value only, no before)
+                parts.append(f"{label} → {_fmt_setting_val(v)}")
+        return "updated - " + "; ".join(parts) if parts else "settings updated"
+    if action == "fleet.mode_reverted":
+        return f"mode auto-reverted wild → {meta.get('to_mode', 'readonly')} (temporary window ended)"
+    if action == "fleet.token_rotated":
+        return "join token rotated"
+    if action == "fleet.revoked":
+        return f"revoked ({meta.get('affected', 0)} members affected)"
+    if action == "fleet.deleted":
+        return "fleet deleted"
+    if action == "fleet.member_detached":
+        return f"member detached: {meta.get('hostname') or meta.get('agent_id') or ''}".strip()
+    if action == "fleet.grants_reconciled":
+        n = meta.get("reconciled")
+        hosts = meta.get("hosts") or []
+        if n == 1 and hosts:  # single member - name it
+            return f"grants reconciled: {hosts[0]}"
+        if n:
+            return f"{n} member grants reconciled"
+        return "member grants reconciled"
+    if action == "fleet.grant_mismatch_accepted":
+        n = meta.get("accepted")
+        hosts = meta.get("hosts") or []
+        if n == 1 and hosts:  # single member - name it
+            return f"grant mismatch accepted: {hosts[0]}"
+        if n:
+            return f"grant mismatch accepted for {n} members"
+        return "grant mismatch accepted"
+    return action.replace("fleet.", "").replace("_", " ")
+
+
+def handle_get_fleet_history(fleet_id: str, raw_token: str) -> dict:
+    user = _verify_tenant_token(raw_token)
+    if not user:
+        return _err("unauthorized", 401)
+    fleet = fleets_repo.get(fleet_id)
+    if not fleet or fleet.get("tenant_id") != user["tenant_id"] or not can_access_fleet(user, fleet):
+        return _err("fleet not found", 404)
+    audit_rows = audit_repo.list_by_tenant(user["tenant_id"], limit=100, resource=fleet_id)
+    entries = [
+        {"kind": "edit", "action": a.get("action"),
+         "note": _fleet_history_note(a.get("action"), a.get("event_metadata") or a.get("metadata")),
+         "by": a.get("actor_name") or a.get("actor_id"), "created_at": a.get("created_at")}
+        for a in audit_rows if a.get("action") in _FLEET_HISTORY_ACTIONS
+    ]
+    entries.sort(key=lambda e: e.get("created_at") or "", reverse=True)
+    return _ok({"history": entries[:50]})
 
 
 # ---------------------------------------------------------------------------
@@ -745,6 +920,14 @@ def delete_fleet_handler(event, context):
         return _err("missing Authorization header", 401)
     fleet_id = (event.get("pathParameters") or {}).get("fleet_id", "")
     return handle_delete_fleet(fleet_id, token)
+
+
+def fleet_history_handler(event, context):
+    token = _token(event)
+    if not token:
+        return _err("missing Authorization header", 401)
+    fleet_id = (event.get("pathParameters") or {}).get("fleet_id", "")
+    return handle_get_fleet_history(fleet_id, token)
 
 
 def remove_fleet_member_handler(event, context):

@@ -202,6 +202,10 @@ class AgentRepo:
             IndexName="tenant-index",
             KeyConditionExpression=DKey("tenant_id").eq(tenant_id),
         ).get("Items", [])
+        # Stable newest-first order (agent_id tiebreaker), matching the SQL backend so an
+        # updated agent keeps its place instead of jumping to the end.
+        items.sort(key=lambda it: it.get("agent_id") or "")
+        items.sort(key=lambda it: it.get("created_at") or "", reverse=True)
         return [_enrich_agent(item) for item in items]
 
     def list_by_fleet(self, fleet_id: str) -> list:
@@ -227,7 +231,8 @@ class AgentRepo:
         kwargs = {"IndexName": "tenant-index",
                   "KeyConditionExpression": DKey("tenant_id").eq(tenant_id),
                   "FilterExpression": Attr("fleet_id").exists(),
-                  "ProjectionExpression": "fleet_id, #st, grant_service_mgmt, grant_docker, grants_exception",
+                  "ProjectionExpression": "fleet_id, #st, grant_service_mgmt, grant_docker, "
+                                          "service_mgmt_detected, docker_detected, grants_exception",
                   "ExpressionAttributeNames": {"#st": "status"}}
         while True:
             resp = _TABLE_AGENTS.query(**kwargs)
@@ -235,13 +240,15 @@ class AgentRepo:
                 if not it.get("fleet_id"):
                     continue
                 key = (it["fleet_id"], it.get("status"), bool(it.get("grant_service_mgmt")),
-                       bool(it.get("grant_docker")), it.get("grants_exception"))
+                       bool(it.get("grant_docker")), bool(it.get("service_mgmt_detected")),
+                       bool(it.get("docker_detected")), it.get("grants_exception"))
                 counts[key] = counts.get(key, 0) + 1
             if "LastEvaluatedKey" not in resp:
                 break
             kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
         return [{"fleet_id": k[0], "status": k[1], "grant_service_mgmt": k[2],
-                 "grant_docker": k[3], "grants_exception": k[4], "count": v}
+                 "grant_docker": k[3], "service_mgmt_detected": k[4], "docker_detected": k[5],
+                 "grants_exception": k[6], "count": v}
                 for k, v in counts.items()]
 
     def mark_inactive(self, agent_id: str) -> bool:
@@ -305,14 +312,30 @@ class AgentRepo:
             _TABLE_AGENTS.delete_item(Key={"agent_id": aid})
         return len(ids)
 
-    def set_mode_by_fleet(self, fleet_id: str, mode: str) -> int:
+    def set_mode_by_fleet(self, fleet_id: str, mode: str,
+                          mode_expires_at=None, mode_revert_to=None) -> int:
+        # Propagate the mode and the temporary-wild schedule to every member; SET the
+        # schedule attrs when present, REMOVE them when clearing (mirrors update_policy).
+        sets = ["#m = :v"]
+        names = {"#m": "mode"}
+        values = {":v": mode}
+        removes = []
+        for attr, val in (("mode_expires_at", mode_expires_at), ("mode_revert_to", mode_revert_to)):
+            if val is None:
+                removes.append(attr)
+            else:
+                sets.append(f"{attr} = :{attr}")
+                values[f":{attr}"] = val
+        expr = "SET " + ", ".join(sets)
+        if removes:
+            expr += " REMOVE " + ", ".join(removes)
         ids = self._fleet_member_ids(fleet_id)
         for aid in ids:
             _TABLE_AGENTS.update_item(
                 Key={"agent_id": aid},
-                UpdateExpression="SET #m = :v",
-                ExpressionAttributeNames={"#m": "mode"},
-                ExpressionAttributeValues={":v": mode},
+                UpdateExpression=expr,
+                ExpressionAttributeNames=names,
+                ExpressionAttributeValues=values,
             )
         return len(ids)
 
@@ -357,12 +380,27 @@ class AgentRepo:
             },
         )
 
-    def update_policy(self, agent_id: str, mode: str) -> None:
+    def update_policy(self, agent_id: str, mode: str,
+                      mode_expires_at=None, mode_revert_to=None) -> None:
+        # Set the mode; SET the schedule when present, REMOVE it when clearing.
+        sets = ["#m = :m"]
+        names = {"#m": "mode"}
+        values = {":m": mode}
+        removes = []
+        for attr, val in (("mode_expires_at", mode_expires_at), ("mode_revert_to", mode_revert_to)):
+            if val is None:
+                removes.append(attr)
+            else:
+                sets.append(f"{attr} = :{attr}")
+                values[f":{attr}"] = val
+        expr = "SET " + ", ".join(sets)
+        if removes:
+            expr += " REMOVE " + ", ".join(removes)
         _TABLE_AGENTS.update_item(
             Key={"agent_id": agent_id},
-            UpdateExpression="SET #m = :m",
-            ExpressionAttributeNames={"#m": "mode"},
-            ExpressionAttributeValues={":m": mode},
+            UpdateExpression=expr,
+            ExpressionAttributeNames=names,
+            ExpressionAttributeValues=values,
         )
 
     def reissue_install_token(
@@ -452,6 +490,26 @@ class AgentRepo:
                 Attr("status").eq("ACTIVE")
                 & Attr("last_heartbeat_at").exists()
                 & Attr("last_heartbeat_at").lt(cutoff_iso)
+            ),
+        }
+        while True:
+            resp = _TABLE_AGENTS.scan(**kwargs)
+            results.extend(resp.get("Items", []))
+            if "LastEvaluatedKey" not in resp:
+                break
+            kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+        return [_enrich_agent(item) for item in results]
+
+    def scan_expired_wild(self, now_iso: str) -> list:
+        """Agents in a temporary `wild` window that has elapsed (mode_expires_at <= now).
+        Caller reverts each to its scheduled fallback - see shared.mode.revert_expired_mode.
+        No index for this predicate, so it is a filtered scan - run it sparingly (hourly)."""
+        results = []
+        kwargs: dict = {
+            "FilterExpression": (
+                Attr("mode").eq("wild")
+                & Attr("mode_expires_at").exists()
+                & Attr("mode_expires_at").lte(now_iso)
             ),
         }
         while True:
@@ -812,6 +870,26 @@ class FleetRepo:
         """Every fleet across all tenants - used by the heartbeat reaper."""
         results: list = []
         kwargs: dict = {}
+        while True:
+            resp = _TABLE_FLEETS.scan(**kwargs)
+            results.extend(resp.get("Items", []))
+            if "LastEvaluatedKey" not in resp:
+                break
+            kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+        return results
+
+    def scan_expired_wild(self, now_iso: str) -> list:
+        """Fleets in a temporary `wild` window that has elapsed (mode_expires_at <= now).
+        Caller reverts each - see shared.mode.revert_expired_fleet_mode. No index for this
+        predicate, so it is a filtered scan - run it sparingly (hourly)."""
+        results: list = []
+        kwargs: dict = {
+            "FilterExpression": (
+                Attr("mode").eq("wild")
+                & Attr("mode_expires_at").exists()
+                & Attr("mode_expires_at").lte(now_iso)
+            ),
+        }
         while True:
             resp = _TABLE_FLEETS.scan(**kwargs)
             results.extend(resp.get("Items", []))

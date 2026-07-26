@@ -137,6 +137,44 @@ def _is_readonly_blocked(command: str) -> bool:
     return False
 
 
+# Sensitive READS - a read is "safe" in Reach's model, but a read can still EXFILTRATE
+# (SSH keys, cloud credentials, .env, the agent's own token). These are gated like writes:
+# blocked in readonly/approved, allowed only in wild. Best-effort by path/name - the agent's
+# non-root OS identity, k8s RBAC, and output redaction remain the other layers. Tune as needed.
+SENSITIVE_READ_PATTERNS = [
+    r"/etc/(g)?shadow\b",                                  # local password hashes
+    r"(^|/|~)\.ssh/",                                      # SSH dir (keys, known_hosts, config)
+    r"\bid_(rsa|dsa|ecdsa|ed25519)\b",                    # SSH private keys by name
+    r"\.aws/credentials\b", r"\.aws/config\b",            # AWS credentials
+    r"\.config/gcloud\b", r"gcloud/[^ ]*credential",      # GCP credentials
+    r"\.azure/",                                           # Azure credentials
+    r"\.kube/config\b",                                   # kubeconfig (cluster creds)
+    r"(?<![\w.])\.env(\.[\w-]+)?\b",                      # .env, .env.production (dotfile)
+    r"/proc/(self|\d+)/environ\b",                        # process environment (secrets in env)
+    r"\.(pem|p12|pfx)\b",                                  # private key / cert bundles
+    r"\.netrc\b", r"\.pgpass\b", r"\.npmrc\b",           # credential files
+    r"\.docker/config\.json\b",                           # docker registry creds
+    r"/etc/reach-agent/",                                 # the agent's own token/config
+]
+
+
+def is_sensitive_read(command: str) -> bool:
+    """Whether a (host) command reads a sensitive path - secrets/credentials that a plain
+    read would otherwise exfiltrate. Checked per shell segment. Best-effort by design."""
+    for segment in _shell_segments(command):
+        for pattern in SENSITIVE_READ_PATTERNS:
+            if re.search(pattern, segment, re.IGNORECASE):
+                return True
+    return False
+
+
+def is_k8s_secret_read(command: str) -> bool:
+    """Whether any kubectl stage READS Secrets (`get`/`describe secrets`). A secret read is a
+    read verb, so it's normally allowed; this flags it so it can be gated like a write. (RBAC
+    is the hard floor - the default `view` role can't read secrets - this is defense-in-depth.)"""
+    return any(_stage_is_secret_read(tokens) for tokens in _kubectl_stages(command))
+
+
 # Kubernetes job classification is authoritative HERE (backend), enforced at job
 # submission - the k8s agent does not classify verbs; it only enforces the no-shell
 # allowlist (see agent/k8s_exec.go). Default-deny: any kubectl verb that is not a
@@ -236,6 +274,20 @@ def _stage_is_write(tokens: list) -> bool:
     if _stage_is_dry_run(tokens):
         return False
     return not _is_read_verb(_kubectl_verb(tokens))
+
+
+def _stage_is_secret_read(tokens: list) -> bool:
+    """Whether one kubectl stage READS Secrets (`get`/`describe secrets`). A read, so it's not
+    a write - but sensitive, so it's gated for approval like one (see _stage_needs_approval)."""
+    if _kubectl_verb(tokens) not in ("get", "describe"):
+        return False
+    parsed = parse_kubectl(tokens)
+    return bool(parsed and parsed.get("resource") == "secrets")
+
+
+def _stage_needs_approval(tokens: list) -> bool:
+    """A stage that must be gated in `approved` mode: any write, or a Secret read."""
+    return _stage_is_write(tokens) or _stage_is_secret_read(tokens)
 
 
 # Pure pipe-filters: they consume stdin and print - they never touch the cluster or exec
@@ -425,19 +477,19 @@ def k8s_rule_matches(parsed: dict, rule: dict) -> bool:
 
 
 def derive_k8s_rule(command: str) -> dict:
-    """The structured rule for a command's first write stage (for the pending
-    approval an operator reviews). None if there is no parseable write."""
+    """The structured rule for a command's first stage that needs approval - a write or a
+    Secret read (for the pending approval an operator reviews). None if there is none."""
     for tokens in _kubectl_stages(command):
-        if _stage_is_write(tokens):
+        if _stage_needs_approval(tokens):
             return parse_kubectl(tokens)
     return None
 
 
 def is_k8s_command_approved(command: str, rules: list) -> bool:
-    """Whether every write stage of a k8s command is permitted by some approved
-    rule. Read stages are always allowed."""
+    """Whether every stage that needs approval (writes, plus Secret reads) is permitted by some
+    approved rule. Ordinary read stages are always allowed."""
     for tokens in _kubectl_stages(command):
-        if not _stage_is_write(tokens):
+        if not _stage_needs_approval(tokens):
             continue
         parsed = parse_kubectl(tokens)
         if not parsed or not any(k8s_rule_matches(parsed, r) for r in rules if isinstance(r, dict)):
@@ -457,10 +509,14 @@ def normalize_k8s_rule(raw: dict) -> dict:
     if not raw_verb:  # verb must be explicit - may be "*", but not defaulted
         return None
     verb = " ".join(str(raw_verb).strip().lower().split())  # collapse inner spaces for compound verbs
-    if verb != "*" and verb not in _K8S_WRITE_VERBS and verb not in _K8S_COMPOUND_WRITES:
-        return None
     resource = str(raw.get("resource") or "*").strip()
     resource = "*" if resource == "*" else (_normalize_resource(resource) or "*")
+    # Rules gate writes; the one read exception is a Secret read (`get`/`describe secrets`),
+    # which is gated for approval so an operator can permit viewing a specific secret.
+    is_secret_read = verb in ("get", "describe") and resource == "secrets"
+    if (verb != "*" and verb not in _K8S_WRITE_VERBS and verb not in _K8S_COMPOUND_WRITES
+            and not is_secret_read):
+        return None
     namespace = str(raw.get("namespace") or "*").strip() or "*"
     name = str(raw.get("name") or "*").strip() or "*"
     return {"verb": verb, "resource": resource, "namespace": namespace, "name": name}

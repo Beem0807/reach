@@ -1,4 +1,6 @@
 import { useState, type ReactNode } from 'react';
+import { useMediaQuery } from './hooks/useMediaQuery';
+import { TimezoneProvider, TimezoneToggle } from './timezone';
 import { CopyButton } from './components/CopyButton';
 import type { TenantConfig, TenantRole } from './types';
 import { TenantUsersPage } from './pages/TenantUsersPage';
@@ -163,16 +165,25 @@ function TenantSidebar({
   page,
   onNavigate,
   onSignOut,
+  isDesktop,
+  mobileOpen,
+  onCloseMobile,
 }: {
   config: TenantConfig;
   page: TenantPage;
   onNavigate: (p: TenantPage) => void;
   onSignOut: () => void;
+  isDesktop: boolean;
+  mobileOpen: boolean;
+  onCloseMobile: () => void;
 }) {
   const visibleNav = NAV_ITEMS.filter(n => canSee(config.role, n.minRole));
   const [collapsed, setCollapsed] = useState(() => {
     try { return localStorage.getItem('sidebar_collapsed') === 'true'; } catch { return false; }
   });
+  // The desktop collapse (thin rail) only applies on desktop; the mobile drawer always
+  // shows the full expanded sidebar.
+  const showCollapsed = collapsed && isDesktop;
 
   const toggle = () => {
     const next = !collapsed;
@@ -181,10 +192,14 @@ function TenantSidebar({
   };
 
   return (
-    <aside className={`${collapsed ? 'w-16' : 'w-56'} bg-slate-950 flex flex-col shrink-0 border-r border-slate-800 transition-all duration-200`}>
+    <aside className={`
+      ${showCollapsed ? 'w-16' : 'w-56'} bg-slate-950 flex flex-col border-r border-slate-800 transition-transform duration-200
+      fixed inset-y-0 left-0 z-40 md:static md:z-auto md:translate-x-0 md:shrink-0
+      ${mobileOpen ? 'translate-x-0' : '-translate-x-full'}
+    `}>
       {/* Logo + collapse toggle */}
-      <div className={`${collapsed ? 'px-2 py-4' : 'px-4 py-4'} border-b border-slate-800/60`}>
-        {collapsed ? (
+      <div className={`${showCollapsed ? 'px-2 py-4' : 'px-4 py-4'} border-b border-slate-800/60`}>
+        {showCollapsed ? (
           <div className="flex flex-col items-center gap-2">
             <div className="w-7 h-7 rounded-lg bg-indigo-500 flex items-center justify-center shrink-0">
               <span className="text-white text-xs font-bold tracking-tight">R</span>
@@ -203,8 +218,12 @@ function TenantSidebar({
                 <p className="text-white font-semibold text-sm leading-none">reach</p>
                 <p className="text-slate-400 text-[11px] mt-0.5">Console</p>
               </div>
-              <button onClick={toggle} title="Collapse sidebar" className="text-slate-500 hover:text-slate-300 p-1 rounded-md hover:bg-slate-800 transition-colors shrink-0">
+              {/* Desktop: collapse to a thin rail. Mobile: close the drawer. */}
+              <button onClick={toggle} title="Collapse sidebar" className="hidden md:inline-flex text-slate-500 hover:text-slate-300 p-1 rounded-md hover:bg-slate-800 transition-colors shrink-0">
                 <ChevronIcon dir="left" />
+              </button>
+              <button onClick={onCloseMobile} title="Close menu" aria-label="Close menu" className="md:hidden inline-flex text-slate-400 hover:text-slate-100 p-1 rounded-md hover:bg-slate-800 transition-colors shrink-0 text-lg leading-none">
+                ✕
               </button>
             </div>
             <div className="bg-slate-900 rounded-lg px-3 py-2.5 space-y-1.5">
@@ -228,14 +247,22 @@ function TenantSidebar({
       <nav className="flex-1 px-2 py-3 overflow-y-auto">
         <div className="space-y-0.5">
           {visibleNav.map(item => (
-            <NavButton key={item.id} item={item} active={page === item.id} onClick={() => onNavigate(item.id)} collapsed={collapsed} />
+            <NavButton key={item.id} item={item} active={page === item.id} onClick={() => onNavigate(item.id)} collapsed={showCollapsed} />
           ))}
         </div>
       </nav>
 
       {/* User info + sign out */}
       <div className="px-2 py-3 border-t border-slate-800/60 space-y-1">
-        {!collapsed && (
+        {showCollapsed ? (
+          <div className="flex justify-center py-1.5"><TimezoneToggle dark compact /></div>
+        ) : (
+          <div className="px-3 py-1.5 flex items-center justify-between gap-2">
+            <span className="text-slate-500 text-[10px] font-semibold uppercase tracking-wider">Times</span>
+            <TimezoneToggle dark />
+          </div>
+        )}
+        {!showCollapsed && (
           <div className="px-3 py-1.5">
             <p className="text-slate-300 text-xs font-medium truncate">{config.name || config.username}</p>
             <p className="text-slate-500 text-[11px] truncate">@{config.username}</p>
@@ -250,13 +277,13 @@ function TenantSidebar({
         )}
         <button
           onClick={onSignOut}
-          title={collapsed ? 'Sign out' : undefined}
-          className={`w-full flex items-center py-2 rounded-md text-sm font-medium text-slate-400 hover:bg-slate-800 hover:text-slate-100 transition-all duration-100 ${collapsed ? 'justify-center px-2' : 'gap-3 px-3 text-left'}`}
+          title={showCollapsed ? 'Sign out' : undefined}
+          className={`w-full flex items-center py-2 rounded-md text-sm font-medium text-slate-400 hover:bg-slate-800 hover:text-slate-100 transition-all duration-100 ${showCollapsed ? 'justify-center px-2' : 'gap-3 px-3 text-left'}`}
         >
           <svg className="w-[18px] h-[18px] shrink-0" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor">
             <path strokeLinecap="round" strokeLinejoin="round" d="M15.75 9V5.25A2.25 2.25 0 0013.5 3h-6a2.25 2.25 0 00-2.25 2.25v13.5A2.25 2.25 0 007.5 21h6a2.25 2.25 0 002.25-2.25V15M12 9l-3 3m0 0l3 3m-3-3h12.75" />
           </svg>
-          {!collapsed && 'Sign out'}
+          {!showCollapsed && 'Sign out'}
         </button>
       </div>
     </aside>
@@ -271,23 +298,43 @@ function defaultPage(role: TenantRole): TenantPage {
 
 export function TenantApp({ config, onSignOut }: { config: TenantConfig; onSignOut: () => void }) {
   const [page, setPage] = useState<TenantPage>(() => defaultPage(config.role));
+  const isDesktop = useMediaQuery('(min-width: 768px)');
+  const [mobileNav, setMobileNav] = useState(false);
   // When a fleet member is clicked, jump to Agents with that agent's detail open,
   // so it's the exact same view (and actions) as the Agents page. We remember the
   // originating fleet so the agent modal can offer a "Back to fleet" link.
   const [focusAgentId, setFocusAgentId] = useState<string | null>(null);
   const [backFleetId, setBackFleetId] = useState<string | null>(null);
   const [focusFleetId, setFocusFleetId] = useState<string | null>(null);
+  const navigate = (p: TenantPage) => { setPage(p); setMobileNav(false); };
   const openAgent = (id: string, fromFleetId?: string) => {
-    setFocusAgentId(id); setBackFleetId(fromFleetId ?? null); setPage('agents');
+    setFocusAgentId(id); setBackFleetId(fromFleetId ?? null); navigate('agents');
   };
   const backToFleet = (fleetId: string) => {
-    setFocusAgentId(null); setBackFleetId(null); setFocusFleetId(fleetId); setPage('fleets');
+    setFocusAgentId(null); setBackFleetId(null); setFocusFleetId(fleetId); navigate('fleets');
   };
+  const currentLabel = NAV_ITEMS.find(n => n.id === page)?.label ?? 'reach';
 
   return (
+    <TimezoneProvider>
     <div className="flex h-screen bg-gray-50 overflow-hidden">
-      <TenantSidebar config={config} page={page} onNavigate={setPage} onSignOut={onSignOut} />
-      <main className="flex-1 overflow-y-auto">
+      {/* Mobile drawer backdrop */}
+      {mobileNav && !isDesktop && (
+        <div className="fixed inset-0 z-30 bg-black/50 md:hidden" onClick={() => setMobileNav(false)} />
+      )}
+      <TenantSidebar config={config} page={page} onNavigate={navigate} onSignOut={onSignOut}
+        isDesktop={isDesktop} mobileOpen={mobileNav} onCloseMobile={() => setMobileNav(false)} />
+      <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
+        {/* Mobile top bar with hamburger (desktop uses the sidebar directly) */}
+        <div className="md:hidden flex items-center gap-3 px-4 h-14 bg-slate-950 border-b border-slate-800 shrink-0">
+          <button onClick={() => setMobileNav(true)} aria-label="Open menu" className="text-slate-300 hover:text-white p-1.5 -ml-1.5 rounded-md hover:bg-slate-800 transition-colors">
+            <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" strokeWidth={1.75} stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M3.75 6.75h16.5M3.75 12h16.5m-16.5 5.25h16.5" />
+            </svg>
+          </button>
+          <span className="text-white font-semibold text-sm">{currentLabel}</span>
+        </div>
+        <main className="flex-1 overflow-y-auto min-w-0">
         {page === 'dashboard'  && <DashboardPage        config={config} />}
         {page === 'users'      && <TenantUsersPage     config={config} />}
         {page === 'agents'     && <TenantAgentsPage    config={config} focusAgentId={focusAgentId} backFleetId={backFleetId} onBackToFleet={backToFleet} onFocusConsumed={() => setFocusAgentId(null)} />}
@@ -299,7 +346,9 @@ export function TenantApp({ config, onSignOut }: { config: TenantConfig; onSignO
           <AuditLogsPage mode="tenant" apiUrl={config.apiUrl} token={config.tenantToken} />
         )}
         {page === 'settings'   && <TenantSettingsPage config={config} />}
-      </main>
+        </main>
+      </div>
     </div>
+    </TimezoneProvider>
   );
 }

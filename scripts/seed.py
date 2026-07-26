@@ -198,7 +198,9 @@ def make_agents(tenant_id: str) -> list[dict]:
             "docker_detected":         True,
             "landlock_status":         "active",  # Linux + Landlock: writes kernel-enforced
         },
-        # 2. ACTIVE - wild mode, running as root, rotation requested, no fleet
+        # 2. ACTIVE - TEMPORARY wild mode (auto-reverts to approved in ~3h), running as
+        #    root, rotation requested, no fleet. Demoes the bounded-wild window: the badge
+        #    shows a countdown and the agent lazily reverts once mode_expires_at passes.
         {
             "agent_id":                _agent_id(),
             "tenant_id":               tenant_id,
@@ -207,6 +209,8 @@ def make_agents(tenant_id: str) -> list[dict]:
             "agent_version":           "0.9.4",
             "machine_fingerprint":     secrets.token_hex(16),
             "mode":                    "wild",
+            "mode_expires_at":         _iso(-3 / 24),   # ~3 hours from now
+            "mode_revert_to":          "approved",       # falls back here at expiry
             "running_as_root":         "true",
             "agent_token_hash":        _hmac(_raw_agent_token()),
             "install_token_hash":      None,
@@ -476,6 +480,39 @@ def make_agents(tenant_id: str) -> list[dict]:
             "landlock_status":         "unavailable",
             "sandbox_ack":             False,
         },
+        # 11. ACTIVE - staging fleet member, OUT-OF-BAND capability. Its grants MATCH the
+        #     staging fleet (which grants nothing), so there's no grant-record mismatch -
+        #     but the host reports docker running. The fleet doesn't grant docker, so the
+        #     Fleets screen flags it "out-of-band": it can't be reconciled (re-provision to
+        #     remove docker, or Accept as-is). Demonstrates the detected-vs-granted drift.
+        {
+            "agent_id":                _agent_id(),
+            "tenant_id":               tenant_id,
+            "status":                  "ACTIVE",
+            "hostname":                "worker-staging-07.internal",
+            "agent_version":           "0.9.4",
+            "machine_fingerprint":     secrets.token_hex(16),
+            "mode":                    "readonly",
+            "running_as_root":         "false",
+            "agent_token_hash":        _hmac(_raw_agent_token()),
+            "install_token_hash":      None,
+            "install_token_expires_at": None,
+            "claimed_at":              _iso(9),
+            "last_heartbeat_at":       _iso(0),
+            "active_until":            _ts(-90 / 86400),
+            "token_issued_at":         _iso(9),
+            "rotation_requested":      False,
+            "type":                    "host",
+            "fleet_id":                f"fleet_{tenant_id}_staging",
+            "tags":                    ["env:staging", "role:worker"],
+            "created_at":              _iso(10),
+            "grant_service_mgmt":      False,    # matches the fleet (grants none)
+            "grant_docker":            False,    # matches the fleet ...
+            "service_mgmt_detected":   False,
+            "docker_detected":         True,     # ... but the host runs docker -> OUT-OF-BAND
+            "landlock_status":         "active",
+            "sandbox_ack":             False,
+        },
     ]
 
 
@@ -521,6 +558,27 @@ def make_fleets(tenant_id: str) -> list[dict]:
             "status":                     "ACTIVE",
             "reap_after_seconds":         None,   # inherits the platform default
             "created_at":                 _iso(12),
+            "created_by":                 None,
+        },
+        {
+            # TEMPORARY-wild fleet: an operator opened a break-glass window that auto-reverts
+            # to approved in ~2h (and re-propagates to members). Demoes the fleet-level
+            # countdown badge + lazy/hourly revert. No members yet (empty fleet is fine).
+            "fleet_id":                   f"fleet_{tenant_id}_breakglass",
+            "tenant_id":                  tenant_id,
+            "name":                       "debug-breakglass",
+            "mode":                       "wild",
+            "mode_expires_at":            _iso(-2 / 24),   # ~2 hours from now
+            "mode_revert_to":             "approved",       # falls back here at expiry
+            "grant_service_mgmt":         False,
+            "grant_docker":               False,
+            "tags":                       ["env:prod", "role:debug"],
+            "join_token_hash":            _hmac("fleet_" + secrets.token_urlsafe(24)),
+            "prev_join_token_hash":       None,
+            "prev_join_token_expires_at": None,
+            "status":                     "ACTIVE",
+            "reap_after_seconds":         900,    # 15 min - ephemeral debug hosts
+            "created_at":                 _iso(0.02),
             "created_by":                 None,
         },
     ]
@@ -828,6 +886,96 @@ def make_jobs(
             "completed_at": None,
             "expires_at":   None,
         },
+        # 13. Sensitive read, APPROVED -> ran, output stored UNREDACTED (approving is the
+        #     authorization to see it). `sensitive: true` is derived at read time from the
+        #     command, so the console masks this behind a click-to-reveal control.
+        {
+            "job_id":       "job_" + secrets.token_hex(8),
+            "tenant_id":    tenant_id,
+            "agent_id":     ag1,
+            "command":      "cat ~/.ssh/id_rsa",
+            "status":       "SUCCEEDED",
+            "mode":         "approved",
+            "is_write":     True,           # sensitive reads fold into is_write (gated like a write)
+            "exit_code":    0,
+            "stdout":       (
+                "-----BEGIN OPENSSH PRIVATE KEY-----\n"
+                "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gt\n"
+                "ZWQyNTUxOQAAACD1kZm3qE7cE1example0nlYredactedSEEDdemoKEYnotREAL00\n"
+                "-----END OPENSSH PRIVATE KEY-----\n"
+            ),
+            "stderr":       "",
+            "duration_ms":  60,
+            "created_by":   uid1,
+            "created_at":   _iso(0.15),
+            "started_at":   _iso(0.15),
+            "completed_at": _iso(0.15),
+            "expires_at":   None,
+        },
+        # 14. Sensitive read in READONLY -> REJECTED (readonly has no approval path).
+        {
+            "job_id":       "job_" + secrets.token_hex(8),
+            "tenant_id":    tenant_id,
+            "agent_id":     ag2,
+            "command":      "cat ~/.aws/credentials",
+            "status":       "REJECTED",
+            "mode":         "readonly",
+            "is_write":     True,           # gated like a write; readonly refuses it
+            "exit_code":    None,
+            "stdout":       None,
+            "stderr":       "Blocked: reading credentials is not allowed in readonly mode.\n",
+            "duration_ms":  None,
+            "created_by":   uid2,
+            "created_at":   _iso(0.9),
+            "started_at":   None,
+            "completed_at": None,
+            "expires_at":   None,
+        },
+        # 15. Sensitive read in APPROVED, not pre-approved -> PENDING (approval was raised).
+        {
+            "job_id":       "job_" + secrets.token_hex(8),
+            "tenant_id":    tenant_id,
+            "agent_id":     ag1,
+            "command":      "cat /srv/app/.env",
+            "status":       "PENDING",
+            "mode":         "approved",
+            "is_write":     True,
+            "exit_code":    None,
+            "stdout":       None,
+            "stderr":       None,
+            "duration_ms":  None,
+            "created_by":   uid1,
+            "created_at":   _iso(0.02),
+            "started_at":   None,
+            "completed_at": None,
+            "expires_at":   _ts(-10 / 1440),
+        },
+        # 16. Ordinary read (NOT sensitive) whose output happened to contain secrets ->
+        #     always-on redaction scrubbed them before storage. `sensitive: false`, so no mask.
+        {
+            "job_id":       "job_" + secrets.token_hex(8),
+            "tenant_id":    tenant_id,
+            "agent_id":     ag1,
+            "command":      "cat /var/app/deploy.log",
+            "status":       "SUCCEEDED",
+            "mode":         "readonly",
+            "is_write":     False,
+            "exit_code":    0,
+            "stdout":       (
+                "[deploy] loading environment...\n"
+                "AWS_ACCESS_KEY_ID=[AWS_KEY_ID]\n"
+                "AWS_SECRET_ACCESS_KEY=[AWS_SECRET]\n"
+                "DATABASE_URL=postgres://[CREDENTIALS_REDACTED]@db.internal:5432/app\n"
+                "[deploy] done in 4.2s\n"
+            ),
+            "stderr":       "",
+            "duration_ms":  70,
+            "created_by":   uid2,
+            "created_at":   _iso(0.6),
+            "started_at":   _iso(0.6),
+            "completed_at": _iso(0.6),
+            "expires_at":   None,
+        },
     ]
 
 
@@ -1101,6 +1249,40 @@ def make_approvals(
             "created_at":    _iso(0.02),
             "reviewed_at":   None,
             "reviewed_by":   None,
+        },
+        # 2b. PENDING - a SENSITIVE READ awaiting approval (gated like a write). Matches the
+        #     pending `cat /srv/app/.env` job; approving it lets that read run, unredacted.
+        {
+            "approval_id":   "appr_" + secrets.token_hex(8),
+            "tenant_id":     tenant_id,
+            "agent_id":      ag1,
+            "command":       "cat /srv/app/.env",
+            "host_rule":     {"bin": "cat", "args": ["/srv/app/.env"]},
+            "requested_by":  uid1,
+            "requester_name": "Alice",
+            "job_id":        None,
+            "status":        "pending",
+            "expires_at":    None,
+            "created_at":    _iso(0.02),
+            "reviewed_at":   None,
+            "reviewed_by":   None,
+        },
+        # 2c. APPROVED - a SENSITIVE READ an operator deliberately allowed for troubleshooting
+        #     (the rule that authorized the unredacted `cat ~/.ssh/id_rsa` job).
+        {
+            "approval_id":   "appr_" + secrets.token_hex(8),
+            "tenant_id":     tenant_id,
+            "agent_id":      ag1,
+            "command":       "cat ~/.ssh/id_rsa",
+            "host_rule":     {"bin": "cat", "args": ["~/.ssh/id_rsa"]},
+            "requested_by":  uid1,
+            "requester_name": "Alice",
+            "job_id":        None,
+            "status":        "approved",
+            "expires_at":    _iso(-2),          # 2 days in the future
+            "created_at":    _iso(0.2),
+            "reviewed_at":   _iso(0.18),
+            "reviewed_by":   "admin",
         },
         # 3. APPROVED - expires 7 days from now (future, so _lazy_expire won't touch it)
         {
@@ -1480,6 +1662,14 @@ def make_audit_logs(tenant_id: str, tenant_slug: str, agent_ids: list[str]) -> l
     ops_id = "user_ops_" + tenant_slug
     dev_id = "user_dev_" + tenant_slug
     ag = agent_ids[0] if agent_ids else "agent_unknown"
+    # A standalone agent (index 1) carries the individual edits; a k8s agent (index 5)
+    # carries a capability ack. Fleet edits are keyed to the fleet resource_id so they
+    # surface on the fleet's own history AND (for fleet.updated) fold into a member's
+    # timeline as an inherited `via fleet` entry.
+    ag_solo = agent_ids[1] if len(agent_ids) > 1 else ag
+    ag_k8s = agent_ids[5] if len(agent_ids) > 5 else ag
+    prod_fleet = f"fleet_{tenant_id}_prod"
+    staging_fleet = f"fleet_{tenant_id}_staging"
 
     events = [
         ("user.login",         admin_id, "Admin",    "admin",    "user",    admin_id,  None,       _iso(0.01)),
@@ -1504,6 +1694,39 @@ def make_audit_logs(tenant_id: str, tenant_slug: str, agent_ids: list[str]) -> l
          {"keys":["fanout_cap","job_retention_days","wave_policy"]}, _iso(1.2)),
         ("run.paused",         admin_id, "Admin",    "admin",    "run",     "run_stagedxx", None, _iso(0.3)),
         ("run.canceled",       ops_id,   "Operator", "operator", "run",     "run_stagedyy", {"canceled":2}, _iso(0.15)),
+
+        # --- Agent edits (kind:"edit" on the agent's own history timeline) ---
+        ("agent.mode_changed", ops_id,   "Operator", "operator", "agent",   ag_solo,
+         {"from_mode":"restricted","to_mode":"wild","hostname":"prod-batch-02.internal"}, _iso(6)),
+        ("agent.tags_changed", ops_id,   "Operator", "operator", "agent",   ag_solo,
+         {"hostname":"prod-batch-02.internal","from":["env:prod"],"to":["env:prod","role:batch"]}, _iso(5)),
+        ("agent.sandbox_acknowledged", admin_id, "Admin", "admin", "agent", ag_solo,
+         {"acknowledged":True,"hostname":"prod-batch-02.internal"}, _iso(4.5)),
+        ("agent.rotation_requested", admin_id, "Admin", "admin",  "agent",   ag_solo,
+         {"hostname":"prod-batch-02.internal"}, _iso(0.2)),
+        ("agent.capability_acknowledged", ops_id, "Operator", "operator", "agent", ag_k8s,
+         {"capability":"k8s_permissions","label":"Kubernetes RBAC","hostname":"k8s-agent-01"}, _iso(3)),
+
+        # --- Fleet edits (kind:"edit" on the fleet's history; fleet.updated also folds
+        #     into the prod member's timeline as an inherited `via fleet` entry) ---
+        ("fleet.created",       admin_id, "Admin",   "admin",    "fleet",   prod_fleet,
+         {"name":"prod","mode":"approved"}, _iso(22)),
+        ("fleet.updated",       admin_id, "Admin",   "admin",    "fleet",   prod_fleet,
+         {"mode":{"from":"restricted","to":"approved"}}, _iso(4)),
+        ("fleet.token_rotated", ops_id,   "Operator", "operator", "fleet",   prod_fleet,
+         {"grace_seconds":86400}, _iso(2.5)),
+        ("fleet.grants_reconciled", ops_id, "Operator", "operator", "fleet", prod_fleet,
+         {"reconciled":2,"blocked":0}, _iso(1.5)),
+        # A single-member reconcile - history names the host it fixed.
+        ("fleet.grants_reconciled", ops_id, "Operator", "operator", "fleet", prod_fleet,
+         {"reconciled":1,"blocked":1,"hosts":["prod-web-05.internal"]}, _iso(1.2)),
+        # A grant mismatch accepted for one member (divergence kept intentionally).
+        ("fleet.grant_mismatch_accepted", admin_id, "Admin", "admin", "fleet", staging_fleet,
+         {"accepted":1,"hosts":["staging-db-02.internal"]}, _iso(1.1)),
+        ("fleet.member_detached", admin_id, "Admin",  "admin",    "fleet",   prod_fleet,
+         {"agent_id":ag,"hostname":"prod-web-07.internal"}, _iso(0.6)),
+        ("fleet.updated",       admin_id, "Admin",   "admin",    "fleet",   staging_fleet,
+         {"tags":{"from":["env:staging"],"to":["env:staging","tier:db"]}}, _iso(3.5)),
     ]
 
     logs = []
@@ -1943,9 +2166,10 @@ def seed():
     print(f"  {len(TENANTS)} rich tenants ({'/'.join(active)} active, {'/'.join(disabled)} disabled) · "
           f"2 fleets/tenant (web-prod, worker-staging) + ~7 enrolled members (incl. a grant-drift host) · "
           f"10 standalone agents/tenant (host + k8s, incl. DELETED and RBAC-drift) · 6 users/tenant · "
-          f"12 jobs + fan-out runs (3 live fleet + 1 reaped-member fleet + 1 tag, batched) · "
-          f"15 approvals/tenant (10 agent + 5 fleet-scoped, incl. structured host rules) · "
-          f"3 api tokens · 15 audit logs · agent history")
+          f"16 jobs + fan-out runs (incl. sensitive reads: approved+unredacted, readonly-REJECTED, "
+          f"pending, and a redacted ordinary read; 3 live fleet + 1 reaped-member fleet + 1 tag, batched) · "
+          f"17 approvals/tenant (12 agent incl. a pending + an approved sensitive read, 5 fleet-scoped) · "
+          f"3 api tokens · audit logs (incl. agent + fleet edits) · merged agent/fleet history")
     print()
     print("  Pagination check - the 'scale' tenant is loaded past the 20-per-page line:")
     print(f"    {BULK_AGENTS} bulk standalone agents (+ a {BIG_FLEET_MEMBERS}-member 'mega-asg' fleet) · "

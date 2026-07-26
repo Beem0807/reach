@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import type { AuditLog, Tenant } from '../types';
+import { formatTs, useTimezone, type TimeZonePref } from '../timezone';
 import { listPlatformAuditLogs, listTenantAuditLogs, listTenants } from '../api';
 import { Spinner } from '../components/Spinner';
 import { DataTable } from '../components/DataTable';
@@ -7,16 +8,20 @@ import { RefreshButton } from '../components/RefreshButton';
 import { Modal } from '../components/Modal';
 
 function fmtDate(iso: string) {
-  return new Date(iso).toLocaleString(undefined, {
+  return formatTs(iso, {
     month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit',
   });
 }
 
-// A `datetime-local` value ("YYYY-MM-DDTHH:MM", local time) -> UTC ISO for the API. Empty
-// (or a bare date, from an older filter) is handled: a bare date becomes the day's start.
-function toUtcIso(local: string): string | undefined {
+// A `datetime-local` value ("YYYY-MM-DDTHH:MM") -> UTC ISO for the API. The value is
+// interpreted in the console's selected display zone, so the filter matches what the user
+// sees: in `local` the entry is their wall-clock; in `UTC` it's read as UTC. A bare date
+// becomes the day's start.
+function toUtcIso(local: string, zone: TimeZonePref = 'local'): string | undefined {
   if (!local) return undefined;
-  const v = local.includes('T') ? local : `${local}T00:00`;   // tolerate a plain date
+  let v = local.includes('T') ? local : `${local}T00:00`;   // tolerate a plain date
+  if (/T\d{2}:\d{2}$/.test(v)) v += ':00';                    // ensure seconds for strict parsers
+  if (zone === 'UTC') v += 'Z';                              // read the entry as UTC, not local
   const d = new Date(v);
   return isNaN(d.getTime()) ? undefined : d.toISOString();
 }
@@ -80,6 +85,7 @@ const ACTION_COLOR: Record<string, string> = {
   'api_token.deleted': 'bg-red-50 text-red-700',
   'fleet.created': 'bg-emerald-50 text-emerald-700',
   'fleet.updated': 'bg-purple-50 text-purple-700',
+  'fleet.mode_reverted': 'bg-purple-50 text-purple-700',
   'fleet.token_rotated': 'bg-amber-50 text-amber-700',
   'fleet.member_detached': 'bg-gray-100 text-gray-700',
   'fleet.grants_reconciled': 'bg-amber-50 text-amber-700',
@@ -102,6 +108,7 @@ const ACTION_COLOR: Record<string, string> = {
   'agent.sandbox_acknowledged': 'bg-amber-50 text-amber-700',
   'agent.sandbox_ack_revoked': 'bg-emerald-50 text-emerald-700',
   'agent.mode_changed': 'bg-purple-50 text-purple-700',
+  'agent.mode_reverted': 'bg-purple-50 text-purple-700',
   'approval.requested': 'bg-amber-50 text-amber-700',
   'approval.approved': 'bg-emerald-50 text-emerald-700',
   'approval.denied': 'bg-red-50 text-red-700',
@@ -282,6 +289,12 @@ interface Props {
 }
 
 export function AuditLogsPage({ mode, apiUrl, token }: Props) {
+  const { zone } = useTimezone();  // subscribe: reflow displayed timestamps when the zone toggles
+  // A ref mirror of the zone so the fetch reads the current value WITHOUT the toggle triggering
+  // a refetch - toggling is purely a display reflow. The date filter uses the latest zone the
+  // next time it's actually applied (or on next page/refresh).
+  const zoneRef = useRef(zone);
+  zoneRef.current = zone;
   const [logs, setLogs] = useState<AuditLog[]>([]);
   const [loading, setLoading] = useState(false);
   const [hasMore, setHasMore] = useState(false);
@@ -312,8 +325,8 @@ export function AuditLogsPage({ mode, apiUrl, token }: Props) {
       cursorRef.current = undefined;
     }
     const f = filterRefs.current;
-    const since = toUtcIso(f.since); if (since) params.since = since;
-    const until = toUtcIso(f.until); if (until) params.until = until;
+    const since = toUtcIso(f.since, zoneRef.current); if (since) params.since = since;
+    const until = toUtcIso(f.until, zoneRef.current); if (until) params.until = until;
     if (f.action) params.action = f.action;
     if (f.actor) params.actor = f.actor;
     if (f.resource) params.resource = f.resource;
@@ -331,7 +344,7 @@ export function AuditLogsPage({ mode, apiUrl, token }: Props) {
       })
       .catch(() => { if (seqRef.current === seq) setError('Failed to load audit logs'); })
       .finally(() => { if (seqRef.current === seq) setLoading(false); });
-  }, [apiUrl, token, mode]);
+  }, [apiUrl, token, mode]);   // NOT zone - toggling reflows display only, never refetches
 
   useEffect(() => { load(true); }, [load]);
 
@@ -367,9 +380,9 @@ export function AuditLogsPage({ mode, apiUrl, token }: Props) {
   return (
     <div className="min-h-full bg-slate-50">
       {/* Page header */}
-      <div className="bg-gradient-to-r from-orange-700 to-orange-600 px-8 py-5">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-4">
+      <div className="bg-gradient-to-r from-orange-700 to-orange-600 px-4 sm:px-8 py-5">
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+          <div className="flex items-center gap-4 min-w-0">
             <div className="w-10 h-10 rounded-xl bg-white/10 ring-1 ring-white/20 flex items-center justify-center shrink-0">
               <svg className="w-5 h-5 text-white" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
                 <path strokeLinecap="round" strokeLinejoin="round" d="M9 12h3.75M9 15h3.75M9 18h3.75m3 .75H18a2.25 2.25 0 002.25-2.25V6.108c0-1.135-.845-2.098-1.976-2.192a48.424 48.424 0 00-1.123-.08m-5.801 0c-.065.21-.1.433-.1.664 0 .414.336.75.75.75h4.5a.75.75 0 00.75-.75 2.25 2.25 0 00-.1-.664m-5.8 0A2.251 2.251 0 0113.5 2.25H15c1.012 0 1.867.668 2.15 1.586m-5.8 0c-.376.023-.75.05-1.124.08C9.095 4.01 8.25 4.973 8.25 6.108V19.5a2.25 2.25 0 002.25 2.25h.75" />
@@ -396,7 +409,7 @@ export function AuditLogsPage({ mode, apiUrl, token }: Props) {
         </div>
       </div>
 
-      <div className="px-8 py-6">
+      <div className="px-4 sm:px-8 py-6">
       {error && (
         <div className="text-sm text-red-700 bg-red-50 border border-red-200 rounded-lg px-4 py-3 mb-4">{error}</div>
       )}
@@ -449,12 +462,15 @@ export function AuditLogsPage({ mode, apiUrl, token }: Props) {
           className="text-sm border border-gray-300 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-orange-400 w-32"
         />
         <div className="flex items-center gap-1.5">
+          <span className="text-[10px] font-semibold uppercase tracking-wide text-gray-400" title={`Date filter is interpreted in ${zone === 'UTC' ? 'UTC' : 'your local timezone'}`}>
+            {zone === 'UTC' ? 'UTC' : 'Local'}
+          </span>
           <input
             type="datetime-local"
             value={filterSince}
             max={filterUntil || undefined}
             onChange={e => setFilterSince(e.target.value)}
-            title="From date & time (local)"
+            title={`From date & time (${zone === 'UTC' ? 'UTC' : 'local'})`}
             className="text-sm border border-gray-300 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-orange-400"
           />
           <span className="text-gray-400 text-xs">to</span>
@@ -593,6 +609,7 @@ function ExportModal({ mode, apiUrl, token, filters, onClose }: {
   filters: ExportFilters;
   onClose: () => void;
 }) {
+  const { zone } = useTimezone();  // interpret the export date range in the console's zone
   // Pre-fill the range from any date filter already applied on the page.
   const [from, setFrom] = useState(filters.since);
   const [to, setTo] = useState(filters.until);
@@ -613,8 +630,8 @@ function ExportModal({ mode, apiUrl, token, filters, onClose }: {
     setBusy(true); setError(''); setFetched(0);
     try {
       const base: Record<string, string> = { limit: '200' };
-      const since = toUtcIso(from); if (since) base.since = since;
-      const until = toUtcIso(to); if (until) base.until = until;
+      const since = toUtcIso(from, zone); if (since) base.since = since;
+      const until = toUtcIso(to, zone); if (until) base.until = until;
       if (filters.action) base.action = filters.action;
       if (filters.actor) base.actor = filters.actor;
       if (filters.resource) base.resource = filters.resource;

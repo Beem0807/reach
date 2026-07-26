@@ -4,7 +4,8 @@ import secrets
 
 from shared.auth import _bearer, _verify_agent_token
 from shared.policy import host_rule_to_command, is_host_argv_approved, normalize_host_rule
-from shared.redact import redact
+from shared.policy import is_k8s_secret_read, is_sensitive_read
+from shared.redact import redact_with_count
 from shared.response import _err, _iso, _ok
 from shared.store import approvals_repo, jobs_repo, users_repo
 
@@ -25,6 +26,11 @@ def handle_agent_job_result(job_id: str, body: dict, raw_token: str) -> dict:
 
     if status not in ("SUCCEEDED", "FAILED", "REJECTED"):
         return _err("status must be SUCCEEDED, FAILED, or REJECTED")
+    # A blocked command was REFUSED (approval required, fail-closed, or a hard k8s block) - it
+    # did not run, so record it as REJECTED, never FAILED (which implies it ran and errored).
+    # This matches the k8s submission-time block, which is already REJECTED.
+    if blocked:
+        status = "REJECTED"
     if not machine_fp:
         return _err("machine_fingerprint required")
 
@@ -63,8 +69,21 @@ def handle_agent_job_result(job_id: str, body: dict, raw_token: str) -> dict:
         stderr = stderr.encode()[:max_bytes].decode(errors="replace") + "\n[TRUNCATED]"
         stderr_truncated = True
 
-    stdout = redact(stdout)
-    stderr = redact(stderr)
+    # Redact stored output by default - output can incidentally carry a secret, it's readable by
+    # the job's creator + operators (and retained), so we don't persist recognizable secrets in
+    # the clear. The exception is an APPROVED sensitive read: it only produced output because an
+    # operator approved it (or it ran in wild) - i.e. someone deliberately authorized seeing this
+    # secret - so redacting it would defeat the point. (readonly/unapproved sensitive reads are
+    # blocked upstream and never reach here with output.)
+    command = job.get("command") or ""
+    approved_sensitive_read = is_sensitive_read(command) or is_k8s_secret_read(command)
+    if approved_sensitive_read:
+        logger.info("Job %s is an approved sensitive read - storing output unredacted", job_id)
+    else:
+        stdout, n1 = redact_with_count(stdout)
+        stderr, n2 = redact_with_count(stderr)
+        if n1 + n2:
+            logger.info("Redacted %d secret(s) from job %s output", n1 + n2, job_id)
 
     jobs_repo.set_result(job_id, {
         "status": status,

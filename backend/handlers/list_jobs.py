@@ -3,6 +3,7 @@ import logging
 from typing import Optional
 
 from shared.access import can_access_agent, can_access_fleet
+from shared.policy import is_k8s_secret_read, is_sensitive_read
 from shared.auth import _bearer, _verify_tenant_token
 from shared.response import _err, _ok
 from shared.store import agents_repo, fleets_repo, jobs_repo
@@ -24,11 +25,12 @@ def _encode_cursor(s: str) -> str:
 
 def handle_list_jobs(raw_token: str, agent_id: Optional[str], limit: int, cursor: Optional[str] = None,
                      fleet_id: Optional[str] = None, run_id: Optional[str] = None,
-                     q: Optional[str] = None) -> dict:
+                     q: Optional[str] = None, status: Optional[str] = None) -> dict:
     tenant = _verify_tenant_token(raw_token)
     if not tenant:
         return _err("unauthorized", 401)
     ql = (q or "").strip().lower() or None
+    status_u = (status or "").strip().upper() or None   # filter by job status, if given
 
     member_ids: Optional[set] = None
     if fleet_id:
@@ -53,11 +55,13 @@ def handle_list_jobs(raw_token: str, agent_id: Optional[str], limit: int, cursor
         if agent_id:
             rows = [j for j in rows if j.get("agent_id") == agent_id]
     else:
-        # A command search is filtered in Python, so pull a generous window.
-        fetch_limit = 500 if ql else limit
+        # A command search / status filter is applied in Python, so pull a generous window.
+        fetch_limit = 500 if (ql or status_u) else limit
         rows = jobs_repo.list_by_tenant(tenant["tenant_id"], agent_id, fetch_limit, cursor=decoded_cursor)
         if ql:
             rows = [j for j in rows if ql in (j.get("command") or "").lower()]
+    if status_u:
+        rows = [j for j in rows if (j.get("status") or "").upper() == status_u]
 
     # A fleet fan-out batch is gated by **fleet** access, not per-agent - its members
     # are ephemeral (reaped when an ASG scales in), so a per-agent accessibility check
@@ -80,9 +84,16 @@ def handle_list_jobs(raw_token: str, agent_id: Optional[str], limit: int, cursor
             return _cache[aid]
         rows = [j for j in rows if _accessible(j["agent_id"])]
 
-    # A command search returns the matches within the fetched window (like a batch),
-    # capped to `limit`; it doesn't cursor-paginate.
-    if ql:
+    # Developers see only the jobs they created; operators/admins keep the full view of every
+    # job on an agent they can access (their reviewing role). Applied after the access filter
+    # so it only ever narrows.
+    if tenant.get("role") == "developer":
+        _uid = tenant.get("user_id")
+        rows = [j for j in rows if j.get("created_by") == _uid]
+
+    # A command search / status filter returns the matches within the fetched window (like
+    # a batch), capped to `limit`; it doesn't cursor-paginate.
+    if ql or status_u:
         rows = rows[:limit]
 
     _agent_cache: dict = {}
@@ -108,6 +119,8 @@ def handle_list_jobs(raw_token: str, agent_id: Optional[str], limit: int, cursor
             "command": j["command"],
             "status": j["status"],
             "exit_code": j.get("exit_code"),
+            # Approved sensitive read - output is stored unredacted; the console masks it.
+            "sensitive": is_sensitive_read(j["command"]) or is_k8s_secret_read(j["command"]),
             "stdout": j.get("stdout"),
             "stderr": j.get("stderr"),
             "stdout_truncated": bool(j.get("stdout_truncated")),
@@ -125,7 +138,7 @@ def handle_list_jobs(raw_token: str, agent_id: Optional[str], limit: int, cursor
     if target_fleet_id:
         result["agent_fleet_id"] = target_fleet_id
     # No cursor for a batch view or a search - those are materialized in one window.
-    if not run_id and not ql and len(rows) == limit and rows:
+    if not run_id and not ql and not status_u and len(rows) == limit and rows:
         result["next_cursor"] = _encode_cursor(rows[-1]["created_at"])
     return _ok(result)
 
@@ -144,4 +157,5 @@ def list_jobs_handler(event, context):
         limit = max(1, min(int(qs.get("limit", 20)), 100))
     except (ValueError, TypeError):
         limit = 20
-    return handle_list_jobs(token, agent_filter, limit, cursor, fleet_id=fleet_filter, run_id=batch_filter, q=qs.get("q"))
+    return handle_list_jobs(token, agent_filter, limit, cursor, fleet_id=fleet_filter, run_id=batch_filter,
+                            q=qs.get("q"), status=qs.get("status"))

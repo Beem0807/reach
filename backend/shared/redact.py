@@ -114,8 +114,16 @@ def redact(text: Optional[str]) -> Optional[str]:
 
     Returns None unchanged so callers don't need to guard against None inputs.
     """
+    return redact_with_count(text)[0]
+
+
+def redact_with_count(text: Optional[str]) -> tuple[Optional[str], int]:
+    """Like redact(), but also returns how many secret matches were scrubbed - a signal
+    for observability (a redaction firing means output carried a recognizable secret)."""
     if not text:
-        return text
+        return text, 0
+    total = 0
     for pattern, replacement in _PATTERNS:
-        text = pattern.sub(replacement, text)
-    return text
+        text, n = pattern.subn(replacement, text)
+        total += n
+    return text, total

@@ -3,6 +3,7 @@ import logging
 import secrets
 
 from shared.auth import AGENT_TOKEN_PREFIX, FLEET_TOKEN_PREFIX, _hmac_token
+from shared.mode import revert_expired_fleet_mode
 from shared.response import _err, _iso, _now, _ok
 from shared.store import agent_history_repo, agents_repo, fleets_repo
 
@@ -25,6 +26,10 @@ def _claim_into_fleet(join_token: str, machine_fp: str, hostname: str,
     if agent_type != "host":
         return _err("fleet agents are host-only", 403)
 
+    # Converge an elapsed temporary-wild window first, so a machine joining after expiry
+    # inherits the reverted mode (not a stale `wild`); joining mid-window inherits the
+    # remaining window below, so the member auto-reverts in lock-step with the fleet.
+    fleet = revert_expired_fleet_mode(fleet)
     raw_agent_token = AGENT_TOKEN_PREFIX + secrets.token_urlsafe(32)
     now_iso = _iso()
     mode = fleet.get("mode", "readonly")
@@ -54,6 +59,10 @@ def _claim_into_fleet(join_token: str, machine_fp: str, hostname: str,
         "type": "host",
         "fleet_id": fleet["fleet_id"],
         "mode": mode,
+        # Inherit the remaining temporary-wild window (None on a permanent mode) so a
+        # mid-window joiner auto-reverts too.
+        "mode_expires_at": fleet.get("mode_expires_at"),
+        "mode_revert_to": fleet.get("mode_revert_to"),
         "tags": list(fleet.get("tags") or []),
         "grant_service_mgmt": bool(fleet.get("grant_service_mgmt")),
         "grant_docker": bool(fleet.get("grant_docker")),

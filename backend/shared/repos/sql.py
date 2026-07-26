@@ -28,6 +28,11 @@ class _Agent(_Base):
     agent_version = Column(String)
     machine_fingerprint = Column(String)
     mode = Column(String, nullable=False, default="wild")
+    # Temporary wild mode: when set, the agent auto-reverts to `mode_revert_to` once
+    # `mode_expires_at` passes (a bounded escape hatch so an operator can't leave an
+    # agent unrestricted forever by accident). Null on a permanent mode.
+    mode_expires_at = Column(String)   # ISO; when the temporary mode ends
+    mode_revert_to = Column(String)    # mode to fall back to at expiry
     running_as_root = Column(String)  # "true" | "false" | None until first sync
     # Both hashes are looked up directly (credential-only auth): the agent never
     # sends its agent_id - the install token identifies it at claim, the agent
@@ -110,6 +115,12 @@ class _Fleet(_Base):
     # Fleets are host-only: members are host agents that enroll via the join token
     # (k8s already has one-agent-per-cluster identity, so it has no fleet concept).
     mode = Column(String, nullable=False, default="readonly")    # least-privilege default
+    # Temporary wild mode, exactly as on an agent: a bounded window that auto-reverts to
+    # `mode_revert_to` once `mode_expires_at` passes. The schedule lives here (the fleet is
+    # the policy source members inherit) and is mirrored onto members on propagation, so a
+    # new joiner during the window inherits the remaining window and enforcement is uniform.
+    mode_expires_at = Column(String)   # ISO; when the temporary mode ends
+    mode_revert_to = Column(String)    # mode to fall back to at expiry
     grant_service_mgmt = Column(Boolean, default=False)
     grant_docker = Column(Boolean, default=False)
     # Fleet-level acknowledgement that members may run readonly/approved WITHOUT the Landlock
@@ -434,7 +445,13 @@ class AgentRepo:
 
     def list_by_tenant(self, tenant_id: str) -> list:
         with SessionLocal() as db:
-            rows = db.execute(select(_Agent).where(_Agent.tenant_id == tenant_id)).scalars().all()
+            # Stable newest-first order (agent_id tiebreaker). Without an explicit ORDER BY
+            # the DB returns rows in physical order, so an updated row (a new tuple version)
+            # jumps to the end of the list on the next fetch.
+            rows = db.execute(
+                select(_Agent).where(_Agent.tenant_id == tenant_id)
+                .order_by(_Agent.created_at.desc(), _Agent.agent_id)
+            ).scalars().all()
             return [_enrich_agent(_to_dict(r)) for r in rows]
 
     def list_by_fleet(self, fleet_id: str) -> list:
@@ -455,14 +472,17 @@ class AgentRepo:
         with SessionLocal() as db:
             rows = db.execute(
                 select(_Agent.fleet_id, _Agent.status, _Agent.grant_service_mgmt,
-                       _Agent.grant_docker, _Agent.grants_exception, func.count())
+                       _Agent.grant_docker, _Agent.service_mgmt_detected, _Agent.docker_detected,
+                       _Agent.grants_exception, func.count())
                 .where(_Agent.tenant_id == tenant_id, _Agent.fleet_id.isnot(None))
                 .group_by(_Agent.fleet_id, _Agent.status, _Agent.grant_service_mgmt,
-                          _Agent.grant_docker, _Agent.grants_exception)
+                          _Agent.grant_docker, _Agent.service_mgmt_detected,
+                          _Agent.docker_detected, _Agent.grants_exception)
             ).all()
             return [{"fleet_id": f, "status": s, "grant_service_mgmt": sm,
-                     "grant_docker": dk, "grants_exception": exc, "count": c}
-                    for f, s, sm, dk, exc, c in rows]
+                     "grant_docker": dk, "service_mgmt_detected": smd, "docker_detected": dkd,
+                     "grants_exception": exc, "count": c}
+                    for f, s, sm, dk, smd, dkd, exc, c in rows]
 
     def mark_inactive(self, agent_id: str) -> bool:
         with SessionLocal() as db:
@@ -533,10 +553,14 @@ class AgentRepo:
             db.commit()
             return result.rowcount or 0
 
-    def set_mode_by_fleet(self, fleet_id: str, mode: str) -> int:
-        """Propagate a fleet's mode to all its members."""
+    def set_mode_by_fleet(self, fleet_id: str, mode: str,
+                          mode_expires_at: Optional[str] = None, mode_revert_to: Optional[str] = None) -> int:
+        """Propagate a fleet's mode (and its temporary-wild schedule) to all its members.
+        Passing None for the schedule clears it, so a plain fleet mode change drops any prior
+        member expiry - members stay in lock-step with the fleet."""
         with SessionLocal() as db:
-            result = db.execute(update(_Agent).where(_Agent.fleet_id == fleet_id).values(mode=mode))
+            result = db.execute(update(_Agent).where(_Agent.fleet_id == fleet_id).values(
+                mode=mode, mode_expires_at=mode_expires_at, mode_revert_to=mode_revert_to))
             db.commit()
             return result.rowcount or 0
 
@@ -557,12 +581,15 @@ class AgentRepo:
             db.execute(update(_Agent).where(_Agent.agent_id == agent_id).values(**values))
             db.commit()
 
-    def update_policy(self, agent_id: str, mode: str) -> None:
+    def update_policy(self, agent_id: str, mode: str,
+                      mode_expires_at: Optional[str] = None, mode_revert_to: Optional[str] = None) -> None:
+        # Also (re)writes the temporary-mode schedule; passing None clears it, so a plain
+        # mode change drops any prior expiry.
         with SessionLocal() as db:
             db.execute(
                 update(_Agent)
                 .where(_Agent.agent_id == agent_id)
-                .values(mode=mode)
+                .values(mode=mode, mode_expires_at=mode_expires_at, mode_revert_to=mode_revert_to)
             )
             db.commit()
 
@@ -573,6 +600,19 @@ class AgentRepo:
                     _Agent.status == "ACTIVE",
                     _Agent.last_heartbeat_at.isnot(None),
                     _Agent.last_heartbeat_at < cutoff_iso,
+                )
+            ).scalars().all()
+            return [_enrich_agent(_to_dict(r)) for r in rows]
+
+    def scan_expired_wild(self, now_iso: str) -> list:
+        """Agents in a temporary `wild` window that has elapsed (mode_expires_at <= now).
+        Caller reverts each to its scheduled fallback - see shared.mode.revert_expired_mode."""
+        with SessionLocal() as db:
+            rows = db.execute(
+                select(_Agent).where(
+                    _Agent.mode == "wild",
+                    _Agent.mode_expires_at.isnot(None),
+                    _Agent.mode_expires_at <= now_iso,
                 )
             ).scalars().all()
             return [_enrich_agent(_to_dict(r)) for r in rows]
@@ -937,6 +977,19 @@ class FleetRepo:
         """Every fleet across all tenants - used by the heartbeat reaper."""
         with SessionLocal() as db:
             rows = db.execute(select(_Fleet)).scalars().all()
+            return [_to_dict(r) for r in rows]
+
+    def scan_expired_wild(self, now_iso: str) -> list:
+        """Fleets in a temporary `wild` window that has elapsed (mode_expires_at <= now).
+        Caller reverts each - see shared.mode.revert_expired_fleet_mode."""
+        with SessionLocal() as db:
+            rows = db.execute(
+                select(_Fleet).where(
+                    _Fleet.mode == "wild",
+                    _Fleet.mode_expires_at.isnot(None),
+                    _Fleet.mode_expires_at <= now_iso,
+                )
+            ).scalars().all()
             return [_to_dict(r) for r in rows]
 
     def member_counts(self, tenant_id: str) -> dict:

@@ -4,6 +4,7 @@ import secrets
 from datetime import datetime, timedelta, timezone
 
 import shared.audit as audit
+from shared.mode import revert_expired_fleet_mode, revert_expired_mode
 from shared.response import _iso_offset, _now
 from shared.settings import effective_settings
 from shared.store import (agent_history_repo, agents_repo, approvals_repo, audit_repo,
@@ -149,6 +150,8 @@ def handle_heartbeat_check() -> dict:
         logger.info("Expired %d stale PENDING job(s)", expired_jobs)
 
     expired_approvals = 0
+    reverted_modes = 0
+    reverted_fleet_modes = 0
     deleted_approvals = 0
     deleted_jobs = 0
     deleted_runs = 0
@@ -159,6 +162,24 @@ def handle_heartbeat_check() -> dict:
         expired_approvals = approvals_repo.mark_expired(now_iso)
         if expired_approvals:
             logger.info("Marked %d approval(s) as expired", expired_approvals)
+
+        # Converge temporary-wild agents whose window has elapsed. Enforcement already
+        # reverts lazily at job-creation time (no wild job runs past expiry); this hourly
+        # sweep persists + audits the revert near its real expiry so the store and the
+        # audit trail don't carry phantom `wild` agents until someone next reads them.
+        for agent in agents_repo.scan_expired_wild(now_iso):
+            if revert_expired_mode(agent).get("mode") != "wild":
+                reverted_modes += 1
+        if reverted_modes:
+            logger.info("Reverted %d expired temporary-wild agent(s)", reverted_modes)
+
+        # Same convergence for fleets - reverting a fleet also re-propagates the reverted
+        # mode to its members (see revert_expired_fleet_mode).
+        for fleet in fleets_repo.scan_expired_wild(now_iso):
+            if revert_expired_fleet_mode(fleet).get("mode") != "wild":
+                reverted_fleet_modes += 1
+        if reverted_fleet_modes:
+            logger.info("Reverted %d expired temporary-wild fleet(s)", reverted_fleet_modes)
 
     if now_dt.hour == 0 and now_dt.minute == 0:
         # Retention is per-tenant now: each tenant's window comes from its own settings
@@ -191,6 +212,8 @@ def handle_heartbeat_check() -> dict:
         "reaped_members": reaped_members,
         "expired_jobs": expired_jobs,
         "expired_approvals": expired_approvals,
+        "reverted_modes": reverted_modes,
+        "reverted_fleet_modes": reverted_fleet_modes,
         "deleted_approvals": deleted_approvals,
         "deleted_jobs": deleted_jobs,
         "deleted_runs": deleted_runs,
@@ -203,13 +226,16 @@ def heartbeat_handler(event, context):
     result = handle_heartbeat_check()
     logger.info(
         "Heartbeat check complete: %d agent(s) marked INACTIVE, %d fleet member(s) reaped, "
-        "%d job(s) expired, %d approval(s) expired, %d stale approval(s) deleted, "
+        "%d job(s) expired, %d approval(s) expired, %d temporary-wild agent(s) reverted, "
+        "%d temporary-wild fleet(s) reverted, %d stale approval(s) deleted, "
         "%d stale job(s) deleted, %d stale run(s) deleted, %d audit log(s) deleted, "
         "%d agent history record(s) deleted",
         result["marked_inactive"],
         result["reaped_members"],
         result["expired_jobs"],
         result["expired_approvals"],
+        result["reverted_modes"],
+        result["reverted_fleet_modes"],
         result["deleted_approvals"],
         result["deleted_jobs"],
         result["deleted_runs"],

@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { createPortal } from 'react-dom';
-import type { Agent, Fleet, FleetToken, FleetWavePolicy, WaveStrategy, TenantConfig } from '../types';
-import { listFleets, listFleetAgents, createFleet, updateFleet, rotateFleetToken, revokeFleet, deleteFleet, removeFleetMember, revokeTenantAgent, deleteTenantAgent, reconcileFleetGrants, acceptFleetGrantMismatch } from '../api';
+import type { Agent, Fleet, FleetHistory, FleetToken, FleetWavePolicy, WaveStrategy, TenantConfig } from '../types';
+import { listFleets, listFleetAgents, listFleetHistory, createFleet, updateFleet, rotateFleetToken, revokeFleet, deleteFleet, removeFleetMember, revokeTenantAgent, deleteTenantAgent, reconcileFleetGrants, acceptFleetGrantMismatch } from '../api';
 import { WavePolicyRW } from '../components/WavePolicyEditor';
 import { Modal } from '../components/Modal';
 import { RunCommandModal } from '../components/RunCommandModal';
@@ -9,12 +9,14 @@ import { Spinner } from '../components/Spinner';
 import { RefreshButton } from '../components/RefreshButton';
 import { CopyButton, TokenBox } from '../components/CopyButton';
 import { Badge } from '../components/Badge';
-import { relTime, memberMismatchFlagged } from '../utils';
+import { WildDurationPicker } from '../components/WildDurationPicker';
+import { relTime, untilTime, memberMismatchFlagged, memberOutOfBand } from '../utils';
+import { formatTs, useTimezone } from '../timezone';
 
 const MODES = ['wild', 'readonly', 'approved'] as const;
 
 type FleetUpdateBody = Partial<{
-  mode: string; tags: string[]; reap_after_seconds: number | null; max_fanout: number | null;
+  mode: string; duration: string; tags: string[]; reap_after_seconds: number | null; max_fanout: number | null;
   grant_service_mgmt: boolean; grant_docker: boolean; sandbox_ack: boolean; wave_policy: FleetWavePolicy | null;
 }>;
 
@@ -204,6 +206,7 @@ export function FleetsPage({ config, onOpenAgent, focusFleetId, onFocusFleetCons
   focusFleetId?: string | null;
   onFocusFleetConsumed?: () => void;
 }) {
+  useTimezone();  // subscribe so a timezone toggle reflows this page's timestamps
   const { apiUrl, tenantToken } = config;
   // Developers get a read-only view (of the fleets they're granted); operators+ manage.
   const isOperator = config.role === 'admin' || config.role === 'operator';
@@ -219,7 +222,14 @@ export function FleetsPage({ config, onOpenAgent, focusFleetId, onFocusFleetCons
   const [defaultWavePolicy, setDefaultWavePolicy] = useState<FleetWavePolicy>({});
   const [loading, setLoading] = useState(false);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
-  const [modal, setModal] = useState<Modals>(null);
+  // Modal STACK: actions opened from the fleet detail modal layer on top and return to it
+  // on close, instead of destroying it.
+  const [modalStack, setModalStack] = useState<Exclude<Modals, null>[]>([]);
+  const modal: Modals = modalStack[modalStack.length - 1] ?? null;
+  const openModal = (m: Exclude<Modals, null>) => setModalStack(s => [...s, m]);
+  const closeModal = () => setModalStack(s => s.slice(0, -1));
+  const closeAllModals = () => setModalStack([]);
+  const swapModal = (m: Exclude<Modals, null>) => setModalStack(s => [...s.slice(0, -1), m]);
   // Name/id search + pagination, both server-side. Search is applied on the button /
   // Enter (not while typing), matching the Agents & Jobs pages.
   const PAGE = 20;
@@ -269,7 +279,7 @@ export function FleetsPage({ config, onOpenAgent, focusFleetId, onFocusFleetCons
     if (!focusFleetId) return;
     const target = fleets.find(f => f.fleet_id === focusFleetId);
     if (target) {
-      setModal({ type: 'detail', fleet: target });
+      openModal({ type: 'detail', fleet: target });
       onFocusFleetConsumed?.();
     }
   }, [focusFleetId, fleets, onFocusFleetConsumed]);
@@ -283,13 +293,28 @@ export function FleetsPage({ config, onOpenAgent, focusFleetId, onFocusFleetCons
 
   const activeCount = fleets.filter(f => f.status === 'ACTIVE').length;
 
-  const afterAction = () => { setModal(null); load(); };
+  const afterAction = () => { closeAllModals(); load(); };
+
+  // Optimistic, targeted updates for mutations whose result is fully known, instead of
+  // refetching the fleet page. Mutations with member-level side effects (reconcile/accept,
+  // revoke, member ops) still go through afterAction, since their derived counts change.
+  const patchFleet = (id: string, changes: Partial<Fleet>) => {
+    setFleets(prev => prev.map(f => (f.fleet_id === id ? { ...f, ...changes } : f)));
+    setModalStack(prev => prev.map(m =>
+      'fleet' in m && m.fleet?.fleet_id === id
+        ? ({ ...m, fleet: { ...m.fleet, ...changes } } as Exclude<Modals, null>)
+        : m));
+  };
+  const removeFleet = (id: string) => {
+    setFleets(prev => prev.filter(f => f.fleet_id !== id));
+    setTotal(t => Math.max(0, t - 1));
+  };
 
   return (
     <div className="min-h-full bg-slate-50">
-      <div className="bg-gradient-to-r from-violet-700 to-violet-600 px-8 py-5">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-4">
+      <div className="bg-gradient-to-r from-violet-700 to-violet-600 px-4 sm:px-8 py-5">
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+          <div className="flex items-center gap-4 min-w-0">
             <div className="w-10 h-10 rounded-xl bg-white/10 ring-1 ring-white/20 flex items-center justify-center shrink-0">
               <svg className="w-5 h-5 text-white" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
                 <path strokeLinecap="round" strokeLinejoin="round" d="M21.75 17.25v-.228a4.5 4.5 0 00-.12-1.03l-2.268-9.64a3.375 3.375 0 00-3.285-2.602H7.923a3.375 3.375 0 00-3.285 2.602l-2.268 9.64a4.5 4.5 0 00-.12 1.03v.228m19.5 0a3 3 0 01-3 3H5.25a3 3 0 01-3-3m19.5 0a3 3 0 00-3-3H5.25a3 3 0 00-3 3m16.5 0h.008v.008h-.008v-.008zm-3 0h.008v.008h-.008v-.008z" />
@@ -300,7 +325,7 @@ export function FleetsPage({ config, onOpenAgent, focusFleetId, onFocusFleetCons
               <p className="text-sm text-violet-200">Reusable-join-token groups of host agents - for autoscaling groups</p>
             </div>
           </div>
-          <div className="flex items-center gap-3">
+          <div className="flex flex-wrap items-center gap-3">
             <div className="flex items-center gap-2">
               <input
                 value={search}
@@ -323,7 +348,7 @@ export function FleetsPage({ config, onOpenAgent, focusFleetId, onFocusFleetCons
             )}
             <RefreshButton onClick={load} loading={loading} />
             {isOperator && (
-              <button onClick={() => setModal({ type: 'create' })}
+              <button onClick={() => openModal({ type: 'create' })}
                 className="inline-flex items-center gap-1.5 bg-white text-violet-700 hover:bg-violet-50 text-sm font-semibold px-4 py-2 rounded-lg transition-colors shadow-sm">
                 <span className="text-base leading-none">+</span> New fleet
               </button>
@@ -332,7 +357,7 @@ export function FleetsPage({ config, onOpenAgent, focusFleetId, onFocusFleetCons
         </div>
       </div>
 
-      <div className="px-8 py-6">
+      <div className="px-4 sm:px-8 py-6">
         {loading && fleets.length === 0 ? (
           <div className="flex justify-center py-20"><Spinner /></div>
         ) : fleets.length === 0 ? (
@@ -379,7 +404,7 @@ export function FleetsPage({ config, onOpenAgent, focusFleetId, onFocusFleetCons
                         memberPageSize={MEMBER_PAGE}
                         onToggle={() => toggle(f.fleet_id)}
                         onPageMembers={(o) => loadMembers(f.fleet_id, o)}
-                        onAction={setModal} onOpenAgent={onOpenAgent}
+                        onAction={openModal} onOpenAgent={onOpenAgent}
                       />
                     );
                   });
@@ -410,57 +435,66 @@ export function FleetsPage({ config, onOpenAgent, focusFleetId, onFocusFleetCons
 
       {modal?.type === 'create' && (
         <CreateFleetModal apiUrl={apiUrl} tenantToken={tenantToken} defaultReap={defaultReap} defaultMaxFanout={defaultMaxFanout}
-          onClose={() => setModal(null)}
-          onCreated={r => { setModal({ type: 'token', token: r, name: r.name, rotated: false }); load(); }} />
+          onClose={() => closeModal()}
+          onCreated={r => { swapModal({ type: 'token', token: r, name: r.name, rotated: false }); load(); }} />
       )}
       {modal?.type === 'token' && (
-        <FleetTokenModal info={modal} onClose={() => setModal(null)} />
+        <FleetTokenModal info={modal} onClose={() => closeModal()} />
       )}
       {modal?.type === 'detail' && (
-        <FleetDetailModal fleet={modal.fleet}
+        <FleetDetailModal fleet={modal.fleet} apiUrl={apiUrl} tenantToken={tenantToken}
           defaultReap={defaultReap} defaultMaxFanout={defaultMaxFanout} defaultWavePolicy={defaultWavePolicy} canManage={isOperator && modal.fleet.writable !== false}
-          onClose={() => setModal(null)} onAction={setModal} />
+          onClose={() => closeModal()} onAction={openModal} />
       )}
       {modal?.type === 'edit' && (
         <EditFleetModal apiUrl={apiUrl} tenantToken={tenantToken} defaultReap={defaultReap} defaultMaxFanout={defaultMaxFanout}
-          fleet={modal.fleet} onClose={() => setModal(null)} onSaved={afterAction}
-          onNeedsRotate={body => setModal({ type: 'rotate', fleet: (modal as { fleet: Fleet }).fleet, pendingUpdate: body })} />
+          fleet={modal.fleet} onClose={() => closeModal()}
+          onSaved={updated => {
+            // Direct edits (mode/tags/reap/max-fanout/wave) don't touch grants, so member
+            // mismatch counts are unaffected. Patch the fleet row; if it's expanded, refresh
+            // just its members (mode/tags propagate to them) - not the whole page.
+            patchFleet(updated.fleet_id, updated);
+            if (expanded.has(updated.fleet_id)) loadMembers(updated.fleet_id, membersByFleet.get(updated.fleet_id)?.offset ?? 0);
+            closeModal();
+          }}
+          onNeedsRotate={body => swapModal({ type: 'rotate', fleet: (modal as { fleet: Fleet }).fleet, pendingUpdate: body })} />
       )}
       {modal?.type === 'rotate' && (
         <RotateFleetModal apiUrl={apiUrl} tenantToken={tenantToken} fleet={modal.fleet}
           pendingUpdate={modal.pendingUpdate}
-          onClose={() => setModal(null)}
-          onRotated={(t, name) => { setModal({ type: 'token', token: t, name, rotated: true }); load(); }} />
+          onClose={() => closeModal()}
+          onRotated={(t, name) => { swapModal({ type: 'token', token: t, name, rotated: true }); load(); }} />
       )}
       {modal?.type === 'acknowledge-grants' && (
         <ReconcileGrantsModal apiUrl={apiUrl} tenantToken={tenantToken}
           fleet={modal.fleet} driftCount={modal.driftCount} agent={modal.agent}
-          onClose={() => setModal(null)} onDone={afterAction} />
+          onClose={() => closeModal()} onDone={afterAction} />
       )}
       {modal?.type === 'revoke' && (
         <RevokeFleetModal apiUrl={apiUrl} tenantToken={tenantToken}
           fleet={modal.fleet} memberCount={modal.fleet.member_count ?? 0}
-          onClose={() => setModal(null)} onDone={afterAction} />
+          onClose={() => closeModal()} onDone={afterAction} />
       )}
       {modal?.type === 'delete' && (
         <DeleteFleetModal apiUrl={apiUrl} tenantToken={tenantToken}
-          fleet={modal.fleet} onClose={() => setModal(null)} onDone={afterAction} />
+          fleet={modal.fleet} onClose={() => closeModal()}
+          onDone={() => { removeFleet((modal as { fleet: Fleet }).fleet.fleet_id); closeAllModals(); }} />
       )}
       {modal?.type === 'run' && (
         <RunCommandModal config={config} target={{ kind: 'fleet', fleet: modal.fleet }}
-          onClose={() => setModal(null)} />
+          onClose={() => closeModal()} />
       )}
       {modal?.type === 'remove-member' && (
         <RemoveMemberModal apiUrl={apiUrl} tenantToken={tenantToken}
-          fleet={modal.fleet} agent={modal.agent} onClose={() => setModal(null)} onDone={afterAction} />
+          fleet={modal.fleet} agent={modal.agent} onClose={() => closeModal()} onDone={afterAction} />
       )}
       {modal?.type === 'revoke-member' && (
         <MemberActionModal kind="revoke" apiUrl={apiUrl} tenantToken={tenantToken}
-          agent={modal.agent} onClose={() => setModal(null)} onDone={afterAction} />
+          agent={modal.agent} onClose={() => closeModal()} onDone={afterAction} />
       )}
       {modal?.type === 'delete-member' && (
         <MemberActionModal kind="delete" apiUrl={apiUrl} tenantToken={tenantToken}
-          agent={modal.agent} onClose={() => setModal(null)} onDone={afterAction} />
+          agent={modal.agent} onClose={() => closeModal()} onDone={afterAction} />
       )}
     </div>
   );
@@ -470,7 +504,7 @@ function FleetRow({ fleet, memberPage, membersLoading, isOpen, revoked, defaultR
   fleet: Fleet; memberPage?: MemberPage; membersLoading: boolean; isOpen: boolean; revoked: boolean;
   defaultReap: number; defaultMaxFanout: number; canManage: boolean; cols: string[]; memberCols: Columns; dragKey: React.MutableRefObject<string | null>;
   showMemberColsPicker?: boolean; memberPageSize: number;
-  onToggle: () => void; onPageMembers: (offset: number) => void; onAction: (m: Modals) => void; onOpenAgent?: (agentId: string, fromFleetId?: string) => void;
+  onToggle: () => void; onPageMembers: (offset: number) => void; onAction: (m: Exclude<Modals, null>) => void; onOpenAgent?: (agentId: string, fromFleetId?: string) => void;
 }) {
   const grants = grantsLabel(fleet.grant_service_mgmt, fleet.grant_docker);
   // Summary counts come from the fleet-list aggregation (cheap, no member load). The
@@ -496,7 +530,17 @@ function FleetRow({ fleet, memberPage, membersLoading, isOpen, revoked, defaultR
         </td>
       );
       case 'fleet_id': return <td key={key} className="px-3 py-3 font-mono text-xs text-gray-400 whitespace-nowrap">{fleet.fleet_id}</td>;
-      case 'mode': return <td key={key} className="px-3 py-3"><Badge value={fleet.mode} /></td>;
+      case 'mode': return (
+        <td key={key} className="px-3 py-3 whitespace-nowrap">
+          <Badge value={fleet.mode} />
+          {fleet.mode === 'wild' && fleet.mode_expires_at && (
+            <span className="ml-1.5 inline-flex items-center gap-0.5 text-[10px] font-medium text-amber-600"
+              title={`Temporary wild - reverts to ${fleet.mode_revert_to ?? 'readonly'} at ${formatTs(fleet.mode_expires_at)}`}>
+              ⏱ {untilTime(fleet.mode_expires_at)}
+            </span>
+          )}
+        </td>
+      );
       case 'members': return (
         <td key={key} className="px-3 py-3 whitespace-nowrap">
           <span className="font-mono text-gray-700">{memberCount}</span>
@@ -530,24 +574,38 @@ function FleetRow({ fleet, memberPage, membersLoading, isOpen, revoked, defaultR
       );
       case 'status': return <td key={key} className="px-3 py-2"><Badge value={a.status} /></td>;
       case 'grants': {
+        const oob = memberOutOfBand(a, fleet);
         const drift = a.status !== 'REVOKED' && memberMismatchFlagged(a, fleet);
+        const detected = [a.service_mgmt_detected && 'service mgmt', a.docker_detected && 'docker'].filter(Boolean);
         return (
           <td key={key} className="px-3 py-2 whitespace-nowrap">
-            <span className="text-xs text-gray-600">{grantsLabel(a.grant_service_mgmt, a.grant_docker)}</span>
-            {drift && (
-              <>
-                <span className="ml-2 inline-flex items-center gap-1 text-[10px] font-semibold text-amber-700 bg-amber-50 border border-amber-200 px-1.5 py-0.5 rounded"
-                  title={`Fleet wants: ${grantsLabel(fleet.grant_service_mgmt, fleet.grant_docker)}`}>
-                  ⚠ mismatch
-                </span>
-                {canManage && (
-                  <button onClick={e => { e.stopPropagation(); onAction({ type: 'acknowledge-grants', fleet, driftCount: 1, agent: a }); }}
-                    className="ml-1.5 text-[10px] font-medium text-amber-700 hover:text-amber-900 underline underline-offset-2">
-                    reconcile
-                  </button>
-                )}
-              </>
-            )}
+            <div className="flex flex-col gap-0.5">
+              <span className="text-xs text-gray-600">{grantsLabel(a.grant_service_mgmt, a.grant_docker)}</span>
+              {detected.length > 0 && (
+                <span className="text-[10px] text-gray-400">detected: {detected.join(', ')}</span>
+              )}
+              {drift && (
+                <div className="flex items-center gap-1.5">
+                  {oob.length > 0 ? (
+                    <span className="inline-flex items-center gap-1 text-[10px] font-semibold text-amber-700 bg-amber-50 border border-amber-200 px-1.5 py-0.5 rounded"
+                      title={`Host reports ${oob.join(', ')} the fleet doesn't grant. Re-provision to remove it, or accept as-is.`}>
+                      ⚠ out-of-band
+                    </span>
+                  ) : (
+                    <span className="inline-flex items-center gap-1 text-[10px] font-semibold text-amber-700 bg-amber-50 border border-amber-200 px-1.5 py-0.5 rounded"
+                      title={`Fleet wants: ${grantsLabel(fleet.grant_service_mgmt, fleet.grant_docker)}`}>
+                      ⚠ mismatch
+                    </span>
+                  )}
+                  {canManage && (
+                    <button onClick={e => { e.stopPropagation(); onAction({ type: 'acknowledge-grants', fleet, driftCount: 1, agent: a }); }}
+                      className="text-[10px] font-medium text-amber-700 hover:text-amber-900 underline underline-offset-2">
+                      resolve
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
           </td>
         );
       }
@@ -724,7 +782,7 @@ function ColumnPicker({ cols }: { cols: Columns }) {
 }
 
 function FleetMenu({ fleet, revoked, canManage, onAction }: {
-  fleet: Fleet; revoked: boolean; canManage: boolean; onAction: (m: Modals) => void;
+  fleet: Fleet; revoked: boolean; canManage: boolean; onAction: (m: Exclude<Modals, null>) => void;
 }) {
   const [open, setOpen] = useState(false);
   const [pos, setPos] = useState<{ top?: number; bottom?: number; right: number }>({ right: 0 });
@@ -802,9 +860,9 @@ function DetailField({ label, children }: { label: string; children: React.React
 
 // A read-only detail view of a fleet, mirroring the agent "View details" modal. Members
 // are loaded on open (per-fleet, not from a tenant-wide agent list).
-function FleetDetailModal({ fleet, defaultReap, defaultMaxFanout, defaultWavePolicy, canManage, onClose, onAction }: {
-  fleet: Fleet; defaultReap: number; defaultMaxFanout: number; defaultWavePolicy?: FleetWavePolicy; canManage: boolean;
-  onClose: () => void; onAction: (m: Modals) => void; onOpenAgent?: (agentId: string, fromFleetId?: string) => void;
+function FleetDetailModal({ fleet, apiUrl, tenantToken, defaultReap, defaultMaxFanout, defaultWavePolicy, canManage, onClose, onAction }: {
+  fleet: Fleet; apiUrl: string; tenantToken: string; defaultReap: number; defaultMaxFanout: number; defaultWavePolicy?: FleetWavePolicy; canManage: boolean;
+  onClose: () => void; onAction: (m: Exclude<Modals, null>) => void; onOpenAgent?: (agentId: string, fromFleetId?: string) => void;
 }) {
   // Members aren't listed here - they're browsed via the fleet row's accordion (and can
   // number in the thousands). The detail view uses the cheap fleet-list aggregate counts.
@@ -815,7 +873,25 @@ function FleetDetailModal({ fleet, defaultReap, defaultMaxFanout, defaultWavePol
   const grants = grantsLabel(fleet.grant_service_mgmt, fleet.grant_docker);
   const driftCount = fleet.mismatch_count ?? 0;
   // Close this modal first, then open the next one on the page (avoids stacked modals).
-  const open = (m: Modals) => { onClose(); setTimeout(() => onAction(m), 50); };
+  // Layer the action over this detail modal (the stack returns here on close).
+  const open = (m: Exclude<Modals, null>) => onAction(m);
+
+  // Info / History tabs (like the agent detail modal). History lazy-loads on first
+  // visit to the History tab.
+  const [tab, setTab] = useState<'info' | 'history'>('info');
+  const [history, setHistory] = useState<FleetHistory[]>([]);
+  const [histLoading, setHistLoading] = useState(false);
+  const [histError, setHistError] = useState('');
+  const histLoaded = useRef(false);
+  useEffect(() => {
+    if (tab !== 'history' || histLoaded.current) return;
+    histLoaded.current = true;
+    setHistLoading(true);
+    listFleetHistory(apiUrl, tenantToken, fleet.fleet_id)
+      .then(r => setHistory(r.history ?? []))
+      .catch(() => setHistError('Failed to load history'))
+      .finally(() => setHistLoading(false));
+  }, [tab, apiUrl, tenantToken, fleet.fleet_id]);
   return (
     <Modal
       wide
@@ -828,10 +904,34 @@ function FleetDetailModal({ fleet, defaultReap, defaultMaxFanout, defaultWavePol
       onClose={onClose}
     >
       <div className="space-y-4">
+        {/* Tabs */}
+        <div className="flex gap-1 border-b border-gray-200 -mt-1">
+          {(['info', 'history'] as const).map(t => (
+            <button
+              key={t}
+              onClick={() => setTab(t)}
+              className={`px-4 py-2 text-sm font-medium border-b-2 -mb-px transition-colors capitalize ${
+                tab === t ? 'border-indigo-600 text-indigo-600' : 'border-transparent text-gray-500 hover:text-gray-700'
+              }`}
+            >
+              {t}
+            </button>
+          ))}
+        </div>
+
+        {tab === 'info' && (
+        <div className="space-y-4">
         <div className="grid grid-cols-2 gap-2.5">
           <DetailField label="Status"><Badge value={fleet.status} /></DetailField>
           <DetailField label="Type"><Badge value="host" /></DetailField>
-          <DetailField label="Mode"><Badge value={fleet.mode} /></DetailField>
+          <DetailField label="Mode">
+            <Badge value={fleet.mode} />
+            {fleet.mode === 'wild' && fleet.mode_expires_at && (
+              <span className="ml-2 text-[11px] text-amber-600" title={formatTs(fleet.mode_expires_at)}>
+                temporary · reverts to {fleet.mode_revert_to ?? 'readonly'} in {untilTime(fleet.mode_expires_at)}
+              </span>
+            )}
+          </DetailField>
           <DetailField label="Grants">
             <span className="text-xs text-gray-700">{grants}</span>
             {driftCount > 0 && (
@@ -909,6 +1009,35 @@ function FleetDetailModal({ fleet, defaultReap, defaultMaxFanout, defaultWavePol
         )}
 
         <p className="text-[11px] text-gray-400">Members are listed under the fleet's row on the Fleets page (expand it).</p>
+        </div>
+        )}
+
+        {/* History tab - fleet-level edit timeline from the audit log (create, mode/tags/grant
+            changes, token rotations, member detaches). Lazy-loaded on first visit. */}
+        {tab === 'history' && (
+          <div>
+            {histLoading ? (
+              <div className="flex justify-center py-10"><Spinner /></div>
+            ) : histError ? (
+              <p className="text-sm text-red-600 text-center py-6">{histError}</p>
+            ) : history.length === 0 ? (
+              <p className="text-sm text-gray-400 text-center py-10">No history recorded yet</p>
+            ) : (
+              <div className="space-y-1.5 max-h-72 overflow-y-auto pr-1">
+                {history.map((h, i) => (
+                  <div key={i} className="flex items-center gap-3 px-3 py-2.5 bg-gray-50 rounded-lg border border-gray-100">
+                    <span className="text-[11px] font-semibold text-violet-700 bg-violet-100 px-2 py-0.5 rounded shrink-0">edit</span>
+                    <div className="flex-1 min-w-0">
+                      {h.note && <p className="text-xs text-gray-600 truncate">{h.note}</p>}
+                      {h.by && <p className="text-[10px] text-gray-400">by {h.by}</p>}
+                    </div>
+                    <span className="text-[10px] text-gray-400 whitespace-nowrap shrink-0">{relTime(h.created_at)}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Actions - same state machine as the fleet kebab menu (operators+ only;
             developers get a read-only view of the fleets they're granted). */}
@@ -952,7 +1081,7 @@ function FleetDetailModal({ fleet, defaultReap, defaultMaxFanout, defaultWavePol
 }
 // Per-member "..." menu inside the accordion: detach, or teardown via the agent
 // state machine (revoke -> delete), matching the Agents page.
-function MemberMenu({ fleet, agent, onAction }: { fleet: Fleet; agent: Agent; onAction: (m: Modals) => void }) {
+function MemberMenu({ fleet, agent, onAction }: { fleet: Fleet; agent: Agent; onAction: (m: Exclude<Modals, null>) => void }) {
   const [open, setOpen] = useState(false);
   const [pos, setPos] = useState<{ top?: number; bottom?: number; right: number }>({ right: 0 });
   const btnRef = useRef<HTMLButtonElement>(null);
@@ -1000,6 +1129,7 @@ function CreateFleetModal({ apiUrl, tenantToken, defaultReap, defaultMaxFanout, 
 }) {
   const [name, setName] = useState('');
   const [mode, setMode] = useState<typeof MODES[number]>('readonly');
+  const [dur, setDur] = useState({ effective: 'permanent', invalid: false, temporary: false });
   const [grantSvc, setGrantSvc] = useState(false);
   const [grantDocker, setGrantDocker] = useState(false);
   const [sandboxAck, setSandboxAck] = useState(false);
@@ -1010,13 +1140,17 @@ function CreateFleetModal({ apiUrl, tenantToken, defaultReap, defaultMaxFanout, 
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
+  const isTemporary = mode === 'wild' && dur.temporary;
+  const customInvalid = mode === 'wild' && dur.invalid;
+
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!name.trim()) { setError('Name is required.'); return; }
     setLoading(true); setError('');
     try {
       const r = await createFleet(apiUrl, tenantToken, {
-        name: name.trim(), mode, grant_service_mgmt: grantSvc, grant_docker: grantDocker,
+        name: name.trim(), mode, ...(isTemporary ? { duration: dur.effective } : {}),
+        grant_service_mgmt: grantSvc, grant_docker: grantDocker,
         sandbox_ack: sandboxAck,
         tags: serializePairs(tagPairs),
         reap_after_seconds: reapMin.trim() ? Math.round(Number(reapMin) * 60) : null,
@@ -1043,6 +1177,13 @@ function CreateFleetModal({ apiUrl, tenantToken, defaultReap, defaultMaxFanout, 
                 className={`px-3 py-2 rounded-lg border-2 text-sm font-semibold capitalize transition-all ${mode === m ? 'border-violet-400 bg-violet-50 text-violet-800' : 'border-gray-200 text-gray-600 hover:border-gray-300'}`}>{m}</button>
             ))}
           </div>
+          {/* Temporary wild: a window after which the new fleet auto-reverts to readonly. */}
+          {mode === 'wild' && (
+            <div className="mt-2">
+              <WildDurationPicker revertTo="readonly"
+                onChange={(effective, invalid, temporary) => setDur({ effective, invalid, temporary })} />
+            </div>
+          )}
         </div>
         <div>
           <label className="block text-sm font-medium text-gray-700 mb-1.5">Host grants</label>
@@ -1082,8 +1223,8 @@ function CreateFleetModal({ apiUrl, tenantToken, defaultReap, defaultMaxFanout, 
         {error && <p className="text-sm text-red-600">{error}</p>}
         <div className="flex justify-end gap-3 pt-1">
           <button type="button" onClick={onClose} className="text-sm text-gray-600">Cancel</button>
-          <button type="submit" disabled={loading} className="flex items-center gap-2 bg-violet-600 hover:bg-violet-700 text-white text-sm font-medium px-4 py-2 rounded-md disabled:opacity-60">
-            {loading && <Spinner className="h-4 w-4" />} Create fleet
+          <button type="submit" disabled={loading || customInvalid} className="flex items-center gap-2 bg-violet-600 hover:bg-violet-700 text-white text-sm font-medium px-4 py-2 rounded-md disabled:opacity-60 disabled:cursor-not-allowed">
+            {loading && <Spinner className="h-4 w-4" />} {isTemporary ? 'Create (temporary wild)' : 'Create fleet'}
           </button>
         </div>
       </form>
@@ -1121,13 +1262,14 @@ function FleetTokenModal({ info, onClose }: { info: { token: FleetToken; name: s
 
 function EditFleetModal({ apiUrl, tenantToken, defaultReap, defaultMaxFanout, fleet, onClose, onSaved, onNeedsRotate }: {
   apiUrl: string; tenantToken: string; defaultReap: number; defaultMaxFanout: number; fleet: Fleet;
-  onClose: () => void; onSaved: () => void;
+  onClose: () => void; onSaved: (updated: Fleet) => void;
   // Called instead of saving when grants changed: the edit is handed off to the
   // rotate-token step and only committed there (so the operator can't change grants
   // without getting the new install command).
   onNeedsRotate: (body: FleetUpdateBody) => void;
 }) {
   const [mode, setMode] = useState<typeof MODES[number]>(fleet.mode);
+  const [dur, setDur] = useState({ effective: 'permanent', invalid: false, temporary: false });
   const [tagPairs, setTagPairs] = useState<KVPair[]>(parseTags(fleet.tags));
   const [reapMin, setReapMin] = useState(fleet.reap_after_seconds ? String(fleet.reap_after_seconds / 60) : '');
   const [maxFanout, setMaxFanout] = useState(fleet.max_fanout ? String(fleet.max_fanout) : '');
@@ -1137,27 +1279,119 @@ function EditFleetModal({ apiUrl, tenantToken, defaultReap, defaultMaxFanout, fl
   const [sandboxAck, setSandboxAck] = useState(!!fleet.sandbox_ack);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  // Non-grant edits go through a review step (grant edits have their own rotate-token review).
+  const [review, setReview] = useState(false);
   const grantsChanged = grantSvc !== !!fleet.grant_service_mgmt || grantDocker !== !!fleet.grant_docker;
+  const isTemporary = mode === 'wild' && dur.temporary;
+  const customInvalid = mode === 'wild' && dur.invalid;
+  // The mode a temporary wild window reverts to (the fleet's previous safe mode).
+  const revertTo = fleet.mode === 'wild' ? 'readonly' : fleet.mode;
+
+  // Human-readable diff of what will change, shown on the review step before committing.
+  const fmtReapVal = (s?: number | null) => (s ? `${Math.round(s / 60)} min` : 'default');
+  const changeList = (): { label: string; from: string; to: string }[] => {
+    const rows: { label: string; from: string; to: string }[] = [];
+    if (mode !== fleet.mode || isTemporary) {
+      rows.push({ label: 'Mode',
+        from: fleet.mode + (fleet.mode === 'wild' && fleet.mode_expires_at ? ` (temporary → ${fleet.mode_revert_to ?? 'readonly'})` : ''),
+        to: isTemporary ? `wild · reverts to ${revertTo} in ${dur.effective}` : mode });
+    }
+    const newTags = serializePairs(tagPairs);
+    if (newTags.slice().sort().join('\n') !== (fleet.tags ?? []).slice().sort().join('\n'))
+      rows.push({ label: 'Tags', from: (fleet.tags ?? []).join(', ') || 'none', to: newTags.join(', ') || 'none' });
+    const newReap = reapMin.trim() ? Math.round(Number(reapMin) * 60) : null;
+    if (newReap !== (fleet.reap_after_seconds ?? null))
+      rows.push({ label: 'Reap members after', from: fmtReapVal(fleet.reap_after_seconds), to: fmtReapVal(newReap) });
+    const newMf = maxFanout.trim() ? Number(maxFanout) : null;
+    if (newMf !== (fleet.max_fanout ?? null))
+      rows.push({ label: 'Max fan-out', from: fleet.max_fanout ? String(fleet.max_fanout) : 'tenant default', to: newMf ? String(newMf) : 'tenant default' });
+    if (JSON.stringify(Object.keys(wavePolicy).length ? wavePolicy : null) !== JSON.stringify(fleet.wave_policy ?? null))
+      rows.push({ label: 'Staged rollout', from: fleet.wave_policy ? 'custom' : 'tenant default', to: Object.keys(wavePolicy).length ? 'custom' : 'tenant default' });
+    if (sandboxAck !== !!fleet.sandbox_ack)
+      rows.push({ label: 'Sandbox acknowledgement', from: fleet.sandbox_ack ? 'on' : 'off', to: sandboxAck ? 'on' : 'off' });
+    return rows;
+  };
 
   const body = (): FleetUpdateBody => ({
-    mode, tags: serializePairs(tagPairs),
+    mode, ...(isTemporary ? { duration: dur.effective } : {}),
+    tags: serializePairs(tagPairs),
     grant_service_mgmt: grantSvc, grant_docker: grantDocker, sandbox_ack: sandboxAck,
     reap_after_seconds: reapMin.trim() ? Math.round(Number(reapMin) * 60) : null,
     max_fanout: maxFanout.trim() ? Number(maxFanout) : null,
     wave_policy: Object.keys(wavePolicy).length ? wavePolicy : null,
   });
 
-  const submit = async (e: React.FormEvent) => {
+  // No-op guard: disable Save unless something actually differs, OR a temporary wild window
+  // is being armed (which is a change even if the mode was already wild).
+  const changed =
+    mode !== fleet.mode
+    || isTemporary
+    || grantsChanged
+    || sandboxAck !== !!fleet.sandbox_ack
+    || serializePairs(tagPairs).slice().sort().join('\n') !== (fleet.tags ?? []).slice().sort().join('\n')
+    || (reapMin.trim() ? Math.round(Number(reapMin) * 60) : null) !== (fleet.reap_after_seconds ?? null)
+    || (maxFanout.trim() ? Number(maxFanout) : null) !== (fleet.max_fanout ?? null)
+    || JSON.stringify(Object.keys(wavePolicy).length ? wavePolicy : null) !== JSON.stringify(fleet.wave_policy ?? null);
+
+  const submit = (e: React.FormEvent) => {
     e.preventDefault();
     // A grant change isn't saved here - it's committed at the rotate-token step, so
     // the operator always leaves with the new launch-template install command.
     if (grantsChanged) { onNeedsRotate(body()); return; }
+    // Otherwise show the review step; the actual save happens on confirm.
+    setError(''); setReview(true);
+  };
+
+  const confirmSave = async () => {
     setLoading(true); setError('');
     try {
-      await updateFleet(apiUrl, tenantToken, fleet.fleet_id, body());
-      onSaved();
+      const updated = await updateFleet(apiUrl, tenantToken, fleet.fleet_id, body());
+      onSaved(updated);
     } catch (e) { setError((e as Error).message); setLoading(false); }
   };
+
+  if (review) {
+    const rows = changeList();
+    return (
+      <Modal title={`Review changes - ${fleet.name}`} onClose={onClose}>
+        <div className="space-y-4">
+          {rows.length === 0 ? (
+            <p className="text-sm text-gray-500">No changes to save.</p>
+          ) : (
+            <>
+              <p className="text-sm text-gray-600">Review the changes before applying them to <strong>{fleet.name}</strong>. Mode and tags propagate to <strong>all current members</strong>.</p>
+              <div className="rounded-lg border border-gray-200 divide-y divide-gray-100">
+                {rows.map(r => (
+                  <div key={r.label} className="flex items-start gap-3 px-3 py-2 text-sm">
+                    <span className="w-40 shrink-0 font-medium text-gray-600">{r.label}</span>
+                    <span className="min-w-0 text-gray-400 line-through break-words">{r.from}</span>
+                    <span className="text-gray-400">→</span>
+                    <span className="min-w-0 font-medium text-gray-800 break-words">{r.to}</span>
+                  </div>
+                ))}
+              </div>
+              {isTemporary && (
+                <p className="text-[11px] text-amber-700 bg-amber-50/60 border border-amber-200 rounded-md px-2.5 py-1.5">
+                  This opens a temporary wild window across the fleet. It auto-reverts to <strong>{revertTo}</strong> when the window ends.
+                </p>
+              )}
+            </>
+          )}
+          {error && <p className="text-sm text-red-600">{error}</p>}
+          <div className="flex justify-between gap-3 pt-1">
+            <button type="button" onClick={() => { setReview(false); setError(''); }} className="text-sm text-gray-600 hover:text-gray-800">← Back to edit</button>
+            <div className="flex gap-3">
+              <button type="button" onClick={onClose} className="text-sm text-gray-600">Cancel</button>
+              <button type="button" onClick={confirmSave} disabled={loading || rows.length === 0}
+                className="flex items-center gap-2 bg-violet-600 hover:bg-violet-700 text-white text-sm font-medium px-4 py-2 rounded-md disabled:opacity-60 disabled:cursor-not-allowed">
+                {loading && <Spinner className="h-4 w-4" />} Confirm & save
+              </button>
+            </div>
+          </div>
+        </div>
+      </Modal>
+    );
+  }
 
   return (
     <Modal title={`Edit fleet - ${fleet.name}`} onClose={onClose}>
@@ -1171,6 +1405,13 @@ function EditFleetModal({ apiUrl, tenantToken, defaultReap, defaultMaxFanout, fl
             ))}
           </div>
           <p className="mt-1 text-xs text-amber-600">Changing this updates the mode of <strong>all current members</strong> too, and new members inherit it.</p>
+          {/* Temporary wild: a window after which the fleet (and its members) auto-revert. */}
+          {mode === 'wild' && (
+            <div className="mt-2">
+              <WildDurationPicker revertTo={revertTo}
+                onChange={(effective, invalid, temporary) => setDur({ effective, invalid, temporary })} />
+            </div>
+          )}
         </div>
         <div>
           <label className="block text-sm font-medium text-gray-700 mb-1.5">Tags <span className="font-normal text-gray-400">(inherited - applied to all members on save)</span></label>
@@ -1197,7 +1438,7 @@ function EditFleetModal({ apiUrl, tenantToken, defaultReap, defaultMaxFanout, fl
         </div>
         <div>
           <label className="block text-sm font-medium text-gray-700 mb-1">Reap members after <span className="font-normal text-gray-400">(minutes; blank = default {reapPhrase(defaultReap)})</span></label>
-          <input value={reapMin} onChange={e => setReapMin(e.target.value.replace(/[^0-9.]/g, ''))}
+          <input value={reapMin} onChange={e => setReapMin(e.target.value.replace(/[^0-9.]/g, ''))} placeholder={String(Math.round(defaultReap / 60))}
             className="w-40 border border-gray-300 rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-500" />
         </div>
         <div>
@@ -1214,8 +1455,10 @@ function EditFleetModal({ apiUrl, tenantToken, defaultReap, defaultMaxFanout, fl
         {error && <p className="text-sm text-red-600">{error}</p>}
         <div className="flex justify-end gap-3 pt-1">
           <button type="button" onClick={onClose} className="text-sm text-gray-600">Cancel</button>
-          <button type="submit" disabled={loading} className="flex items-center gap-2 bg-violet-600 hover:bg-violet-700 text-white text-sm font-medium px-4 py-2 rounded-md disabled:opacity-60">
-            {loading && <Spinner className="h-4 w-4" />} {grantsChanged ? 'Next: rotate token →' : 'Save'}
+          <button type="submit" disabled={loading || !changed || customInvalid}
+            title={!changed ? 'No changes to save' : undefined}
+            className="flex items-center gap-2 bg-violet-600 hover:bg-violet-700 text-white text-sm font-medium px-4 py-2 rounded-md disabled:opacity-60 disabled:cursor-not-allowed">
+            {loading && <Spinner className="h-4 w-4" />} {grantsChanged ? 'Next: rotate token →' : 'Review changes →'}
           </button>
         </div>
       </form>
@@ -1317,11 +1560,11 @@ function ReconcileGrantsModal({ apiUrl, tenantToken, fleet, driftCount, agent, o
         </p>
         <div className="bg-amber-50 border border-amber-200 rounded-lg px-3 py-2.5 text-xs text-amber-800 space-y-1">
           <p><strong>Reconcile</strong> - you re-provisioned the host to match the fleet. <strong>Verified against detection:</strong> {one ? 'the member is' : 'a member is'} only reconciled once the host actually reports the granted capability; hosts that don't are <strong>skipped</strong>, so this can't clear a mismatch on a host that wasn't fixed.</p>
-          <p><strong>Accept as-is</strong> - you're OK with {one ? 'this member' : 'these members'} running with different grants. Their real grants are kept (nothing is falsified); they just stop being flagged. The acceptance is scoped to this exact divergence: it <strong>re-flags automatically</strong> if the fleet grants change or the member's own grants change to a new mismatch, and it's <strong>dropped once the member matches the fleet</strong> - so a later return to the same divergence must be accepted again.</p>
+          <p><strong>Accept as-is</strong> - you're OK with {one ? 'this member' : 'these members'} diverging from the fleet (different grants, or a capability the host reports that the fleet doesn't grant). Their real state is kept (nothing is falsified); they just stop being flagged. The acceptance is scoped to this exact divergence: it <strong>re-flags automatically</strong> if the fleet grants change, the member's own grants change, or the host's <strong>detected</strong> capabilities change - and it's <strong>dropped once the member is fully in line with the fleet</strong>.</p>
         </div>
         {blocked.length > 0 && (
           <div className="bg-red-50 border border-red-200 rounded-lg px-3 py-2.5 text-xs text-red-700 space-y-1">
-            <p className="font-semibold">Not reconciled - the host doesn't report the granted capability yet. Re-provision it, or <strong>Accept as-is</strong> if the divergence is intentional:</p>
+            <p className="font-semibold">Couldn't reconcile these - re-provision the host, or <strong>Accept as-is</strong> if the divergence is intentional:</p>
             <ul className="list-disc list-inside space-y-0.5">
               {blocked.map(b => <li key={b.agent_id}><span className="font-mono">{b.hostname ?? b.agent_id}</span> - {b.reason}</li>)}
             </ul>

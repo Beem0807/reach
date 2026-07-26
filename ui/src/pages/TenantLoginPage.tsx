@@ -49,7 +49,7 @@ export function TenantLoginPage({ onLogin, onSwitchToPlatform }: Props) {
     <div className="min-h-screen bg-slate-950 flex items-center justify-center p-4">
       <div className="w-full max-w-sm">
         <div className="flex justify-center mb-8">
-          <div className="flex items-center gap-3">
+          <div className="flex flex-wrap items-center gap-3">
             <div className="w-10 h-10 rounded-xl bg-indigo-500 flex items-center justify-center shadow-lg">
               <span className="text-white font-bold text-lg">R</span>
             </div>

@@ -34,6 +34,9 @@ def upgrade() -> None:
         sa.Column('tenant_id', sa.String(), nullable=False),
         sa.Column('name', sa.String(), nullable=False),
         sa.Column('mode', sa.String(), nullable=False, server_default='readonly'),
+        # Temporary-wild schedule: bounded window that auto-reverts to mode_revert_to.
+        sa.Column('mode_expires_at', sa.String(), nullable=True),
+        sa.Column('mode_revert_to', sa.String(), nullable=True),
         sa.Column('grant_service_mgmt', sa.Boolean(), nullable=True, server_default=sa.false()),
         sa.Column('grant_docker', sa.Boolean(), nullable=True, server_default=sa.false()),
         sa.Column('sandbox_ack', sa.Boolean(), nullable=True, server_default=sa.false()),
@@ -86,6 +89,9 @@ def upgrade() -> None:
         sa.Column('agent_version', sa.String(), nullable=True),
         sa.Column('machine_fingerprint', sa.String(), nullable=True),
         sa.Column('mode', sa.String(), nullable=False),
+        # Temporary-wild schedule: bounded window that auto-reverts to mode_revert_to.
+        sa.Column('mode_expires_at', sa.String(), nullable=True),
+        sa.Column('mode_revert_to', sa.String(), nullable=True),
         sa.Column('running_as_root', sa.String(), nullable=True),
         sa.Column('agent_token_hash', sa.String(), nullable=True),
         sa.Column('install_token_hash', sa.String(), nullable=True),

@@ -340,6 +340,16 @@ class TestHandleTenantListAllApprovals:
         body = json.loads(r["body"])
         assert len(body["approvals"]) == 1
 
+    def test_attaches_explanation(self):
+        # Each approval carries a computed explanation (action, scope, risk) for the console.
+        appr = {**_FULL_APPROVAL, "host_rule": {"bin": "systemctl", "args": ["restart", "*"]},
+                "expires_at": None}
+        r, _ = self._call(approvals=[appr])
+        exp = json.loads(r["body"])["approvals"][0]["explanation"]
+        assert exp["risk"] in ("low", "medium", "high")
+        labels = {f["label"] for f in exp["facts"]}
+        assert "Requested action" in labels and "Allowed service" in labels
+
     def test_admin_can_list(self):
         r, _ = self._call(user=_ADMIN)
         assert r["statusCode"] == 200

@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import type { TenantConfig, Agent, AgentHistory, TenantUser, Fleet } from '../types';
+import { formatTs, useTimezone } from '../timezone';
 import {
   listTenantAgents,
   listTenantUsers,
@@ -25,9 +26,10 @@ import { RefreshButton } from '../components/RefreshButton';
 import { Badge } from '../components/Badge';
 import { K8sPermissionsView } from '../components/K8sPermissionsView';
 import { Spinner } from '../components/Spinner';
+import { WildDurationPicker } from '../components/WildDurationPicker';
 import { CopyButton, TokenBox } from '../components/CopyButton';
 import { DataTable } from '../components/DataTable';
-import { relTime, memberMismatchAccepted } from '../utils';
+import { relTime, untilTime, memberMismatchAccepted } from '../utils';
 
 const MODES = ['wild', 'readonly', 'approved'] as const;
 type Mode = typeof MODES[number];
@@ -45,18 +47,29 @@ const MODE_DESC: Record<string, string> = {
 };
 
 
-function CapabilityCell({ granted, detected, onAcknowledge, fleetDrift, fleetWants }: {
+function CapabilityCell({ granted, detected, onAcknowledge, fleetDrift, fleetWants, fleetManaged, accepted }: {
   granted?: boolean; detected?: boolean; onAcknowledge?: () => void;
   // Set for fleet members whose grant differs from the fleet's desired grant - the
   // the same "grant mismatch" the Fleets screen flags, surfaced here for consistency.
   fleetDrift?: boolean; fleetWants?: boolean;
+  // Fleet member: grants are fleet-managed, so "detected without a grant" is resolved by
+  // re-provisioning / a fleet grant, not a per-agent acknowledge.
+  fleetManaged?: boolean;
+  // Fleet member whose out-of-band capability was Accepted-as-is on the fleet: shown as a
+  // neutral, non-actionable state rather than an amber warning.
+  accepted?: boolean;
 }) {
   const outOfBand   = detected && !granted;
   const active      = detected && granted;
   const grantedOnly = granted && !detected;
+  const oobAccepted = outOfBand && accepted;
 
   const tooltip = outOfBand
-    ? 'Detected without a grant - out-of-band access, needs acknowledgement'
+    ? (oobAccepted
+        ? 'Accepted as-is on the fleet: the host reports this capability, which the fleet does not grant. Re-flags if the fleet grants or the host detection change.'
+        : fleetManaged
+        ? 'Host reports this capability (the socket/tool is present) but the fleet does not grant it. Reconcile only updates the grant record - re-provision the host to actually remove it, or grant it on the fleet.'
+        : 'Detected without a grant - out-of-band access, needs acknowledgement')
     : active
     ? 'Granted and currently detected running on this agent'
     : grantedOnly
@@ -65,13 +78,13 @@ function CapabilityCell({ granted, detected, onAcknowledge, fleetDrift, fleetWan
 
   const badge = outOfBand ? (
     <div className="flex flex-col items-start gap-0.5">
-      <span className="inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-0.5 rounded-full bg-amber-50 text-amber-700 border border-amber-200">
+      <span className={`inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-0.5 rounded-full ${oobAccepted ? 'bg-gray-100 text-gray-500 border border-gray-200' : 'bg-amber-50 text-amber-700 border border-amber-200'}`}>
         <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
           <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126z" />
         </svg>
-        Detected
+        {oobAccepted ? 'Detected (accepted)' : 'Detected'}
       </span>
-      {onAcknowledge && (
+      {onAcknowledge && !oobAccepted && (
         <button
           onClick={e => { e.stopPropagation(); onAcknowledge(); }}
           className="text-[10px] text-amber-600 hover:text-amber-800 font-medium underline underline-offset-2 leading-none px-0.5"
@@ -167,7 +180,7 @@ function RbacCell({ reported, drift, onOpen }: { reported?: boolean; drift?: boo
 
 function fmtDate(iso?: string) {
   if (!iso) return '-';
-  return new Date(iso).toLocaleString(undefined, {
+  return formatTs(iso, {
     month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit',
   });
 }
@@ -185,6 +198,7 @@ type ModalState =
   | { type: 'rotate'; agent: Agent }
   | { type: 'detach-fleet'; agent: Agent }
   | { type: 'confirm-sandbox'; agent: Agent; acknowledged: boolean }
+  | { type: 'confirm-acknowledge'; agent: Agent; capability: 'docker' | 'service_mgmt' | 'k8s_permissions' }
   | { type: 'run-agent'; agent: Agent }
   | null;
 
@@ -195,6 +209,7 @@ export function TenantAgentsPage({ config, focusAgentId, backFleetId, onBackToFl
   onBackToFleet?: (fleetId: string) => void;
   onFocusConsumed?: () => void;
 }) {
+  useTimezone();  // subscribe so a timezone toggle reflows this page's timestamps
   const { apiUrl, tenantToken, role } = config;
   const isOperator = role === 'admin' || role === 'operator';
 
@@ -219,7 +234,14 @@ export function TenantAgentsPage({ config, focusAgentId, backFleetId, onBackToFl
   const [allTags, setAllTags] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
-  const [modal, setModal] = useState<ModalState>(null);
+  // Modal STACK: opening an action from the detail modal layers it on top and returns to
+  // the detail when it closes, instead of destroying it (so the operator keeps their place).
+  const [modalStack, setModalStack] = useState<Exclude<ModalState, null>[]>([]);
+  const modal: ModalState = modalStack[modalStack.length - 1] ?? null;
+  const openModal = (m: Exclude<ModalState, null>) => setModalStack(s => [...s, m]);   // push (layer)
+  const closeModal = () => setModalStack(s => s.slice(0, -1));                          // pop (back one)
+  const closeAllModals = () => setModalStack([]);
+  const swapModal = (m: Exclude<ModalState, null>) => setModalStack(s => [...s.slice(0, -1), m]);
   const [fleets, setFleets] = useState<Fleet[]>([]);
   const [tagPickerOpen, setTagPickerOpen] = useState(false);
   const tagPickerRef = useRef<HTMLDivElement>(null);
@@ -270,21 +292,40 @@ export function TenantAgentsPage({ config, focusAgentId, backFleetId, onBackToFl
     if (!focusAgentId) return;
     const target = agents.find(a => a.agent_id === focusAgentId);
     if (target) {
-      setModal({ type: 'detail', agent: target, backFleetId });
+      openModal({ type: 'detail', agent: target, backFleetId });
       onFocusConsumed?.();
     }
   }, [focusAgentId, backFleetId, agents, onFocusConsumed]);
 
-  const closeAndReload = () => { setModal(null); load(); };
+  const closeAndReload = () => { closeAllModals(); load(); };
 
+  // Optimistic, targeted updates: after a successful single-agent mutation we patch just
+  // that row in place instead of refetching the whole page. Drift / out-of-band badges are
+  // derived client-side from the agent's own fields + its fleet, so they recompute for free.
+  // Also patch any modal in the stack holding this agent (e.g. the detail modal underneath),
+  // so returning to it after a layered action shows the updated data.
+  const patchAgent = (id: string, changes: Partial<Agent>) => {
+    setAgents(prev => prev.map(a => (a.agent_id === id ? { ...a, ...changes } : a)));
+    setModalStack(prev => prev.map(m =>
+      'agent' in m && m.agent?.agent_id === id
+        ? ({ ...m, agent: { ...m.agent, ...changes } } as Exclude<ModalState, null>)
+        : m));
+  };
+  const removeAgent = (id: string) => {
+    setAgents(prev => prev.filter(a => a.agent_id !== id));
+    setTotal(t => Math.max(0, t - 1));
+  };
+
+  // Called from the confirm-acknowledge modal, so errors propagate to it (spinner/error);
+  // on success we patch the row and close.
   const handleAcknowledge = async (agent: Agent, capability: 'docker' | 'service_mgmt' | 'k8s_permissions') => {
-    try {
-      await acknowledgeCapability(apiUrl, tenantToken, agent.agent_id, capability);
-      setModal(null);  // close the (now-stale) detail modal so the reloaded list shows cleared drift
-      load();
-    } catch (e) {
-      setError((e as Error).message);
-    }
+    await acknowledgeCapability(apiUrl, tenantToken, agent.agent_id, capability);
+    // Acknowledging sets the individual grant (docker/service-mgmt) or pins the current
+    // k8s RBAC as the acknowledged baseline (clearing drift).
+    if (capability === 'docker') patchAgent(agent.agent_id, { grant_docker: true });
+    else if (capability === 'service_mgmt') patchAgent(agent.agent_id, { grant_service_mgmt: true });
+    else patchAgent(agent.agent_id, { k8s_permissions_drift: false, k8s_permissions_acked: agent.k8s_permissions });
+    closeModal();
   };
 
 
@@ -332,9 +373,9 @@ export function TenantAgentsPage({ config, focusAgentId, backFleetId, onBackToFl
   return (
     <div className="min-h-full bg-slate-50">
       {/* Page header */}
-      <div className="bg-gradient-to-r from-slate-800 to-slate-700 px-8 py-5">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-4">
+      <div className="bg-gradient-to-r from-slate-800 to-slate-700 px-4 sm:px-8 py-5">
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+          <div className="flex items-center gap-4 min-w-0">
             <div className="w-10 h-10 rounded-xl bg-white/10 ring-1 ring-white/20 flex items-center justify-center shrink-0">
               <svg className="w-5 h-5 text-white" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
                 <path strokeLinecap="round" strokeLinejoin="round" d="M5.25 14.25h13.5m-13.5 0a3 3 0 01-3-3m3 3a3 3 0 100 6h13.5a3 3 0 100-6m-16.5-3a3 3 0 013-3h13.5a3 3 0 013 3m-19.5 0a4.5 4.5 0 01.9-2.7L5.737 5.1a3.375 3.375 0 012.7-1.35h7.126c1.062 0 2.062.5 2.7 1.35l2.587 3.45a4.5 4.5 0 01.9 2.7" />
@@ -345,7 +386,7 @@ export function TenantAgentsPage({ config, focusAgentId, backFleetId, onBackToFl
               <p className="text-sm text-slate-300">Machines registered to your tenant</p>
             </div>
           </div>
-          <div className="flex items-center gap-3">
+          <div className="flex flex-wrap items-center gap-3">
             {!loading && agents.length > 0 && (
               <>
                 {activeCount > 0 && (
@@ -369,7 +410,7 @@ export function TenantAgentsPage({ config, focusAgentId, backFleetId, onBackToFl
             <RefreshButton onClick={load} loading={loading} />
             {isOperator && (
               <button
-                onClick={() => setModal({ type: 'create' })}
+                onClick={() => openModal({ type: 'create' })}
                 className="inline-flex items-center gap-1.5 bg-white text-slate-800 hover:bg-slate-100 text-sm font-semibold px-4 py-2 rounded-lg transition-colors shadow-sm"
               >
                 <span className="text-base leading-none">+</span> New agent
@@ -379,14 +420,14 @@ export function TenantAgentsPage({ config, focusAgentId, backFleetId, onBackToFl
         </div>
       </div>
 
-      <div className="px-8 py-6">
+      <div className="px-4 sm:px-8 py-6">
         {error && (
           <div className="text-sm text-red-700 bg-red-50 border border-red-200 rounded-lg px-4 py-3 mb-4">{error}</div>
         )}
 
         {/* Search + filters are applied together, server-side, only on click / Enter -
             so every filter spans all pages, not just the loaded one. */}
-        <div className="flex items-center gap-3 mb-4">
+        <div className="flex flex-wrap items-center gap-3 mb-4">
           <div className="relative flex-1 max-w-md">
             <svg className="w-4 h-4 text-gray-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
               <path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-4.35-4.35m0 0A7.5 7.5 0 105.6 5.6a7.5 7.5 0 0011.05 11.05z" />
@@ -568,7 +609,7 @@ export function TenantAgentsPage({ config, focusAgentId, backFleetId, onBackToFl
                 <>
                   {anyApplied ? 'No agents match the current filters' : 'No agents registered'}
                   {isOperator && !anyApplied && (
-                    <span> - <button onClick={() => setModal({ type: 'create' })} className="text-indigo-600 hover:underline">create one</button></span>
+                    <span> - <button onClick={() => openModal({ type: 'create' })} className="text-indigo-600 hover:underline">create one</button></span>
                   )}
                 </>
               }
@@ -576,9 +617,12 @@ export function TenantAgentsPage({ config, focusAgentId, backFleetId, onBackToFl
                 const isActive = a.status === 'ACTIVE';
                 const lastSeen = a.last_heartbeat_at ? Date.now() - new Date(a.last_heartbeat_at).getTime() : null;
                 const stale = isActive && lastSeen !== null && lastSeen > 5 * 60 * 1000;
+                // Left accent for ACTIVE agents: an inset box-shadow on the row's leftmost
+                // cell (td:first-child), not a <tr> border-left - the latter renders
+                // inconsistently per-row under border-collapse (only the first row showed).
                 return (
-                <tr key={a.agent_id} className={`group border-l-2 transition-colors ${isActive ? 'border-l-emerald-400 hover:bg-emerald-50/30' : 'border-l-transparent hover:bg-gray-50'}`}>
-                  <td className="px-4 py-3.5 cursor-pointer" onClick={() => setModal({ type: 'detail', agent: a })}>
+                <tr key={a.agent_id} className={`group transition-colors ${isActive ? '[&>td:first-child]:shadow-[inset_3px_0_0_0_theme(colors.emerald.400)] hover:bg-emerald-50/30' : 'hover:bg-gray-50'}`}>
+                  <td className="px-4 py-3.5 cursor-pointer" onClick={() => openModal({ type: 'detail', agent: a })}>
                     <div className="flex items-center gap-2">
                       <svg className="w-3.5 h-3.5 text-gray-300 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
                         <path strokeLinecap="round" strokeLinejoin="round" d="M9 17.25v1.007a3 3 0 01-.879 2.122L7.5 21h9l-.621-.621A3 3 0 0115 18.257V17.25m6-12V15a2.25 2.25 0 01-2.25 2.25H5.25A2.25 2.25 0 013 15V5.25m18 0A2.25 2.25 0 0018.75 3H5.25A2.25 2.25 0 003 5.25m18 0H3" />
@@ -614,7 +658,15 @@ export function TenantAgentsPage({ config, focusAgentId, backFleetId, onBackToFl
                       : <span className="text-gray-400">-</span>}
                   </td>
                   <td className="px-4 py-3"><Badge value={a.status} /></td>
-                  <td className="px-4 py-3"><Badge value={a.mode} /></td>
+                  <td className="px-4 py-3 whitespace-nowrap">
+                    <Badge value={a.mode} />
+                    {a.mode === 'wild' && a.mode_expires_at && (
+                      <span className="ml-1.5 inline-flex items-center gap-0.5 text-[10px] font-medium text-amber-600"
+                        title={`Temporary wild - reverts to ${a.mode_revert_to ?? 'readonly'} at ${formatTs(a.mode_expires_at)}`}>
+                        ⏱ {untilTime(a.mode_expires_at)}
+                      </span>
+                    )}
+                  </td>
                   <td className="px-4 py-3"><Badge value={a.access_level} /></td>
                   <td className="px-4 py-3">
                     {a.type === 'k8s' ? (
@@ -626,9 +678,11 @@ export function TenantAgentsPage({ config, focusAgentId, backFleetId, onBackToFl
                         <CapabilityCell
                           granted={a.grant_docker}
                           detected={a.docker_detected}
-                          onAcknowledge={isOperator ? () => handleAcknowledge(a, 'docker') : undefined}
+                          onAcknowledge={isOperator && !a.fleet_id ? () => openModal({ type: 'confirm-acknowledge', agent: a, capability: 'docker' }) : undefined}
                           fleetDrift={!!drift}
                           fleetWants={!!fleet?.grant_docker}
+                          fleetManaged={!!a.fleet_id}
+                          accepted={!!(fleet && memberMismatchAccepted(a, fleet))}
                         />
                       );
                     })()}
@@ -643,9 +697,11 @@ export function TenantAgentsPage({ config, focusAgentId, backFleetId, onBackToFl
                         <CapabilityCell
                           granted={a.grant_service_mgmt}
                           detected={a.service_mgmt_detected}
-                          onAcknowledge={isOperator ? () => handleAcknowledge(a, 'service_mgmt') : undefined}
+                          onAcknowledge={isOperator && !a.fleet_id ? () => openModal({ type: 'confirm-acknowledge', agent: a, capability: 'service_mgmt' }) : undefined}
                           fleetDrift={!!drift}
                           fleetWants={!!fleet?.grant_service_mgmt}
+                          fleetManaged={!!a.fleet_id}
+                          accepted={!!(fleet && memberMismatchAccepted(a, fleet))}
                         />
                       );
                     })()}
@@ -655,7 +711,7 @@ export function TenantAgentsPage({ config, focusAgentId, backFleetId, onBackToFl
                       <RbacCell
                         reported={a.k8s_permissions_reported}
                         drift={a.k8s_permissions_drift}
-                        onOpen={() => setModal({ type: 'detail', agent: a })}
+                        onOpen={() => openModal({ type: 'detail', agent: a })}
                       />
                     ) : (
                       <span className="text-gray-300 text-xs">n/a</span>
@@ -682,7 +738,7 @@ export function TenantAgentsPage({ config, focusAgentId, backFleetId, onBackToFl
                   <td className="px-4 py-3 text-xs text-gray-400 whitespace-nowrap">{a.created_at ? relTime(a.created_at) : '-'}</td>
                   {isOperator && (
                     <td className="px-4 py-3">
-                      <AgentMenu agent={a} isOperator={isOperator} onAction={setModal} />
+                      <AgentMenu agent={a} isOperator={isOperator} onAction={openModal} />
                     </td>
                   )}
                 </tr>
@@ -715,10 +771,10 @@ export function TenantAgentsPage({ config, focusAgentId, backFleetId, onBackToFl
             backToFleet={modal.backFleetId && onBackToFleet
               ? { label: fleetLabel(modal.backFleetId), onBack: () => onBackToFleet(modal.backFleetId!) }
               : undefined}
-            onClose={() => setModal(null)}
-            onAction={setModal}
-            onAcknowledge={isOperator ? cap => handleAcknowledge(modal.agent, cap) : undefined}
-            onAcknowledgeSandbox={isOperator ? ack => setModal({ type: 'confirm-sandbox', agent: modal.agent, acknowledged: ack }) : undefined}
+            onClose={() => closeModal()}
+            onAction={openModal}
+            onAcknowledge={isOperator && !modal.agent.fleet_id ? cap => openModal({ type: 'confirm-acknowledge', agent: modal.agent, capability: cap }) : undefined}
+            onAcknowledgeSandbox={isOperator ? ack => openModal({ type: 'confirm-sandbox', agent: modal.agent, acknowledged: ack }) : undefined}
           />
         )}
 
@@ -726,8 +782,8 @@ export function TenantAgentsPage({ config, focusAgentId, backFleetId, onBackToFl
           <CreateAgentModal
             apiUrl={apiUrl}
             token={tenantToken}
-            onClose={() => setModal(null)}
-            onCreated={result => setModal({ type: 'install', agent: result as Agent & { install_token: string; commands: Record<string, string> } })}
+            onClose={() => closeModal()}
+            onCreated={result => swapModal({ type: 'install', agent: result as Agent & { install_token: string; commands: Record<string, string> } })}
           />
         )}
 
@@ -743,8 +799,8 @@ export function TenantAgentsPage({ config, focusAgentId, backFleetId, onBackToFl
             apiUrl={apiUrl}
             token={tenantToken}
             agent={modal.agent}
-            onClose={() => setModal(null)}
-            onDone={result => setModal({ type: 'install', agent: { ...modal.agent, install_token: result.install_token, commands: result.commands } })}
+            onClose={() => closeModal()}
+            onDone={result => swapModal({ type: 'install', agent: { ...modal.agent, install_token: result.install_token, commands: result.commands } })}
           />
         )}
 
@@ -753,8 +809,8 @@ export function TenantAgentsPage({ config, focusAgentId, backFleetId, onBackToFl
             apiUrl={apiUrl}
             token={tenantToken}
             agent={modal.agent}
-            onClose={() => setModal(null)}
-            onDone={closeAndReload}
+            onClose={() => closeModal()}
+            onDone={r => { patchAgent(modal.agent.agent_id, { mode: r.mode, mode_expires_at: r.mode_expires_at, mode_revert_to: r.mode_revert_to }); closeModal(); }}
           />
         )}
 
@@ -763,8 +819,8 @@ export function TenantAgentsPage({ config, focusAgentId, backFleetId, onBackToFl
             apiUrl={apiUrl}
             token={tenantToken}
             agent={modal.agent}
-            onClose={() => setModal(null)}
-            onDone={closeAndReload}
+            onClose={() => closeModal()}
+            onDone={tags => { patchAgent(modal.agent.agent_id, { tags }); closeModal(); }}
           />
         )}
 
@@ -772,7 +828,7 @@ export function TenantAgentsPage({ config, focusAgentId, backFleetId, onBackToFl
           <RunCommandModal
             config={config}
             target={{ kind: 'agent', agent: modal.agent }}
-            onClose={() => setModal(null)}
+            onClose={() => closeModal()}
           />
         )}
 
@@ -782,10 +838,11 @@ export function TenantAgentsPage({ config, focusAgentId, backFleetId, onBackToFl
             danger
             message={`Revoking will immediately disconnect "${modal.agent.hostname ?? modal.agent.agent_id}". The agent process will stop and cannot reconnect without a new install token.`}
             confirmLabel="Revoke"
-            onClose={() => setModal(null)}
+            onClose={() => closeModal()}
             onConfirm={async () => {
               await revokeTenantAgent(apiUrl, tenantToken, modal.agent.agent_id);
-              closeAndReload();
+              patchAgent(modal.agent.agent_id, { status: 'REVOKED' });
+              closeModal();
             }}
           />
         )}
@@ -796,10 +853,11 @@ export function TenantAgentsPage({ config, focusAgentId, backFleetId, onBackToFl
             danger
             message={`Soft-delete "${modal.agent.hostname ?? modal.agent.agent_id}"? The record is kept but the agent cannot reconnect. The agent must already be REVOKED.`}
             confirmLabel="Delete"
-            onClose={() => setModal(null)}
+            onClose={() => closeModal()}
             onConfirm={async () => {
               await deleteTenantAgent(apiUrl, tenantToken, modal.agent.agent_id);
-              closeAndReload();
+              removeAgent(modal.agent.agent_id);  // DELETED agents drop out of the list
+              closeAllModals();  // the agent is gone - don't return to a stale detail modal
             }}
           />
         )}
@@ -810,10 +868,11 @@ export function TenantAgentsPage({ config, focusAgentId, backFleetId, onBackToFl
             danger
             message={`Permanently remove "${modal.agent.hostname ?? modal.agent.agent_id}" from the database? This cannot be undone. The agent must already be DELETED.`}
             confirmLabel="Remove permanently"
-            onClose={() => setModal(null)}
+            onClose={() => closeModal()}
             onConfirm={async () => {
               await removeTenantAgent(apiUrl, tenantToken, modal.agent.agent_id);
-              closeAndReload();
+              removeAgent(modal.agent.agent_id);
+              closeAllModals();
             }}
           />
         )}
@@ -823,9 +882,10 @@ export function TenantAgentsPage({ config, focusAgentId, backFleetId, onBackToFl
             title="Rotate auth token"
             message={`Request token rotation for "${modal.agent.hostname ?? modal.agent.agent_id}"? The agent will generate a new auth token on its next check-in.`}
             confirmLabel="Request rotation"
-            onClose={() => setModal(null)}
+            onClose={() => closeModal()}
             onConfirm={async () => {
               await requestAgentRotation(apiUrl, tenantToken, modal.agent.agent_id);
+              closeModal();  // rotation is a background hint; nothing in the list row changes
             }}
           />
         )}
@@ -835,11 +895,23 @@ export function TenantAgentsPage({ config, focusAgentId, backFleetId, onBackToFl
             title="Remove from fleet"
             message={`Remove "${modal.agent.hostname ?? modal.agent.agent_id}" from its fleet? It becomes a standalone individual agent - it keeps running and regains individual controls (mode, tags, install token).`}
             confirmLabel="Remove from fleet"
-            onClose={() => setModal(null)}
+            onClose={() => closeModal()}
             onConfirm={async () => {
               if (modal.agent.fleet_id) await removeFleetMember(apiUrl, tenantToken, modal.agent.fleet_id, modal.agent.agent_id);
               closeAndReload();
             }}
+          />
+        )}
+
+        {modal?.type === 'confirm-acknowledge' && (
+          <ConfirmModal
+            title={modal.capability === 'k8s_permissions' ? 'Acknowledge Kubernetes RBAC' : `Acknowledge ${modal.capability === 'docker' ? 'Docker' : 'service management'}`}
+            message={modal.capability === 'k8s_permissions'
+              ? `Pin "${modal.agent.hostname ?? modal.agent.agent_id}"'s currently-reported Kubernetes permissions as the acknowledged baseline. The drift warning clears until the cluster RBAC changes again. This is audited.`
+              : `Acknowledge the detected ${modal.capability === 'docker' ? 'Docker' : 'service-management'} capability on "${modal.agent.hostname ?? modal.agent.agent_id}". This grants the capability to the agent (the out-of-band capability becomes an allowed grant). This is audited and can be changed later.`}
+            confirmLabel="Acknowledge"
+            onClose={() => closeModal()}
+            onConfirm={() => handleAcknowledge(modal.agent, modal.capability)}
           />
         )}
 
@@ -851,10 +923,11 @@ export function TenantAgentsPage({ config, focusAgentId, backFleetId, onBackToFl
               ? `Allow "${modal.agent.hostname ?? modal.agent.agent_id}" to run readonly/approved commands WITHOUT kernel write protection. Filesystem writes will no longer be blocked by the kernel - only the write classifier gates them. This is audited and can be reversed later.`
               : `Stop allowing "${modal.agent.hostname ?? modal.agent.agent_id}" to run without write protection. If it has none, readonly/approved commands will be blocked again until you allow it.`}
             confirmLabel={modal.acknowledged ? 'Allow without protection' : 'Require protection'}
-            onClose={() => setModal(null)}
+            onClose={() => closeModal()}
             onConfirm={async () => {
               await acknowledgeSandbox(apiUrl, tenantToken, modal.agent.agent_id, modal.acknowledged);
-              closeAndReload();
+              patchAgent(modal.agent.agent_id, { sandbox_ack: modal.acknowledged });
+              closeModal();
             }}
           />
         )}
@@ -938,7 +1011,7 @@ function AgentDetailModal({
   isOperator: boolean;
   backToFleet?: { label: string; onBack: () => void };
   onClose: () => void;
-  onAction: (s: ModalState) => void;
+  onAction: (s: Exclude<ModalState, null>) => void;
   onAcknowledge?: (capability: 'docker' | 'service_mgmt' | 'k8s_permissions') => void;
   onAcknowledgeSandbox?: (acknowledged: boolean) => void;
 }) {
@@ -960,7 +1033,9 @@ function AgentDetailModal({
     }
   }, [tab, apiUrl, token, agent.agent_id]);
 
-  const open = (ms: ModalState) => { onClose(); setTimeout(() => onAction(ms), 50); };
+  // Layer the action over this detail modal (the stack returns here when it closes),
+  // instead of closing the detail first.
+  const open = (ms: Exclude<ModalState, null>) => onAction(ms);
   const status = agent.status;
   const [rotateLoading, setRotateLoading] = useState(false);
   const [rotateDone, setRotateDone] = useState(false);
@@ -1023,6 +1098,11 @@ function AgentDetailModal({
               </DetailField>
               <DetailField label="Mode">
                 <Badge value={agent.mode} />
+                {agent.mode === 'wild' && agent.mode_expires_at && (
+                  <span className="ml-2 text-[11px] text-amber-600" title={formatTs(agent.mode_expires_at)}>
+                    temporary · reverts to {agent.mode_revert_to ?? 'readonly'} in {untilTime(agent.mode_expires_at)}
+                  </span>
+                )}
               </DetailField>
               <DetailField label="Access level">
                 <Badge value={agent.access_level} />
@@ -1121,22 +1201,30 @@ function AgentDetailModal({
               <p className="text-sm text-gray-400 text-center py-10">No history recorded yet</p>
             ) : (
               <div className="space-y-1.5 max-h-72 overflow-y-auto pr-1">
-                {history.map(h => (
-                  <div key={h.history_id} className="flex items-center gap-3 px-3 py-2.5 bg-gray-50 rounded-lg border border-gray-100">
+                {history.map((h, i) => (
+                  <div key={i} className="flex items-center gap-3 px-3 py-2.5 bg-gray-50 rounded-lg border border-gray-100">
                     <div className="flex items-center gap-1.5 shrink-0">
-                      {h.from_status && (
+                      {h.kind === 'edit' ? (
+                        <span className="text-[11px] font-semibold text-amber-700 bg-amber-100 px-2 py-0.5 rounded">edit</span>
+                      ) : h.kind === 'fleet' ? (
+                        <span className="text-[11px] font-semibold text-violet-700 bg-violet-100 px-2 py-0.5 rounded">fleet</span>
+                      ) : (
                         <>
-                          <span className="text-[11px] font-semibold text-gray-500 bg-gray-200 px-2 py-0.5 rounded">{h.from_status}</span>
-                          <svg className="w-3 h-3 text-gray-400 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
-                            <path strokeLinecap="round" strokeLinejoin="round" d="M13.5 4.5L21 12m0 0l-7.5 7.5M21 12H3" />
-                          </svg>
+                          {h.from_status && (
+                            <>
+                              <span className="text-[11px] font-semibold text-gray-500 bg-gray-200 px-2 py-0.5 rounded">{h.from_status}</span>
+                              <svg className="w-3 h-3 text-gray-400 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+                                <path strokeLinecap="round" strokeLinejoin="round" d="M13.5 4.5L21 12m0 0l-7.5 7.5M21 12H3" />
+                              </svg>
+                            </>
+                          )}
+                          <span className="text-[11px] font-semibold text-indigo-700 bg-indigo-100 px-2 py-0.5 rounded">{h.to_status}</span>
                         </>
                       )}
-                      <span className="text-[11px] font-semibold text-indigo-700 bg-indigo-100 px-2 py-0.5 rounded">{h.to_status}</span>
                     </div>
                     <div className="flex-1 min-w-0">
                       {h.note && <p className="text-xs text-gray-600 truncate">{h.note}</p>}
-                      {h.triggered_by && <p className="text-[10px] text-gray-400">by {h.triggered_by}</p>}
+                      {h.by && <p className="text-[10px] text-gray-400">by {h.by}</p>}
                     </div>
                     <span className="text-[10px] text-gray-400 whitespace-nowrap shrink-0">{fmtDate(h.created_at)}</span>
                   </div>
@@ -1229,7 +1317,7 @@ function AgentMenu({
 }: {
   agent: Agent;
   isOperator: boolean;
-  onAction: (s: ModalState) => void;
+  onAction: (s: Exclude<ModalState, null>) => void;
 }) {
   const [open, setOpen] = useState(false);
   const [pos, setPos] = useState<{ top?: number; bottom?: number; right: number }>({ right: 0 });
@@ -1869,17 +1957,27 @@ function SetModeModal({
   token: string;
   agent: Agent;
   onClose: () => void;
-  onDone: () => void;
+  onDone: (r: { mode: Mode; mode_expires_at: string | null; mode_revert_to: string | null }) => void;
 }) {
-  const [mode, setMode] = useState<Mode>((agent.mode as Mode) ?? 'wild');
+  const current = (agent.mode as Mode) ?? 'wild';
+  const [mode, setMode] = useState<Mode>(current);
+  const [dur, setDur] = useState({ effective: 'permanent', invalid: false, temporary: false });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+
+  const isTemporary = mode === 'wild' && dur.temporary;
+  const customInvalid = mode === 'wild' && dur.invalid;
+  const effectiveDuration = dur.effective;
+  // The mode it will revert to when a temporary wild window ends (the previous safe mode).
+  const revertTo = current === 'wild' ? 'readonly' : current;
+  // Enable Save on a real change, OR when arming a temporary wild window on an agent.
+  const canSave = (mode !== current || isTemporary) && !customInvalid;
 
   const submit = async () => {
     setLoading(true); setError('');
     try {
-      await setTenantAgentMode(apiUrl, token, agent.agent_id, mode);
-      onDone();
+      const r = await setTenantAgentMode(apiUrl, token, agent.agent_id, mode, isTemporary ? effectiveDuration : undefined);
+      onDone({ mode, mode_expires_at: r.mode_expires_at ?? null, mode_revert_to: r.mode_revert_to ?? null });
     } catch (e) {
       setError((e as Error).message);
       setLoading(false);
@@ -1891,25 +1989,36 @@ function SetModeModal({
       <div className="space-y-4">
         <div className="space-y-2">
           {MODES.map(m => (
-            <label key={m} className="flex items-start gap-3 p-3 border border-gray-200 rounded-lg cursor-pointer hover:bg-gray-50 transition-colors">
+            <label key={m} className={`flex items-start gap-3 p-3 border rounded-lg cursor-pointer transition-colors ${mode === m ? 'border-indigo-300 bg-indigo-50/40' : 'border-gray-200 hover:bg-gray-50'}`}>
               <input type="radio" name="mode" value={m} checked={mode === m} onChange={() => setMode(m)} className="mt-0.5" />
               <div>
-                <p className="text-sm font-medium text-gray-800">{MODE_LABEL[m]}</p>
+                <p className="text-sm font-medium text-gray-800 flex items-center gap-2">
+                  {MODE_LABEL[m]}
+                  {m === current && <span className="text-[10px] font-semibold uppercase tracking-wide bg-gray-100 text-gray-500 px-1.5 py-0.5 rounded">current</span>}
+                </p>
                 <p className="text-xs text-gray-500">{MODE_DESC[m]}</p>
               </div>
             </label>
           ))}
         </div>
+
+        {/* Temporary wild: pick a window after which the agent auto-reverts to a safer mode. */}
+        {mode === 'wild' && (
+          <WildDurationPicker revertTo={revertTo}
+            onChange={(effective, invalid, temporary) => setDur({ effective, invalid, temporary })} />
+        )}
+
         {error && <p className="text-sm text-red-600">{error}</p>}
         <div className="flex justify-end gap-3 pt-1">
           <button onClick={onClose} className="text-sm text-gray-500 hover:text-gray-700 px-3 py-2">Cancel</button>
           <button
             onClick={submit}
-            disabled={loading}
-            className="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-semibold px-4 py-2 rounded-lg disabled:opacity-50 transition-colors"
+            disabled={loading || !canSave}
+            title={!canSave ? 'This is already the current mode' : undefined}
+            className="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-semibold px-4 py-2 rounded-lg disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
           >
             {loading && <Spinner className="h-4 w-4" />}
-            Save
+            {isTemporary ? 'Set temporary wild' : 'Save'}
           </button>
         </div>
       </div>
@@ -1943,7 +2052,7 @@ function SetTagsModal({
   token: string;
   agent: Agent;
   onClose: () => void;
-  onDone: () => void;
+  onDone: (tags: string[]) => void;
 }) {
   const [pairs, setPairs] = useState<KVPair[]>(
     agent.tags && agent.tags.length > 0 ? parseTags(agent.tags) : [{ key: '', value: '' }],
@@ -1956,12 +2065,16 @@ function SetTagsModal({
   const updatePair = (idx: number, field: 'key' | 'value', val: string) =>
     setPairs(p => p.map((pair, i) => i === idx ? { ...pair, [field]: val } : pair));
 
+  // No-op guard: disable Save when the tag set is unchanged (order-independent).
+  const original = (agent.tags ?? []).slice().sort().join('\n');
+  const unchanged = serializePairs(pairs).slice().sort().join('\n') === original;
+
   const submit = async () => {
     const tags = serializePairs(pairs);
     setLoading(true); setError('');
     try {
       await setTenantAgentTags(apiUrl, token, agent.agent_id, tags);
-      onDone();
+      onDone(tags);
     } catch (e) {
       setError((e as Error).message);
       setLoading(false);
@@ -2010,8 +2123,9 @@ function SetTagsModal({
           <button onClick={onClose} className="text-sm text-gray-500 hover:text-gray-700 px-3 py-2">Cancel</button>
           <button
             onClick={submit}
-            disabled={loading}
-            className="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-semibold px-4 py-2 rounded-lg disabled:opacity-50 transition-colors"
+            disabled={loading || unchanged}
+            title={unchanged ? 'No tag changes to save' : undefined}
+            className="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-semibold px-4 py-2 rounded-lg disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
           >
             {loading && <Spinner className="h-4 w-4" />}
             Save tags

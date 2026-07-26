@@ -109,13 +109,13 @@ export function UsersPage({ config }: { config: Config }) {
   const selectedTenant = tenants.find(t => t.tenant_id === tenantId);
 
   return (
-    <div className="p-8">
-      <div className="flex items-center justify-between mb-6">
+    <div className="p-4 sm:p-8">
+      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-6">
         <div>
           <h1 className="text-2xl font-semibold text-gray-900 tracking-tight">Users</h1>
           <p className="text-sm text-gray-500 mt-0.5">Manage tenant users</p>
         </div>
-        <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-center gap-3">
           <select
             value={tenantId}
             onChange={e => setTenantId(e.target.value)}
@@ -167,7 +167,7 @@ export function UsersPage({ config }: { config: Config }) {
             onChange={e => setSearch(e.target.value)}
             onKeyDown={e => { if (e.key === 'Enter') applySearch(); }}
             placeholder="Search name or username…"
-            className="border border-gray-300 rounded-lg px-3 py-1.5 text-sm bg-white shadow-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 w-72"
+            className="border border-gray-300 rounded-lg px-3 py-1.5 text-sm bg-white shadow-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 w-full sm:w-72"
           />
           <button onClick={applySearch} className="text-sm text-white bg-slate-800 hover:bg-slate-700 rounded-lg px-3 py-1.5">Search</button>
           {query && (
@@ -464,9 +464,10 @@ function ChangeRoleModal({
         <div className="space-y-2">
           {ROLES.map(r => (
             <button key={r} type="button" onClick={() => setRole(r)}
-              className={`w-full text-left px-3 py-2.5 rounded-md border transition-colors ${role === r ? 'bg-indigo-50 border-indigo-400 text-indigo-900' : 'border-gray-200 text-gray-700 hover:bg-gray-50'}`}>
+              className={`w-full flex items-center text-left px-3 py-2.5 rounded-md border transition-colors ${role === r ? 'bg-indigo-50 border-indigo-400 text-indigo-900' : 'border-gray-200 text-gray-700 hover:bg-gray-50'}`}>
               <span className={`text-xs font-semibold px-1.5 py-0.5 rounded ${ROLE_STYLE[r]}`}>{ROLE_LABEL[r]}</span>
-              <span className="text-xs text-gray-500 ml-2">{ROLE_DESC[r]}</span>
+              <span className="text-xs text-gray-500 ml-2 flex-1">{ROLE_DESC[r]}</span>
+              {r === user.role && <span className="text-[10px] font-semibold uppercase tracking-wide bg-gray-100 text-gray-500 px-1.5 py-0.5 rounded shrink-0">current</span>}
             </button>
           ))}
         </div>
@@ -513,8 +514,9 @@ function RenameModal({
         {error && <p className="text-sm text-red-600">{error}</p>}
         <div className="flex justify-end gap-3 pt-1">
           <button type="button" onClick={onClose} className="text-sm text-gray-600">Cancel</button>
-          <button type="submit" disabled={loading || !name.trim()}
-            className="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium px-4 py-2 rounded-md disabled:opacity-60">
+          <button type="submit" disabled={loading || !name.trim() || name.trim() === user.name}
+            title={name.trim() === user.name ? 'No change to save' : undefined}
+            className="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium px-4 py-2 rounded-md disabled:opacity-60 disabled:cursor-not-allowed">
             {loading && <Spinner className="h-4 w-4" />} Save
           </button>
         </div>

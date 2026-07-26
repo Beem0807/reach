@@ -121,7 +121,23 @@ Recognized patterns include:
 - SaaS / provider tokens - GitHub/GitLab/Slack (`ghp_`, `ghs_`, `glpat-`, `xoxb-`, `xoxp-`), Stripe (`sk_live_`, `rk_live_`), OpenAI (`sk-…`, `sk-proj-…`), HashiCorp Vault (`hvs.`, `hvb.`, `hvr.`), npm, and SendGrid (`SG.…`) keys
 - Generic secrets - PEM private key blocks, JWTs, bearer tokens in headers, credentials embedded in URLs (`proto://user:pass@host`), common secret env-var assignments (e.g. `*_PASSWORD=`, `*_SECRET=`), and high-entropy hex values in a key-name context
 
-This is **defense-in-depth, not a guarantee.** It catches structurally recognizable secrets, not every possible format. Do not rely on it as the only control - prefer `readonly` or `approved` mode on machines that hold sensitive data, and avoid commands that print credentials in the first place.
+This is **defense-in-depth, not a guarantee.** It catches structurally recognizable secrets, not every possible format. It is the safety net **under** the sensitive-read gate below - not the primary control.
+
+**One deliberate exception:** an **approved sensitive read** (see below) is stored **unredacted**. It only produced output because an operator explicitly approved reading that secret (or it ran in `wild`), so scrubbing it would defeat the point - approving *is* the authorization to see it.
+
+---
+
+## Sensitive reads
+
+A "read" is treated as low-risk in Reach's model, but a read can still **exfiltrate** - `cat ~/.ssh/id_rsa`, `cat .env`, `kubectl get secret x -o yaml`. So reads that touch **secrets/credentials** are gated **like writes**, not run freely:
+
+- **Blocked in `readonly`** - a sensitive read is refused (readonly has no approval path).
+- **Approval-gated in `approved`** - it needs an operator-approved rule (host `{bin, args[]}`, or a k8s `{verb: get, resource: secrets, …}` rule). This is the deliberate, audited way to permit reading a specific secret for troubleshooting.
+- **Runs in `wild`** - the personal-box mode is unrestricted.
+
+Enforced at **both** layers: the backend gates at submission, and the **agent** refuses an unapproved sensitive read locally (Landlock blocks *writes*, not *reads*, so the agent can't rely on the kernel here). Detection is best-effort by path/command - SSH keys, cloud/kube credentials, `.env`, `/proc/*/environ`, `.pem`, the agent's own token, and `kubectl get/describe secret` on any agent type. The agent's **non-root OS identity** and **k8s RBAC** (the default `view` role can't read Secrets) remain the harder floors underneath.
+
+**Who can see the output:** job output is **developer-scoped** - a `developer` sees only the jobs **they** created; operators/admins see all jobs on agents they can access. So an approved (unredacted) secret read is visible to its creator plus the operators/admins who authorized it, not every developer on the agent. In the console, such output is additionally **hidden behind a click-to-reveal** control, so a secret isn't left sitting on screen during a screen-share or in scrollback.
 
 ---
 
@@ -184,7 +200,7 @@ Every command submitted through Reach creates a **job record** with:
 
 Terminal job records are deleted by the daily cleanup after the tenant's `job_retention_days` setting (default 7).
 
-Job history is available in the tenant console under **Jobs**, and platform-wide in the platform admin console under **Audit Logs**. The audit log covers 35+ event types including platform and tenant logins (success and failure), user management, agent lifecycle events (create, revoke, rotate, unreachable, recover), policy changes, approval requests/reviews/pre-approvals, and API-token operations. See the full action list in [API.md](API.md#audit-log-actions). A tenant's own audit entries are retained for its `audit_retention_days` setting (default 90); agent status-history records for `agent_history_retention_days` (default 30). Cross-tenant platform-admin audit entries follow the deployment-wide `AUDIT_RETENTION_DAYS` env var (default 90).
+Job history is available in the tenant console under **Jobs**, and platform-wide in the platform admin console under **Audit Logs**. The audit log covers 35+ event types including platform and tenant logins (success and failure), user management, agent lifecycle events (create, revoke, rotate, unreachable, recover), policy changes, approval requests/reviews/pre-approvals, and API-token operations. See the full action list in [API.md](API.md#audit-log-actions). A tenant's own audit entries are retained for its `audit_retention_days` setting (default 90); agent status-history records for `agent_history_retention_days` (default 30). Cross-tenant platform-admin audit entries follow the deployment-wide `AUDIT_RETENTION_DAYS` env var (default 90). Every entry is timestamped in **UTC** (as stored); the console renders it in the viewer's local timezone by default with a Local/UTC toggle, so keep the viewer's selected zone in mind when correlating events across systems - the underlying record is always UTC.
 
 In `approved` mode, every blocked write also creates an **approval record** - a persistent log of what was attempted, who attempted it, and when. Denied and expired approval records are retained for the tenant's `approval_retention_days` setting (default 7) before cleanup. Approved records persist until manually deleted.
 
@@ -230,7 +246,7 @@ An attacker with **agent config file access on the remote machine**:
 
 **Agent policy**
 - Run production agents in `approved` mode. Allowlist only the commands your automation actually needs.
-- Avoid `wild` mode on shared or production machines. Reserve it for personal dev boxes where you are the only user.
+- Avoid `wild` mode on shared or production machines. Reserve it for personal dev boxes where you are the only user. When you do need wild for break-glass debugging (on an agent **or a fleet**), **arm it with a duration** so it auto-reverts (see [POLICIES.md → Temporary wild](POLICIES.md#temporary-break-glass-wild)) instead of being left open - no wild job runs past the window, and the revert is audited as `agent.mode_reverted` / `fleet.mode_reverted`.
 - Grant each user the least access they need: non-admins start with none, so add specific agents/fleets, and prefer **read-only** where they don't need to run writes. Keep the `admin` role (tenant-wide) to as few people as possible.
 
 **Monitoring**

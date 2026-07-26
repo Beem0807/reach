@@ -11,7 +11,9 @@ from shared.policy import (
     derive_k8s_rule,
     is_host_argv_approved,
     is_k8s_command_approved,
+    is_k8s_secret_read,
     is_k8s_write,
+    is_sensitive_read,
     k8s_nonkubectl_argv,
     k8s_uses_unapprovable_binary,
     needs_shell,
@@ -20,6 +22,7 @@ from shared.policy import (
     to_argv,
 )
 import shared.audit as audit
+from shared.mode import revert_expired_mode
 from shared.response import _err, _iso, _now, _ok
 from shared.store import agents_repo, approvals_repo, jobs_repo, users_repo
 
@@ -57,6 +60,9 @@ def handle_create_job(body: dict, raw_token: str, ip: str = "") -> dict:
         return _err("agent not found", 404)
     if agent.get("status") != "ACTIVE":
         return _err("agent is not active", 409)
+    # A temporary wild window may have elapsed - revert first so this job is gated by the
+    # agent's real current mode, not a stale wild.
+    agent = revert_expired_mode(agent)
 
     mode = agent.get("mode", "wild")
 
@@ -68,6 +74,17 @@ def handle_create_job(body: dict, raw_token: str, ip: str = "") -> dict:
     if argv is not None and is_k8s:
         return _err("structured exec (argv) is for host agents; k8s uses kubectl commands", 400)
     is_write = is_k8s_write(command) if is_k8s else _is_readonly_blocked(command)
+    # A sensitive READ (SSH keys, cloud creds, .env, k8s Secrets) can exfiltrate, so it's gated
+    # like a write: blocked in readonly, needs an operator-approved rule in approved (the
+    # troubleshooting escape hatch - sign off once, then it runs), and runs in wild. Folding it
+    # into is_write reuses the whole structuring/approval/scope path. The agent enforces it too
+    # (Landlock doesn't block reads), so a dispatched-but-unapproved sensitive read is refused
+    # there and raised for approval.
+    # Catch both a host file read (SSH keys, .env, …) AND a kubectl Secret read - the latter is
+    # sensitive on any agent type, including a host that happens to run kubectl.
+    sensitive_read = not is_write and (is_sensitive_read(command) or is_k8s_secret_read(command))
+    if sensitive_read:
+        is_write = True
     # Host WRITES are structured (argv, no shell) so approval is JSON-rule-based - no
     # command strings. A write that needs the shell (pipe/redirect/glob/expansion) can't be
     # a structured rule: in **approved** mode it's unapprovable, so it's rejected; in **wild**

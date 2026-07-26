@@ -99,29 +99,37 @@ export function TenantUsersPage({ config }: { config: TenantConfig }) {
 
   useEffect(() => { load(); }, [load]);
 
+  // Optimistic, targeted updates: patch just the affected user row instead of refetching
+  // the whole page after each mutation.
+  const patchUser = (id: string, changes: Partial<TenantUser>) =>
+    setUsers(prev => prev.map(u => (u.user_id === id ? { ...u, ...changes } : u)));
+  const removeUser = (id: string) => {
+    setUsers(prev => prev.filter(u => u.user_id !== id));
+    setTotal(t => Math.max(0, t - 1));
+  };
+
   const doDisable = async (u: TenantUser, revokeTokens: boolean) => {
     await disableTenantUser(apiUrl, tenantToken, u.user_id);
     if (revokeTokens) await revokeAllUserTokens(apiUrl, tenantToken, u.user_id).catch(() => {});
     setDisableTarget(null);
-    load();
+    patchUser(u.user_id, { status: 'REVOKED', disabled_at: new Date().toISOString() });
   };
 
   const doEnable = async (u: TenantUser) => {
     await enableTenantUser(apiUrl, tenantToken, u.user_id);
     setEnableTarget(null);
-    load();
+    patchUser(u.user_id, { status: 'ACTIVE', disabled_at: undefined });
   };
 
   const doDelete = async (u: TenantUser) => {
     await deleteTenantUser(apiUrl, tenantToken, u.user_id);
     setDeleteTarget(null);
-    load();
+    removeUser(u.user_id);
   };
 
   const doRevokeTokens = async (u: TenantUser) => {
     await revokeAllUserTokens(apiUrl, tenantToken, u.user_id);
-    setRevokeTokensTarget(null);
-    load();
+    setRevokeTokensTarget(null);  // no visible row field changes
   };
 
   const doResetPw = async (u: TenantUser) => {
@@ -138,9 +146,9 @@ export function TenantUsersPage({ config }: { config: TenantConfig }) {
   return (
     <div className="min-h-full bg-slate-50">
       {/* Page header */}
-      <div className="bg-gradient-to-r from-violet-700 to-violet-600 px-8 py-5">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-4">
+      <div className="bg-gradient-to-r from-violet-700 to-violet-600 px-4 sm:px-8 py-5">
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+          <div className="flex items-center gap-4 min-w-0">
             <div className="w-10 h-10 rounded-xl bg-white/10 ring-1 ring-white/20 flex items-center justify-center shrink-0">
               <svg className="w-5 h-5 text-white" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
                 <path strokeLinecap="round" strokeLinejoin="round" d="M15 19.128a9.38 9.38 0 002.625.372 9.337 9.337 0 004.121-.952 4.125 4.125 0 00-7.533-2.493M15 19.128v-.003c0-1.113-.285-2.16-.786-3.07M15 19.128v.106A12.318 12.318 0 018.624 21c-2.331 0-4.512-.645-6.374-1.766l-.001-.109a6.375 6.375 0 0111.964-3.07M12 6.375a3.375 3.375 0 11-6.75 0 3.375 3.375 0 016.75 0zm8.25 2.25a2.625 2.625 0 11-5.25 0 2.625 2.625 0 015.25 0z" />
@@ -151,7 +159,7 @@ export function TenantUsersPage({ config }: { config: TenantConfig }) {
               <p className="text-sm text-violet-200">Manage tenant users and roles</p>
             </div>
           </div>
-          <div className="flex items-center gap-3">
+          <div className="flex flex-wrap items-center gap-3">
             {!loading && users.length > 0 && total <= PAGE && !applied.role && !applied.status && !applied.q && (
               <>
                 {adminCount > 0 && (
@@ -184,7 +192,7 @@ export function TenantUsersPage({ config }: { config: TenantConfig }) {
         </div>
       </div>
 
-      <div className="px-8 py-6">
+      <div className="px-4 sm:px-8 py-6">
       {error && (
         <div className="text-sm text-red-700 bg-red-50 border border-red-200 rounded-lg px-4 py-3 mb-4">{error}</div>
       )}
@@ -352,8 +360,9 @@ export function TenantUsersPage({ config }: { config: TenantConfig }) {
           apiUrl={apiUrl}
           tenantToken={tenantToken}
           onClose={() => { setModal(null); setTargetUser(null); }}
-          onChanged={(editAgentsFor) => {
-            load(); setModal(null); setTargetUser(null);
+          onChanged={(newRole, editAgentsFor) => {
+            patchUser(targetUser.user_id, editAgentsFor ? { role: newRole, readwrite_agent_ids: null } : { role: newRole });
+            setModal(null); setTargetUser(null);
             if (editAgentsFor) setAgentAccessTarget(editAgentsFor);
           }}
         />
@@ -408,7 +417,7 @@ export function TenantUsersPage({ config }: { config: TenantConfig }) {
           apiUrl={apiUrl}
           tenantToken={tenantToken}
           user={agentAccessTarget}
-          onClose={() => { setAgentAccessTarget(null); load(); }}
+          onClose={() => setAgentAccessTarget(null) /* agent access isn't shown in the row */}
         />
       )}
       </div>
@@ -534,7 +543,7 @@ function ChangeRoleModal({
   apiUrl: string;
   tenantToken: string;
   onClose: () => void;
-  onChanged: (editAgentsFor?: TenantUser) => void;
+  onChanged: (newRole: TenantRole, editAgentsFor?: TenantUser) => void;
 }) {
   const [role, setRole] = useState<TenantRole>((user.role as TenantRole) ?? 'developer');
   const [loading, setLoading] = useState(false);
@@ -549,7 +558,7 @@ function ChangeRoleModal({
     setLoading(true); setError('');
     try {
       await setTenantUserRole(apiUrl, tenantToken, user.user_id, role);
-      onChanged(demotingAdmin ? { ...user, role, readwrite_agent_ids: null } : undefined);
+      onChanged(role, demotingAdmin ? { ...user, role, readwrite_agent_ids: null } : undefined);
     } catch (e) { setError((e as Error).message); setLoading(false); }
   };
 
@@ -563,7 +572,8 @@ function ChangeRoleModal({
               <span className="w-24 shrink-0">
                 <span className={`inline-block text-xs font-semibold px-1.5 py-0.5 rounded ${ROLE_STYLE[r]}`}>{ROLE_LABEL[r]}</span>
               </span>
-              <span className="text-xs text-gray-500">{ROLE_DESC[r]}</span>
+              <span className="text-xs text-gray-500 flex-1">{ROLE_DESC[r]}</span>
+              {r === user.role && <span className="text-[10px] font-semibold uppercase tracking-wide bg-gray-100 text-gray-500 px-1.5 py-0.5 rounded shrink-0">current</span>}
             </button>
           ))}
         </div>
@@ -1093,6 +1103,16 @@ function AgentAccessModal({ apiUrl, tenantToken, user, onClose }: {
       .finally(() => setLoading(false));
   }, [apiUrl, tenantToken, user.user_id]);
 
+  // No-op guard: disable Save until the chosen scope differs from what's stored
+  // (order-independent comparison of the four id lists).
+  const normScope = (s?: UserAccessScope | null) => JSON.stringify({
+    rwa: (s?.readwrite_agent_ids ?? []).slice().sort(),
+    roa: (s?.readonly_agent_ids ?? []).slice().sort(),
+    rwf: (s?.readwrite_fleet_ids ?? []).slice().sort(),
+    rof: (s?.readonly_fleet_ids ?? []).slice().sort(),
+  });
+  const unchanged = !!initial && normScope(scope) === normScope(initial);
+
   const save = async () => {
     setSaving(true); setError('');
     try {
@@ -1119,8 +1139,9 @@ function AgentAccessModal({ apiUrl, tenantToken, user, onClose }: {
           <button onClick={onClose} className="text-sm text-gray-500 hover:text-gray-700 px-3 py-2">Cancel</button>
           <button
             onClick={save}
-            disabled={loading || saving}
-            className="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-semibold px-4 py-2 rounded-lg disabled:opacity-50 transition-colors"
+            disabled={loading || saving || unchanged}
+            title={unchanged ? 'No access changes to save' : undefined}
+            className="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-semibold px-4 py-2 rounded-lg disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
           >
             {saving && <Spinner className="h-4 w-4" />}
             Save access

@@ -1,4 +1,4 @@
-import type { Agent, AgentHistory, ApiToken, Approval, AuditLog, FanoutPreview, FanoutResult, Fleet, FleetRun, FleetToken, FleetWavePolicy, HostRule, Job, JobPreview, K8sRule, RunStatus, Tenant, TenantSettings, TenantWavePolicy, TenantUser, UserAccessScope } from './types';
+import type { Agent, AgentHistory, ApiToken, Approval, AuditLog, FanoutPreview, FanoutResult, Fleet, FleetHistory, FleetRun, FleetToken, FleetWavePolicy, HostRule, Job, JobPreview, K8sRule, RunStatus, Tenant, TenantSettings, TenantWavePolicy, TenantUser, UserAccessScope } from './types';
 
 export async function adminLogin(apiUrl: string, password: string): Promise<string> {
   const url = apiUrl.replace(/\/$/, '');
@@ -195,12 +195,12 @@ export const listFleetAgents = (u: string, t: string, fleetId: string, params: R
 
 export const createFleet = (
   u: string, t: string,
-  body: { name: string; mode?: string; grant_service_mgmt?: boolean; grant_docker?: boolean; sandbox_ack?: boolean; tags?: string[]; reap_after_seconds?: number | null; max_fanout?: number | null; wave_policy?: FleetWavePolicy | null },
+  body: { name: string; mode?: string; duration?: string; grant_service_mgmt?: boolean; grant_docker?: boolean; sandbox_ack?: boolean; tags?: string[]; reap_after_seconds?: number | null; max_fanout?: number | null; wave_policy?: FleetWavePolicy | null },
 ) => req<Fleet & FleetToken>(u, t, 'POST', '/tenant/fleets', body);
 
 export const updateFleet = (
   u: string, t: string, fleetId: string,
-  body: Partial<{ name: string; mode: string; tags: string[]; reap_after_seconds: number | null;
+  body: Partial<{ name: string; mode: string; duration: string; tags: string[]; reap_after_seconds: number | null;
                   grant_service_mgmt: boolean; grant_docker: boolean; sandbox_ack: boolean; max_fanout: number | null;
                   wave_policy: FleetWavePolicy | null }>,
 ) => req<Fleet>(u, t, 'PUT', `/tenant/fleets/${fleetId}`, body);
@@ -313,8 +313,9 @@ export const deleteTenantAgent = (u: string, t: string, agentId: string) =>
 export const removeTenantAgent = (u: string, t: string, agentId: string) =>
   req<{ agent_id: string; removed: boolean }>(u, t, 'DELETE', `/tenant/agents/${agentId}/remove`);
 
-export const setTenantAgentMode = (u: string, t: string, agentId: string, mode: string) =>
-  req<{ agent_id: string; mode: string }>(u, t, 'PUT', `/tenant/agents/${agentId}/policy/mode`, { mode });
+export const setTenantAgentMode = (u: string, t: string, agentId: string, mode: string, duration?: string) =>
+  req<{ agent_id: string; mode: string; mode_expires_at?: string | null; mode_revert_to?: string | null }>(
+    u, t, 'PUT', `/tenant/agents/${agentId}/policy/mode`, duration ? { mode, duration } : { mode });
 
 export const setTenantAgentTags = (u: string, t: string, agentId: string, tags: string[]) =>
   req<{ agent_id: string; tags: string[] }>(u, t, 'PUT', `/tenant/agents/${agentId}/tags`, { tags });
@@ -465,9 +466,13 @@ export const tenantPreApproveFleetHostRule = (u: string, t: string, fleetId: str
   });
 
 
-// Agent history
+// Agent history (merged: status transitions + edits, incl. inherited fleet edits)
 export const listAgentHistory = (u: string, t: string, agentId: string) =>
   req<{ history: AgentHistory[] }>(u, t, 'GET', `/tenant/agents/${agentId}/history`);
+
+// Fleet history (edit timeline from the audit log)
+export const listFleetHistory = (u: string, t: string, fleetId: string) =>
+  req<{ history: FleetHistory[] }>(u, t, 'GET', `/tenant/fleets/${fleetId}/history`);
 
 // User agent/fleet access scope (read-write + read-only, agents + fleets)
 export const getUserAgentAccess = (u: string, t: string, userId: string) =>

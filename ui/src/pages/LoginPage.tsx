@@ -37,7 +37,7 @@ export function LoginPage({ onLogin, onSwitchToTenant }: Props) {
       <div className="relative w-full max-w-sm">
         {/* Logo mark */}
         <div className="flex justify-center mb-8">
-          <div className="flex items-center gap-3">
+          <div className="flex flex-wrap items-center gap-3">
             <div className="w-10 h-10 rounded-xl bg-indigo-500 flex items-center justify-center shadow-lg shadow-indigo-500/30">
               <span className="text-white text-lg font-bold tracking-tight">R</span>
             </div>

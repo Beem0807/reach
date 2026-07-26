@@ -38,6 +38,97 @@ function renderPage(agents: Agent[]) {
 
 beforeEach(() => { vi.restoreAllMocks(); });
 
+describe('optimistic updates (no full refetch)', () => {
+  it('patches the row in place on a mode change without refetching the list', async () => {
+    const listSpy = vi.spyOn(api, 'listTenantAgents').mockResolvedValue({ agents: [BASE_AGENT], total: 1, limit: 20, offset: 0 });
+    vi.spyOn(api, 'listFleets').mockResolvedValue({ fleets: [], default_reap_after_seconds: 1800 });
+    const modeSpy = vi.spyOn(api, 'setTenantAgentMode').mockResolvedValue({} as never);
+    render(<TenantAgentsPage config={CONFIG} />);
+
+    // Open the detail modal, then Set mode.
+    fireEvent.click(await screen.findByText('myhost.local'));
+    fireEvent.click(await screen.findByRole('button', { name: /set mode/i }));
+    // Pick "readonly" and save.
+    const readonly = (await screen.findAllByRole('radio')).find(r => (r as HTMLInputElement).value === 'readonly')!;
+    fireEvent.click(readonly);
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+
+    await waitFor(() => expect(modeSpy).toHaveBeenCalledWith(CONFIG.apiUrl, CONFIG.tenantToken, 'agent_abc', 'readonly', undefined));
+    // The new mode shows (in the row and the detail modal we return to)...
+    expect((await screen.findAllByText('readonly')).length).toBeGreaterThan(0);
+    // ...and the list was fetched only once (initial load) - no refetch after the update.
+    expect(listSpy).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('modal stack (layered actions return to the detail modal)', () => {
+  it('returns to the detail modal when a layered action is cancelled', async () => {
+    vi.spyOn(api, 'listTenantAgents').mockResolvedValue({ agents: [BASE_AGENT], total: 1, limit: 20, offset: 0 });
+    vi.spyOn(api, 'listFleets').mockResolvedValue({ fleets: [], default_reap_after_seconds: 1800 });
+    render(<TenantAgentsPage config={CONFIG} />);
+    fireEvent.click(await screen.findByText('myhost.local'));            // open detail
+    fireEvent.click(await screen.findByRole('button', { name: /set mode/i }));  // layer set-mode over it
+    // Now in the Set-mode modal (Save/Cancel) - cancel it.
+    fireEvent.click(await screen.findByRole('button', { name: /^cancel$/i }));
+    // We're back in the detail modal: its "Set mode" action is available again.
+    expect(await screen.findByRole('button', { name: /set mode/i })).toBeInTheDocument();
+  });
+});
+
+describe('edit forms: current value shown, Save disabled when unchanged', () => {
+  it('marks the current mode and disables Save until a different mode is picked', async () => {
+    vi.spyOn(api, 'listTenantAgents').mockResolvedValue({ agents: [BASE_AGENT], total: 1, limit: 20, offset: 0 });
+    vi.spyOn(api, 'listFleets').mockResolvedValue({ fleets: [], default_reap_after_seconds: 1800 });
+    render(<TenantAgentsPage config={CONFIG} />);
+    fireEvent.click(await screen.findByText('myhost.local'));
+    fireEvent.click(await screen.findByRole('button', { name: /set mode/i }));
+    // Opens on the current mode: it's marked, and Save is disabled (no change).
+    expect(screen.getByText('current')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^save$/i })).toBeDisabled();
+    // Choosing a different mode enables Save.
+    const readonly = screen.getAllByRole('radio').find(r => (r as HTMLInputElement).value === 'readonly')!;
+    fireEvent.click(readonly);
+    expect(screen.getByRole('button', { name: /^save$/i })).not.toBeDisabled();
+  });
+});
+
+describe('temporary wild mode', () => {
+  it('arms a wild window with a duration and sends it', async () => {
+    vi.spyOn(api, 'listTenantAgents').mockResolvedValue({ agents: [BASE_AGENT], total: 1, limit: 20, offset: 0 });
+    vi.spyOn(api, 'listFleets').mockResolvedValue({ fleets: [], default_reap_after_seconds: 1800 });
+    const modeSpy = vi.spyOn(api, 'setTenantAgentMode').mockResolvedValue(
+      { agent_id: 'agent_abc', mode: 'wild', mode_expires_at: '2026-08-01T00:00:00Z', mode_revert_to: 'readonly' } as never);
+    render(<TenantAgentsPage config={CONFIG} />);
+    fireEvent.click(await screen.findByText('myhost.local'));      // BASE_AGENT is already wild
+    fireEvent.click(await screen.findByRole('button', { name: /set mode/i }));
+    // The duration picker shows for wild; pick "4 hours".
+    fireEvent.click(screen.getByRole('button', { name: '4 hours' }));
+    fireEvent.click(screen.getByRole('button', { name: /set temporary wild/i }));
+    await waitFor(() => expect(modeSpy).toHaveBeenCalledWith(CONFIG.apiUrl, CONFIG.tenantToken, 'agent_abc', 'wild', '4h'));
+  });
+});
+
+describe('confirmation before capability acknowledge', () => {
+  it('opens a confirm modal instead of acknowledging immediately', async () => {
+    const oob = { ...BASE_AGENT, docker_detected: true, service_mgmt_detected: false, grant_docker: false };
+    vi.spyOn(api, 'listTenantAgents').mockResolvedValue({ agents: [oob], total: 1, limit: 20, offset: 0 });
+    vi.spyOn(api, 'listFleets').mockResolvedValue({ fleets: [], default_reap_after_seconds: 1800 });
+    const ackSpy = vi.spyOn(api, 'acknowledgeCapability').mockResolvedValue({} as never);
+    render(<TenantAgentsPage config={CONFIG} />);
+    await screen.findByText('myhost.local');
+
+    // The cell's "Acknowledge" opens a confirm modal - it must NOT mutate yet.
+    fireEvent.click(screen.getByRole('button', { name: 'Acknowledge' }));
+    expect(await screen.findByRole('heading', { name: /acknowledge docker/i })).toBeInTheDocument();
+    expect(ackSpy).not.toHaveBeenCalled();
+
+    // Confirming fires the mutation.
+    const ackButtons = screen.getAllByRole('button', { name: 'Acknowledge' });
+    fireEvent.click(ackButtons[ackButtons.length - 1]);
+    await waitFor(() => expect(ackSpy).toHaveBeenCalledWith(CONFIG.apiUrl, CONFIG.tenantToken, 'agent_abc', 'docker'));
+  });
+});
+
 describe('search + pagination', () => {
   it('sends the search query to the server only when Search is clicked', async () => {
     const spy = vi.spyOn(api, 'listTenantAgents').mockResolvedValue({ agents: [BASE_AGENT], total: 1, limit: 20, offset: 0 });

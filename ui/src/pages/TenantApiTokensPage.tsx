@@ -51,7 +51,8 @@ export function TenantApiTokensPage({ config }: { config: TenantConfig }) {
 
   const commitRename = async (tokenId: string) => {
     const name = renameValue.trim();
-    if (!name) { cancelRename(); return; }
+    // No-op guard: empty or unchanged name just closes the editor without a request.
+    if (!name || name === tokens.find(t => t.token_id === tokenId)?.name) { cancelRename(); return; }
     setRenameLoading(true);
     try {
       await renameApiToken(apiUrl, tenantToken, tokenId, name);
@@ -67,9 +68,9 @@ export function TenantApiTokensPage({ config }: { config: TenantConfig }) {
   return (
     <div className="min-h-full bg-slate-50">
       {/* Page header */}
-      <div className="bg-gradient-to-r from-sky-700 to-sky-600 px-8 py-5">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-4">
+      <div className="bg-gradient-to-r from-sky-700 to-sky-600 px-4 sm:px-8 py-5">
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+          <div className="flex items-center gap-4 min-w-0">
             <div className="w-10 h-10 rounded-xl bg-white/10 ring-1 ring-white/20 flex items-center justify-center shrink-0">
               <svg className="w-5 h-5 text-white" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
                 <path strokeLinecap="round" strokeLinejoin="round" d="M15.75 5.25a3 3 0 013 3m3 0a6 6 0 01-7.029 5.912c-.563-.097-1.159.026-1.563.43L10.5 17.25H8.25v2.25H6v2.25H2.25v-2.818c0-.597.237-1.17.659-1.591l6.499-6.499c.404-.404.527-1 .43-1.563A6 6 0 1121.75 8.25z" />
@@ -80,7 +81,7 @@ export function TenantApiTokensPage({ config }: { config: TenantConfig }) {
               <p className="text-sm text-sky-200">Tokens for CLI and MCP authentication</p>
             </div>
           </div>
-          <div className="flex items-center gap-3">
+          <div className="flex flex-wrap items-center gap-3">
             {!loading && activeCount > 0 && (
               <span className="inline-flex items-center gap-1.5 bg-emerald-500/20 border border-emerald-400/30 text-emerald-300 text-xs font-semibold px-3 py-1.5 rounded-lg">
                 <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 shrink-0" />
@@ -98,7 +99,7 @@ export function TenantApiTokensPage({ config }: { config: TenantConfig }) {
         </div>
       </div>
 
-      <div className="px-8 py-6">
+      <div className="px-4 sm:px-8 py-6">
       {loading && tokens.length === 0 ? (
         <div className="flex justify-center py-20"><Spinner /></div>
       ) : (

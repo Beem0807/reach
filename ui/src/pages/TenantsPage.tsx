@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import type { Config, Tenant } from '../types';
+import { formatTs, useTimezone } from '../timezone';
 import { listTenants, createTenant, disableTenant, enableTenant, listUsers, listAgentsAdmin } from '../api';
 import { Modal } from '../components/Modal';
 import { Spinner } from '../components/Spinner';
@@ -9,10 +10,11 @@ import { tenantPalette, tenantInitials } from '../utils';
 
 function fmtDate(iso?: string) {
   if (!iso) return null;
-  return new Date(iso).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+  return formatTs(iso, { year: 'numeric', month: 'short', day: 'numeric' });
 }
 
 export function TenantsPage({ config }: { config: Config }) {
+  useTimezone();  // subscribe so a timezone toggle reflows this page's timestamps
   const { apiUrl, adminToken } = config;
   const PAGE = 20;
   const [tenants, setTenants] = useState<Tenant[]>([]);
@@ -85,14 +87,14 @@ export function TenantsPage({ config }: { config: Config }) {
   };
 
   return (
-    <div className="p-8">
+    <div className="p-4 sm:p-8">
       {/* Header */}
-      <div className="flex items-center justify-between mb-8">
+      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-8">
         <div>
           <h1 className="text-2xl font-semibold text-gray-900 tracking-tight">Tenants</h1>
           <p className="text-sm text-gray-500 mt-0.5">Organisations with access to reach</p>
         </div>
-        <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-center gap-3">
           {tenants.length > 0 && (
             <span className="text-sm text-gray-500 bg-gray-100 px-3 py-1.5 rounded-full font-medium">
               {tenants.length} {tenants.length === 1 ? 'tenant' : 'tenants'}
@@ -120,7 +122,7 @@ export function TenantsPage({ config }: { config: Config }) {
           onChange={e => setSearch(e.target.value)}
           onKeyDown={e => { if (e.key === 'Enter') applySearch(); }}
           placeholder="Search tenants by name or ID…"
-          className="border border-gray-300 rounded-lg px-3 py-1.5 text-sm bg-white shadow-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 w-72"
+          className="border border-gray-300 rounded-lg px-3 py-1.5 text-sm bg-white shadow-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 w-full sm:w-72"
         />
         <button onClick={applySearch} className="text-sm text-white bg-slate-800 hover:bg-slate-700 rounded-lg px-3 py-1.5">Search</button>
         {query && (
@@ -168,7 +170,7 @@ export function TenantsPage({ config }: { config: Config }) {
 
                 {/* Counts */}
                 {counts[t.tenant_id] !== undefined && (
-                  <div className="flex items-center gap-3">
+                  <div className="flex flex-wrap items-center gap-3">
                     <span className="text-xs text-gray-500">
                       <span className="font-semibold text-gray-800">{counts[t.tenant_id].agents}</span> agent{counts[t.tenant_id].agents !== 1 ? 's' : ''}
                     </span>

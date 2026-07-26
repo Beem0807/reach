@@ -18,6 +18,7 @@ class TestHeartbeatCheck:
              patch("handlers.heartbeat.approvals_repo") as apr, \
              patch("handlers.heartbeat._now", return_value=fixed_ts):
             ar.scan_stale_active.return_value = stale_agents or []
+            ar.scan_expired_wild.return_value = []
             ar.mark_inactive.return_value = True
             jr.expire_stale.return_value = expired_jobs
             apr.mark_expired.return_value = 0
@@ -86,6 +87,7 @@ class TestHeartbeatFleetReaper:
              patch("handlers.heartbeat.audit") as aud, \
              patch("handlers.heartbeat._now", return_value=fixed_ts):
             ar.scan_stale_active.return_value = []
+            ar.scan_expired_wild.return_value = []
             ar.mark_inactive.return_value = True
             ar.scan_reapable_fleet_members.return_value = reapable_members
             fr.scan_all.return_value = fleets
@@ -179,6 +181,7 @@ class TestHeartbeatApprovalScheduling:
              patch("handlers.heartbeat.tenants_repo") as tr, \
              patch("handlers.heartbeat._now", return_value=fixed_ts):
             ar.scan_stale_active.return_value = []
+            ar.scan_expired_wild.return_value = []
             ar.mark_inactive.return_value = True
             jr.expire_stale.return_value = 0
             jr.delete_stale.return_value = 0
@@ -238,6 +241,7 @@ class TestHeartbeatApprovalScheduling:
              patch("handlers.heartbeat.approvals_repo") as apr, \
              patch("handlers.heartbeat._now", return_value=fixed_ts):
             ar.scan_stale_active.return_value = []
+            ar.scan_expired_wild.return_value = []
             ar.mark_inactive.return_value = True
             jr.expire_stale.return_value = 0
             apr.mark_expired.return_value = 0
@@ -267,6 +271,7 @@ class TestHeartbeatCleanupExtended:
              patch("handlers.heartbeat._now", return_value=fixed_ts), \
              patch.dict("os.environ", env or {}, clear=False):
             ar.scan_stale_active.return_value = []
+            ar.scan_expired_wild.return_value = []
             ar.mark_inactive.return_value = True
             jr.expire_stale.return_value = 0
             apr.mark_expired.return_value = 0
@@ -386,3 +391,77 @@ class TestHeartbeatCleanupExtended:
         assert call_args["from_status"] == "ACTIVE"
         assert call_args["to_status"] == "INACTIVE"
         assert call_args["triggered_by"] == "heartbeat"
+
+
+class TestHeartbeatTemporaryWildSweep:
+    """The top-of-hour sweep that converges expired temporary-wild agents. revert_expired_mode
+    itself is unit-tested in test_mode_revert; here we cover the heartbeat wiring/gating."""
+
+    def _call_at(self, hour, minute, expired=None, reverted=None, expired_fleets=None):
+        fixed_dt = _make_dt(hour=hour, minute=minute)
+        fixed_ts = fixed_dt.timestamp()
+        with patch("handlers.heartbeat.agents_repo") as ar, \
+             patch("handlers.heartbeat.fleets_repo") as flr, \
+             patch("handlers.heartbeat.jobs_repo") as jr, \
+             patch("handlers.heartbeat.approvals_repo") as apr, \
+             patch("handlers.heartbeat.tenants_repo") as tr, \
+             patch("handlers.heartbeat.revert_expired_mode") as rev, \
+             patch("handlers.heartbeat.revert_expired_fleet_mode") as frev, \
+             patch("handlers.heartbeat._now", return_value=fixed_ts):
+            ar.scan_stale_active.return_value = []
+            ar.scan_expired_wild.return_value = expired if expired is not None else []
+            ar.mark_inactive.return_value = True
+            flr.scan_all.return_value = []   # member reaper runs every tick
+            flr.scan_expired_wild.return_value = expired_fleets if expired_fleets is not None else []
+            jr.expire_stale.return_value = 0
+            apr.mark_expired.return_value = 0
+            tr.list_all.return_value = []
+            # revert returns the record reverted (mode != wild) unless told otherwise.
+            rev.side_effect = reverted or (lambda a: {**a, "mode": a.get("mode_revert_to", "readonly")})
+            frev.side_effect = lambda f: {**f, "mode": f.get("mode_revert_to", "readonly")}
+            result = handle_heartbeat_check()
+            return result, ar, rev, flr, frev
+
+    def test_mid_hour_does_not_sweep(self):
+        result, ar, rev, flr, frev = self._call_at(hour=12, minute=30, expired=[{"agent_id": "a1"}],
+                                                    expired_fleets=[{"fleet_id": "f1"}])
+        ar.scan_expired_wild.assert_not_called()
+        flr.scan_expired_wild.assert_not_called()
+        rev.assert_not_called()
+        frev.assert_not_called()
+        assert result["reverted_modes"] == 0 and result["reverted_fleet_modes"] == 0
+
+    def test_top_of_hour_reverts_each_expired_agent(self):
+        expired = [{"agent_id": "a1", "mode": "wild", "mode_revert_to": "approved"},
+                   {"agent_id": "a2", "mode": "wild", "mode_revert_to": "readonly"}]
+        result, ar, rev, flr, frev = self._call_at(hour=9, minute=0, expired=expired)
+        ar.scan_expired_wild.assert_called_once()
+        # Passed the current ISO timestamp.
+        now_arg = ar.scan_expired_wild.call_args[0][0]
+        assert abs((datetime.fromisoformat(now_arg) - _make_dt(hour=9, minute=0)).total_seconds()) < 2
+        assert rev.call_count == 2
+        assert result["reverted_modes"] == 2
+
+    def test_top_of_hour_reverts_each_expired_fleet(self):
+        fleets = [{"fleet_id": "f1", "mode": "wild", "mode_revert_to": "approved"},
+                  {"fleet_id": "f2", "mode": "wild", "mode_revert_to": "readonly"}]
+        result, ar, rev, flr, frev = self._call_at(hour=9, minute=0, expired_fleets=fleets)
+        flr.scan_expired_wild.assert_called_once()
+        assert frev.call_count == 2
+        assert result["reverted_fleet_modes"] == 2
+
+    def test_agent_still_wild_not_counted(self):
+        # A concurrent write could leave it wild; revert_expired_mode is idempotent and
+        # returns it unchanged - the sweep must not count it.
+        expired = [{"agent_id": "a1", "mode": "wild"}]
+        result, *_ = self._call_at(hour=9, minute=0, expired=expired,
+                                   reverted=lambda a: a)  # stays wild
+        assert result["reverted_modes"] == 0
+
+    def test_top_of_hour_no_expired_records(self):
+        result, ar, rev, flr, frev = self._call_at(hour=9, minute=0, expired=[], expired_fleets=[])
+        ar.scan_expired_wild.assert_called_once()
+        flr.scan_expired_wild.assert_called_once()
+        rev.assert_not_called()
+        frev.assert_not_called()
+        assert result["reverted_modes"] == 0 and result["reverted_fleet_modes"] == 0

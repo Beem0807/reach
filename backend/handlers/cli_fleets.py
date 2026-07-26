@@ -17,7 +17,9 @@ import shared.audit as audit
 from shared.access import can_access_fleet, can_write_fleet
 from shared.auth import _bearer, _verify_tenant_token
 from shared.fanout import deterministic_run_id, new_run_row, order_and_limit, parse_max_targets, run_summary_view
-from shared.policy import _is_blocked, _is_readonly_blocked, needs_shell, to_argv
+from shared.mode import revert_expired_fleet_mode
+from shared.policy import (_is_blocked, _is_readonly_blocked, is_k8s_secret_read,
+                           is_sensitive_read, needs_shell, to_argv)
 from shared.response import _err, _iso, _now, _ok
 from shared.settings import effective_settings
 from shared.store import agents_repo, approvals_repo, fleets_repo, jobs_repo, runs_repo, tenants_repo
@@ -43,7 +45,9 @@ def _resolve_fleet(user: dict, fleet_id: str) -> Optional[dict]:
     fleet = fleets_repo.get(fleet_id)
     if not fleet or fleet.get("tenant_id") != user["tenant_id"] or not can_access_fleet(user, fleet):
         return None
-    return fleet
+    # Converge an elapsed temporary-wild window before gating a fan-out on the fleet's mode
+    # (enforcement: no wild fan-out runs past the window) or listing it.
+    return revert_expired_fleet_mode(fleet)
 
 
 def _members(tenant_id: str, fleet_id: str) -> list:
@@ -97,6 +101,9 @@ def handle_cli_list_fleet_agents(fleet_id: str, raw_token: str, q=None,
         "status": a.get("status"),
         "type": a.get("type") or "host",
         "mode": a.get("mode"),
+        # Temporary-wild window (mirrored from the fleet), so the CLI can show the countdown.
+        "mode_expires_at": a.get("mode_expires_at"),
+        "mode_revert_to": a.get("mode_revert_to"),
         "fleet_id": fleet_id,
         "agent_version": a.get("agent_version"),
         "claimed_at": a.get("claimed_at"),
@@ -214,6 +221,10 @@ def handle_cli_fleet_fanout(fleet_id: str, body: dict, raw_token: str, ip: str =
 
     now = _now()
     is_write = _is_readonly_blocked(command)
+    # Sensitive reads (secrets/credentials) are gated like writes across the fleet - approvable
+    # via the fleet's rules, blocked in a readonly fleet, run in a wild one.
+    if not is_write and (is_sensitive_read(command) or is_k8s_secret_read(command)):
+        is_write = True
     # Mode is a fleet property (members inherit it uniformly), so a write to a read-only
     # fleet is a fleet-level "no" - reject it upfront with a clear reason instead of
     # silently skipping every member. (The agent is still the authoritative gate; this
