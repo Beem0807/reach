@@ -1,0 +1,37 @@
+Reach backend "{{ .Release.Name }}" is installed in namespace "{{ .Release.Namespace }}".
+
+The single backend image serves BOTH the REST API and the web console (at /ui).
+{{ if .Values.migrations.enabled }}Migrations run automatically in each pod's initContainer (alembic upgrade head).{{ else }}NOTE: migrations.enabled=false - run `alembic upgrade head` against your database yourself.{{ end }}
+{{ if (include "reach.usePostgresql" .) }}Bundled Postgres is running in-cluster ({{ include "reach.postgresql.fullname" . }}). For production, point config.databaseUrl at a managed/replicated Postgres.{{ else }}Using your external Postgres.{{ end }}
+{{- if (include "reach.useRedis" .) }}
+Bundled Redis/Valkey is running for shared rate limiting ({{ include "reach.redis.fullname" . }}).
+{{- end }}
+
+Reach it:
+{{- if .Values.ingress.enabled }}
+{{- range .Values.ingress.hosts }}
+  {{- $scheme := "http" }}{{- if $.Values.ingress.tls }}{{ $scheme = "https" }}{{- end }}
+  Console:  {{ $scheme }}://{{ .host }}/ui/
+  API:      {{ $scheme }}://{{ .host }}/
+{{- end }}
+{{- else if contains "NodePort" .Values.service.type }}
+  export NODE_PORT=$(kubectl get -n {{ .Release.Namespace }} -o jsonpath="{.spec.ports[0].nodePort}" svc {{ include "reach.fullname" . }})
+  export NODE_IP=$(kubectl get nodes -n {{ .Release.Namespace }} -o jsonpath="{.items[0].status.addresses[0].address}")
+  echo "http://$NODE_IP:$NODE_PORT/ui/"
+{{- else }}
+  # ClusterIP (no Ingress). Port-forward to reach it locally:
+  kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "reach.fullname" . }} 8080:{{ .Values.service.port }}
+  # then open http://localhost:8080/ui/
+{{- end }}
+
+Log in:
+  - Platform admin console (/admin): password from ADMIN_PASSWORD.
+  - Tenant console: create a tenant from the platform admin console first.
+
+Health:  kubectl get pods -n {{ .Release.Namespace }} -l app.kubernetes.io/instance={{ .Release.Name }}
+{{- if not .Values.config.existingSecret }}
+
+Secrets are chart-managed. For production, move them into your own Secret and set
+`config.existingSecret` (keys: TOKEN_PEPPER, SESSION_SIGNING_KEY, ADMIN_PASSWORD,
+DATABASE_URL, and optionally METRICS_TOKEN).
+{{- end }}

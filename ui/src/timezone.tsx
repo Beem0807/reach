@@ -66,7 +66,7 @@ export function TimezoneToggle({ dark = false, compact = false, className = '' }
     const other = zone === 'UTC' ? 'local' : 'UTC';
     return (
       <button type="button" onClick={() => setZone(other)}
-        title={`Times shown in ${zone === 'UTC' ? 'UTC' : `your local timezone (${localZoneName()})`} — click for ${other === 'UTC' ? 'UTC' : 'local'}`}
+        title={`Times shown in ${zone === 'UTC' ? 'UTC' : `your local timezone (${localZoneName()})`} - click for ${other === 'UTC' ? 'UTC' : 'local'}`}
         className={`w-9 h-7 rounded-md text-[10px] font-bold transition-colors ${dark ? 'bg-slate-800/70 text-slate-300 hover:text-white hover:bg-slate-700' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'} ${className}`}>
         {zone === 'UTC' ? 'UTC' : 'LOC'}
       </button>

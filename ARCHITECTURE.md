@@ -23,18 +23,18 @@ Reach is a command bridge between AI agents (or any automation) and remote machi
 │  Backend                                                        │
 │                                                                 │
 │   ┌────────────────────────────────────────────────────────┐    │
-│   │  FastAPI  (Docker)   or   Lambda + API Gateway         │    │
+│   │  FastAPI (Docker / Kubernetes)  or  Lambda             │    │
 │   └────────────────────────────────────────────────────────┘    │
 │   ┌────────────────────────────────────────────────────────┐    │
-│   │  PostgreSQL (Docker)  or   DynamoDB (Lambda)           │    │
+│   │  PostgreSQL (default)  or  DynamoDB (AWS)              │    │
 │   └────────────────────────────────────────────────────────┘    │
 └─────────────────────────────▲───────────────────────────────────┘
                               │ HTTPS (outbound from agent)
 ┌─────────────────────────────┴───────────────────────────────────┐
-│  Remote machine                                                 │
+│  Remote machine  /  Kubernetes cluster                          │
 │                                                                 │
 │   ┌──────────────┐                                              │
-│   │  reach-agent │  (systemd / launchd service or foreground)   │
+│   │  reach-agent │  host: systemd/launchd · k8s: Helm Deployment│
 │   └──────────────┘                                              │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -111,11 +111,14 @@ A FastAPI application with a storage-backend abstraction that supports two datab
 | ------------- | ------------------------------ | ------------------------------------------------------- |
 | Docker        | FastAPI (uvicorn behind nginx) | PostgreSQL (via SQLAlchemy + Alembic) - default         |
 | Docker on AWS | FastAPI (uvicorn behind nginx) | DynamoDB (boto3) - opt-in with `STORAGE_BACKEND=dynamo` |
+| Kubernetes    | FastAPI (uvicorn; Ingress fronts it) | PostgreSQL (bundled or external) - default; or DynamoDB on EKS |
 | Lambda        | API Gateway + Lambda           | DynamoDB (boto3)                                        |
 
 The same handler code runs in every deployment. The storage layer is swapped via the `STORAGE_BACKEND` env var (`postgres` or `dynamo`). Handlers import from `shared.store`, which returns the correct repo implementation.
 
-nginx is required in front of uvicorn for the Docker deployment. Long-polling connections from the agent (`POST /agent/sync`) need to be terminated cleanly; uvicorn alone does not handle this correctly under load.
+The **Kubernetes** deployment uses the [`reach`](deploy/helm/reach) Helm chart: the same image, Postgres + Redis bundled by default (or pointed at managed ones), migrations in an initContainer, and DynamoDB via IRSA/Pod Identity on EKS. See [SELF_HOSTING.md → Option 4](SELF_HOSTING.md#option-4-kubernetes-helm).
+
+A proxy in front of uvicorn terminates the agent's long-polling `POST /agent/sync` connections cleanly (uvicorn alone doesn't under load): **nginx** for the Docker deployment, the **Ingress controller** for Kubernetes.
 
 A background scheduler (APScheduler on FastAPI, EventBridge on Lambda) runs every minute to:
 

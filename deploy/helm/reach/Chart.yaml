@@ -1,0 +1,27 @@
+apiVersion: v2
+name: reach
+description: >-
+  Reach backend (control plane) for Kubernetes - the API, web console, and
+  Postgres-backed store that AI agents and operators connect to. Serves the
+  REST API and the bundled web UI from a single image; runs database
+  migrations automatically on install/upgrade.
+type: application
+# Chart version - bump on chart changes.
+version: 0.1.0
+# Matches the reach backend image version this chart targets.
+appVersion: "0.1.0"
+keywords:
+  - reach
+  - backend
+  - control-plane
+  - ai
+  - remote-execution
+home: https://github.com/nabeemdev/reach
+sources:
+  - https://github.com/nabeemdev/reach
+# Per-version changelog (Artifact Hub convention). Update BEFORE releasing the chart.
+# kind is one of: added | changed | deprecated | removed | fixed | security
+annotations:
+  artifacthub.io/changes: |
+    - kind: added
+      description: Initial reach backend chart - API + console, Postgres store, migration hook

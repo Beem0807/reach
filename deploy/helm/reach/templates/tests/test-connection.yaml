@@ -1,0 +1,52 @@
+{{- if .Values.tests.enabled }}
+# `helm test <release>` runs this Pod: it hits the backend Service's /health endpoint and
+# fails if it isn't 200. A cheap post-install/upgrade smoke check that the Service routes to
+# a healthy backend (catches selector/port regressions like the one live-install found).
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "reach.fullname" . }}-test-connection
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "reach.labels" . | nindent 4 }}
+    # Override the default component=backend so this one-shot client pod is NOT picked up as
+    # an endpoint by the backend Service (whose selector is name+instance+component=backend).
+    app.kubernetes.io/component: test
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  {{- with .Values.imagePullSecrets }}
+  imagePullSecrets:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  automountServiceAccountToken: false
+  {{- with .Values.podSecurityContext }}
+  # Same pod-level hardening as the backend so `helm test` also passes in a
+  # Pod-Security-Admission "restricted" namespace (needs runAsNonRoot + seccompProfile).
+  securityContext:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  containers:
+    - name: health
+      # Reuse the app image (has Python) so there's no extra pull / registry to trust.
+      image: {{ include "reach.image" . | quote }}
+      imagePullPolicy: {{ .Values.image.pullPolicy }}
+      {{- with .Values.securityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      command: ["python", "-c"]
+      args:
+        - |
+          import sys, urllib.request
+          url = "http://{{ include "reach.fullname" . }}:{{ .Values.service.port }}/health"
+          try:
+              with urllib.request.urlopen(url, timeout=10) as r:
+                  code = r.getcode()
+          except Exception as e:
+              print("reach: health check failed to reach %s: %s" % (url, e)); sys.exit(1)
+          print("reach: GET %s -> %d" % (url, code))
+          sys.exit(0 if code == 200 else 1)
+{{- end }}

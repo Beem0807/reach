@@ -10,7 +10,8 @@ Deploy and operate your own reach backend. The CLI and agent are separate - they
 |---|---|---|---|
 | [Local machine](#option-1-local-machine) | FastAPI | PostgreSQL | Home server, spare machine, no cloud account needed |
 | [AWS Lambda](#option-2-aws-lambda) | Lambda | DynamoDB | Small teams, low cost, AWS-native |
-| [Docker / FastAPI](#option-3-docker--fastapi) | FastAPI | PostgreSQL (or [DynamoDB on AWS](#dynamodb-on-aws)) | Any cloud, self-hosted VMs, k8s |
+| [Docker / FastAPI](#option-3-docker--fastapi) | FastAPI | PostgreSQL (or [DynamoDB on AWS](#dynamodb-on-aws)) | Any cloud, self-hosted VMs |
+| [Kubernetes (Helm)](#option-4-kubernetes-helm) | FastAPI | PostgreSQL (bundled or external) | Clusters - self-contained by default, or wire to managed Postgres/Redis |
 
 ### Why DynamoDB with Lambda, and PostgreSQL with Docker?
 
@@ -228,6 +229,7 @@ docker run -d -p 8000:8000 \
 
 Notes:
 - The bundled image already includes the Redis client; you only need a reachable Redis (managed ElastiCache/MemoryDB, or your own).
+- **A Redis outage does not take the API down.** The limiter is configured to fall back to per-process in-memory counting if the shared store is unreachable (and to fail open if even that errors), then transparently switch back when Redis recovers. During the outage limits degrade to per-replica rather than being enforced globally - the trade-off is availability over exactness, which is the right call for an anti-DoS limit backed by 256-bit tokens.
 - `limits` (the rate-limit backend) also supports `redis+sentinel://`, `memcached://`, and `mongodb://` URIs.
 - **Alternative:** rate limit at a single ingress instead of in the app - nginx `limit_req`, an ALB/API Gateway, or Cloudflare. That moves the shared-state problem to one chokepoint and removes the Redis dependency, at the cost of not keying off the API token the way the app does.
 
@@ -261,6 +263,7 @@ docker run -d \
 ```
 
 - No `DATABASE_URL` is needed.
+- `AWS_REGION` selects the **DynamoDB tables' region**, which is independent of where the container runs - set it to wherever your tables live (or should be created). Running the app in one region against tables in another works, at the cost of cross-region latency and inter-region data-transfer charges on every read/write; co-locate them unless you have a reason not to. Credentials work cross-region regardless (STS/DynamoDB are regional endpoints).
 - Provide AWS credentials the boto3 way - an ECS task role / EKS IRSA / EC2 instance profile is recommended over static keys. For local testing you can pass `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`.
 - On startup the container runs an idempotent bootstrap that creates the eight `reach-*` tables (on-demand billing) if they don't already exist - the DynamoDB equivalent of `alembic upgrade head`. Existing tables and their data are left untouched. You can also run it standalone with `python -m shared.dynamo_bootstrap`.
 - Per-tenant retention and the fan-out cap are tenant settings (not env vars), same as the PostgreSQL path; only the platform-level `AUDIT_RETENTION_DAYS` applies here.
@@ -297,6 +300,140 @@ docker run -d \
 Once the tables exist you can drop the `ReachBootstrap` statement if you prefer a least-privilege runtime role (the bootstrap treats already-existing tables as a no-op).
 
 DynamoDB tables created this way use no `DeletionPolicy`, so deleting them deletes their data - unlike the Lambda stack, which retains them. Back up with point-in-time recovery if needed.
+
+---
+
+## Option 4: Kubernetes (Helm)
+
+Run the backend (API + web console) in a cluster with the [`reach`](deploy/helm/reach) Helm
+chart. It deploys the same `nabeemdev/reach` image as [Option 3](#option-3-docker--fastapi) - one
+image serving the REST API and the UI at `/ui` on port `8000` - plus a Service, health probes, a
+PodDisruptionBudget, and (optionally) an Ingress, HPA, and ServiceMonitor.
+
+This is the server side. The in-cluster **agent** is a separate chart -
+see [Kubernetes agents](#kubernetes-agents).
+
+### Prerequisites
+
+- Kubernetes 1.23+ and Helm 3
+- Nothing else for a quick start: the chart **bundles Postgres and Redis by default**. For
+  production, point it at a managed Postgres (and optionally Redis) instead.
+
+### Deploy (self-contained)
+
+Bundled Postgres + Redis are on by default, so this is all you need. Install from the published
+Helm repo (pin the chart with `--version`; the image tag comes from the chart's `appVersion`):
+
+```bash
+helm repo add reach https://reach-releases.s3.amazonaws.com/charts/reach --force-update
+helm install reach reach/reach -n reach --create-namespace \
+  --set config.tokenPepper=$(openssl rand -hex 32) \
+  --set config.sessionSigningKey=$(openssl rand -hex 32) \
+  --set config.adminPassword=$(openssl rand -hex 16)
+```
+
+From a cloned repo, install the local chart instead: `helm install reach deploy/helm/reach …`.
+
+Reach the console (no Ingress): `kubectl port-forward -n reach svc/reach 8080:80`, then open
+`http://localhost:8080/ui/`. Expose it properly with `--set ingress.enabled=true` and your
+host/TLS/class.
+
+The three secrets map to the same env vars as [Option 3](#option-3-docker--fastapi): `TOKEN_PEPPER` (permanent),
+`SESSION_SIGNING_KEY`, `ADMIN_PASSWORD`. The bundled Postgres password is **auto-generated** on
+first install (and reused on upgrade) when you don't set one - no `reach/reach` default.
+
+For production, put the secrets in your own Secret (External Secrets / Sealed Secrets) and set
+`config.existingSecret`. Its required keys are **storage-aware**:
+
+- **Always:** `TOKEN_PEPPER`, `SESSION_SIGNING_KEY`, `ADMIN_PASSWORD` (optionally `METRICS_TOKEN`).
+- **Postgres** (`storageBackend=postgres`, the default): **plus `DATABASE_URL`**. Setting
+  `existingSecret` skips the bundled Postgres, so you supply the connection string.
+- **DynamoDB** (`storageBackend=dynamo`): **no `DATABASE_URL`** - the store is DynamoDB.
+
+The chart doesn't validate the *contents* of an existing Secret (it may not exist at template
+time under ESO/Sealed Secrets), so match these keys yourself.
+
+### Bring your own Postgres / Redis
+
+Supplying an external URL makes the chart **skip** the matching bundled dependency - no toggle
+needed. The bundled Postgres is a single instance with a PVC (fine for dev/small installs, **not
+HA**); use a managed/replicated Postgres in production.
+
+```bash
+--set config.databaseUrl='postgresql://user:pass@my-postgres:5432/reach'   # skips bundled PG
+--set config.rateLimitStorageUri='redis://my-redis:6379'                   # skips bundled Redis; shared rate limits
+```
+
+### DynamoDB backend (AWS/EKS)
+
+On EKS you can use **DynamoDB** instead of Postgres (same rationale as
+[DynamoDB on AWS](#dynamodb-on-aws) - no database instance to run). Set `storageBackend=dynamo`,
+give it a region, and grant the pod's ServiceAccount DynamoDB access. The chart then skips
+Postgres entirely, drops the `DATABASE_URL` requirement, and the migration step runs
+`dynamo_bootstrap` (creates the tables) instead of Alembic. The chart never holds AWS keys.
+
+The IAM role needs the **same policy** shown under [DynamoDB on AWS → IAM policy](#dynamodb-on-aws)
+(read/write on `reach-*` tables + indexes, plus the `ReachBootstrap` create/describe statement so
+`dynamo_bootstrap` can create them; drop that statement once the tables exist). Attach it to the
+role you bind below - two ways to attach the role:
+
+**IRSA** (annotate the ServiceAccount with the role ARN; needs a cluster OIDC provider):
+
+```bash
+helm install reach deploy/helm/reach -n reach --create-namespace \
+  --set config.storageBackend=dynamo \
+  --set config.awsRegion=us-east-1 \
+  --set 'serviceAccount.annotations.eks\.amazonaws\.com/role-arn=arn:aws:iam::<acct>:role/reach-dynamo' \
+  --set config.tokenPepper=$(openssl rand -hex 32) \
+  --set config.sessionSigningKey=$(openssl rand -hex 32) \
+  --set config.adminPassword=$(openssl rand -hex 16)
+```
+
+**EKS Pod Identity** (newer; no SA annotation, no OIDC provider). Install the *Amazon EKS Pod
+Identity Agent* addon, install the chart **without** the role-arn annotation (pin the SA name so
+the association is stable), then create the association out of band:
+
+```bash
+helm install reach deploy/helm/reach -n reach --create-namespace \
+  --set config.storageBackend=dynamo --set config.awsRegion=us-east-1 \
+  --set serviceAccount.name=reach \
+  --set config.tokenPepper=$(openssl rand -hex 32) \
+  --set config.sessionSigningKey=$(openssl rand -hex 32) \
+  --set config.adminPassword=$(openssl rand -hex 16)
+
+aws eks create-pod-identity-association \
+  --cluster-name <cluster> --namespace reach --service-account reach \
+  --role-arn arn:aws:iam::<acct>:role/reach-dynamo
+```
+
+(The role's trust policy differs by method - IRSA trusts the OIDC provider; Pod Identity trusts
+`pods.eks.amazonaws.com`.) Redis stays bundled for rate limiting unless you point at an external
+one - it's independent of the storage backend.
+
+### Migrations
+
+Schema setup runs in an **initContainer** before each pod serves, using the *same*
+storage-aware logic as the image's own entrypoint (`dynamo_bootstrap` for DynamoDB, else
+`alembic upgrade head`). It waits for the database, and on **Postgres** holds a **session
+advisory lock** across `alembic upgrade head` so concurrent replicas *serialize* on schema DDL
+(idempotency alone doesn't prevent two replicas racing on a fresh DB's DDL). The lock releases
+when the initContainer exits; a replica that waited then finds the schema already at head.
+DynamoDB table creation is naturally idempotent (retry loop). Disable with
+`migrations.enabled=false` only if you run migrations out of band.
+
+### Notes
+
+- **Scaling.** The backend is stateless; raise `replicaCount` or enable `autoscaling`. Keep Redis
+  (bundled or external) for correct cross-replica rate limiting - see
+  [Running multiple replicas](#running-multiple-replicas).
+- **Network isolation.** `--set networkPolicy.enabled=true` locks the bundled Postgres/Redis to
+  **backend-only** ingress and restricts who can reach the backend (add your ingress controller /
+  Prometheus via `networkPolicy.ingressFrom`; optionally tighten egress with `restrictEgress`).
+  Requires a CNI that enforces NetworkPolicies.
+- **Metrics.** `/metrics` is on the same port; guard it with `config.metricsToken` and enable
+  `metrics.serviceMonitor.enabled` for the Prometheus Operator. See
+  [Backend metrics](#backend-metrics-metrics).
+- **Full values reference:** [`deploy/helm/reach/README.md`](deploy/helm/reach/README.md).
 
 ---
 

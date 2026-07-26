@@ -1,0 +1,109 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- $backendSel := include "reach.backend.selectorLabels" . }}
+# --- Backend: restrict who can reach it, and (optionally) where it can talk to. -------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "reach.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "reach.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- $backendSel | nindent 6 }}
+  policyTypes:
+    - Ingress
+    {{- if .Values.networkPolicy.restrictEgress }}
+    - Egress
+    {{- end }}
+  ingress:
+    - from:
+        # Same-namespace pods (covers in-cluster CLI/agents and a same-namespace ingress).
+        - podSelector: {}
+        {{- with .Values.networkPolicy.ingressFrom }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      ports:
+        - port: 8000
+          protocol: TCP
+  {{- if .Values.networkPolicy.restrictEgress }}
+  egress:
+    # DNS resolution.
+    - ports:
+        - { port: 53, protocol: UDP }
+        - { port: 53, protocol: TCP }
+    # HTTPS out - agent artifact/chart discovery (RELEASES_S3_BASE) and DynamoDB (on AWS).
+    - ports:
+        - { port: 443, protocol: TCP }
+    {{- if (include "reach.usePostgresql" .) }}
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "reach.postgresql.labels" . | nindent 14 }}
+      ports:
+        - { port: 5432, protocol: TCP }
+    {{- end }}
+    {{- if (include "reach.useRedis" .) }}
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "reach.redis.labels" . | nindent 14 }}
+      ports:
+        - { port: 6379, protocol: TCP }
+    {{- end }}
+    {{- with .Values.networkPolicy.egressTo }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- end }}
+{{- if (include "reach.usePostgresql" .) }}
+---
+# --- Bundled Postgres: accept connections ONLY from the backend. ----------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "reach.postgresql.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "reach.labels" . | nindent 4 }}
+    {{- include "reach.postgresql.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "reach.postgresql.labels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- $backendSel | nindent 14 }}
+      ports:
+        - { port: 5432, protocol: TCP }
+{{- end }}
+{{- if (include "reach.useRedis" .) }}
+---
+# --- Bundled Redis/Valkey: accept connections ONLY from the backend. ------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "reach.redis.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "reach.labels" . | nindent 4 }}
+    {{- include "reach.redis.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "reach.redis.labels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- $backendSel | nindent 14 }}
+      ports:
+        - { port: 6379, protocol: TCP }
+{{- end }}
+{{- end }}

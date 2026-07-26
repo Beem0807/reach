@@ -1,0 +1,280 @@
+# Default values for the reach backend (control plane).
+#
+# Self-contained by default - bundles Postgres + Redis, so this is all you need to run:
+#   helm install reach deploy/helm/reach -n reach --create-namespace \
+#     --set config.tokenPepper=$(openssl rand -hex 32) \
+#     --set config.sessionSigningKey=$(openssl rand -hex 32) \
+#     --set config.adminPassword=$(openssl rand -hex 16)
+#
+# Bring your own Postgres/Redis - just point at them and the bundled ones are skipped:
+#     --set config.databaseUrl='postgresql://reach:reach@my-postgres:5432/reach'
+#     --set config.rateLimitStorageUri='redis://my-redis:6379'
+#
+# Production: point at managed Postgres/Redis, put the secrets in your own Secret and set
+# `config.existingSecret` (keys: TOKEN_PEPPER, SESSION_SIGNING_KEY, ADMIN_PASSWORD,
+# DATABASE_URL, optionally METRICS_TOKEN), and expose it via `ingress`.
+#
+# Datastore precedence (primary DB): storageBackend=dynamo > config.databaseUrl /
+# config.existingSecret (external Postgres) > bundled Postgres (postgresql.enabled). Any of
+# the first three suppresses the bundled Postgres regardless of postgresql.enabled. The one
+# rejected combo - postgres + postgresql.enabled=false + no databaseUrl + no existingSecret -
+# fails at install with a clear message. Rate-limit store is chosen independently:
+# config.rateLimitStorageUri (external) > bundled Redis (redis.enabled) > in-process per-replica.
+# See the chart README "How the datastore is chosen (precedence)" for the full table.
+
+# -- Number of backend replicas. The app is stateless (all state is in Postgres), so it scales
+# horizontally; each pod's initContainer runs the (idempotent) migration before serving.
+replicaCount: 2
+
+image:
+  # -- Backend image repository. The published image is `nabeemdev/reach` on Docker Hub
+  # (built + pushed by scripts/release_backend.sh); override for your own registry/mirror.
+  repository: nabeemdev/reach
+  # -- Image tag. Defaults to the chart's appVersion when empty.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# -- Image pull secrets for a private registry.
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  # -- Create a dedicated ServiceAccount for the backend pods.
+  create: true
+  # -- Name to use; generated from the release when empty.
+  name: ""
+  annotations: {}
+
+# ==========================================================================
+# Application configuration
+# ==========================================================================
+config:
+  # -- Use an EXISTING Secret (e.g. from External Secrets / Sealed Secrets) instead of
+  # chart-managed values. Required keys are STORAGE-AWARE: always TOKEN_PEPPER,
+  # SESSION_SIGNING_KEY, ADMIN_PASSWORD; PLUS DATABASE_URL only when storageBackend=postgres
+  # (DynamoDB needs none); optionally METRICS_TOKEN. Setting this skips the chart-managed
+  # Secret AND the bundled Postgres (it implies you bring the datastore).
+  existingSecret: ""
+
+  # -- Postgres connection string. REQUIRED unless you set existingSecret OR enable the
+  # bundled Postgres (postgresql.enabled=true, which auto-wires this). Point it at your
+  # own/managed Postgres, e.g. postgresql://reach:reach@my-postgres:5432/reach
+  databaseUrl: ""
+  # -- HMAC pepper for hashing tokens & passwords. REQUIRED, stable, secret. Rotating it
+  # invalidates all existing tokens and logins - generate once and keep it.
+  tokenPepper: ""
+  # -- Signing key for session cookies/tokens. REQUIRED, secret.
+  sessionSigningKey: ""
+  # -- Platform-admin bootstrap password (the /admin console login). REQUIRED, secret.
+  adminPassword: ""
+  # -- Optional bearer token to protect the /metrics endpoint. Empty = metrics are open
+  # (read-only counters, no secrets) but still guard them with a NetworkPolicy.
+  metricsToken: ""
+
+  # -- Storage backend: "postgres" (default) or "dynamo". With "dynamo" (AWS/EKS only) no
+  # Postgres is used or bundled, DATABASE_URL is not required, and migrations run
+  # dynamo_bootstrap. Provide config.awsRegion and grant DynamoDB access to the pod's
+  # ServiceAccount via EITHER: IRSA (set serviceAccount.annotations."eks.amazonaws.com/role-arn"),
+  # OR EKS Pod Identity (no annotation - create a Pod Identity Association for this namespace +
+  # ServiceAccount out of band with `aws eks create-pod-identity-association`).
+  storageBackend: postgres
+  # -- AWS region for the DynamoDB backend (only used when storageBackend=dynamo). Sets
+  # AWS_REGION/AWS_DEFAULT_REGION; credentials come from IRSA or Pod Identity, not from here.
+  # This is the DynamoDB *tables'* region, independent of the cluster's region - set it to
+  # where the tables live. Cross-region (cluster in one region, tables in another) works but
+  # adds latency and inter-region data-transfer cost per request; co-locate them when you can.
+  awsRegion: ""
+  # -- Days to retain platform-wide audit entries (per-tenant retention is a tenant setting).
+  auditRetentionDays: 90
+  # -- Redis URI for distributed rate-limit state across replicas. Auto-wired when the bundled
+  # Redis is enabled (redis.enabled=true). Empty uses in-process limits (per replica), which is
+  # fine for small/single-replica deployments.
+  rateLimitStorageUri: ""
+  # -- Extra environment variables (list of {name, value} or valueFrom) for advanced tuning
+  # (e.g. FLEET_REAP_AFTER_SECONDS, METRICS_DOMAIN_GAUGES).
+  extraEnv: []
+
+# ==========================================================================
+# Database migrations
+# ==========================================================================
+migrations:
+  # -- Run `alembic upgrade head` in an initContainer before each backend pod serves. The step
+  # retries (so it waits for the DB to be reachable and tolerates a concurrent replica racing
+  # on a fresh DB); `alembic upgrade head` is idempotent. Disable only if you migrate out of band.
+  enabled: true
+  # -- Retry attempts for the migrate/wait-for-db initContainer (spaced retryDelaySeconds apart).
+  retries: 30
+  retryDelaySeconds: 3
+  # -- Postgres advisory-lock key used to serialize concurrent replica migrations. Any 64-bit
+  # int; only needs to be stable and unique to this app within the database.
+  advisoryLockKey: 8274630119
+
+# ==========================================================================
+# Bundled dependencies (optional). Off by default: production should point at a managed
+# Postgres / Redis. Enable these to run a self-contained stack (dev, demos, small installs).
+# ==========================================================================
+postgresql:
+  # -- Run an in-cluster Postgres and auto-wire DATABASE_URL to it. ON by default for a
+  # self-contained install; automatically skipped when you supply config.databaseUrl or
+  # config.existingSecret (your external DB takes precedence).
+  enabled: true
+  image: postgres:16-alpine
+  imagePullPolicy: IfNotPresent
+  auth:
+    username: reach
+    database: reach
+    # -- Password for the bundled Postgres. Leave EMPTY to auto-generate a strong one on first
+    # install and reuse it on upgrades (read back from the Secret via lookup). Set it explicitly
+    # only if you need a known value, or for GitOps tools that render without cluster access
+    # (Argo CD `helm template`), where an auto-generated value would churn each sync.
+    password: ""
+  persistence:
+    # -- Back the data dir with a PersistentVolumeClaim. Off = emptyDir (data lost on restart).
+    enabled: true
+    size: 8Gi
+    # -- StorageClass; empty uses the cluster default.
+    storageClass: ""
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 512Mi
+
+redis:
+  # -- Run an in-cluster Redis-protocol cache (Valkey by default) and auto-wire
+  # RATE_LIMIT_STORAGE_URI to it (shared rate-limit state across replicas). ON by default;
+  # automatically skipped when you supply config.rateLimitStorageUri (your external cache wins).
+  enabled: true
+  # -- Redis-compatible image. Valkey is the license-safe default; redis:7-alpine also works.
+  image: valkey/valkey:8-alpine
+  imagePullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 256Mi
+
+service:
+  type: ClusterIP
+  port: 80
+  annotations: {}
+
+ingress:
+  # -- Expose the console + API through an Ingress. The backend serves both the API and the
+  # web UI (at /ui), so a single host/path is enough.
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: reach.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+  #  - secretName: reach-tls
+  #    hosts:
+  #      - reach.example.com
+
+# -- Pod resource requests/limits. The backend is lightweight; tune for your load.
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    memory: 512Mi
+
+autoscaling:
+  # -- Horizontal Pod Autoscaler (CPU-based).
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 6
+  targetCPUUtilizationPercentage: 75
+
+# -- PodDisruptionBudget so a voluntary drain never takes the whole control plane down. Only
+# takes effect with 2+ replicas - it is intentionally not rendered for a single replica (where
+# minAvailable=1 would block node drains and cluster-autoscaler scale-down without adding any HA).
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+# NetworkPolicies (opt-in; requires a CNI that enforces them). When enabled the bundled Postgres
+# and Redis accept traffic ONLY from the backend, and the backend's ingress is restricted.
+networkPolicy:
+  # -- Create NetworkPolicies for the backend and the bundled Postgres/Redis.
+  enabled: false
+  # -- Extra ingress peers allowed to reach the backend on its HTTP port, beyond same-namespace
+  # pods (add your ingress-controller and/or Prometheus here). List of NetworkPolicyPeer.
+  ingressFrom: []
+  #  - namespaceSelector:
+  #      matchLabels: { kubernetes.io/metadata.name: ingress-nginx }
+  # -- Restrict backend egress to DNS + HTTPS(443) + the bundled/known DB & cache. Off (default)
+  # leaves egress open, so an external Postgres/Redis on non-standard ports keeps working; turn
+  # on for stricter egress and add any external DB/cache peers via egressTo.
+  restrictEgress: false
+  # -- Extra egress peers allowed when restrictEgress is on (e.g. an external Postgres CIDR).
+  egressTo: []
+
+# ==========================================================================
+# Health probes (the app serves GET /health on the container port).
+# ==========================================================================
+probes:
+  # Startup: give the process time to boot before liveness kicks in (migrations run in an
+  # initContainer, so by the time the app container starts it's just the server coming up).
+  startup:
+    enabled: true
+    periodSeconds: 5
+    failureThreshold: 12
+  readiness:
+    enabled: true
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    failureThreshold: 3
+  liveness:
+    enabled: true
+    initialDelaySeconds: 15
+    periodSeconds: 20
+    failureThreshold: 3
+
+# -- Prometheus metrics (the app exposes /metrics on the container port).
+metrics:
+  # -- Create a ServiceMonitor (requires the Prometheus Operator CRDs).
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    # Extra labels so your Prometheus's serviceMonitorSelector picks it up.
+    labels: {}
+
+# -- Pod-level security context. Runs non-root; the image is built for arbitrary uids.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+# -- Container security context. Read-only root filesystem (a /tmp emptyDir is mounted for
+# scratch); all capabilities dropped; no privilege escalation.
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+# -- Topology spread for backend replicas. Leave empty to get the chart's built-in best-effort
+# spread across nodes and zones (applied automatically when there is more than one replica;
+# ScheduleAnyway, so it never blocks scheduling). Set a value here to override that default.
+topologySpreadConstraints: []
+
+tests:
+  # -- Enable the `helm test` connection hook (a Pod that GETs the Service's /health and
+  # fails if it isn't 200). Run it with `helm test <release>`.
+  enabled: true

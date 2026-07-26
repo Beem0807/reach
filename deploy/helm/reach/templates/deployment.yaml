@@ -1,0 +1,202 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "reach.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "reach.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "reach.backend.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "reach.backend.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        # Roll pods when the config/secret content changes (so edits take effect on upgrade).
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if not .Values.config.existingSecret }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- end }}
+        {{- if (include "reach.usePostgresql" .) }}
+        # Roll the app pods if the bundled Postgres Secret (which holds DATABASE_URL) changes.
+        checksum/pgsecret: {{ include (print $.Template.BasePath "/postgresql.yaml") . | sha256sum }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "reach.serviceAccountName" . }}
+      # The backend calls no Kubernetes API - don't mount the SA token. (IRSA/Pod Identity for
+      # the DynamoDB backend inject their own credentials independently of this.)
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.migrations.enabled }}
+      # The image's default CMD migrates-then-serves; we split migration into this initContainer
+      # (app container is serve-only) so it can wait for the DB and, on Postgres, SERIALIZE
+      # concurrent replicas with a session advisory lock held across `alembic upgrade head` -
+      # idempotency alone doesn't prevent two replicas racing on a fresh DB's DDL. DynamoDB table
+      # creation is naturally idempotent, so it uses a simple retry loop. Same storage-aware
+      # split as the image CMD (Dockerfile) so the two can't drift.
+      initContainers:
+        - name: migrate
+          image: {{ include "reach.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          command: ["sh", "-c"]
+          args:
+            - |
+              if [ "$STORAGE_BACKEND" = "dynamo" ]; then
+                for i in $(seq 1 {{ .Values.migrations.retries }}); do
+                  python -m shared.dynamo_bootstrap && exit 0
+                  echo "reach: dynamo bootstrap attempt $i/{{ .Values.migrations.retries }} failed - retrying in {{ .Values.migrations.retryDelaySeconds }}s..."
+                  sleep {{ .Values.migrations.retryDelaySeconds }}
+                done
+                echo "reach: dynamo bootstrap did not complete"; exit 1
+              fi
+              # Postgres: wait for the DB, then hold a session advisory lock across the migration
+              # so concurrent replicas serialize on schema DDL. The lock auto-releases when this
+              # process exits; a replica that waited then finds the schema already at head (no-op).
+              python -c "
+              import os, time, sys, subprocess, sqlalchemy
+              from sqlalchemy import text
+              url = os.environ['DATABASE_URL']; conn = None
+              N = {{ .Values.migrations.retries }}; D = {{ .Values.migrations.retryDelaySeconds }}; K = {{ .Values.migrations.advisoryLockKey | int64 }}
+              for i in range(N):
+                  try: conn = sqlalchemy.create_engine(url).connect(); break
+                  except Exception as e: print('reach: waiting for DB', i + 1, '/', N, e, flush=True); time.sleep(D)
+              if conn is None: print('reach: database never became reachable'); sys.exit(1)
+              conn.execute(text('SELECT pg_advisory_lock(%d)' % K)); conn.commit()
+              print('reach: migration lock held; running alembic upgrade head', flush=True)
+              sys.exit(subprocess.call(['alembic', 'upgrade', 'head']))
+              "
+          envFrom:
+            {{- include "reach.envFrom" . | nindent 12 }}
+          {{- with .Values.config.extraEnv }}
+          env:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      {{- end }}
+      containers:
+        - name: backend
+          image: {{ include "reach.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          # Serve only. We override the image's default (migrate + serve) CMD because migrations
+          # are handled explicitly: by the initContainer above when migrations.enabled=true, or
+          # by you out of band when it's false. Either way the server never migrates per replica.
+          command: ["uvicorn"]
+          args:
+            - adapters.fastapi.main:app
+            - --host
+            - "0.0.0.0"
+            - --port
+            - "8000"
+          envFrom:
+            {{- include "reach.envFrom" . | nindent 12 }}
+          {{- with .Values.config.extraEnv }}
+          env:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          {{- if .Values.probes.startup.enabled }}
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: {{ .Values.probes.startup.periodSeconds }}
+            failureThreshold: {{ .Values.probes.startup.failureThreshold }}
+          {{- end }}
+          {{- if .Values.probes.readiness.enabled }}
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+          {{- end }}
+          {{- if .Values.probes.liveness.enabled }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+          {{- end }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            # readOnlyRootFilesystem is on; give the process a writable scratch dir.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml .Values.topologySpreadConstraints | nindent 8 }}
+      {{- else if gt ((.Values.autoscaling.enabled | ternary .Values.autoscaling.minReplicas .Values.replicaCount) | int) 1 }}
+      # Best-effort spread of backend replicas across nodes (and zones where labelled) so a
+      # single node/zone failure can't take out the whole control plane. ScheduleAnyway keeps
+      # this a soft preference - pods still schedule on small/single-node clusters. Override
+      # via .Values.topologySpreadConstraints.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "reach.backend.selectorLabels" . | nindent 14 }}
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "reach.backend.selectorLabels" . | nindent 14 }}
+      {{- end }}

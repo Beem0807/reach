@@ -1,0 +1,156 @@
+{{- if (include "reach.usePostgresql" .) }}
+{{- $name := include "reach.postgresql.fullname" . }}
+{{- $user := .Values.postgresql.auth.username }}
+{{- $db := .Values.postgresql.auth.database }}
+{{- /* Capture the password ONCE (generated or reused), then use it for both the DB and the
+       DATABASE_URL the app reads - so there is a single source of truth. */}}
+{{- $pw := include "reach.postgresql.password" . }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "reach.labels" . | nindent 4 }}
+    {{- include "reach.postgresql.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  POSTGRES_USER: {{ $user | quote }}
+  POSTGRES_PASSWORD: {{ $pw | quote }}
+  POSTGRES_DB: {{ $db | quote }}
+  # The app + migration containers read DATABASE_URL from here (via envFrom), so the generated
+  # password lives in exactly one place.
+  DATABASE_URL: {{ printf "postgresql://%s:%s@%s:5432/%s" $user $pw $name $db | quote }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "reach.labels" . | nindent 4 }}
+    {{- include "reach.postgresql.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "reach.postgresql.labels" . | nindent 4 }}
+  ports:
+    - name: postgresql
+      port: 5432
+      targetPort: postgresql
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "reach.labels" . | nindent 4 }}
+    {{- include "reach.postgresql.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ $name }}
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "reach.postgresql.labels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "reach.labels" . | nindent 8 }}
+        {{- include "reach.postgresql.labels" . | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      # Postgres talks to no Kubernetes API - don't mount the SA token.
+      automountServiceAccountToken: false
+      # The official postgres image manages its own user; set fsGroup so the mounted volume is
+      # writable and run as the postgres uid/gid (70 on alpine). runAsNonRoot + seccompProfile
+      # (plus the container securityContext below) keep it admissible under Pod Security
+      # Admission "restricted". readOnlyRootFilesystem is intentionally NOT set - restricted
+      # doesn't require it and postgres needs to write its socket/runtime dirs.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 70
+        runAsGroup: 70
+        fsGroup: 70
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: postgresql
+          image: {{ .Values.postgresql.image | quote }}
+          imagePullPolicy: {{ .Values.postgresql.imagePullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            # The data dir is the PVC and the runtime/socket + temp dirs are emptyDir mounts
+            # below, so the image's root filesystem can be read-only.
+            readOnlyRootFilesystem: true
+          envFrom:
+            - secretRef:
+                name: {{ $name }}
+          env:
+            # Keep data in a subdir so a volume's lost+found doesn't collide with initdb.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - name: postgresql
+              containerPort: 5432
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" -h 127.0.0.1"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" -h 127.0.0.1"]
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          {{- with .Values.postgresql.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            # Writable dirs so the root filesystem can stay read-only: the Unix socket / lock
+            # dir and temp space (Postgres' actual data is on the `data` volume above).
+            - name: run
+              mountPath: /var/run/postgresql
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: run
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+      {{- if not .Values.postgresql.persistence.enabled }}
+        - name: data
+          emptyDir: {}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  {{- if .Values.postgresql.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          {{- include "reach.labels" . | nindent 10 }}
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.postgresql.persistence.storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.postgresql.persistence.size | quote }}
+  {{- end }}
+{{- end }}

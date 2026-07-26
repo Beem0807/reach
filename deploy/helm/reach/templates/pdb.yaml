@@ -1,0 +1,18 @@
+{{- $replicas := .Values.autoscaling.enabled | ternary .Values.autoscaling.minReplicas .Values.replicaCount | int }}
+{{- /* Only emit a PDB when there are at least 2 replicas. A minAvailable=1 PDB on a single
+       replica allows zero voluntary disruptions, which deadlocks `kubectl drain` and blocks
+       cluster-autoscaler scale-down - and it protects nothing (a lone pod isn't HA anyway). */}}
+{{- if and .Values.podDisruptionBudget.enabled (gt $replicas 1) }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "reach.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "reach.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "reach.backend.selectorLabels" . | nindent 6 }}
+{{- end }}

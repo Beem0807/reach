@@ -74,7 +74,7 @@ That's it: your AI agent has **controlled, audited** access to the machine - no 
 
 The agent never accepts inbound connections - it makes outbound HTTPS requests to your backend, polls for jobs, runs them, and posts results back.
 
-1. Deploy the backend (Local, Lambda, or Docker).
+1. Deploy the backend (Local, Lambda, Docker, or Kubernetes).
 2. Register agents in the console (or let the setup script do it) - you get ready-to-paste install commands.
 3. Install the CLI locally and the agent on each machine.
 4. Queue commands via the CLI, MCP, or the console; the agent picks them up and runs them; results come back.
@@ -102,15 +102,16 @@ The local and Lambda setup scripts do 1-3 for you. See [ARCHITECTURE.md](ARCHITE
 
 ## Deployment
 
-Reach is self-hosted. The Quick Start above uses the Local script; three backends are available:
+Reach is self-hosted. The Quick Start above uses the Local script; four backends are available:
 
 | Backend                             | Setup                                                                        |
 | ----------------------------------- | ---------------------------------------------------------------------------- |
 | **Local** (no cloud account)        | `curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh \| bash`  |
 | **AWS Lambda + DynamoDB**           | `curl -fsSL https://reach-releases.s3.amazonaws.com/lambda-setup.sh \| bash` |
 | **Docker + PostgreSQL** (any cloud) | `docker run … nabeemdev/reach:0.1.0`, then finish in the console at `/ui`    |
+| **Kubernetes** (Helm)               | `helm install reach reach/reach …` - self-contained (bundles Postgres + Redis), or wire to managed Postgres / DynamoDB |
 
-The Local and Lambda scripts are interactive and re-runnable (`--update`, `--down`, …) and enroll your first agent for you. Full setup - environment variables, installing the CLI, enrolling **host / Kubernetes / fleet** agents, grants, and lifecycle - is in **[SELF_HOSTING.md](SELF_HOSTING.md)**.
+The Local and Lambda scripts are interactive and re-runnable (`--update`, `--down`, …) and enroll your first agent for you. The **Kubernetes backend** runs the same image via the [`reach`](deploy/helm/reach) Helm chart - self-contained by default, or point it at a managed Postgres (or DynamoDB on EKS). Full setup - environment variables, installing the CLI, enrolling **host / Kubernetes / fleet** agents, grants, and lifecycle - is in **[SELF_HOSTING.md](SELF_HOSTING.md)**.
 
 ---
 
@@ -155,8 +156,9 @@ A built-in **audit log** (every action - logins, agent/fleet lifecycle, policy c
 | [cli/README.md](cli/README.md)                     | The `reach` CLI and `reach-mcp` server - install, commands, profiles, aliases, MCP setup                                                        |
 | [POLICIES.md](POLICIES.md)                         | Policy modes (approved/readonly/wild), approvals, host vs Kubernetes enforcement, structured host & k8s rules, `access_level`                   |
 | [agent/README.md](agent/README.md)                 | How the agent works - host vs Kubernetes, credential-only identity, the poll loop, execution models, leader election, RBAC self-review, metrics |
-| [deploy/helm/reach-agent](deploy/helm/reach-agent) | Kubernetes agent Helm chart - install, RBAC (`clusterAccess`), execution allowlist, and all values                                              |
-| [SELF_HOSTING.md](SELF_HOSTING.md)                 | Deploy and operate your own backend (Local, AWS Lambda, Docker), setup, agent lifecycle, grants, blocked-command reference                      |
+| [deploy/helm/reach](deploy/helm/reach)             | Kubernetes **backend** Helm chart - API + console, bundled Postgres/Redis or external, DynamoDB (IRSA/Pod Identity), migrations, and all values  |
+| [deploy/helm/reach-agent](deploy/helm/reach-agent) | Kubernetes **agent** Helm chart - install, RBAC (`clusterAccess`), execution allowlist, and all values                                          |
+| [SELF_HOSTING.md](SELF_HOSTING.md)                 | Deploy and operate your own backend (Local, AWS Lambda, Docker, Kubernetes), setup, agent lifecycle, grants, blocked-command reference          |
 | [API.md](API.md)                                   | Complete HTTP endpoint reference, rate limits, pagination, audit-log actions                                                                    |
 | [ARCHITECTURE.md](ARCHITECTURE.md)                 | How the pieces fit - command flow, token model, storage split, policy enforcement, approvals, fleets, multi-tenancy                             |
 | [SECURITY.md](SECURITY.md)                         | Threat model, token storage and rotation, revoking access, audit history, production hardening                                                  |

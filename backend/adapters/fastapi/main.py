@@ -137,7 +137,22 @@ def _rate_limit_key(request: Request) -> str:
 # RATE_LIMIT_STORAGE_URI to a shared store, e.g. redis://host:6379. Defaults to
 # in-memory, which is right for a single instance or local dev.
 _RATE_LIMIT_STORAGE = os.environ.get("RATE_LIMIT_STORAGE_URI", "memory://")
-limiter = Limiter(key_func=_rate_limit_key, storage_uri=_RATE_LIMIT_STORAGE)
+# Resilience if the rate-limit store is unreachable. With a shared store (e.g. Redis), a
+# store outage would otherwise raise on every limited request and 500 the whole API - i.e.
+# the limiter becomes a hard dependency that can take the service down.
+#   - in_memory_fallback_enabled: on a store error slowapi transparently switches to a
+#     per-process in-memory limiter (so limits are still enforced, just per-replica rather
+#     than globally) and periodically probes the real store, auto-switching back on recovery.
+#     This also keeps X-RateLimit bookkeeping consistent, avoiding a secondary 500.
+#   - swallow_errors: belt-and-suspenders - if even the fallback path errors, fail OPEN
+#     (request proceeds) rather than 500. The in-memory default store can't error, so this
+#     whole block only matters for the shared-store case.
+limiter = Limiter(
+    key_func=_rate_limit_key,
+    storage_uri=_RATE_LIMIT_STORAGE,
+    in_memory_fallback_enabled=True,
+    swallow_errors=True,
+)
 
 
 async def _rate_limit_handler(request: Request, exc: RateLimitExceeded) -> JSONResponse:

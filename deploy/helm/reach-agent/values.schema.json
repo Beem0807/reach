@@ -1,0 +1,169 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "reach-agent chart values",
+  "description": "Validates values at `helm install`/`upgrade`/`template`/`lint` time. Top-level and most nested objects reject unknown keys, so typos (e.g. `reach.apiURL`, `clusterAccess.scope: namespace`) fail fast instead of being silently ignored.",
+  "type": "object",
+  "additionalProperties": false,
+  "definitions": {
+    "pullPolicy": {
+      "type": "string",
+      "enum": ["Always", "IfNotPresent", "Never"]
+    },
+    "resourceMap": {
+      "type": "object",
+      "description": "cpu/memory/ephemeral-storage etc. Quantities are strings (\"50m\", \"64Mi\") or plain integers.",
+      "additionalProperties": { "type": ["string", "integer"] }
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "requests": { "$ref": "#/definitions/resourceMap" },
+        "limits": { "$ref": "#/definitions/resourceMap" }
+      }
+    },
+    "optionalSeconds": {
+      "description": "Empty string uses the agent's built-in default; otherwise an integer (or its string form).",
+      "type": ["integer", "string"]
+    }
+  },
+  "properties": {
+    "global": {
+      "type": "object",
+      "description": "Reserved for Helm when this chart is used as a subchart; not read by the chart itself."
+    },
+    "replicaCount": { "type": "integer", "minimum": 1 },
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "tag": { "type": "string" },
+        "pullPolicy": { "$ref": "#/definitions/pullPolicy" }
+      }
+    },
+    "imagePullSecrets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": { "name": { "type": "string" } },
+        "required": ["name"]
+      }
+    },
+    "reach": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "apiUrl": { "type": "string" },
+        "installToken": { "type": "string" },
+        "existingSecret": { "type": "string" }
+      }
+    },
+    "tokenSecretName": { "type": "string" },
+    "extraAllowedBinaries": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "url": { "type": "string" },
+          "sha256": { "type": "string" },
+          "archivePath": { "type": "string" }
+        },
+        "required": ["name"]
+      }
+    },
+    "allowedBinaries": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "permissionReviewIntervalSeconds": { "$ref": "#/definitions/optionalSeconds" },
+    "commandTimeoutSeconds": { "$ref": "#/definitions/optionalSeconds" },
+    "maxOutputBytes": { "$ref": "#/definitions/optionalSeconds" },
+    "leaderElection": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "leaseName": { "type": "string" }
+      }
+    },
+    "livenessProbe": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "staleSeconds": { "type": "integer", "minimum": 1 },
+        "initialDelaySeconds": { "type": "integer", "minimum": 0 },
+        "periodSeconds": { "type": "integer", "minimum": 1 },
+        "failureThreshold": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "serviceAccount": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "create": { "type": "boolean" },
+        "name": { "type": "string" },
+        "annotations": { "type": "object" }
+      }
+    },
+    "rbac": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "create": { "type": "boolean" }
+      }
+    },
+    "clusterAccess": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "roleName": { "type": "string" },
+        "scope": { "type": "string", "enum": ["cluster", "namespaces"] },
+        "namespaces": { "type": "array", "items": { "type": "string" } },
+        "rules": { "type": "array", "items": { "type": "object" } }
+      }
+    },
+    "resources": { "$ref": "#/definitions/resources" },
+    "podSecurityContext": { "type": "object" },
+    "securityContext": { "type": "object" },
+    "podAnnotations": { "type": "object" },
+    "podLabels": { "type": "object" },
+    "nodeSelector": { "type": "object" },
+    "tolerations": { "type": "array" },
+    "affinity": { "type": "object" },
+    "topologySpreadConstraints": { "type": "array" },
+    "extraEnv": { "type": "array", "items": { "type": "object" } },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "serviceMonitor": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "interval": { "type": "string" },
+            "scrapeTimeout": { "type": "string" },
+            "namespace": { "type": "string" },
+            "labels": { "type": "object" }
+          }
+        },
+        "networkPolicy": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "prometheusNamespace": { "type": "string" },
+            "from": { "type": "array" }
+          }
+        }
+      }
+    }
+  }
+}

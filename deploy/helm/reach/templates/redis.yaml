@@ -1,0 +1,93 @@
+{{- if (include "reach.useRedis" .) }}
+{{- $name := include "reach.redis.fullname" . }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "reach.labels" . | nindent 4 }}
+    {{- include "reach.redis.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "reach.redis.labels" . | nindent 4 }}
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "reach.labels" . | nindent 4 }}
+    {{- include "reach.redis.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  # Rate-limit state is ephemeral; a restart just re-warms. No persistence needed.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "reach.redis.labels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "reach.labels" . | nindent 8 }}
+        {{- include "reach.redis.labels" . | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      # Redis/Valkey talks to no Kubernetes API - don't mount the SA token.
+      automountServiceAccountToken: false
+      securityContext:
+        # The valkey/redis image ships a non-root user but doesn't default to it (USER unset),
+        # so run as it explicitly to satisfy runAsNonRoot. valkey = 999:1000.
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: redis
+          image: {{ .Values.redis.image | quote }}
+          imagePullPolicy: {{ .Values.redis.imagePullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          # Ephemeral cache: no on-disk persistence (readOnlyRootFilesystem-friendly).
+          args: ["--save", "", "--appendonly", "no"]
+          ports:
+            - name: redis
+              containerPort: 6379
+          readinessProbe:
+            tcpSocket:
+              port: redis
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: redis
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          {{- with .Values.redis.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}
