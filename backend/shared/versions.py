@@ -23,8 +23,8 @@ from typing import List, Optional
 
 logger = logging.getLogger()
 
-_S3_BASE = os.environ.get("RELEASES_S3_BASE", "https://reach-releases.s3.amazonaws.com")
-_CHART_REPO_URL = os.environ.get("RELEASES_CHART_REPO", f"{_S3_BASE}/charts/reach-agent")
+_BASE_URL = os.environ.get("RELEASES_BASE_URL", "https://releases.reach.nabeem.com")
+_CHART_REPO_URL = os.environ.get("RELEASES_CHART_REPO", f"{_BASE_URL}/charts/reach-agent")
 
 # A version string safe to interpolate into an install command. Strict on
 # purpose: these values reach a shell (`helm --version X`, `curl .../agent/X/`).
@@ -71,7 +71,7 @@ def _chart_versions() -> List[str]:
 
 
 def _host_versions() -> List[str]:
-    url = f"{_S3_BASE.rstrip('/')}/agent/versions.json"
+    url = f"{_BASE_URL.rstrip('/')}/agent/versions.json"
     try:
         with urllib.request.urlopen(url, timeout=4) as resp:  # nosec - fixed release URL
             data = json.loads(resp.read().decode("utf-8", "replace"))

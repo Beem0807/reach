@@ -1540,10 +1540,21 @@ def make_approvals(
     ]
 
 
+# Mirrors backend/shared/password.py (scrypt). The console's verify_password rejects any
+# non-scrypt hash, so seeded logins MUST use the same scheme/format or every seeded login fails.
+# Keep the parameters in sync with shared/password.py. Memoized: this is throwaway dev data, so
+# reusing a salt across identical dev passwords is harmless and keeps the seed fast (scrypt is
+# deliberately ~tens of ms per hash, and the bulk tenants create hundreds of users).
+_PW_N, _PW_R, _PW_P = 2 ** 16, 8, 1
+_pw_cache: dict = {}
+
 def _hash_password(password: str) -> str:
-    salt = secrets.token_hex(16)
-    h = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 200_000)
-    return f"pbkdf2${salt}${h.hex()}"
+    if password not in _pw_cache:
+        salt = secrets.token_bytes(16)
+        dk = hashlib.scrypt(password.encode(), salt=salt, n=_PW_N, r=_PW_R, p=_PW_P,
+                            dklen=32, maxmem=128 * 1024 * 1024)
+        _pw_cache[password] = f"scrypt${_PW_N}${_PW_R}${_PW_P}${salt.hex()}${dk.hex()}"
+    return _pw_cache[password]
 
 
 def make_tenant_admin_users(tenant_id: str, tenant_slug: str, restrict_agent_id: str = None,

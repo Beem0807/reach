@@ -214,6 +214,23 @@ class TestHandleCreateTenantAgent:
         cmd = json.loads(r["body"])["commands"]["agent"]
         assert "/agent/v0.9.4/install.sh" in cmd
 
+    def test_host_install_offers_verified_path(self):
+        # The one-liner is retained; a verifiable download->authenticate->inspect->run path
+        # is offered alongside it (cosign signature over the checksums), same version pin.
+        cmds = json.loads(self._call(body={"mode": "wild", "version": "0.9.4"})[0]["body"])["commands"]
+        assert cmds["agent"].startswith("curl -fsSL ") and "| sudo bash" in cmds["agent"]
+        v = cmds["agent_verified"]
+        assert "cosign verify-blob" in v
+        assert "SHA256SUMS" in v and "sha256sum --ignore-missing -c SHA256SUMS" in v
+        assert "less install.sh" in v          # inspect step
+        assert "/agent/v0.9.4/" in v           # same version pin as the one-liner
+        assert "sudo bash install.sh" in v and "| sudo bash" not in v  # runs a local file, not piped
+
+    def test_k8s_install_has_no_piped_bash(self):
+        # k8s onboarding is `helm install`, never curl|bash - and offers no host verified path.
+        cmds = json.loads(self._call(body={"mode": "wild", "type": "k8s"})[0]["body"])["commands"]
+        assert "helm" in cmds and "agent_verified" not in cmds
+
     def test_picked_k8s_version_pins_helm_chart(self):
         r, _ = self._call(body={"mode": "wild", "type": "k8s", "version": "0.2.0"})
         helm = json.loads(r["body"])["commands"]["helm"]

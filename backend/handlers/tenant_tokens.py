@@ -4,7 +4,7 @@ import logging
 
 from shared.auth import _hmac_token
 from shared.response import _err, _iso, _ok
-from shared.store import api_tokens_repo
+from shared.store import api_tokens_repo, users_repo
 from shared.auth import _verify_tenant_payload
 import shared.audit as audit
 
@@ -124,6 +124,12 @@ def handle_revoke_all_user_tokens(user_id: str, token_payload: dict, ip: str = "
     if token_payload.get("role") not in ("admin",):
         return _err("forbidden", 403)
     tenant_id = token_payload["tenant_id"]
+    # Confirm the target user belongs to the caller's tenant before touching anything, so a
+    # cross-tenant user_id is refused (404) rather than silently processed (the per-token tenant
+    # filter below already prevents any cross-tenant revocation - this is the up-front guard).
+    target = users_repo.get(user_id)
+    if not target or target.get("tenant_id") != tenant_id:
+        return _err("user not found", 404)
     tokens = api_tokens_repo.list_by_user(user_id)
     now = _iso()
     revoked = 0

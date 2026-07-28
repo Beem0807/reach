@@ -10,6 +10,16 @@ from shared.response import _iso
 
 _ddb = boto3.resource("dynamodb")
 
+
+def _clean(item: dict) -> dict:
+    """Drop keys whose value is None before a put_item. DynamoDB serializes Python None to the NULL
+    type, which is REJECTED for any attribute that is a table/GSI key (e.g. a standalone agent's
+    ``fleet_id``, a fleet's ``prev_join_token_hash``, a non-run job's ``run_id``) - the put_item
+    fails with a ValidationException and the Lambda returns 500. On a fresh item an absent attribute
+    is equivalent to None on read, so stripping None is always safe. (SQL/Postgres stores NULL fine,
+    which is why this only bites the DynamoDB backend.)"""
+    return {k: v for k, v in item.items() if v is not None}
+
 # DynamoDB items are capped at 400KB. The agent hashes and (mostly) sends the full
 # RBAC snapshot; here - and only here, for the DynamoDB backend - we truncate for
 # storage so `current` + `acknowledged` snapshots fit in one item. The hash is left
@@ -267,7 +277,7 @@ class AgentRepo:
             raise
 
     def create(self, agent: dict) -> None:
-        _TABLE_AGENTS.put_item(Item=agent)
+        _TABLE_AGENTS.put_item(Item=_clean(agent))
 
     def get_by_fleet_and_fingerprint(self, fleet_id: str, machine_fingerprint: str) -> Optional[dict]:
         if not fleet_id or not machine_fingerprint:
@@ -544,7 +554,7 @@ class AgentRepo:
 
 class JobRepo:
     def create(self, job: dict) -> None:
-        _TABLE_JOBS.put_item(Item=job)
+        _TABLE_JOBS.put_item(Item=_clean(job))
 
     def get(self, job_id: str) -> Optional[dict]:
         return _TABLE_JOBS.get_item(Key={"job_id": job_id}).get("Item")
@@ -785,7 +795,7 @@ class TenantRepo:
         name = tenant.get("name", "")
         if name and self.get_by_name(name):
             raise NameTakenError(name)
-        _TABLE_TENANTS.put_item(Item=tenant)
+        _TABLE_TENANTS.put_item(Item=_clean(tenant))
 
     def list_all(self) -> list:
         results = []
@@ -852,7 +862,7 @@ class FleetRepo:
         name = fleet.get("name", "")
         if name and self.get_by_name(fleet.get("tenant_id", ""), name):
             raise NameTakenError(name)
-        _TABLE_FLEETS.put_item(Item=fleet)
+        _TABLE_FLEETS.put_item(Item=_clean(fleet))
 
     def list_by_tenant(self, tenant_id: str) -> list:
         results: list = []
@@ -968,7 +978,7 @@ class UserRepo:
         return _TABLE_USERS.get_item(Key={"user_id": user_id}).get("Item")
 
     def create(self, user: dict) -> None:
-        _TABLE_USERS.put_item(Item=user)
+        _TABLE_USERS.put_item(Item=_clean(user))
 
     def list_by_tenant(self, tenant_id: str) -> list:
         return _TABLE_USERS.query(
@@ -1093,7 +1103,7 @@ class ApprovalRepo:
         # (DynamoDB has no ILIKE). The SQL repo uses ILIKE and stores neither.
         item["command_lc"] = (item.get("command") or "").lower()
         item["requester_name_lc"] = (item.get("requester_name") or "").lower()
-        _TABLE_APPROVALS.put_item(Item=item)
+        _TABLE_APPROVALS.put_item(Item=_clean(item))
 
     def get(self, approval_id: str) -> Optional[dict]:
         return _TABLE_APPROVALS.get_item(Key={"approval_id": approval_id}).get("Item")
@@ -1414,7 +1424,7 @@ class ApprovalRepo:
 
 class ApiTokenRepo:
     def create(self, token: dict) -> None:
-        _TABLE_API_TOKENS.put_item(Item=token)
+        _TABLE_API_TOKENS.put_item(Item=_clean(token))
 
     def get_by_hash(self, token_hash: str) -> Optional[dict]:
         items = _TABLE_API_TOKENS.query(
@@ -1489,7 +1499,7 @@ _TABLE_AGENT_HISTORY = _ddb.Table("reach-agent-history")
 
 class RunRepo:
     def create(self, run: dict) -> None:
-        _TABLE_RUNS.put_item(Item=run)
+        _TABLE_RUNS.put_item(Item=_clean(run))
 
     def get(self, run_id: str) -> Optional[dict]:
         return _TABLE_RUNS.get_item(Key={"run_id": run_id}).get("Item")
@@ -1556,7 +1566,7 @@ class RunRepo:
 
 class AgentHistoryRepo:
     def create(self, entry: dict) -> None:
-        _TABLE_AGENT_HISTORY.put_item(Item=entry)
+        _TABLE_AGENT_HISTORY.put_item(Item=_clean(entry))
 
     def list_by_agent(self, agent_id: str, limit: int = 50) -> list:
         return _TABLE_AGENT_HISTORY.query(
@@ -1578,7 +1588,7 @@ class AuditRepo:
         # (DynamoDB has no ILIKE). The SQL repo uses ILIKE and stores none of these.
         for field in ("actor_name", "resource_id", "ip_address"):
             item[f"{field}_lc"] = (item.get(field) or "").lower()
-        _TABLE_AUDIT_LOGS.put_item(Item=item)
+        _TABLE_AUDIT_LOGS.put_item(Item=_clean(item))
 
     def list_platform(self, limit: int = 100, cursor: Optional[str] = None,
                       action: Optional[str] = None, actor: Optional[str] = None,

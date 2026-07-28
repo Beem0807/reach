@@ -33,7 +33,7 @@ Reach agent for Kubernetes - gives AI agents controlled, audited command executi
    pre-filled and with the chart `--version` pinned):
 
 ```bash
-helm repo add reach https://reach-releases.s3.amazonaws.com/charts/reach-agent --force-update
+helm repo add reach https://releases.reach.nabeem.com/charts/reach-agent --force-update
 helm install reach-agent reach/reach-agent \
   --namespace reach --create-namespace \
   --set reach.apiUrl=https://reach.example.com \
@@ -65,7 +65,7 @@ at this repo. Example Argo CD `Application`:
 ```yaml
 spec:
   source:
-    repoURL: https://reach-releases.s3.amazonaws.com/charts/reach-agent
+    repoURL: https://releases.reach.nabeem.com/charts/reach-agent
     chart: reach-agent
     targetRevision: "*"          # track the latest chart automatically
     # or pin/range for controlled, PR-driven updates: "0.1.0" | ">=0.1.0 <0.2.0"

@@ -15,13 +15,13 @@ Globals:
         SESSION_SIGNING_KEY: !Ref SessionSigningKey
         ADMIN_PASSWORD: !Ref AdminPassword
         STORAGE_BACKEND: dynamo
-        RELEASES_S3_BASE: !Ref ReleasesS3Base
-        # Empty ReleasesChartRepo derives the repo from ReleasesS3Base rather than
+        RELEASES_BASE_URL: !Ref ReleasesBaseUrl
+        # Empty ReleasesChartRepo derives the repo from ReleasesBaseUrl rather than
         # setting an empty env var (which would override the backend's default).
         RELEASES_CHART_REPO: !If
           - HasChartRepo
           - !Ref ReleasesChartRepo
-          - !Sub "${ReleasesS3Base}/charts/reach-agent"
+          - !Sub "${ReleasesBaseUrl}/charts/reach-agent"
         # Retention windows (approval/job/run/agent-history) and the fan-out cap are
         # per-tenant settings now, not env vars. The platform-level audit trail
         # (tenant_id IS NULL) keeps its own deployment-wide window here.
@@ -54,21 +54,21 @@ Parameters:
     Type: String
     NoEcho: true
     Description: Password for the admin console (generates 8-hour session tokens on login)
-  ReleasesS3Base:
+  ReleasesBaseUrl:
     Type: String
-    Default: "https://reach-releases.s3.amazonaws.com"
+    Default: "https://releases.reach.nabeem.com"
     Description: Base URL for agent binary downloads (override if self-hosting binaries)
   ReleasesChartRepo:
     Type: String
     Default: ""
-    Description: Helm chart repo URL for the generated k8s helm command. Empty derives it from ReleasesS3Base (<base>/charts/reach-agent).
+    Description: Helm chart repo URL for the generated k8s helm command. Empty derives it from ReleasesBaseUrl (<base>/charts/reach-agent).
   AuditRetentionDays:
     Type: Number
     Default: 90
     Description: Days to retain platform-level audit log records (tenant_id IS NULL) before the daily cleanup deletes them. Per-tenant audit/job/approval/run/agent-history retention and the fan-out cap are tenant settings, not stack parameters.
 
 Conditions:
-  # Chart repo explicitly set vs. derived from ReleasesS3Base.
+  # Chart repo explicitly set vs. derived from ReleasesBaseUrl.
   HasChartRepo: !Not [!Equals [!Ref ReleasesChartRepo, ""]]
 
 Resources:
@@ -1647,6 +1647,23 @@ Resources:
             Name: reach-heartbeat-check
             Description: Mark agents INACTIVE (45s gap); expire stale approvals hourly; purge old terminal approvals daily
 
+  # Catch-all for paths that match no route above. HTTP API prefers specific routes over the greedy
+  # {proxy+}, so defined routes are unaffected; only genuinely-unknown paths land here and get a
+  # content-negotiated 404 (a friendly HTML page for browsers, JSON for API clients) instead of API
+  # Gateway's bare {"message":"Not Found"}.
+  CatchAllFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: reach-not-found
+      Role: !GetAtt LambdaRole.Arn
+      Handler: handlers.not_found.not_found_handler
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /{proxy+}
+            Method: ANY
+
   # -----------------------------------------------------------------------
   # UI: S3 bucket + CloudFront distribution
   # -----------------------------------------------------------------------
@@ -1691,13 +1708,97 @@ Resources:
       Name: !Sub "reach-ui-rewrite-${AWS::StackName}"
       AutoPublish: true
       FunctionConfig:
-        Comment: Rewrite /ui and /ui/ to /ui/index.html for SPA entry point
+        Comment: /ui/ entry point; serve assets, and content-negotiated 404 for stray /ui/ paths
+        Runtime: cloudfront-js-2.0
+      FunctionCode: |
+        function handler(event) {
+          var request = event.request;
+          var uri = request.uri;
+          // Scoped to the /ui/* behavior, so uri always starts with /ui/.
+          if (uri === '/ui/') {
+            request.uri = '/ui/index.html';
+            return request;
+          }
+          // A real asset (its last segment has a file extension) passes through to S3.
+          var last = uri.substring(uri.lastIndexOf('/') + 1);
+          if (last.indexOf('.') !== -1) {
+            return request;
+          }
+          // A stray extension-less path under /ui/: return the SAME content-negotiated 404 the API
+          // catch-all (handlers/not_found.py) and the FastAPI adapter serve - so /ui/x behaves like
+          // /uix. JSON for API clients; the shared HTML page for browsers. The page below is kept
+          // byte-identical to shared/error_page.py NOT_FOUND_HTML, enforced by
+          // backend/tests/test_cloudfront_404_parity.py (so the embedded copy can't drift).
+          var accept = (request.headers.accept && request.headers.accept.value) || '';
+          if (accept.indexOf('text/html') === -1) {
+            return {
+              statusCode: 404, statusDescription: 'Not Found',
+              headers: { 'content-type': { value: 'application/json' } },
+              body: '{"error": "not found"}'
+            };
+          }
+          var body = [
+            '<!doctype html>',
+            '<html lang="en">',
+            '<head>',
+            '<meta charset="utf-8">',
+            '<meta name="viewport" content="width=device-width, initial-scale=1">',
+            '<title>Not found · reach</title>',
+            '<style>',
+            '  :root { color-scheme: dark; }',
+            '  body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;',
+            '         background:#0f172a; color:#e2e8f0;',
+            '         font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }',
+            '  .card { text-align:center; padding:2.5rem 2rem; }',
+            '  .code { font-size:3.5rem; font-weight:700; color:#818cf8; margin:0; line-height:1; }',
+            '  h1 { font-size:1.25rem; font-weight:600; margin:.75rem 0 .25rem; }',
+            '  p { color:#94a3b8; margin:.25rem 0 1.5rem; }',
+            '  a { display:inline-block; background:#4f46e5; color:#fff; text-decoration:none; font-weight:600;',
+            '      font-size:.9rem; padding:.6rem 1.2rem; border-radius:.5rem; transition:background .15s; }',
+            '  a:hover { background:#4338ca; }',
+            '</style>',
+            '</head>',
+            '<body>',
+            '  <div class="card">',
+            '    <p class="code">404</p>',
+            '    <h1>Page not found</h1>',
+            '    <p>This page doesn&#39;t exist.</p>',
+            '    <a href="/ui/">Go to the console</a>',
+            '  </div>',
+            '</body>',
+            '</html>'
+          ].join('\n');
+          return {
+            statusCode: 404, statusDescription: 'Not Found',
+            headers: { 'content-type': { value: 'text/html; charset=utf-8' } },
+            body: body
+          };
+        }
+
+  # The default behavior fronts the API (which has no "/" route), so a browser hitting the bare
+  # domain would get an API 404. Redirect "/" -> "/ui/" at the edge, mirroring the FastAPI app's
+  # GET "/" -> /ui/ redirect (the Lambda deployment uses per-route handlers, not the FastAPI app).
+  RootRedirectFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub "reach-root-redirect-${AWS::StackName}"
+      AutoPublish: true
+      FunctionConfig:
+        Comment: Redirect the bare root and bare app prefix to the canonical UI (/ and /ui -> /ui/)
         Runtime: cloudfront-js-2.0
       FunctionCode: |
         function handler(event) {
           var uri = event.request.uri;
-          if (uri === '/ui' || uri === '/ui/') {
-            event.request.uri = '/ui/index.html';
+          // The /ui/* behavior handles /ui/ and its assets; /ui with no trailing slash does NOT
+          // match it, so canonicalize it (and the bare root) to /ui/ here. Everything else falls
+          // through to the API - including near-miss paths like /uii, which then get the API's
+          // content-negotiated 404 (the same page the FastAPI adapter serves).
+          if (uri === '/' || uri === '' || uri === '/ui') {
+            return {
+              statusCode: 301,
+              statusDescription: 'Moved Permanently',
+              headers: { 'location': { value: '/ui/' } }
+            };
           }
           return event.request;
         }
@@ -1724,8 +1825,15 @@ Resources:
           CachedMethods: [GET, HEAD]
           CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad       # CachingDisabled
           OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac  # AllViewerExceptHostHeader
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt RootRedirectFunction.FunctionARN
         CacheBehaviors:
-          - PathPattern: /ui*
+          # /ui/* (NOT /ui*) so near-miss paths like /uii don't get diverted to S3 (where a missing
+          # key is an AccessDenied). They fall through to the default (API) behavior instead, which
+          # returns the content-negotiated 404 - matching the FastAPI adapter. /ui (no slash) is
+          # canonicalized to /ui/ by RootRedirectFunction on the default behavior.
+          - PathPattern: /ui/*
             TargetOriginId: AdminUiS3Origin
             ViewerProtocolPolicy: redirect-to-https
             AllowedMethods: [GET, HEAD, OPTIONS]

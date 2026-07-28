@@ -32,7 +32,13 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 COPY backend/adapters/fastapi/requirements.txt requirements.txt
-RUN pip install -r requirements.txt
+# Install deps, then REMOVE pip from the final image. pip is build-time only here (the runtime is
+# uvicorn and never installs packages), and it bundles vendored libraries - msgpack, setuptools, ...
+# - that scanners flag as HIGH, plus pip's own CVEs. Nothing at runtime (uvicorn, alembic, the
+# /health check) needs pip, so dropping it eliminates that whole class of finding and trims attack
+# surface. (Upgrading pip instead just swaps one pip's vulnerable vendored libs for another's.)
+RUN python -m pip install -r requirements.txt \
+ && python -m pip uninstall -y pip
 
 COPY backend/ .
 
@@ -40,7 +46,7 @@ COPY backend/ .
 COPY --from=ui-builder /ui/dist /app/ui_dist
 
 ENV STORAGE_BACKEND=postgres
-ENV RELEASES_S3_BASE=https://reach-releases.s3.amazonaws.com
+ENV RELEASES_BASE_URL=https://releases.reach.nabeem.com
 
 # Run as non-root by default, while staying compatible with ANY uid - including
 # `--user 0` (root) and the random uids Kubernetes/OpenShift assign. Those

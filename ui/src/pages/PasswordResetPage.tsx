@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { tenantChangePassword } from '../api';
 import type { TenantConfig } from '../types';
 import { Spinner } from '../components/Spinner';
+import reachMark from '../assets/reach-mark.png';
 
 interface Props {
   config: TenantConfig;
@@ -16,9 +17,8 @@ export function PasswordResetPage({ config, onComplete }: Props) {
   function pwStrength(pw: string): { bars: number; label: string; color: string } | null {
     if (!pw) return null;
     const variety = [/[a-z]/, /[A-Z]/, /\d/, /[^a-zA-Z0-9]/].filter(r => r.test(pw)).length;
-    if (pw.length < 8)                              return { bars: 1, label: 'Weak',   color: 'bg-red-500' };
-    if (pw.length < 12 && variety < 3)              return { bars: 2, label: 'Fair',   color: 'bg-amber-500' };
-    if (pw.length >= 12 && variety >= 3)            return { bars: 4, label: 'Strong', color: 'bg-emerald-500' };
+    if (pw.length < 12)                             return { bars: 1, label: 'Weak',   color: 'bg-red-500' };
+    if (variety >= 3)                               return { bars: 4, label: 'Strong', color: 'bg-emerald-500' };
     return                                                 { bars: 3, label: 'Good',   color: 'bg-blue-500' };
   }
   const strength = pwStrength(next);
@@ -28,7 +28,7 @@ export function PasswordResetPage({ config, onComplete }: Props) {
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (next !== confirm) { setError('Passwords do not match.'); return; }
-    if (next.length < 8) { setError('Password must be at least 8 characters.'); return; }
+    if (next.length < 12) { setError('Password must be at least 12 characters.'); return; }
     setLoading(true); setError('');
     try {
       await tenantChangePassword(config.apiUrl, config.tenantToken, current, next);
@@ -45,9 +45,7 @@ export function PasswordResetPage({ config, onComplete }: Props) {
       <div className="w-full max-w-sm">
         <div className="flex justify-center mb-8">
           <div className="flex flex-wrap items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-indigo-500 flex items-center justify-center shadow-lg">
-              <span className="text-white font-bold text-lg">R</span>
-            </div>
+            <img src={reachMark} alt="reach" className="w-10 h-10" />
             <div>
               <p className="text-white font-semibold text-xl leading-none">reach</p>
               <p className="text-slate-400 text-xs mt-0.5">Set new password</p>
@@ -85,7 +83,7 @@ export function PasswordResetPage({ config, onComplete }: Props) {
                 type="password"
                 value={next}
                 onChange={e => setNext(e.target.value)}
-                placeholder="At least 8 characters"
+                placeholder="At least 12 characters"
                 className="w-full bg-slate-800 border border-slate-700 text-white rounded-lg px-3.5 py-2.5 text-sm placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500"
               />
               {strength && (

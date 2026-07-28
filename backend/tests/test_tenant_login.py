@@ -176,7 +176,7 @@ class TestChangePassword:
             ur.get.return_value = USER
             ur.update_password.return_value = None
             r = handle_change_password(
-                {"current_password": "secret123", "new_password": "newpass99"},
+                {"current_password": "secret123", "new_password": "newpassword99"},
                 self._payload,
             )
         assert r["statusCode"] == 200
@@ -186,7 +186,7 @@ class TestChangePassword:
         with patch("handlers.tenant_login.users_repo") as ur:
             ur.get.return_value = USER
             r = handle_change_password(
-                {"current_password": "bad", "new_password": "newpass99"},
+                {"current_password": "bad", "new_password": "newpassword99"},
                 self._payload,
             )
         assert r["statusCode"] == 401
@@ -208,7 +208,7 @@ class TestChangePassword:
         with patch("handlers.tenant_login.users_repo") as ur:
             ur.get.return_value = None
             r = handle_change_password(
-                {"current_password": "secret123", "new_password": "newpass99"},
+                {"current_password": "secret123", "new_password": "newpassword99"},
                 self._payload,
             )
         assert r["statusCode"] == 404
@@ -311,7 +311,7 @@ class TestChangePasswordHandler:
 
     def test_delegates_to_handler(self):
         payload = {"sub": "user_123", "tenant_id": "tenant_acme", "role": "admin"}
-        body = {"current_password": "old", "new_password": "newpass99"}
+        body = {"current_password": "old", "new_password": "newpassword99"}
         with patch("handlers.tenant_login._verify_tenant_payload", return_value=payload), \
              patch("handlers.tenant_login.handle_change_password", return_value=_OK) as h:
             change_password_handler(_evt(body=json.dumps(body)), None)
