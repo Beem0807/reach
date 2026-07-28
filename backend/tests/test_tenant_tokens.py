@@ -2,6 +2,8 @@
 import json
 from unittest.mock import patch
 
+import pytest
+
 from handlers.tenant_tokens import (
     handle_create_api_token,
     handle_list_api_tokens,
@@ -182,6 +184,14 @@ class TestRevokeApiToken:
 
 
 class TestRevokeAllUserTokens:
+    @pytest.fixture(autouse=True)
+    def _target_user_in_tenant(self):
+        # The handler now confirms the target user belongs to the caller's tenant before revoking,
+        # so these tests seed a same-tenant user (the cross-tenant case is covered in test_tenant_isolation).
+        with patch("handlers.tenant_tokens.users_repo") as ur:
+            ur.get.return_value = {"user_id": "user_alice", "tenant_id": ADMIN_TOKEN["tenant_id"]}
+            yield
+
     def _tokens(self):
         return [
             {**STORED_TOKEN, "token_id": "tk_1", "status": "ACTIVE"},

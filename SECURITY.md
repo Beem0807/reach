@@ -18,7 +18,38 @@ You will receive an acknowledgement within 48 hours. If the issue is confirmed, 
 
 ## Supported versions
 
-Only the latest released version receives security fixes. Older versions are not backported.
+Only the latest released version of each component receives security fixes; older versions are not
+backported. The full per-component policy (backend / agent / CLI) is in [SUPPORT.md](SUPPORT.md).
+
+---
+
+## Release integrity (supply chain)
+
+The software-distribution path is held to the same bar as the runtime. Releases are built only by
+GitHub Actions (no local or manual pushes), and every artifact is verifiable:
+
+- **Signed** - container images and the release checksums are signed with **cosign, keyless**
+  (Sigstore/Fulcio via the workflow's OIDC identity - there is no long-lived signing key).
+- **Checksummed** - a signed `SHA256SUMS` covers every binary, wheel, chart, and the backend's
+  Lambda **template + UI bundle** (signing the packaged template also pins the Lambda code, which
+  `sam` references by content-hashed S3 key). Code and chart each get their own signed release.
+- **SBOM + provenance** - an SPDX SBOM and SLSA build provenance accompany each image and artifact.
+- **Vulnerability scanning** - Trivy scans every image on the PR and again on the pushed
+  `image@digest` at release (before it's tagged); the CLI (no image) has its resolved Python
+  dependency tree scanned directly. Fixable `CRITICAL`/`HIGH` findings fail the build, and results
+  are uploaded to the repo's code-scanning (Security) tab.
+- **Verifiable install** - every installer verifies what it downloads before using it, checksum
+  mandatory + cosign signature when `cosign` is present:
+  - `install.sh` (agent) checks each host binary; the console also offers a
+    download → authenticate → inspect → run path alongside the one-command installer.
+  - `local-setup.sh` (Docker backend) `cosign verify`s the `nabeemdev/reach` image before running
+    it, and checksum-verifies the CLI wheel.
+  - `lambda-setup.sh` (AWS backend) verifies the CloudFormation template + UI bundle against the
+    signed `SHA256SUMS` before deploying - a mismatch aborts the deploy.
+  - On a fork, point verification at your repo with `REACH_REPO=owner/repo`.
+
+Commands and full verification steps (`cosign verify`, `gh attestation verify`, checksum checks)
+are in [SUPPORT.md](SUPPORT.md).
 
 ---
 
@@ -51,7 +82,7 @@ For full architectural detail see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 **Tokens** - no token is stored raw. Only `HMAC-SHA256(TOKEN_PEPPER, token)` hashes are persisted. If the database is compromised without `TOKEN_PEPPER`, tokens cannot be recovered or forged.
 
-**User passwords** - console login passwords are hashed with PBKDF2-HMAC-SHA256 (200,000 iterations) using a unique 16-byte random salt per user, stored as `pbkdf2$salt$hash`. The raw password is never stored. New passwords must be at least 8 characters. First-login passwords are randomly generated, issued once, and must be changed before the account can be used.
+**User passwords** - console login passwords are hashed with **scrypt** (a memory-hard KDF: N=2¹⁶, r=8, p=1, ~64 MiB per hash), using a unique 16-byte random salt per user, stored as `scrypt$N$r$p$salt$hash` (parameters embedded so they can be tuned without invalidating existing hashes). scrypt's memory-hardness resists GPU/ASIC brute force in a way PBKDF2 does not, and it's provided by the standard library (OpenSSL) so the serverless package stays dependency-free. The raw password is never stored. New passwords must be at least 12 characters. First-login passwords are randomly generated, issued once, and must be changed before the account can be used.
 
 **Console session tokens** - the web console issues short-lived (8-hour) HS256 session tokens that are distinct from API tokens and are never persisted server-side. The platform admin session is signed with `ADMIN_PASSWORD`; the tenant console session is signed with a dedicated `SESSION_SIGNING_KEY` and carries the user's tenant and role. Both signing secrets are **safe to rotate** - doing so only invalidates active sessions, so users simply log in again. This is deliberately separate from `TOKEN_PEPPER` (which hashes stored credentials and cannot be rotated without reissuing everything), so session-key rotation never touches stored tokens. The CLI and MCP server do **not** use session tokens - they authenticate with long-lived API tokens (`tok_`).
 
@@ -65,11 +96,11 @@ For full architectural detail see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 **Fleet join token** - a fleet's join token is deliberately **reusable and long-lived** (it enrolls a whole autoscaling group), so it is a higher-value credential than a one-time install token: anyone who obtains it can enroll rogue **host** agents into that fleet, inheriting the fleet's mode and grants. It is host-only (a fleet claim with `type: k8s` is rejected) and is mitigated like any long-lived secret - **rotate** it (`Fleets → Rotate`, with a grace window so the old token keeps working until you update the launch template) and **revoke** the fleet if it leaks. Each enrolled instance still receives its own machine-fingerprint-bound **agent token**, so a stolen join token lets an attacker enroll *new* rogue agents but does not grant existing members' credentials. Keep it in your autoscaler's instance startup config (AWS user-data, GCP startup-script, Azure custom-data, …), protected by that platform's secret handling, not in source control.
 
-**Tenant isolation** - user tokens can only access agents and jobs within their own tenant. The storage layer enforces this; there is no client-side filtering.
+**Tenant isolation** - a user token can only reach resources within its own tenant, across the whole tenant-scoped API (agents, jobs, fleets, users, API tokens, approvals). Enforcement is server-side in **two layers**, never client-side filtering: a by-id request fetches the resource and refuses it (`404`) when `resource.tenant_id` differs from the caller's tenant, and every listing query is scoped to the caller's tenant at the storage layer (`WHERE tenant_id` on Postgres, a `tenant-index` GSI query on DynamoDB). A cross-tenant reference is therefore indistinguishable from a non-existent one. This is verified by an isolation harness that drives tenant B's credentials against tenant A's ids over every by-id route end-to-end, plus a DynamoDB-backed check that the tenant-index listing never leaks another tenant's rows.
 
 **Policy enforcement** - the global blocklist and mode-specific write blocking are enforced server-side before the job reaches the agent. On a host the agent enforces a second time locally with the **Landlock kernel sandbox** (Linux), which makes the filesystem read-only (except `/tmp`) so writes are blocked by the kernel, not just by the classifier. Two independent enforcement points must both be bypassed. **This fails closed:** if the kernel sandbox can't be applied (a Linux kernel without Landlock, or macOS, which has none), `readonly`/`approved` commands are **blocked, not run unprotected** - unless an operator has explicitly **acknowledged** running that agent unsandboxed (an audited, revocable console action; macOS agents can pre-acknowledge at create time). So the "writes are kernel-enforced on Linux" guarantee can't silently degrade to "the classifier guessed right."
 
-**Structured host writes** - a host **write** is not a shell string: it is parsed into an `argv` and executed with `execve` (**no shell**), so there is nothing to pipe, chain, substitute, or glob. Approvals are structured **JSON rules** `{bin, args[]}` (each arg a literal, the single-arg wildcard `*`, or a trailing `...` for the rest) matched against the argv - never a string comparison - mirroring the k8s `{verb, resource, namespace, name}` model. Every host approval is such a rule: a command string submitted for approval is structured into one, or rejected if it can't be - there is no command-string (prefix-match) approval path. A write that needs shell features can't be a rule, so it is refused in `approved` mode, runs freeform only in `wild` (no approval, no sandbox), and is Landlock-blocked in `readonly`. **Reads** are unchanged: they run freeform under Landlock. This model applies to single-agent and **fleet** writes alike.
+**Structured host writes** - a host **write** is not a shell string: it is parsed into an `argv` and executed with `execve` (**no shell**), so there is nothing to pipe, chain, substitute, or glob. Approvals are structured **JSON rules** `{bin, args[]}` (each arg a literal, the single-arg wildcard `*`, or a trailing `...` for the rest) matched against the argv - never a string comparison - mirroring the k8s `{verb, resource, namespace, name}` model. Every host approval is such a rule: a command string submitted for approval is structured into one, or rejected if it can't be - there is no command-string (prefix-match) approval path. A write that needs shell features can't be a rule, so it is refused in `approved` mode, runs freeform only in `wild` (no approval, no sandbox), and is Landlock-blocked in `readonly`. **Reads** are unchanged: they run freeform under Landlock. This model applies to single-agent and **fleet** writes alike. The agent re-derives approval on the same structured rules the backend stores, so its rule matcher (`{bin, args[]}` with `*` and trailing `...`) is held byte-for-decision identical to the backend's by the same cross-language parity test that covers sensitive-read detection - an operator approval can never mean one thing to the backend and another to the agent.
 
 **Kubernetes execution** - a pod holds a cluster credential, so the model is stricter. Three layers compose: **RBAC** (the API server's unbypassable floor; what the agent can do is the `clusterAccess` you bind, defaulting to read-only), the **policy mode** (enforced by the backend at submission), and the **agent's no-shell + allowlist** - jobs run as `kubectl` plus a few read-only filters with **no shell**, and arguments resolving to a local file are rejected so a job can never read the mounted ServiceAccount token. The agent self-reports its effective cluster-wide RBAC for acknowledge/drift.
 
@@ -135,7 +166,7 @@ A "read" is treated as low-risk in Reach's model, but a read can still **exfiltr
 - **Approval-gated in `approved`** - it needs an operator-approved rule (host `{bin, args[]}`, or a k8s `{verb: get, resource: secrets, …}` rule). This is the deliberate, audited way to permit reading a specific secret for troubleshooting.
 - **Runs in `wild`** - the personal-box mode is unrestricted.
 
-Enforced at **both** layers: the backend gates at submission, and the **agent** refuses an unapproved sensitive read locally (Landlock blocks *writes*, not *reads*, so the agent can't rely on the kernel here). Detection is best-effort by path/command - SSH keys, cloud/kube credentials, `.env`, `/proc/*/environ`, `.pem`, the agent's own token, and `kubectl get/describe secret` on any agent type. The agent's **non-root OS identity** and **k8s RBAC** (the default `view` role can't read Secrets) remain the harder floors underneath.
+Enforced at **both** layers: the backend gates at submission, and the **agent** refuses an unapproved sensitive read locally (Landlock blocks *writes*, not *reads*, so the agent can't rely on the kernel here). Detection is best-effort by path/command - SSH keys, cloud credentials (AWS, Azure, and GCP - including gcloud legacy credentials stored outside `~/.config`), kubeconfig, `.env`, `/proc/*/environ`, `.pem`/`.p12`, `.netrc`/`.pgpass`/`.npmrc`, docker registry creds, the agent's own token, and `kubectl get/describe secret` on any agent type. The backend (Python) and agent (Go) implement this detection independently, so the two pattern lists are pinned in lock-step by a **cross-language parity test** (shared golden vectors both suites assert against) - a pattern present on one side but missing on the other fails CI, rather than silently letting the agent run a read the backend classified as sensitive. The agent's **non-root OS identity** and **k8s RBAC** (the default `view` role can't read Secrets) remain the harder floors underneath.
 
 **Who can see the output:** job output is **developer-scoped** - a `developer` sees only the jobs **they** created; operators/admins see all jobs on agents they can access. So an approved (unredacted) secret read is visible to its creator plus the operators/admins who authorized it, not every developer on the agent. In the console, such output is additionally **hidden behind a click-to-reveal** control, so a secret isn't left sitting on screen during a screen-share or in scrollback.
 

@@ -820,6 +820,7 @@ var sensitiveReadPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)\bid_(rsa|dsa|ecdsa|ed25519)\b`),
 	regexp.MustCompile(`(?i)\.aws/(credentials|config)\b`),
 	regexp.MustCompile(`(?i)\.config/gcloud\b`),
+	regexp.MustCompile(`(?i)gcloud/[^ ]*credential`),
 	regexp.MustCompile(`(?i)\.azure/`),
 	regexp.MustCompile(`(?i)\.kube/config\b`),
 	regexp.MustCompile(`(?i)(^|[\s/'"=])\.env(\.[\w-]+)?\b`),

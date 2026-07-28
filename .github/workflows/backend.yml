@@ -1,0 +1,464 @@
+# Backend pipeline. Triggers ONLY when backend-related paths change (never for agent/cli).
+# The backend Docker image bundles the UI (Dockerfile stage 1), so ui/** and the Dockerfile
+# belong here too; the Helm chart lives under deploy/helm/reach.
+#
+#   PR into main  -> version-bump `checks` + `test`s + a `build` that compiles the image (no push)
+#                    and verifies this version's artifacts don't already exist. Nothing is published.
+#   Push to main  -> checks + tests run, and only if they pass the `release` job publishes and
+#                    tags - but only for what changed:
+#       * code (backend/**, ui/**, Dockerfile): needs a NEW backend version (backend/version.py)
+#         AND a chart bump with appVersion updated to match. Publishes the image, the Lambda
+#         package + UI bundle + setup scripts to S3, and the chart; cuts TWO signed GitHub Releases
+#         - backend-<ver> (Lambda template + UI bundle) and backend-helm-<chartVer> (chart).
+#       * chart-only (deploy/helm/reach/**): reuses the image; publishes just the chart + its own
+#         signed GitHub Release. Tags backend-helm-<chartVer>.
+#
+# Release logic is inlined (mirrors the former scripts/release_backend*.sh).
+# Required config: secrets DOCKERHUB_USERNAME, DOCKERHUB_TOKEN; and AWS_ROLE_ARN (the IAM role
+# assumed via GitHub OIDC - no long-lived AWS keys). The AWS account needs a GitHub OIDC provider
+# and that role's trust policy scoped to this repo.
+name: Backend
+
+on:
+  pull_request:
+    branches: [main]
+    paths: ["backend/**", "ui/**", "Dockerfile", "deploy/helm/reach/**"]
+  push:
+    branches: [main]
+    paths: ["backend/**", "ui/**", "Dockerfile", "deploy/helm/reach/**"]
+
+concurrency:
+  # Cancel superseded PR runs; serialize (never cancel) releases on main.
+  group: backend-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: write # release job pushes git tags + creates GitHub Releases
+  id-token: write # OIDC: assume the AWS role + keyless cosign / attestations
+  attestations: write # SLSA build-provenance attestations
+  security-events: write # Trivy SARIF -> code-scanning alerts
+
+env:
+  BUCKET: reach-releases # S3 bucket the CI writes release artifacts to (CDN-fronted)
+  RELEASES_BASE_URL: https://releases.reach.nabeem.com # CDN the artifacts are read from (chart index URLs)
+  DEPLOY_BUCKET: reach-deployments # separate bucket for the SAM/Lambda package code
+  DEPLOY_BASE_URL: https://reach-deployments.s3.amazonaws.com # public read of lambda/* (PR existence checks)
+  IMAGE: nabeemdev/reach
+
+jobs:
+  # Version-bump guard. Runs on PRs too, so a forgotten version/chart bump (or a version that
+  # was already released) is caught at PR time - the author fixes it before merge. Runs again on
+  # merge, and its outputs (what changed + the versions) feed the release job so nothing is
+  # recomputed. Credential-free: just git + file reads.
+  checks:
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.changed.outputs.code }}
+      chart: ${{ steps.changed.outputs.chart }}
+      backend: ${{ steps.ver.outputs.backend }}
+      chartver: ${{ steps.ver.outputs.chart }}
+    steps:
+      - name: Validate required secrets
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+        run: |
+          missing=""
+          for s in DOCKERHUB_USERNAME DOCKERHUB_TOKEN AWS_ROLE_ARN; do
+            if [ -z "${!s}" ]; then missing="$missing $s"; fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Missing required repository secrets:$missing - add them under Settings > Secrets and variables > Actions before merging to main (the release job needs them)"
+            exit 1
+          fi
+          echo "required secrets present"
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Detect what changed (code vs chart)
+        id: changed
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+          else
+            BASE="${{ github.event.before }}"
+            if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
+              BASE=$(git rev-parse HEAD^ 2>/dev/null || echo "")
+            fi
+          fi
+          if [ -n "$BASE" ]; then CHANGED=$(git diff --name-only "$BASE" HEAD); else CHANGED=$(git ls-files); fi
+          echo "changed files:"; echo "$CHANGED"
+          code=false; chart=false
+          echo "$CHANGED" | grep -qE '^(backend/|ui/|Dockerfile$)' && code=true
+          echo "$CHANGED" | grep -qE '^deploy/helm/reach/'          && chart=true
+          echo "code=$code"   >> "$GITHUB_OUTPUT"
+          echo "chart=$chart" >> "$GITHUB_OUTPUT"
+      - name: Read versions
+        id: ver
+        run: |
+          BACKEND_VER=$(grep '__version__' backend/version.py | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+          CHART_VER=$(grep -E '^version:'  deploy/helm/reach/Chart.yaml | head -1 | awk '{print $2}' | tr -d '"')
+          APP_VER=$(grep -E '^appVersion:' deploy/helm/reach/Chart.yaml | head -1 | awk '{print $2}' | tr -d '"')
+          echo "backend=$BACKEND_VER" >> "$GITHUB_OUTPUT"
+          echo "chart=$CHART_VER"     >> "$GITHUB_OUTPUT"
+          echo "app=$APP_VER"         >> "$GITHUB_OUTPUT"
+          echo "backend=$BACKEND_VER  chart=$CHART_VER  appVersion=$APP_VER"
+      - name: Version-bump + tag existence check
+        env:
+          CODE: ${{ steps.changed.outputs.code }}
+          CHART_CHANGED: ${{ steps.changed.outputs.chart }}
+          BACKEND_VER: ${{ steps.ver.outputs.backend }}
+          CHART_VER: ${{ steps.ver.outputs.chart }}
+          APP_VER: ${{ steps.ver.outputs.app }}
+        run: |
+          tag_exists() { git ls-remote --exit-code --tags origin "refs/tags/$1" >/dev/null 2>&1; }
+          fail() { echo "::error::$1"; exit 1; }
+          if [ "$CODE" = "true" ]; then
+            [ "$APP_VER" = "$BACKEND_VER" ] || fail "chart appVersion ($APP_VER) must equal backend version ($BACKEND_VER) - update deploy/helm/reach/Chart.yaml appVersion"
+            tag_exists "backend-$BACKEND_VER"    && fail "backend code changed but tag backend-$BACKEND_VER already exists - bump __version__ in backend/version.py (and chart appVersion)"
+            tag_exists "backend-helm-$CHART_VER" && fail "backend code changed but tag backend-helm-$CHART_VER already exists - bump 'version:' in deploy/helm/reach/Chart.yaml too"
+          elif [ "$CHART_CHANGED" = "true" ]; then
+            tag_exists "backend-helm-$CHART_VER" && fail "backend chart changed but tag backend-helm-$CHART_VER already exists - bump 'version:' in deploy/helm/reach/Chart.yaml"
+          else
+            echo "no backend code or chart change detected"
+          fi
+          echo "version-bump check passed"
+
+  test:
+    runs-on: ubuntu-latest
+    env:
+      # conftest.py sets app secrets + a sqlite DATABASE_URL but NOT an AWS region;
+      # shared/repos/dynamo.py calls boto3.resource("dynamodb") at import, which needs one.
+      AWS_DEFAULT_REGION: us-east-1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements-dev.txt
+      - run: pip install -r requirements-dev.txt
+        working-directory: backend
+      - run: python -m pytest -q
+        working-directory: backend
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - run: npm install -g npm@11 # use current npm so `npm ci` reads a lock written by any npm version
+      - run: npm ci
+        working-directory: ui
+      - run: npm run test
+        working-directory: ui
+
+  # PR validation: prove the image *builds* and that this version's immutable artifacts don't
+  # already exist - but publish/push nothing. Credential-free by design (PRs can't assume the
+  # main-only AWS role), so existence is checked against the public registry + CDN rather than
+  # `aws s3 ls`. Merges run `release` below, which does the real push/publish/tag.
+  build:
+    needs: [checks, test]
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    env:
+      CODE: ${{ needs.checks.outputs.code }}
+      CHART_CHANGED: ${{ needs.checks.outputs.chart }}
+      BACKEND_VER: ${{ needs.checks.outputs.backend }}
+      CHART_VER: ${{ needs.checks.outputs.chartver }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+        if: env.CODE == 'true'
+      - uses: docker/setup-buildx-action@v3
+        if: env.CODE == 'true'
+      # Same guard as the release job, credential-free: the immutable image / Lambda bundle / chart
+      # for this version must not already exist, so the author learns to bump at PR time.
+      - name: Ensure this version's artifacts don't already exist
+        run: |
+          fail() { echo "::error::$1"; exit 1; }
+          url_exists() { curl -fsIL -o /dev/null "$1"; }
+          if [ "$CODE" = "true" ]; then
+            docker buildx imagetools inspect "$IMAGE:$BACKEND_VER" >/dev/null 2>&1 \
+              && fail "image $IMAGE:$BACKEND_VER already exists in the registry - bump __version__ in backend/version.py"
+            url_exists "$DEPLOY_BASE_URL/lambda/v$BACKEND_VER/template.yaml" \
+              && fail "Lambda bundle lambda/v$BACKEND_VER/ already exists - bump __version__ in backend/version.py"
+          fi
+          if [ "$CODE" = "true" ] || [ "$CHART_CHANGED" = "true" ]; then
+            url_exists "$RELEASES_BASE_URL/charts/reach/reach-$CHART_VER.tgz" \
+              && fail "chart reach-$CHART_VER.tgz already exists - bump 'version:' in deploy/helm/reach/Chart.yaml"
+          fi
+          echo "no conflicting artifacts for this version"
+      - name: Build backend image (no push - PR validation)
+        if: env.CODE == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64 # match the release build so an arch-specific failure is caught on the PR
+          push: false
+          cache-from: type=gha,scope=backend # reuse layers from prior PR/release builds (esp. emulated arm64)
+          cache-to: type=gha,mode=max,scope=backend
+          build-args: |
+            VERSION=${{ env.BACKEND_VER }}
+      # Load the amd64 image into the runner's daemon so Trivy can scan it. Layers are already cached
+      # by the multi-arch build above, so this is a near-instant cache hit (no cache-to to avoid a
+      # manifest conflict with that build). Scanning amd64 is representative - the OS/library set is
+      # arch-independent for CVE purposes.
+      - name: Load backend image for scanning (amd64)
+        if: env.CODE == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          load: true
+          tags: reach-backend:pr-scan
+          cache-from: type=gha,scope=backend
+          build-args: |
+            VERSION=${{ env.BACKEND_VER }}
+      # Scan the built image: SARIF -> Security tab + fail the PR on fixable CRITICAL/HIGH.
+      - name: Trivy scan (backend image)
+        if: env.CODE == 'true'
+        uses: ./.github/actions/trivy-scan
+        with:
+          ref: reach-backend:pr-scan
+          category: backend-image
+
+  # Publish + tag. Merge to main only, after checks + tests pass. Consumes checks' outputs
+  # (what changed + the versions) so nothing is recomputed here.
+  release:
+    needs: [checks, test]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    env:
+      # AWS region comes from configure-aws-credentials (aws-region: us-east-1) below - it sets
+      # AWS_REGION/AWS_DEFAULT_REGION for the aws cli + sam, so no job-level region is needed here.
+      CODE: ${{ needs.checks.outputs.code }}
+      CHART_CHANGED: ${{ needs.checks.outputs.chart }}
+      BACKEND_VER: ${{ needs.checks.outputs.backend }}
+      CHART_VER: ${{ needs.checks.outputs.chartver }}
+      DIST: ${{ github.workspace }}/dist              # code artifacts (Lambda template + UI bundle) -> backend-<ver> release
+      CHART_DIST: ${{ github.workspace }}/dist-chart  # chart tgz -> its own backend-helm-<chartver> release
+    steps:
+      - uses: actions/checkout@v4 # for the build context and to push tags
+
+      # ---- Tooling + credentials.
+      - uses: azure/setup-helm@v4
+      - uses: sigstore/cosign-installer@v3
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - run: npm install -g npm@11 # use current npm so `npm ci` reads a lock written by any npm version
+      - uses: aws-actions/setup-sam@v2
+        if: needs.checks.outputs.code == 'true'
+        with:
+          use-installer: true
+      - uses: docker/setup-qemu-action@v3
+        if: needs.checks.outputs.code == 'true'
+      - uses: docker/setup-buildx-action@v3
+        if: needs.checks.outputs.code == 'true'
+      - name: Docker Hub login
+        if: needs.checks.outputs.code == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+      - run: mkdir -p "$DIST" "$CHART_DIST"
+
+      # ---- Artifact existence check: on top of the tag check in `checks`, refuse to overwrite
+      #      the actual immutable artifacts for this version (registry image, Lambda bundle, chart
+      #      tgz) - guards a prior run that published something but died before tagging. `:latest`
+      #      and the S3 `latest/` copies are intentionally mutable and not checked.
+      - name: Ensure this version's artifacts don't already exist
+        run: |
+          fail() { echo "::error::$1"; exit 1; }
+          s3_exists() { [ -n "$(aws s3 ls "$1" 2>/dev/null)" ]; }
+          if [ "$CODE" = "true" ]; then
+            docker buildx imagetools inspect "$IMAGE:$BACKEND_VER" >/dev/null 2>&1 \
+              && fail "image $IMAGE:$BACKEND_VER already exists in the registry - bump __version__ in backend/version.py"
+            s3_exists "s3://$DEPLOY_BUCKET/lambda/v$BACKEND_VER/template.yaml" \
+              && fail "Lambda bundle lambda/v$BACKEND_VER/ already exists in the deployment bucket - bump __version__ in backend/version.py"
+          fi
+          if [ "$CODE" = "true" ] || [ "$CHART_CHANGED" = "true" ]; then
+            s3_exists "s3://$BUCKET/charts/reach/reach-$CHART_VER.tgz" \
+              && fail "chart reach-$CHART_VER.tgz already exists in S3 - bump 'version:' in deploy/helm/reach/Chart.yaml"
+          fi
+          echo "no conflicting artifacts for this version"
+
+      # ---- Publish the image (multi-arch), stamping OCI build metadata like the old script did.
+      - name: Build metadata
+        if: needs.checks.outputs.code == 'true'
+        id: meta
+        run: |
+          echo "vcs_ref=$(git rev-parse --short HEAD)"     >> "$GITHUB_OUTPUT"
+          echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+      - name: Build + push backend image
+        if: needs.checks.outputs.code == 'true'
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          cache-from: type=gha,scope=backend # shares the PR build's cache (same scope) so merge is fast too
+          cache-to: type=gha,mode=max,scope=backend
+          tags: |
+            ${{ env.IMAGE }}:${{ env.BACKEND_VER }}
+            ${{ env.IMAGE }}:latest
+          build-args: |
+            VERSION=${{ env.BACKEND_VER }}
+            VCS_REF=${{ steps.meta.outputs.vcs_ref }}
+            BUILD_DATE=${{ steps.meta.outputs.build_date }}
+      # Scan the EXACT pushed artifact (by digest). Runs before tag/publish, so a fixable CRITICAL/HIGH
+      # disclosed since the PR fails the release before it's finalized (the image is on Docker Hub but
+      # gets no git tag / GitHub Release). SARIF -> Security tab.
+      - name: Trivy scan (backend image)
+        if: needs.checks.outputs.code == 'true'
+        uses: ./.github/actions/trivy-scan
+        with:
+          ref: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          category: backend-image
+      - name: Sign image (keyless cosign)
+        if: needs.checks.outputs.code == 'true'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "$IMAGE@$DIGEST"
+      - name: Image SBOM (SPDX)
+        if: needs.checks.outputs.code == 'true'
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          output-file: ${{ runner.temp }}/image-sbom.spdx.json
+          upload-artifact: false
+      - name: Attach SBOM to image (cosign attest)
+        if: needs.checks.outputs.code == 'true'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign attest --yes --type spdxjson --predicate "$RUNNER_TEMP/image-sbom.spdx.json" "$IMAGE@$DIGEST"
+      - name: Image SLSA provenance attestation
+        if: needs.checks.outputs.code == 'true'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+
+      # ---- Lambda package (sam) + UI bundle + setup scripts -> S3.
+      - name: Package + upload Lambda template
+        if: needs.checks.outputs.code == 'true'
+        run: |
+          sam package \
+            --template-file deploy/lambda/template.yaml \
+            --s3-bucket "$DEPLOY_BUCKET" \
+            --s3-prefix lambda/code \
+            --output-template-file /tmp/reach-lambda-packaged.yaml \
+            --no-progressbar
+          # Template goes to the DEPLOY bucket alongside the code: CloudFormation reads both from
+          # S3 during deploy (the template via --template-url, which must be an S3 URL).
+          aws s3 cp /tmp/reach-lambda-packaged.yaml "s3://$DEPLOY_BUCKET/lambda/v${BACKEND_VER}/template.yaml"
+          aws s3 cp /tmp/reach-lambda-packaged.yaml "s3://$DEPLOY_BUCKET/lambda/latest/template.yaml"
+          # Stage for release-integrity: signing the packaged template covers the Lambda code too,
+          # since sam references it by content-hashed S3 key (a code swap breaks that reference).
+          cp /tmp/reach-lambda-packaged.yaml "$DIST/template.yaml"
+      - name: Build + upload UI bundle
+        if: needs.checks.outputs.code == 'true'
+        working-directory: ui
+        run: |
+          npm ci
+          npm run build
+          tar -czf /tmp/reach-ui.tar.gz -C dist .
+          aws s3 cp /tmp/reach-ui.tar.gz "s3://$BUCKET/lambda/v${BACKEND_VER}/ui.tar.gz"
+          aws s3 cp /tmp/reach-ui.tar.gz "s3://$BUCKET/lambda/latest/ui.tar.gz"
+          cp /tmp/reach-ui.tar.gz "$DIST/ui.tar.gz" # stage for release-integrity (signed SHA256SUMS)
+      # NOTE: local-setup.sh / lambda-setup.sh are published + signed by the dedicated scripts.yml
+      # pipeline (they are unversioned "latest" tooling), not here - so a script fix doesn't need a
+      # backend version bump.
+
+      # ---- Publish the chart (package + merge index + upload), mirroring release_backend_chart.sh.
+      - name: Publish backend chart
+        if: needs.checks.outputs.code == 'true' || needs.checks.outputs.chart == 'true'
+        run: |
+          CHART_DIR=deploy/helm/reach
+          REPO_PATH="charts/reach"
+          REPO_URL="$RELEASES_BASE_URL/$REPO_PATH"
+          helm lint "$CHART_DIR" --strict --set config.tokenPepper=x --set config.sessionSigningKey=x --set config.adminPassword=x
+          WORK=$(mktemp -d)
+          helm package "$CHART_DIR" -d "$WORK"
+          cp "$WORK/reach-$CHART_VER.tgz" "$CHART_DIST/"
+          if aws s3 cp "s3://$BUCKET/$REPO_PATH/index.yaml" "$WORK/old-index.yaml" >/dev/null 2>&1; then
+            helm repo index "$WORK" --url "$REPO_URL" --merge "$WORK/old-index.yaml"
+          else
+            helm repo index "$WORK" --url "$REPO_URL"
+          fi
+          aws s3 cp "$WORK/reach-$CHART_VER.tgz" "s3://$BUCKET/$REPO_PATH/reach-$CHART_VER.tgz"
+          aws s3 cp "$WORK/index.yaml"           "s3://$BUCKET/$REPO_PATH/index.yaml"
+
+      # ---- Tag the repo (before the GitHub Release, which attaches to the tag).
+      - name: Tag the repo
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          push_tag() { git tag -a "$1" -m "$2" && git push origin "$1"; echo "tagged $1"; }
+          if [ "$CODE" = "true" ]; then
+            push_tag "backend-$BACKEND_VER"    "Backend $BACKEND_VER"
+            push_tag "backend-helm-$CHART_VER" "Backend chart $CHART_VER"
+          elif [ "$CHART_CHANGED" = "true" ]; then
+            push_tag "backend-helm-$CHART_VER" "Backend chart $CHART_VER"
+          fi
+
+      # ---- Two independent signed GitHub Releases, each with its own SHA256SUMS + cosign signature
+      #      + SLSA provenance, so the chart tag ALWAYS has its own release - whether it shipped with
+      #      code or on its own:
+      #        * backend-<ver>       (code):  Lambda template + UI bundle (image is signed above)
+      #        * backend-helm-<ver>  (chart): the chart tgz
+      - name: Release integrity (backend code)
+        if: needs.checks.outputs.code == 'true'
+        uses: ./.github/actions/release-integrity
+        with:
+          tag: backend-${{ env.BACKEND_VER }}
+          artifacts-dir: ${{ env.DIST }}
+          sbom-source: backend
+          notes: |
+            Signed release. Container image `${{ env.IMAGE }}:${{ env.BACKEND_VER }}` is cosign-signed
+            (keyless) with an SPDX SBOM and SLSA provenance. The Lambda template + UI bundle are covered
+            by the signed `SHA256SUMS`. See SUPPORT.md → "Verifying a release".
+      - name: Release integrity (backend chart)
+        if: needs.checks.outputs.code == 'true' || needs.checks.outputs.chart == 'true'
+        uses: ./.github/actions/release-integrity
+        with:
+          tag: backend-helm-${{ env.CHART_VER }}
+          artifacts-dir: ${{ env.CHART_DIST }}
+          notes: |
+            Signed Helm chart release. `reach-${{ env.CHART_VER }}.tgz` is covered by the signed
+            `SHA256SUMS` (keyless cosign) with SLSA provenance. Install from the Helm repo at
+            `${{ env.RELEASES_BASE_URL }}/charts/reach`. See SUPPORT.md → "Verifying a release".
+
+      # ---- Publish the signed SHA256SUMS next to the Lambda artifacts so lambda-setup.sh can verify
+      #      the template + UI bundle it deploys (mirrors how install.sh verifies agent binaries).
+      #      The code release's $DIST is template.yaml + ui.tar.gz. (The setup scripts have their own
+      #      signature at the bucket root, published by scripts.yml.)
+      - name: Publish signed checksums for the Lambda artifacts
+        if: needs.checks.outputs.code == 'true'
+        run: |
+          for dest in "lambda/v${BACKEND_VER}" "lambda/latest"; do
+            for f in SHA256SUMS SHA256SUMS.sig SHA256SUMS.pem; do
+              aws s3 cp "$DIST/$f" "s3://$BUCKET/$dest/$f"
+            done
+          done
+
+      # ---- Refresh the CDN's mutable pointers (Helm index, latest/, setup scripts). Versioned
+      #      artifacts are immutable and stay cached. No-op until RELEASES_CF_DISTRIBUTION_ID is set.
+      - name: Invalidate CDN cache (mutable paths)
+        if: vars.RELEASES_CF_DISTRIBUTION_ID != ''
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id "${{ vars.RELEASES_CF_DISTRIBUTION_ID }}" \
+            --paths /charts/reach/index.yaml "/lambda/latest/*"

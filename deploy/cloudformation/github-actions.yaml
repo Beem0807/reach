@@ -1,0 +1,65 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: AWS CloudFormation Template to deploy resources for Github actions
+
+Parameters:
+  ReleasesDistributionId:
+    Type: String
+    Description: >-
+      CloudFront distribution ID of the releases CDN (the releases stack's
+      ReleasesDistributionId output), so CI can invalidate mutable paths on publish.
+
+Resources:
+  GitHubOIDCProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      ThumbprintList:
+        - "6938fd4d98bab03faadb97b34396831e3780aea1"  # GitHub OIDC cert
+
+  GitHubOIDCRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: Role-GitHub-Permissions
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !GetAtt GitHubOIDCProvider.Arn
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringLike:
+                token.actions.githubusercontent.com:sub: repo:Beem0807/reach:ref:refs/heads/main
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+      Policies:
+        - PolicyName: Policy-GitHub-Permissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ListReachReleasesBucket
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - arn:aws:s3:::reach-releases
+                  - arn:aws:s3:::reach-deployments
+
+              - Sid: ManageReachReleaseObjects
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - arn:aws:s3:::reach-releases/*
+                  - arn:aws:s3:::reach-deployments/*
+
+              - Sid: InvalidateReleasesCdn
+                Effect: Allow
+                Action:
+                  - cloudfront:CreateInvalidation
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${ReleasesDistributionId}'

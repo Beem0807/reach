@@ -4,15 +4,15 @@
 # Usage:
 #
 #   Fresh deploy:
-#     curl -fsSL https://reach-releases.s3.amazonaws.com/lambda-setup.sh | bash
+#     curl -fsSL https://releases.reach.nabeem.com/lambda-setup.sh | bash
 #     ./scripts/lambda-setup.sh
 #
 #   Update stack (new release tag and/or password rotation):
-#     curl -fsSL https://reach-releases.s3.amazonaws.com/lambda-setup.sh | bash -s -- --update
+#     curl -fsSL https://releases.reach.nabeem.com/lambda-setup.sh | bash -s -- --update
 #     ./scripts/lambda-setup.sh --update
 #
 #   Delete stack (data retained in DynamoDB):
-#     curl -fsSL https://reach-releases.s3.amazonaws.com/lambda-setup.sh | bash -s -- --down
+#     curl -fsSL https://releases.reach.nabeem.com/lambda-setup.sh | bash -s -- --down
 #     ./scripts/lambda-setup.sh --down
 #
 # Notes:
@@ -33,8 +33,12 @@
 
 set -euo pipefail
 
-S3_BASE="https://reach-releases.s3.amazonaws.com"
-CLI_WHEEL_URL="https://reach-releases.s3.amazonaws.com/cli/latest/reach-0.1.0-py3-none-any.whl"
+S3_BASE="https://releases.reach.nabeem.com"
+CLI_WHEEL_URL="https://releases.reach.nabeem.com/cli/latest/reach-0.1.0-py3-none-any.whl"
+# CloudFormation fetches the stack template via --template-url, which must be an S3 URL (not the
+# CDN) and, at >51KB, can't be passed inline. The packaged template and the Lambda code both live
+# in the deployment bucket. Override DEPLOY_S3_BASE if you host the deployment artifacts elsewhere.
+DEPLOY_S3_BASE="${DEPLOY_S3_BASE:-https://reach-deployments.s3.amazonaws.com}"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -46,6 +50,52 @@ warn() { printf "  [WARN]    %s\n" "$1"; }
 fail() { printf "  [ERROR]   %s\n" "$1"; exit 1; }
 
 trap 'echo ""; echo "[ERROR] Setup failed at line $LINENO"; exit 1' ERR
+
+# Release integrity. Every release publishes a SHA256SUMS (+ .sig/.pem) next to its artifacts;
+# the checksums are signed keyless (Sigstore) by this repo's release workflow. verify_download
+# fetches a file, checks its SHA256 against the signed SHA256SUMS (mandatory), and - when cosign
+# is installed - verifies the signature too. Aborts on any mismatch. Mirrors agent/install.sh.
+REACH_REPO="${REACH_REPO:-Beem0807/reach}"
+verify_download() {
+  local url="$1" name="$2" base="$3" workflow="$4" out="$5"
+  curl -fsSL -o "$out" "$url" || fail "could not download $url"
+  local sums; sums=$(mktemp)
+  curl -fsSL -o "$sums" "$base/SHA256SUMS" \
+    || { rm -f "$sums"; fail "could not fetch $base/SHA256SUMS - refusing to use unverified $name"; }
+  local sha_cmd expected actual
+  if command -v sha256sum &>/dev/null; then sha_cmd=(sha256sum); else sha_cmd=(shasum -a 256); fi
+  expected=$(awk -v n="$name" '$2==n {print $1}' "$sums")
+  actual=$("${sha_cmd[@]}" "$out" | awk '{print $1}')
+  [[ -n "$expected" ]] || { rm -f "$sums"; fail "$name not listed in SHA256SUMS - refusing to use it"; }
+  [[ "$actual" == "$expected" ]] || { rm -f "$sums"; fail "checksum mismatch for $name (expected $expected, got $actual)"; }
+  if command -v cosign &>/dev/null; then
+    local sig cert; sig=$(mktemp); cert=$(mktemp)
+    if curl -fsSL -o "$sig" "$base/SHA256SUMS.sig" && curl -fsSL -o "$cert" "$base/SHA256SUMS.pem"; then
+      if cosign verify-blob --certificate "$cert" --signature "$sig" \
+           --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+           --certificate-identity-regexp "^https://github.com/${REACH_REPO}/\.github/workflows/${workflow}\.yml@" \
+           "$sums" >/dev/null 2>&1; then
+        ok "$name verified (checksum + cosign signature)"
+      else
+        rm -f "$sums" "$sig" "$cert"; fail "cosign signature verification FAILED for $name - refusing to use it"
+      fi
+    else
+      ok "$name checksum verified (signature files not published for this release)"
+    fi
+    rm -f "$sig" "$cert"
+  else
+    ok "$name checksum verified (install 'cosign' to also verify the release signature)"
+  fi
+  rm -f "$sums"
+}
+
+# Verify the CloudFormation template CFN is about to deploy from S3. We download + verify a copy;
+# a match proves the S3 object (which CFN reads via --template-url) is authentic and untampered.
+verify_template() {
+  echo ""
+  echo "==> Verifying release integrity ($RELEASE_TAG)..."
+  verify_download "$TEMPLATE_URL" template.yaml "${S3_BASE}/lambda/${RELEASE_TAG}" backend "$(mktemp)"
+}
 
 prompt() {
   local label="$1"
@@ -92,7 +142,7 @@ prompt_password() {
   while true; do
     read -rsp "  Password: " p1 < /dev/tty; echo "" > /dev/tty
     [[ -z "$p1" ]] && { echo "    Password cannot be empty." > /dev/tty; continue; }
-    [[ ${#p1} -lt 8 ]] && { echo "    Password must be at least 8 characters." > /dev/tty; continue; }
+    [[ ${#p1} -lt 12 ]] && { echo "    Password must be at least 12 characters." > /dev/tty; continue; }
     read -rsp "  Confirm password: " p2 < /dev/tty; echo "" > /dev/tty
     [[ "$p1" == "$p2" ]] && { echo "$p1"; return; }
     echo "    Passwords do not match. Try again." > /dev/tty
@@ -229,8 +279,11 @@ verify_aws() {
 deploy_ui() {
   local release_tag="$1" bucket="$2" dist_id="$3"
   local ui_tmp; ui_tmp=$(mktemp -d)
-  local tarball="${S3_BASE}/lambda/${release_tag}/ui.tar.gz"
-  if curl -fsSL "$tarball" | tar -xz -C "$ui_tmp" 2>/dev/null; then
+  local tarfile="$ui_tmp/ui.tar.gz"
+  # Verify the UI bundle against the signed SHA256SUMS before extracting + publishing it.
+  verify_download "${S3_BASE}/lambda/${release_tag}/ui.tar.gz" ui.tar.gz "${S3_BASE}/lambda/${release_tag}" backend "$tarfile"
+  if tar -xzf "$tarfile" -C "$ui_tmp" 2>/dev/null; then
+    rm -f "$tarfile" # don't sync the tarball itself to the UI bucket
     aws s3 sync "$ui_tmp/" "s3://$bucket/ui/" --delete --region "$AWS_REGION"
     ok "UI deployed"
     if [[ -n "$dist_id" && "$dist_id" != "None" ]]; then
@@ -241,9 +294,31 @@ deploy_ui() {
       ok "Cache invalidated"
     fi
   else
-    warn "could not fetch UI assets from $tarball"
+    warn "could not extract UI assets"
   fi
   rm -rf "$ui_tmp"
+}
+
+# Poll a URL until it returns one of the acceptable HTTP codes. A freshly-created CloudFront
+# distribution - plus the fresh /ui S3 sync + invalidation - takes a few minutes to propagate to the
+# edges, so we wait for it to actually serve before bootstrapping / handing out the console URL
+# (otherwise the first requests race propagation: empty /ui, flaky agent creation).
+#   $1 url  $2 comma-list of OK codes  $3 label  [$4 method=GET]  [$5 body]  [$6 max tries (x5s)=72]
+wait_for_http() {
+  local url="$1" want="$2" label="$3" method="${4:-GET}" body="${5:-}" max="${6:-72}"
+  printf "  %s" "$label"
+  local code=000
+  for _ in $(seq 1 "$max"); do
+    if [[ -n "$body" ]]; then
+      code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 6 -L -X "$method" "$url" -H "Content-Type: application/json" -d "$body" 2>/dev/null || echo 000)
+    else
+      code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 6 -L -X "$method" "$url" 2>/dev/null || echo 000)
+    fi
+    case ",$want," in *",$code,"*) printf "\n"; ok "$label ready (HTTP $code)"; return 0 ;; esac
+    printf "."; sleep 5
+  done
+  printf "\n"; warn "$label not ready after ~$((max * 5))s (last HTTP $code) - continuing; it may just need another minute to propagate"
+  return 1
 }
 
 stack_output() {
@@ -347,8 +422,9 @@ if [[ "${1:-}" == "--update" ]]; then
   STACK_NAME=$(prompt "Stack name" "reach-platform")
 
   RELEASE_TAG=$(prompt "Release tag" "latest")
-  TEMPLATE_URL="${S3_BASE}/lambda/${RELEASE_TAG}/template.yaml"
+  TEMPLATE_URL="${DEPLOY_S3_BASE}/lambda/${RELEASE_TAG}/template.yaml"
   echo "    Using template: $TEMPLATE_URL"
+  verify_template
 
   echo ""
   echo "  Platform secrets (leave blank to keep existing value):"
@@ -406,7 +482,7 @@ if [[ "${1:-}" == "--update" ]]; then
     --template-url "$TEMPLATE_URL" \
     --parameters \
       ParameterKey=TokenPepper,UsePreviousValue=true \
-      ParameterKey=ReleasesS3Base,UsePreviousValue=true \
+      ParameterKey=ReleasesBaseUrl,UsePreviousValue=true \
       "$SESSION_SIGNING_PARAM" \
       "$ADMIN_PASSWORD_PARAM" \
       "$AUDIT_RETENTION_PARAM" \
@@ -436,6 +512,7 @@ if [[ "${1:-}" == "--update" ]]; then
 
   echo "==> Deploying UI..."
   deploy_ui "$RELEASE_TAG" "$ADMIN_UI_BUCKET" "$CF_DISTRIBUTION_ID"
+  wait_for_http "$API_URL/ui/" "200" "Admin console (/ui/)"  # let the invalidation reach the edges
 
   echo ""
   echo "┌──────────────────────────────────────────────┐"
@@ -479,9 +556,21 @@ fi
 command -v curl    &>/dev/null && ok "curl"    || { miss "curl";    MISSING=1; }
 command -v jq      &>/dev/null && ok "jq"      || { miss "jq  →  https://jqlang.github.io/jq/download/"; MISSING=1; }
 command -v openssl &>/dev/null && ok "openssl" || { miss "openssl  →  required to generate secure tokens"; MISSING=1; }
-# python3 is NOT needed for the deploy itself (JSON is handled by jq) - only for
-# the optional Reach CLI install (a Python package). Warn, don't fail.
-command -v python3 &>/dev/null && ok "python3 (for optional CLI install)" || warn "python3 not found - the optional Reach CLI install will be skipped"
+# python3 is NOT needed for the deploy itself (JSON is handled by jq) - only for the optional Reach
+# CLI install, which requires Python 3.10+. Detect the version up front so we skip cleanly with a
+# clear message instead of letting pip fail later. Warn, don't fail (the CLI is optional).
+CLI_PYTHON_OK=false
+if command -v python3 &>/dev/null; then
+  PY_VERSION=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo "?")
+  if python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' 2>/dev/null; then
+    CLI_PYTHON_OK=true
+    ok "python3 $PY_VERSION (for optional CLI install)"
+  else
+    warn "python3 $PY_VERSION found, but the Reach CLI requires Python 3.10+ - the optional CLI install will be skipped"
+  fi
+else
+  warn "python3 not found - the optional Reach CLI install will be skipped"
+fi
 [[ "$MISSING" -eq 1 ]] && fail "install missing dependencies and re-run."
 
 # ===========================================================================
@@ -495,8 +584,9 @@ echo ""
 prompt_aws
 STACK_NAME=$(prompt "Stack name" "reach-platform")
 RELEASE_TAG=$(prompt "Release tag" "latest")
-TEMPLATE_URL="${S3_BASE}/lambda/${RELEASE_TAG}/template.yaml"
+TEMPLATE_URL="${DEPLOY_S3_BASE}/lambda/${RELEASE_TAG}/template.yaml"
 echo "    Using template: $TEMPLATE_URL"
+verify_template
 
 verify_aws
 
@@ -603,7 +693,7 @@ else
   AUDIT_RETENTION_DAYS=90
 fi
 
-# Chart repo defaults to <ReleasesS3Base>/charts/reach-agent. Self-hosting the
+# Chart repo defaults to <ReleasesBaseUrl>/charts/reach-agent. Self-hosting the
 # Helm repo is rare, so it's an env override (RELEASES_CHART_REPO=…) rather than a
 # prompt. Agent/chart versions are chosen per-agent in the console.
 RELEASES_CHART_REPO="${RELEASES_CHART_REPO:-}"
@@ -613,8 +703,26 @@ echo ""
 CLI_INSTALL="false"
 if command -v reach &>/dev/null; then
   info "Reach CLI already installed"
+elif [[ "$CLI_PYTHON_OK" != "true" ]]; then
+  info "Skipping Reach CLI install - needs Python 3.10+ (install it and re-run, or: pip install $CLI_WHEEL_URL)"
 else
   CLI_INSTALL=$(prompt_yes_no "Install Reach CLI?" "Y")
+fi
+
+# If we'll log the CLI in and a profile already exists, decide the overwrite NOW (Phase 1) so the
+# deploy phase stays non-interactive - `reach login` would otherwise stop mid-deploy to ask
+# "Overwrite?". The decision is applied later via `reach login --force` (or by skipping login).
+CLI_OVERWRITE="false"
+CLI_PROFILE_EXISTS="false"
+REACH_CONFIG="$HOME/.reach/config.json"
+if [[ "$CLI_INSTALL" == "true" ]] || command -v reach &>/dev/null; then
+  if [[ -f "$REACH_CONFIG" ]] && jq -e '.profiles.default' "$REACH_CONFIG" >/dev/null 2>&1; then
+    CLI_PROFILE_EXISTS="true"
+    _existing_api=$(jq -r '.profiles.default.api_url // "unknown"' "$REACH_CONFIG" 2>/dev/null)
+    echo ""
+    warn "A Reach CLI profile 'default' already exists (API: $_existing_api)."
+    CLI_OVERWRITE=$(prompt_yes_no "Overwrite it with this deployment's login?" "N")
+  fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -697,6 +805,13 @@ CF_DISTRIBUTION_ID=$(stack_output "CloudFrontDistributionId")
 echo "==> Deploying UI..."
 deploy_ui "$RELEASE_TAG" "$ADMIN_UI_BUCKET" "$CF_DISTRIBUTION_ID"
 
+# A fresh CloudFront distribution + the /ui sync/invalidation need a few minutes to reach the edges.
+# Wait for BOTH origins to actually serve before we bootstrap (which calls the API) and before we
+# print the console URL - otherwise the first requests race propagation (empty /ui, flaky bootstrap).
+echo "==> Waiting for CloudFront to finish propagating (a fresh distribution can take a few minutes)..."
+wait_for_http "$API_URL/tenant/login" "400,401,422" "API" POST "{}"
+wait_for_http "$API_URL/ui/" "200" "Admin console (/ui/)"
+
 # ---------------------------------------------------------------------------
 # Bootstrap: tenant → user → API key → agent
 # ---------------------------------------------------------------------------
@@ -749,23 +864,34 @@ if [[ "$CREATE_AGENT" == "true" ]]; then
   # The freshly-deployed API (API Gateway + Lambda) can be briefly unavailable while it warms
   # up or DNS propagates, so create with a few automatic retries and fail cleanly on repeated
   # failure instead of aborting through jq/errexit.
-  AGENT_RESP=""
-  for attempt in 1 2 3; do
+  # 5 attempts with exponential backoff (3->6->12->24s, ~45s total). This route is its own Lambda
+  # function invoked for the first time here, so its cold start can outlast a few quick retries.
+  AGENT_RESP=""; delay=3
+  for attempt in 1 2 3 4 5; do
     AGENT_RESP=$(request_json_soft POST "$API_URL/tenant/agents" \
       "$(mkjson type "$AGENT_TYPE" mode "$AGENT_MODE" os "$AGENT_OS" grant_service_mgmt "$GRANT_SERVICE_MGMT" grant_docker "$GRANT_DOCKER")" \
       -H "Authorization: Bearer $USER_TOKEN" \
       -H "Content-Type: application/json") || AGENT_RESP=""
     AGENT_ID=$(printf '%s' "$AGENT_RESP" | json_get '.agent_id // empty' 2>/dev/null || true)
     [[ -n "$AGENT_ID" ]] && break
-    if [[ "$attempt" -lt 3 ]]; then
-      info "Agent creation attempt $attempt/3 failed (API warming up); retrying in 3s..."
-      sleep 3
+    if [[ "$attempt" -lt 5 ]]; then
+      info "Agent creation attempt $attempt/5 failed (API warming up); retrying in ${delay}s..."
+      sleep "$delay"; delay=$((delay * 2))
     fi
   done
-  [[ -n "$AGENT_ID" ]] || fail "Agent creation failed against $API_URL. Response: ${AGENT_RESP:-<none>}"
-  # host agents return commands.agent (install.sh); k8s agents return commands.helm.
-  INSTALL_AGENT=$(printf '%s' "$AGENT_RESP" | json_get '.commands.helm // .commands.agent // empty' 2>/dev/null || true)
-  ok "Agent:    $AGENT_ID"
+  if [[ -n "$AGENT_ID" ]]; then
+    # host agents return commands.agent (install.sh); k8s agents return commands.helm.
+    INSTALL_AGENT=$(printf '%s' "$AGENT_RESP" | json_get '.commands.helm // .commands.agent // empty' 2>/dev/null || true)
+    ok "Agent:    $AGENT_ID"
+  else
+    # Don't abort the whole setup - the tenant, user, and API key already exist. The API is most
+    # likely still warming up / CloudFront still propagating; skip the agent and let them add one in
+    # the console, then continue with the CLI so setup still finishes usefully.
+    AGENT_CREATE_SKIPPED=true
+    warn "Agent creation didn't succeed - the API may still be warming up or CloudFront still propagating."
+    info "Skipping the agent. Once the API is up, create one in the console: ${UI_URL:-$API_URL/ui/}  (New agent)."
+    info "Continuing with the CLI setup..."
+  fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -782,17 +908,20 @@ if command -v reach &>/dev/null; then
   ok "reach already installed"
 elif [[ "$CLI_INSTALL" == "true" ]]; then
   _installed=false
+  # Verify the wheel against the signed SHA256SUMS before installing it, then install the local copy.
+  CLI_WHEEL_LOCAL="$(mktemp -d)/$(basename "$CLI_WHEEL_URL")"
+  verify_download "$CLI_WHEEL_URL" "$(basename "$CLI_WHEEL_URL")" "${CLI_WHEEL_URL%/*}" cli "$CLI_WHEEL_LOCAL"
   if command -v uv &>/dev/null; then
-    uv tool install "$CLI_WHEEL_URL" --force && _installed=true || true
+    uv tool install "$CLI_WHEEL_LOCAL" --force && _installed=true || true
   fi
   if [[ "$_installed" == false ]] && command -v pipx &>/dev/null; then
-    pipx install "$CLI_WHEEL_URL" --force && _installed=true || true
+    pipx install "$CLI_WHEEL_LOCAL" --force && _installed=true || true
   fi
   if [[ "$_installed" == false ]] && command -v pip3 &>/dev/null; then
-    pip3 install "$CLI_WHEEL_URL" && _installed=true || true
+    pip3 install "$CLI_WHEEL_LOCAL" && _installed=true || true
   fi
   if [[ "$_installed" == false ]]; then
-    python3 -m pip install "$CLI_WHEEL_URL" && _installed=true || true
+    python3 -m pip install "$CLI_WHEEL_LOCAL" && _installed=true || true
   fi
   if [[ "$_installed" == false ]]; then
     warn "CLI install failed. Install manually: pip install $CLI_WHEEL_URL"
@@ -801,12 +930,16 @@ elif [[ "$CLI_INSTALL" == "true" ]]; then
 fi
 
 if [[ "$CLI_READY" == "true" ]]; then
-  reach login --api-url "$API_URL" --api-key "$API_KEY"
-  if [[ -n "$AGENT_ID" ]]; then
-    reach agents use "$AGENT_ID"
+  if [[ "$CLI_PROFILE_EXISTS" == "true" && "$CLI_OVERWRITE" != "true" ]]; then
+    info "Keeping your existing CLI profile 'default' (you chose not to overwrite). Skipping login."
+  else
+    # --force applies the overwrite decision made in Phase 1 (no interactive prompt here).
+    _login_force=""; [[ "$CLI_OVERWRITE" == "true" ]] && _login_force="--force"
+    reach login $_login_force --api-url "$API_URL" --api-key "$API_KEY"
+    [[ -n "$AGENT_ID" ]] && reach agents use "$AGENT_ID"
+    CLI_LOGGED_IN=true
+    ok "CLI ready"
   fi
-  CLI_LOGGED_IN=true
-  ok "CLI ready"
 fi
 
 # ---------------------------------------------------------------------------
@@ -853,7 +986,15 @@ else
   fi
 fi
 echo ""
-if [[ "$CREATE_AGENT" == "true" ]]; then
+if [[ "${AGENT_CREATE_SKIPPED:-false}" == "true" ]]; then
+  echo "  ── Agent (skipped) ──────────────────────────────────────────────"
+  echo ""
+  echo "  Agent creation was skipped - the API / CloudFront was still warming up."
+  echo "  Create one in the console once it's reachable:"
+  echo ""
+  echo "    ${UI_URL:-$API_URL/ui/}   ->  New agent"
+  echo ""
+elif [[ "$CREATE_AGENT" == "true" ]]; then
   if [[ "$AGENT_TYPE" == "k8s" ]]; then
     echo "  ── Install agent on your Kubernetes cluster ─────────────────────"
   else

@@ -1,0 +1,53 @@
+name: Trivy scan
+description: >
+  Scan a container image (scan-type image) OR a filesystem dependency tree (scan-type fs) for OS +
+  library vulnerabilities. Uploads SARIF to the GitHub Security tab (code-scanning alerts, with
+  history) and fails on FIXABLE CRITICAL/HIGH findings. Shared by the image builds/releases and the
+  CLI dependency scan so the scan config lives in one place.
+inputs:
+  ref:
+    description: What to scan - an image ref (scan-type image) or a filesystem path (scan-type fs).
+    required: true
+  scan-type:
+    description: "image (default, scan a container image) | fs (scan a dependency tree)."
+    required: false
+    default: image
+  category:
+    description: Code-scanning category, so different components' alerts don't overwrite each other.
+    required: true
+runs:
+  using: composite
+  steps:
+    # 1. SARIF for the Security tab. exit-code 0 here so this step only *reports*; the gate below is
+    #    what fails the build. Uploaded unconditionally so alerts appear even when the gate fails.
+    - name: Trivy scan (SARIF report)
+      uses: aquasecurity/trivy-action@v0.36.0
+      with:
+        scan-type: ${{ inputs.scan-type }}
+        image-ref: ${{ inputs.scan-type == 'image' && inputs.ref || '' }}
+        scan-ref: ${{ inputs.scan-type == 'fs' && inputs.ref || '' }}
+        format: sarif
+        output: trivy-results.sarif
+        severity: CRITICAL,HIGH
+        ignore-unfixed: true
+        vuln-type: os,library
+        exit-code: "0"
+    - name: Upload SARIF to the Security tab
+      if: always()
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: trivy-results.sarif
+        category: ${{ inputs.category }}
+    # 2. Human-readable gate: reuses the DB just downloaded, so it's fast. Fails on fixable
+    #    CRITICAL/HIGH (unfixable base-image CVEs are reported in the SARIF but don't block).
+    - name: Trivy scan (gate)
+      uses: aquasecurity/trivy-action@v0.36.0
+      with:
+        scan-type: ${{ inputs.scan-type }}
+        image-ref: ${{ inputs.scan-type == 'image' && inputs.ref || '' }}
+        scan-ref: ${{ inputs.scan-type == 'fs' && inputs.ref || '' }}
+        format: table
+        severity: CRITICAL,HIGH
+        ignore-unfixed: true
+        vuln-type: os,library
+        exit-code: "1"

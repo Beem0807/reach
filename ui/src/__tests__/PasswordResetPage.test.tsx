@@ -23,7 +23,7 @@ function renderPage() {
   return { onComplete };
 }
 
-const newPw = () => screen.getByPlaceholderText('At least 8 characters');
+const newPw = () => screen.getByPlaceholderText('At least 12 characters');
 const confirmPw = () => screen.getAllByPlaceholderText('••••••••')[1];
 
 beforeEach(() => { vi.restoreAllMocks(); });
@@ -40,14 +40,14 @@ describe('PasswordResetPage', () => {
     expect(spy).not.toHaveBeenCalled();
   });
 
-  it('rejects passwords shorter than 8 characters', async () => {
+  it('rejects passwords shorter than 12 characters', async () => {
     const spy = vi.spyOn(api, 'tenantChangePassword');
     renderPage();
     await userEvent.type(screen.getAllByPlaceholderText('••••••••')[0], 'oldpass12');
     await userEvent.type(newPw(), 'short');
     await userEvent.type(confirmPw(), 'short');
     fireEvent.click(screen.getByRole('button', { name: 'Set new password' }));
-    expect(await screen.findByText('Password must be at least 8 characters.')).toBeInTheDocument();
+    expect(await screen.findByText('Password must be at least 12 characters.')).toBeInTheDocument();
     expect(spy).not.toHaveBeenCalled();
   });
 
