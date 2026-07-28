@@ -12,39 +12,39 @@
 # Usage:
 #
 #   Fresh setup:
-#     curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh | bash
+#     curl -fsSL https://releases.reach.nabeem.com/local-setup.sh | bash
 #     ./scripts/local-setup.sh
 #
 #   Check if everything is running:
-#     curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh | bash -s -- --status
+#     curl -fsSL https://releases.reach.nabeem.com/local-setup.sh | bash -s -- --status
 #     ./scripts/local-setup.sh --status
 #
 #   Register another agent against the running stack:
-#     curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh | bash -s -- --create-agent
+#     curl -fsSL https://releases.reach.nabeem.com/local-setup.sh | bash -s -- --create-agent
 #     ./scripts/local-setup.sh --create-agent
 #
 #   Update backend image only (keeps all data):
-#     curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh | bash -s -- --update
+#     curl -fsSL https://releases.reach.nabeem.com/local-setup.sh | bash -s -- --update
 #     ./scripts/local-setup.sh --update
 #
 #   Stop backend, keep database:
-#     curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh | bash -s -- --down
+#     curl -fsSL https://releases.reach.nabeem.com/local-setup.sh | bash -s -- --down
 #     ./scripts/local-setup.sh --down
 #
 #   Stop backend and delete database:
-#     curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh | bash -s -- --reset
+#     curl -fsSL https://releases.reach.nabeem.com/local-setup.sh | bash -s -- --reset
 #     ./scripts/local-setup.sh --reset
 #
 #   Remove everything, optionally uninstall CLI:
-#     curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh | bash -s -- --purge
+#     curl -fsSL https://releases.reach.nabeem.com/local-setup.sh | bash -s -- --purge
 #     ./scripts/local-setup.sh --purge
 #
 #   Rotate the platform admin password:
-#     curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh | bash -s -- --rotate-password
+#     curl -fsSL https://releases.reach.nabeem.com/local-setup.sh | bash -s -- --rotate-password
 #     ./scripts/local-setup.sh --rotate-password
 #
 #   Rotate the session signing key (forces console re-login):
-#     curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh | bash -s -- --rotate-session-key
+#     curl -fsSL https://releases.reach.nabeem.com/local-setup.sh | bash -s -- --rotate-session-key
 #     ./scripts/local-setup.sh --rotate-session-key
 #
 # Notes:
@@ -79,7 +79,7 @@ WORK_DIR="$HOME/.reach/local"
 COMPOSE_FILE="$WORK_DIR/docker-compose.yml"
 ENV_FILE="$WORK_DIR/env"
 API_PORT="${API_PORT:-8000}"
-CLI_WHEEL_URL="https://reach-releases.s3.amazonaws.com/cli/latest/reach-0.1.0-py3-none-any.whl"
+CLI_WHEEL_URL="https://releases.reach.nabeem.com/cli/latest/reach-0.1.0-py3-none-any.whl"
 # Resolve public tunnel hostnames over DoH. macOS curl's system resolver can fail
 # on freshly-created *.trycloudflare.com names that a browser (which uses DoH)
 # reaches fine; `curl --doh-url` sidesteps that. Not used for localhost. Only
@@ -363,7 +363,7 @@ NGINXEOF
 
 write_compose_file() {
   # Only emit RELEASES_CHART_REPO when set; an empty value would override the
-  # backend's default (derived from RELEASES_S3_BASE) with an empty string.
+  # backend's default (derived from RELEASES_BASE_URL) with an empty string.
   local chart_repo_env=""
   [[ -n "${RELEASES_CHART_REPO:-}" ]] && chart_repo_env="
       RELEASES_CHART_REPO: \"${RELEASES_CHART_REPO}\""
@@ -1365,7 +1365,7 @@ else
   AUDIT_RETENTION_DAYS=90
 fi
 
-# Chart repo defaults to <RELEASES_S3_BASE>/charts/reach-agent. Self-hosting the
+# Chart repo defaults to <RELEASES_BASE_URL>/charts/reach-agent. Self-hosting the
 # Helm repo is rare, so it's an env override (RELEASES_CHART_REPO=…) rather than a
 # prompt. Agent/chart versions are chosen per-agent in the console.
 RELEASES_CHART_REPO="${RELEASES_CHART_REPO:-}"
@@ -1713,7 +1713,7 @@ echo ""
 # Show management commands the way the user actually invoked us: the local script
 # path when run from a checkout, otherwise the curl form (a `curl … | bash`
 # install has no ./scripts/local-setup.sh on disk to re-run).
-_setup_url="${RELEASES_S3_BASE:-https://reach-releases.s3.amazonaws.com}/local-setup.sh"
+_setup_url="${RELEASES_BASE_URL:-https://releases.reach.nabeem.com}/local-setup.sh"
 if [[ -f "$0" && "$0" == *local-setup.sh ]]; then
   SETUP_CMD="$0"
 else

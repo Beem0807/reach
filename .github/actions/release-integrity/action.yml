@@ -1,0 +1,68 @@
+name: Release integrity
+description: >
+  For a set of file artifacts: emit SHA256 checksums, an optional SPDX SBOM, a keyless
+  cosign signature over the checksums, a SLSA build-provenance attestation, and a formal
+  GitHub Release with auto-generated notes. Shared by the backend/agent/cli pipelines so
+  the signing/checksums/provenance/release logic lives in exactly one place.
+inputs:
+  tag:
+    description: Existing git tag the GitHub Release is attached to.
+    required: true
+  artifacts-dir:
+    description: Directory whose flat contents are the release artifacts (all get checksummed, signed-over, attested, and attached).
+    required: true
+  sbom-source:
+    description: Optional path/dir to generate an SPDX SBOM from (e.g. the component's source dir). Empty = no source SBOM.
+    required: false
+    default: ""
+  title:
+    description: Release title. Defaults to the tag.
+    required: false
+    default: ""
+  notes:
+    description: Optional markdown prepended to the auto-generated release notes.
+    required: false
+    default: ""
+runs:
+  using: composite
+  steps:
+    - uses: sigstore/cosign-installer@v3
+
+    - name: Source SBOM (SPDX)
+      if: inputs.sbom-source != ''
+      uses: anchore/sbom-action@v0
+      with:
+        path: ${{ inputs.sbom-source }}
+        format: spdx-json
+        output-file: ${{ inputs.artifacts-dir }}/sbom.spdx.json
+        upload-artifact: false
+
+    - name: Checksums + keyless signature over them
+      shell: bash
+      working-directory: ${{ inputs.artifacts-dir }}
+      run: |
+        set -euo pipefail
+        # Checksum every artifact (write elsewhere first so SHA256SUMS can't checksum itself).
+        sha256sum * > "$RUNNER_TEMP/SHA256SUMS"
+        mv "$RUNNER_TEMP/SHA256SUMS" SHA256SUMS
+        echo "── SHA256SUMS ──"; cat SHA256SUMS
+        # One keyless (OIDC/Fulcio) signature over the checksum file: verifying it authenticates
+        # every artifact. Emits a detached signature + the short-lived signing certificate.
+        cosign sign-blob --yes SHA256SUMS \
+          --output-signature SHA256SUMS.sig \
+          --output-certificate SHA256SUMS.pem
+
+    - name: SLSA provenance attestation (files)
+      uses: actions/attest-build-provenance@v2
+      with:
+        subject-path: ${{ inputs.artifacts-dir }}/*
+
+    - name: GitHub Release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ inputs.tag }}
+        name: ${{ inputs.title != '' && inputs.title || inputs.tag }}
+        body: ${{ inputs.notes }}
+        generate_release_notes: true
+        fail_on_unmatched_files: true
+        files: ${{ inputs.artifacts-dir }}/*

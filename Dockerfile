@@ -40,7 +40,7 @@ COPY backend/ .
 COPY --from=ui-builder /ui/dist /app/ui_dist
 
 ENV STORAGE_BACKEND=postgres
-ENV RELEASES_S3_BASE=https://reach-releases.s3.amazonaws.com
+ENV RELEASES_BASE_URL=https://releases.reach.nabeem.com
 
 # Run as non-root by default, while staying compatible with ANY uid - including
 # `--user 0` (root) and the random uids Kubernetes/OpenShift assign. Those

@@ -18,7 +18,26 @@ You will receive an acknowledgement within 48 hours. If the issue is confirmed, 
 
 ## Supported versions
 
-Only the latest released version receives security fixes. Older versions are not backported.
+Only the latest released version of each component receives security fixes; older versions are not
+backported. The full per-component policy (backend / agent / CLI) is in [SUPPORT.md](SUPPORT.md).
+
+---
+
+## Release integrity (supply chain)
+
+The software-distribution path is held to the same bar as the runtime. Releases are built only by
+GitHub Actions (no local or manual pushes), and every artifact is verifiable:
+
+- **Signed** - container images and the release checksums are signed with **cosign, keyless**
+  (Sigstore/Fulcio via the workflow's OIDC identity - there is no long-lived signing key).
+- **Checksummed** - a signed `SHA256SUMS` covers every binary, wheel, and chart.
+- **SBOM + provenance** - an SPDX SBOM and SLSA build provenance accompany each image and artifact.
+- **Verifiable install** - the agent installer (`install.sh`) checks the binary's checksum before
+  installing (and the cosign signature when cosign is present), and the console offers a
+  download → authenticate → inspect → run path alongside the one-command installer.
+
+Commands and full verification steps (`cosign verify`, `gh attestation verify`, checksum checks)
+are in [SUPPORT.md](SUPPORT.md).
 
 ---
 
