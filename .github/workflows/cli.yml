@@ -1,0 +1,191 @@
+# CLI pipeline. Triggers ONLY when cli/** changes (never for agent/backend). Separate from
+# the agent/backend flows: the CLI has no Helm chart - just a wheel published to S3.
+#
+#   PR into main  -> run the version-bump `checks` + the CLI `test`s. Nothing is published.
+#   Push to main  -> checks + tests run, and only if they pass the `release` job builds the wheel,
+#     uploads it to S3 (cli/v<version>/ and cli/latest/), then tags cli-<ver>.
+#
+# Release logic is inlined (mirrors the former scripts/release_cli.sh).
+# Required config: AWS_ROLE_ARN (the IAM role assumed via GitHub OIDC - no long-lived AWS keys).
+# The AWS account needs a GitHub OIDC provider and that role's trust policy scoped to this repo.
+name: CLI
+
+on:
+  pull_request:
+    branches: [main]
+    paths: ["cli/**"]
+  push:
+    branches: [main]
+    paths: ["cli/**"]
+
+concurrency:
+  # Cancel superseded PR runs; serialize (never cancel) releases on main.
+  group: cli-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: write # release job pushes git tags + creates GitHub Releases
+  id-token: write # OIDC: assume the AWS role + keyless cosign / attestations
+  attestations: write # SLSA build-provenance attestations
+
+env:
+  BUCKET: reach-releases
+  RELEASES_BASE_URL: https://releases.reach.nabeem.com # CDN the wheel is read from (PR existence check)
+
+jobs:
+  # Version-bump guard. Runs on PRs too, so a CLI change without a version bump (a version that
+  # was already released) is caught at PR time - the author fixes it before merge. Runs again on
+  # merge; its output (the version) feeds the release job. Credential-free: just git + file reads.
+  checks:
+    runs-on: ubuntu-latest
+    outputs:
+      cli: ${{ steps.ver.outputs.cli }}
+    steps:
+      - name: Validate required secrets
+        env:
+          AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+        run: |
+          if [ -z "$AWS_ROLE_ARN" ]; then
+            echo "::error::Missing required repository secret: AWS_ROLE_ARN - add it under Settings > Secrets and variables > Actions before merging to main (the release job needs it)"
+            exit 1
+          fi
+          echo "required secrets present"
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Read version
+        id: ver
+        run: |
+          CLI_VER=$(grep '__version__' cli/reach/__init__.py | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+          echo "cli=$CLI_VER" >> "$GITHUB_OUTPUT"
+          echo "cli=$CLI_VER"
+      - name: Version-bump + tag existence check
+        env:
+          CLI_VER: ${{ steps.ver.outputs.cli }}
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/cli-$CLI_VER" >/dev/null 2>&1; then
+            echo "::error::cli changed but tag cli-$CLI_VER already exists - bump __version__ in cli/reach/__init__.py"
+            exit 1
+          fi
+          echo "version-bump check passed"
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # Test the MINIMUM supported Python (pyproject requires-python) and the latest, so a
+      # version-floor incompatibility - e.g. a 3.12+ f-string reused on 3.10 - fails CI instead
+      # of shipping a wheel that can't even import for users below the newest Python.
+      matrix:
+        python-version: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install pytest .
+        working-directory: cli
+      - run: python -m pytest tests/ -q
+        working-directory: cli
+
+  # PR validation: build the wheel (proves it packages) and confirm this version's wheel isn't
+  # already published - but upload/tag nothing. Credential-free: existence is checked over the
+  # public CDN (PRs can't assume the AWS role). Merges run `release` below.
+  build:
+    needs: [checks, test]
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    env:
+      CLI_VER: ${{ needs.checks.outputs.cli }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build wheel + ensure it doesn't already exist
+        run: |
+          python -m pip install --quiet --upgrade pip build
+          OUT=$(mktemp -d)
+          python -m build --wheel --outdir "$OUT" cli
+          NAME=$(basename "$(ls "$OUT"/*.whl | head -1)")
+          echo "built $NAME"
+          if curl -fsIL -o /dev/null "$RELEASES_BASE_URL/cli/v$CLI_VER/$NAME"; then
+            echo "::error::CLI wheel cli/v$CLI_VER/$NAME already exists - bump __version__ in cli/reach/__init__.py"; exit 1
+          fi
+          echo "no conflicting wheel for this version"
+
+  # Publish + tag. Merge to main only, after checks + tests pass. Consumes checks' output.
+  release:
+    needs: [checks, test]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    env:
+      CLI_VER: ${{ needs.checks.outputs.cli }}
+      DIST: ${{ github.workspace }}/dist
+    steps:
+      - uses: actions/checkout@v4 # to push tags
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+      - run: mkdir -p "$DIST"
+
+      # ---- Artifact existence check: on top of the tag check in `checks`, refuse to overwrite the
+      #      actual wheel for this version. (cli/latest/ is intentionally mutable and not checked.)
+      - name: Ensure this version's wheel doesn't already exist
+        run: |
+          if [ -n "$(aws s3 ls "s3://$BUCKET/cli/v$CLI_VER/" 2>/dev/null)" ]; then
+            echo "::error::CLI wheel cli/v$CLI_VER/ already exists in S3 - bump __version__ in cli/reach/__init__.py"; exit 1
+          fi
+          echo "no conflicting wheel for this version"
+
+      # ---- Build the wheel (hatchling), stage it for the release, and upload to S3 (versioned + latest).
+      - name: Build + upload CLI wheel
+        run: |
+          python -m pip install --quiet --upgrade pip build
+          python -m build --wheel --outdir "$DIST" cli
+          WHEEL=$(ls "$DIST"/*.whl | head -1)
+          NAME=$(basename "$WHEEL")
+          aws s3 cp "$WHEEL" "s3://$BUCKET/cli/v${CLI_VER}/$NAME"
+          aws s3 cp "$WHEEL" "s3://$BUCKET/cli/latest/$NAME"
+
+      - name: Tag the repo
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "cli-$CLI_VER" -m "CLI $CLI_VER"
+          git push origin "cli-$CLI_VER"
+          echo "tagged cli-$CLI_VER"
+
+      # ---- Checksums + SBOM + keyless signature + provenance + GitHub Release for the wheel.
+      - name: Release integrity
+        uses: ./.github/actions/release-integrity
+        with:
+          tag: cli-${{ env.CLI_VER }}
+          artifacts-dir: ${{ env.DIST }}
+          sbom-source: cli
+          notes: |
+            Signed release. The wheel is covered by the signed `SHA256SUMS` (keyless cosign) with an
+            SPDX SBOM and SLSA provenance. See SUPPORT.md → "Verifying a release".
+
+      # ---- Publish the signed SHA256SUMS next to the wheel so setup scripts can verify the CLI
+      #      install (mirrors how install.sh verifies agent binaries).
+      - name: Publish signed checksums next to the wheel
+        run: |
+          for dest in "cli/v${CLI_VER}" "cli/latest"; do
+            for f in SHA256SUMS SHA256SUMS.sig SHA256SUMS.pem; do
+              aws s3 cp "$DIST/$f" "s3://$BUCKET/$dest/$f"
+            done
+          done
+
+      # ---- Refresh the CDN's mutable pointer for cli/latest. No-op until RELEASES_CF_DISTRIBUTION_ID is set.
+      - name: Invalidate CDN cache (mutable paths)
+        if: vars.RELEASES_CF_DISTRIBUTION_ID != ''
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id "${{ vars.RELEASES_CF_DISTRIBUTION_ID }}" \
+            --paths "/cli/latest/*"

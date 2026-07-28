@@ -592,27 +592,37 @@ Both helpers are role-aware only through the data: admins are created with `None
 
 ## Release structure
 
-Artifacts are published to S3 under component-specific prefixes:
+Release artifacts are served over a CDN - `https://releases.reach.nabeem.com` (CloudFront over the
+private `reach-releases` bucket): CI writes to S3, users read via the domain. Every release is
+signed, checksummed, and carries an SBOM + SLSA provenance (see [SUPPORT.md](SUPPORT.md)). The
+SAM/Lambda **function code** lives in a separate `reach-deployments` bucket, because a user's
+CloudFormation reads it straight from `s3://` during a Lambda deploy, so it is not CDN-fronted.
 
 ```
-s3://reach-releases/
+https://releases.reach.nabeem.com/   (CloudFront -> s3://reach-releases/)
   cli/                          (CLI wheel)
     v0.1.0/reach-0.1.0-py3-none-any.whl
-    latest/reach-0.1.0-py3-none-any.whl
+    v0.1.0/SHA256SUMS(.sig/.pem) (signed - local/lambda-setup verify the wheel)
+    latest/  (same files)
   agent/                        (host install artifacts)
     v0.1.0/reach-agent-{linux,darwin}-{amd64,arm64}
     v0.1.0/install.sh           (install + uninstall via --uninstall)
+    v0.1.0/SHA256SUMS(.sig/.pem) (signed checksums - install.sh verifies against these)
     latest/  (same files)
     versions.json               (published host versions - the create dropdown reads this)
-  charts/reach-agent/           (Helm repo for the Kubernetes agent)
-    index.yaml                  (published chart versions - the create dropdown reads this)
-    reach-agent-0.1.0.tgz       (one tarball per published chart version)
-  lambda/
-    code/                       (SAM-packaged function zips, content-addressed)
-    v0.1.0/template.yaml
-    latest/template.yaml
-  local-setup.sh
-  lambda-setup.sh
+  charts/{reach,reach-agent}/   (Helm repos; the create dropdown reads index.yaml)
+    index.yaml                  (mutable - cache-bypassed at the edge)
+    reach[-agent]-0.1.0.tgz     (one tarball per published chart version)
+  lambda/                       (backend UI bundle + signed checksums for the deploy)
+    v0.1.0/ui.tar.gz            (admin UI, synced to the stack's UI bucket)
+    v0.1.0/SHA256SUMS(.sig/.pem) (lambda-setup verifies the template + UI against these)
+    latest/  (same files)
+  local-setup.sh                (Docker install; cosign-verifies the backend image)
+  lambda-setup.sh               (Lambda install; verifies template + UI before deploy)
+
+s3://reach-deployments/         (not CDN-fronted; CloudFormation reads these from s3:// at deploy)
+  lambda/v0.1.0/template.yaml   (SAM packaged template; latest/template.yaml too)
+  lambda/code/                  (SAM-packaged function zips, content-addressed)
 ```
 
 Docker images:

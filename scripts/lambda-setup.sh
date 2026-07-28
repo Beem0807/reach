@@ -4,15 +4,15 @@
 # Usage:
 #
 #   Fresh deploy:
-#     curl -fsSL https://reach-releases.s3.amazonaws.com/lambda-setup.sh | bash
+#     curl -fsSL https://releases.reach.nabeem.com/lambda-setup.sh | bash
 #     ./scripts/lambda-setup.sh
 #
 #   Update stack (new release tag and/or password rotation):
-#     curl -fsSL https://reach-releases.s3.amazonaws.com/lambda-setup.sh | bash -s -- --update
+#     curl -fsSL https://releases.reach.nabeem.com/lambda-setup.sh | bash -s -- --update
 #     ./scripts/lambda-setup.sh --update
 #
 #   Delete stack (data retained in DynamoDB):
-#     curl -fsSL https://reach-releases.s3.amazonaws.com/lambda-setup.sh | bash -s -- --down
+#     curl -fsSL https://releases.reach.nabeem.com/lambda-setup.sh | bash -s -- --down
 #     ./scripts/lambda-setup.sh --down
 #
 # Notes:
@@ -33,8 +33,12 @@
 
 set -euo pipefail
 
-S3_BASE="https://reach-releases.s3.amazonaws.com"
-CLI_WHEEL_URL="https://reach-releases.s3.amazonaws.com/cli/latest/reach-0.1.0-py3-none-any.whl"
+S3_BASE="https://releases.reach.nabeem.com"
+CLI_WHEEL_URL="https://releases.reach.nabeem.com/cli/latest/reach-0.1.0-py3-none-any.whl"
+# CloudFormation fetches the stack template via --template-url, which must be an S3 URL (not the
+# CDN) and, at >51KB, can't be passed inline. The packaged template and the Lambda code both live
+# in the deployment bucket. Override DEPLOY_S3_BASE if you host the deployment artifacts elsewhere.
+DEPLOY_S3_BASE="${DEPLOY_S3_BASE:-https://reach-deployments.s3.amazonaws.com}"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -46,6 +50,52 @@ warn() { printf "  [WARN]    %s\n" "$1"; }
 fail() { printf "  [ERROR]   %s\n" "$1"; exit 1; }
 
 trap 'echo ""; echo "[ERROR] Setup failed at line $LINENO"; exit 1' ERR
+
+# Release integrity. Every release publishes a SHA256SUMS (+ .sig/.pem) next to its artifacts;
+# the checksums are signed keyless (Sigstore) by this repo's release workflow. verify_download
+# fetches a file, checks its SHA256 against the signed SHA256SUMS (mandatory), and - when cosign
+# is installed - verifies the signature too. Aborts on any mismatch. Mirrors agent/install.sh.
+REACH_REPO="${REACH_REPO:-Beem0807/reach}"
+verify_download() {
+  local url="$1" name="$2" base="$3" workflow="$4" out="$5"
+  curl -fsSL -o "$out" "$url" || fail "could not download $url"
+  local sums; sums=$(mktemp)
+  curl -fsSL -o "$sums" "$base/SHA256SUMS" \
+    || { rm -f "$sums"; fail "could not fetch $base/SHA256SUMS - refusing to use unverified $name"; }
+  local sha_cmd expected actual
+  if command -v sha256sum &>/dev/null; then sha_cmd=(sha256sum); else sha_cmd=(shasum -a 256); fi
+  expected=$(awk -v n="$name" '$2==n {print $1}' "$sums")
+  actual=$("${sha_cmd[@]}" "$out" | awk '{print $1}')
+  [[ -n "$expected" ]] || { rm -f "$sums"; fail "$name not listed in SHA256SUMS - refusing to use it"; }
+  [[ "$actual" == "$expected" ]] || { rm -f "$sums"; fail "checksum mismatch for $name (expected $expected, got $actual)"; }
+  if command -v cosign &>/dev/null; then
+    local sig cert; sig=$(mktemp); cert=$(mktemp)
+    if curl -fsSL -o "$sig" "$base/SHA256SUMS.sig" && curl -fsSL -o "$cert" "$base/SHA256SUMS.pem"; then
+      if cosign verify-blob --certificate "$cert" --signature "$sig" \
+           --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+           --certificate-identity-regexp "^https://github.com/${REACH_REPO}/\.github/workflows/${workflow}\.yml@" \
+           "$sums" >/dev/null 2>&1; then
+        ok "$name verified (checksum + cosign signature)"
+      else
+        rm -f "$sums" "$sig" "$cert"; fail "cosign signature verification FAILED for $name - refusing to use it"
+      fi
+    else
+      ok "$name checksum verified (signature files not published for this release)"
+    fi
+    rm -f "$sig" "$cert"
+  else
+    ok "$name checksum verified (install 'cosign' to also verify the release signature)"
+  fi
+  rm -f "$sums"
+}
+
+# Verify the CloudFormation template CFN is about to deploy from S3. We download + verify a copy;
+# a match proves the S3 object (which CFN reads via --template-url) is authentic and untampered.
+verify_template() {
+  echo ""
+  echo "==> Verifying release integrity ($RELEASE_TAG)..."
+  verify_download "$TEMPLATE_URL" template.yaml "${S3_BASE}/lambda/${RELEASE_TAG}" backend "$(mktemp)"
+}
 
 prompt() {
   local label="$1"
@@ -229,8 +279,11 @@ verify_aws() {
 deploy_ui() {
   local release_tag="$1" bucket="$2" dist_id="$3"
   local ui_tmp; ui_tmp=$(mktemp -d)
-  local tarball="${S3_BASE}/lambda/${release_tag}/ui.tar.gz"
-  if curl -fsSL "$tarball" | tar -xz -C "$ui_tmp" 2>/dev/null; then
+  local tarfile="$ui_tmp/ui.tar.gz"
+  # Verify the UI bundle against the signed SHA256SUMS before extracting + publishing it.
+  verify_download "${S3_BASE}/lambda/${release_tag}/ui.tar.gz" ui.tar.gz "${S3_BASE}/lambda/${release_tag}" backend "$tarfile"
+  if tar -xzf "$tarfile" -C "$ui_tmp" 2>/dev/null; then
+    rm -f "$tarfile" # don't sync the tarball itself to the UI bucket
     aws s3 sync "$ui_tmp/" "s3://$bucket/ui/" --delete --region "$AWS_REGION"
     ok "UI deployed"
     if [[ -n "$dist_id" && "$dist_id" != "None" ]]; then
@@ -241,7 +294,7 @@ deploy_ui() {
       ok "Cache invalidated"
     fi
   else
-    warn "could not fetch UI assets from $tarball"
+    warn "could not extract UI assets"
   fi
   rm -rf "$ui_tmp"
 }
@@ -347,8 +400,9 @@ if [[ "${1:-}" == "--update" ]]; then
   STACK_NAME=$(prompt "Stack name" "reach-platform")
 
   RELEASE_TAG=$(prompt "Release tag" "latest")
-  TEMPLATE_URL="${S3_BASE}/lambda/${RELEASE_TAG}/template.yaml"
+  TEMPLATE_URL="${DEPLOY_S3_BASE}/lambda/${RELEASE_TAG}/template.yaml"
   echo "    Using template: $TEMPLATE_URL"
+  verify_template
 
   echo ""
   echo "  Platform secrets (leave blank to keep existing value):"
@@ -406,7 +460,7 @@ if [[ "${1:-}" == "--update" ]]; then
     --template-url "$TEMPLATE_URL" \
     --parameters \
       ParameterKey=TokenPepper,UsePreviousValue=true \
-      ParameterKey=ReleasesS3Base,UsePreviousValue=true \
+      ParameterKey=ReleasesBaseUrl,UsePreviousValue=true \
       "$SESSION_SIGNING_PARAM" \
       "$ADMIN_PASSWORD_PARAM" \
       "$AUDIT_RETENTION_PARAM" \
@@ -479,9 +533,21 @@ fi
 command -v curl    &>/dev/null && ok "curl"    || { miss "curl";    MISSING=1; }
 command -v jq      &>/dev/null && ok "jq"      || { miss "jq  →  https://jqlang.github.io/jq/download/"; MISSING=1; }
 command -v openssl &>/dev/null && ok "openssl" || { miss "openssl  →  required to generate secure tokens"; MISSING=1; }
-# python3 is NOT needed for the deploy itself (JSON is handled by jq) - only for
-# the optional Reach CLI install (a Python package). Warn, don't fail.
-command -v python3 &>/dev/null && ok "python3 (for optional CLI install)" || warn "python3 not found - the optional Reach CLI install will be skipped"
+# python3 is NOT needed for the deploy itself (JSON is handled by jq) - only for the optional Reach
+# CLI install, which requires Python 3.10+. Detect the version up front so we skip cleanly with a
+# clear message instead of letting pip fail later. Warn, don't fail (the CLI is optional).
+CLI_PYTHON_OK=false
+if command -v python3 &>/dev/null; then
+  PY_VERSION=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo "?")
+  if python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' 2>/dev/null; then
+    CLI_PYTHON_OK=true
+    ok "python3 $PY_VERSION (for optional CLI install)"
+  else
+    warn "python3 $PY_VERSION found, but the Reach CLI requires Python 3.10+ - the optional CLI install will be skipped"
+  fi
+else
+  warn "python3 not found - the optional Reach CLI install will be skipped"
+fi
 [[ "$MISSING" -eq 1 ]] && fail "install missing dependencies and re-run."
 
 # ===========================================================================
@@ -495,8 +561,9 @@ echo ""
 prompt_aws
 STACK_NAME=$(prompt "Stack name" "reach-platform")
 RELEASE_TAG=$(prompt "Release tag" "latest")
-TEMPLATE_URL="${S3_BASE}/lambda/${RELEASE_TAG}/template.yaml"
+TEMPLATE_URL="${DEPLOY_S3_BASE}/lambda/${RELEASE_TAG}/template.yaml"
 echo "    Using template: $TEMPLATE_URL"
+verify_template
 
 verify_aws
 
@@ -603,7 +670,7 @@ else
   AUDIT_RETENTION_DAYS=90
 fi
 
-# Chart repo defaults to <ReleasesS3Base>/charts/reach-agent. Self-hosting the
+# Chart repo defaults to <ReleasesBaseUrl>/charts/reach-agent. Self-hosting the
 # Helm repo is rare, so it's an env override (RELEASES_CHART_REPO=…) rather than a
 # prompt. Agent/chart versions are chosen per-agent in the console.
 RELEASES_CHART_REPO="${RELEASES_CHART_REPO:-}"
@@ -613,6 +680,8 @@ echo ""
 CLI_INSTALL="false"
 if command -v reach &>/dev/null; then
   info "Reach CLI already installed"
+elif [[ "$CLI_PYTHON_OK" != "true" ]]; then
+  info "Skipping Reach CLI install - needs Python 3.10+ (install it and re-run, or: pip install $CLI_WHEEL_URL)"
 else
   CLI_INSTALL=$(prompt_yes_no "Install Reach CLI?" "Y")
 fi
@@ -782,17 +851,20 @@ if command -v reach &>/dev/null; then
   ok "reach already installed"
 elif [[ "$CLI_INSTALL" == "true" ]]; then
   _installed=false
+  # Verify the wheel against the signed SHA256SUMS before installing it, then install the local copy.
+  CLI_WHEEL_LOCAL="$(mktemp -d)/$(basename "$CLI_WHEEL_URL")"
+  verify_download "$CLI_WHEEL_URL" "$(basename "$CLI_WHEEL_URL")" "${CLI_WHEEL_URL%/*}" cli "$CLI_WHEEL_LOCAL"
   if command -v uv &>/dev/null; then
-    uv tool install "$CLI_WHEEL_URL" --force && _installed=true || true
+    uv tool install "$CLI_WHEEL_LOCAL" --force && _installed=true || true
   fi
   if [[ "$_installed" == false ]] && command -v pipx &>/dev/null; then
-    pipx install "$CLI_WHEEL_URL" --force && _installed=true || true
+    pipx install "$CLI_WHEEL_LOCAL" --force && _installed=true || true
   fi
   if [[ "$_installed" == false ]] && command -v pip3 &>/dev/null; then
-    pip3 install "$CLI_WHEEL_URL" && _installed=true || true
+    pip3 install "$CLI_WHEEL_LOCAL" && _installed=true || true
   fi
   if [[ "$_installed" == false ]]; then
-    python3 -m pip install "$CLI_WHEEL_URL" && _installed=true || true
+    python3 -m pip install "$CLI_WHEEL_LOCAL" && _installed=true || true
   fi
   if [[ "$_installed" == false ]]; then
     warn "CLI install failed. Install manually: pip install $CLI_WHEEL_URL"

@@ -42,7 +42,12 @@ function checkboxes() {
 
 beforeEach(() => {
   vi.restoreAllMocks();
-  try { localStorage.removeItem('dt_hidden_test-dt'); } catch {}
+  // Clear ALL DataTable-persisted state - hidden columns (dt_hidden_*) AND column order
+  // (dt_order_*) - so a reorder in one test can't leak into later ones. Clearing only
+  // dt_hidden_ left dt_order_test-dt behind, which reordered the sorting tests' columns and
+  // failed on CI (Node 20's jsdom localStorage persists within a file; Node 22+ native
+  // localStorage happened to hide it locally).
+  try { localStorage.clear(); } catch {}
 });
 
 // ---------------------------------------------------------------------------

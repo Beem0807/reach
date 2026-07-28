@@ -12,39 +12,39 @@
 # Usage:
 #
 #   Fresh setup:
-#     curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh | bash
+#     curl -fsSL https://releases.reach.nabeem.com/local-setup.sh | bash
 #     ./scripts/local-setup.sh
 #
 #   Check if everything is running:
-#     curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh | bash -s -- --status
+#     curl -fsSL https://releases.reach.nabeem.com/local-setup.sh | bash -s -- --status
 #     ./scripts/local-setup.sh --status
 #
 #   Register another agent against the running stack:
-#     curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh | bash -s -- --create-agent
+#     curl -fsSL https://releases.reach.nabeem.com/local-setup.sh | bash -s -- --create-agent
 #     ./scripts/local-setup.sh --create-agent
 #
 #   Update backend image only (keeps all data):
-#     curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh | bash -s -- --update
+#     curl -fsSL https://releases.reach.nabeem.com/local-setup.sh | bash -s -- --update
 #     ./scripts/local-setup.sh --update
 #
 #   Stop backend, keep database:
-#     curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh | bash -s -- --down
+#     curl -fsSL https://releases.reach.nabeem.com/local-setup.sh | bash -s -- --down
 #     ./scripts/local-setup.sh --down
 #
 #   Stop backend and delete database:
-#     curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh | bash -s -- --reset
+#     curl -fsSL https://releases.reach.nabeem.com/local-setup.sh | bash -s -- --reset
 #     ./scripts/local-setup.sh --reset
 #
 #   Remove everything, optionally uninstall CLI:
-#     curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh | bash -s -- --purge
+#     curl -fsSL https://releases.reach.nabeem.com/local-setup.sh | bash -s -- --purge
 #     ./scripts/local-setup.sh --purge
 #
 #   Rotate the platform admin password:
-#     curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh | bash -s -- --rotate-password
+#     curl -fsSL https://releases.reach.nabeem.com/local-setup.sh | bash -s -- --rotate-password
 #     ./scripts/local-setup.sh --rotate-password
 #
 #   Rotate the session signing key (forces console re-login):
-#     curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh | bash -s -- --rotate-session-key
+#     curl -fsSL https://releases.reach.nabeem.com/local-setup.sh | bash -s -- --rotate-session-key
 #     ./scripts/local-setup.sh --rotate-session-key
 #
 # Notes:
@@ -79,7 +79,7 @@ WORK_DIR="$HOME/.reach/local"
 COMPOSE_FILE="$WORK_DIR/docker-compose.yml"
 ENV_FILE="$WORK_DIR/env"
 API_PORT="${API_PORT:-8000}"
-CLI_WHEEL_URL="https://reach-releases.s3.amazonaws.com/cli/latest/reach-0.1.0-py3-none-any.whl"
+CLI_WHEEL_URL="https://releases.reach.nabeem.com/cli/latest/reach-0.1.0-py3-none-any.whl"
 # Resolve public tunnel hostnames over DoH. macOS curl's system resolver can fail
 # on freshly-created *.trycloudflare.com names that a browser (which uses DoH)
 # reaches fine; `curl --doh-url` sidesteps that. Not used for localhost. Only
@@ -96,6 +96,66 @@ warn() { printf "  [WARN]    %s\n" "$1"; }
 fail() { printf "  [ERROR]   %s\n" "$1"; exit 1; }
 
 trap 'echo ""; echo "[ERROR] Setup failed at line $LINENO"; echo "Backend logs:"; echo "  docker compose -f $COMPOSE_FILE logs backend"; echo ""; exit 1' ERR
+
+# Release integrity. Releases publish a SHA256SUMS (+ .sig/.pem) next to their artifacts, signed
+# keyless (Sigstore) by this repo's release workflow. verify_download checks a file's SHA256 against
+# the signed SHA256SUMS (mandatory) and, when cosign is installed, its signature too. verify_image
+# cosign-verifies the backend container image itself. Both abort on failure. Mirrors agent/install.sh.
+REACH_REPO="${REACH_REPO:-Beem0807/reach}"
+verify_download() {
+  local url="$1" name="$2" base="$3" workflow="$4" out="$5"
+  curl -fsSL -o "$out" "$url" || fail "could not download $url"
+  local sums; sums=$(mktemp)
+  curl -fsSL -o "$sums" "$base/SHA256SUMS" \
+    || { rm -f "$sums"; fail "could not fetch $base/SHA256SUMS - refusing to use unverified $name"; }
+  local sha_cmd expected actual
+  if command -v sha256sum &>/dev/null; then sha_cmd=(sha256sum); else sha_cmd=(shasum -a 256); fi
+  expected=$(awk -v n="$name" '$2==n {print $1}' "$sums")
+  actual=$("${sha_cmd[@]}" "$out" | awk '{print $1}')
+  [[ -n "$expected" ]] || { rm -f "$sums"; fail "$name not listed in SHA256SUMS - refusing to use it"; }
+  [[ "$actual" == "$expected" ]] || { rm -f "$sums"; fail "checksum mismatch for $name (expected $expected, got $actual)"; }
+  if command -v cosign &>/dev/null; then
+    local sig cert; sig=$(mktemp); cert=$(mktemp)
+    if curl -fsSL -o "$sig" "$base/SHA256SUMS.sig" && curl -fsSL -o "$cert" "$base/SHA256SUMS.pem"; then
+      if cosign verify-blob --certificate "$cert" --signature "$sig" \
+           --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+           --certificate-identity-regexp "^https://github.com/${REACH_REPO}/\.github/workflows/${workflow}\.yml@" \
+           "$sums" >/dev/null 2>&1; then
+        ok "$name verified (checksum + cosign signature)"
+      else
+        rm -f "$sums" "$sig" "$cert"; fail "cosign signature verification FAILED for $name - refusing to use it"
+      fi
+    else
+      ok "$name checksum verified (signature files not published for this release)"
+    fi
+    rm -f "$sig" "$cert"
+  else
+    ok "$name checksum verified (install 'cosign' to also verify the release signature)"
+  fi
+  rm -f "$sums"
+}
+
+# Verify the backend image's keyless cosign signature before we run it. cosign is optional (set
+# REACH_REQUIRE_COSIGN=1 to make a missing cosign a hard failure), but a *failed* verify always aborts.
+verify_image() {
+  local image="$1"
+  echo ""
+  echo "==> Verifying backend image signature ($image)..."
+  if command -v cosign &>/dev/null; then
+    if cosign verify "$image" \
+         --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+         --certificate-identity-regexp "^https://github.com/${REACH_REPO}/\.github/workflows/backend\.yml@" \
+         >/dev/null 2>&1; then
+      ok "image verified (cosign keyless)"
+    else
+      fail "cosign verification FAILED for $image - refusing to run an unverified image"
+    fi
+  elif [[ "${REACH_REQUIRE_COSIGN:-0}" == "1" ]]; then
+    fail "cosign not installed but REACH_REQUIRE_COSIGN=1 - install cosign to verify the image"
+  else
+    warn "cosign not installed - skipping image signature check (install cosign to verify: https://docs.sigstore.dev/system_config/installation/)"
+  fi
+}
 
 get_compose() {
   if docker compose version &>/dev/null 2>&1; then
@@ -363,7 +423,7 @@ NGINXEOF
 
 write_compose_file() {
   # Only emit RELEASES_CHART_REPO when set; an empty value would override the
-  # backend's default (derived from RELEASES_S3_BASE) with an empty string.
+  # backend's default (derived from RELEASES_BASE_URL) with an empty string.
   local chart_repo_env=""
   [[ -n "${RELEASES_CHART_REPO:-}" ]] && chart_repo_env="
       RELEASES_CHART_REPO: \"${RELEASES_CHART_REPO}\""
@@ -1119,6 +1179,8 @@ case "${1:-}" in
     echo ""
     ok "Updating backend image to: $IMAGE"
 
+    verify_image "$IMAGE"
+
     write_nginx_config
     write_compose_file
 
@@ -1365,7 +1427,7 @@ else
   AUDIT_RETENTION_DAYS=90
 fi
 
-# Chart repo defaults to <RELEASES_S3_BASE>/charts/reach-agent. Self-hosting the
+# Chart repo defaults to <RELEASES_BASE_URL>/charts/reach-agent. Self-hosting the
 # Helm repo is rare, so it's an env override (RELEASES_CHART_REPO=…) rather than a
 # prompt. Agent/chart versions are chosen per-agent in the console.
 RELEASES_CHART_REPO="${RELEASES_CHART_REPO:-}"
@@ -1401,6 +1463,8 @@ echo ""
 # ===========================================================================
 # Phase 2 - Execute
 # ===========================================================================
+
+verify_image "$IMAGE"
 
 write_nginx_config
 write_compose_file
@@ -1485,17 +1549,20 @@ elif [[ "$INSTALL_CLI" == "true" ]]; then
     warn "Skipping CLI install - Python 3.10+ is required. Install it and run: pip install $CLI_WHEEL_URL"
   else
     _cli_installed=false
+    # Verify the wheel against the signed SHA256SUMS before installing it, then install the local copy.
+    CLI_WHEEL_LOCAL="$(mktemp -d)/$(basename "$CLI_WHEEL_URL")"
+    verify_download "$CLI_WHEEL_URL" "$(basename "$CLI_WHEEL_URL")" "${CLI_WHEEL_URL%/*}" cli "$CLI_WHEEL_LOCAL"
     if command -v uv &>/dev/null; then
-      uv tool install "$CLI_WHEEL_URL" --force && _cli_installed=true || true
+      uv tool install "$CLI_WHEEL_LOCAL" --force && _cli_installed=true || true
     fi
     if [[ "$_cli_installed" == false ]] && command -v pipx &>/dev/null; then
-      pipx install "$CLI_WHEEL_URL" --force && _cli_installed=true || true
+      pipx install "$CLI_WHEEL_LOCAL" --force && _cli_installed=true || true
     fi
     if [[ "$_cli_installed" == false ]] && command -v pip3 &>/dev/null; then
-      pip3 install "$CLI_WHEEL_URL" && _cli_installed=true || true
+      pip3 install "$CLI_WHEEL_LOCAL" && _cli_installed=true || true
     fi
     if [[ "$_cli_installed" == false ]]; then
-      python3 -m pip install "$CLI_WHEEL_URL" && _cli_installed=true || true
+      python3 -m pip install "$CLI_WHEEL_LOCAL" && _cli_installed=true || true
     fi
     if [[ "$_cli_installed" == false ]]; then
       warn "CLI install failed. Install manually: pip install $CLI_WHEEL_URL"
@@ -1713,7 +1780,7 @@ echo ""
 # Show management commands the way the user actually invoked us: the local script
 # path when run from a checkout, otherwise the curl form (a `curl … | bash`
 # install has no ./scripts/local-setup.sh on disk to re-run).
-_setup_url="${RELEASES_S3_BASE:-https://reach-releases.s3.amazonaws.com}/local-setup.sh"
+_setup_url="${RELEASES_BASE_URL:-https://releases.reach.nabeem.com}/local-setup.sh"
 if [[ -f "$0" && "$0" == *local-setup.sh ]]; then
   SETUP_CMD="$0"
 else

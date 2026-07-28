@@ -222,7 +222,7 @@ def whoami():
         console.print(f"[bold]Username:[/bold]  {data.get('username')}")
     if data.get('role'):
         console.print(f"[bold]Role:[/bold]      {data.get('role')}")
-    console.print(f"[bold]Created:[/bold]   {_fmt_ts(data.get("created_at"))}")
+    console.print(f"[bold]Created:[/bold]   {_fmt_ts(data.get('created_at'))}")
 
 
 # ---------------------------------------------------------------------------

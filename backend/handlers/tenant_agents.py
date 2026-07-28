@@ -40,14 +40,22 @@ def _grant_agent_to_user(target: dict, agent_id: str, readonly: bool) -> bool:
     return True
 
 
-_S3_BASE = os.environ.get("RELEASES_S3_BASE", "https://reach-releases.s3.amazonaws.com")
+_BASE_URL = os.environ.get("RELEASES_BASE_URL", "https://releases.reach.nabeem.com")
 # The default (unpinned) host install always tracks the newest release under
 # agent/latest/; a specific version is chosen per-agent at create time.
-_S3_LATEST = f"{_S3_BASE}/agent/latest"
+_LATEST_URL = f"{_BASE_URL}/agent/latest"
 # The Helm chart repo serves index.yaml + reach-agent-<version>.tgz. Chart version
 # == appVersion == agent image, released together; the image follows the chart's
 # appVersion (no --set image.tag). An unpinned install always takes the newest chart.
-_CHART_REPO_URL = os.environ.get("RELEASES_CHART_REPO", f"{_S3_BASE}/charts/reach-agent")
+_CHART_REPO_URL = os.environ.get("RELEASES_CHART_REPO", f"{_BASE_URL}/charts/reach-agent")
+# Sigstore keyless identity that signs releases, for the verified install path (cosign
+# verify-blob). Defaults to this repo's agent release workflow; override when self-hosting a
+# fork so the console's verify command matches your own signer. See SUPPORT.md.
+_OIDC_ISSUER = os.environ.get("RELEASES_OIDC_ISSUER", "https://token.actions.githubusercontent.com")
+_SIGNER_ID_REGEXP = os.environ.get(
+    "RELEASES_SIGNER_ID_REGEXP",
+    r"^https://github.com/Beem0807/reach/\.github/workflows/agent\.yml@",
+)
 INSTALL_TOKEN_TTL = 86400
 VALID_MODES = ("wild", "readonly", "approved")
 _ROLE_RANK = {"admin": 3, "operator": 2, "developer": 1}
@@ -98,7 +106,7 @@ def _build_install_commands(
 
     # Released binaries live under agent/v<version>/ (the `v` prefix); an unpinned
     # install uses agent/latest/.
-    base = f"{_S3_BASE}/agent/v{picked}" if picked else _S3_LATEST
+    base = f"{_BASE_URL}/agent/v{picked}" if picked else _LATEST_URL
     flags = (
         f'--api-url "{api_url}" '
         f'--install-token "{raw_install_token}" '
@@ -108,8 +116,24 @@ def _build_install_commands(
         flags += " --no-grant-service-mgmt"
     if grant_docker:
         flags += " --grant-docker"
+    # Two paths, same artifacts. `agent` is the one-command installer (install.sh still
+    # verifies the binary it downloads against the signed SHA256SUMS). `agent_verified` is the
+    # download -> authenticate -> inspect -> run path for security-conscious operators: it
+    # authenticates install.sh itself (keyless cosign signature over the checksums) before
+    # running it. Requires cosign on the host. See SUPPORT.md -> "Installing the agent".
+    verified = (
+        f'curl -fsSL -O "{base}/install.sh" -O "{base}/SHA256SUMS" '
+        f'-O "{base}/SHA256SUMS.sig" -O "{base}/SHA256SUMS.pem"\n'
+        f"cosign verify-blob --certificate SHA256SUMS.pem --signature SHA256SUMS.sig \\\n"
+        f"  --certificate-oidc-issuer {_OIDC_ISSUER} \\\n"
+        f"  --certificate-identity-regexp '{_SIGNER_ID_REGEXP}' SHA256SUMS\n"
+        f"sha256sum --ignore-missing -c SHA256SUMS   # macOS: shasum -a 256 -c\n"
+        f"less install.sh   # inspect before running\n"
+        f"sudo bash install.sh {flags}"
+    )
     return {
         "agent": f"curl -fsSL {base}/install.sh | sudo bash -s -- {flags}",
+        "agent_verified": verified,
         "cli_use": f"reach agents use {agent_id}",
     }
 
