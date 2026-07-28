@@ -184,6 +184,7 @@ the note at the end of this doc.
 | `release` fails: "image/wheel/chart already exists"     | A prior run published this version but didn't tag (partial failure). Bump the version, or manually complete the release. |
 | Invalidation step skipped                               | `RELEASES_CF_DISTRIBUTION_ID` repo variable isn't set yet.                                                               |
 | AWS step denied                                         | The OIDC role is missing a permission or the trust isn't scoped to this repo/branch.                                     |
+| `npm ci` fails: "can only install … in sync" | `ui/package-lock.json` drifted from `package.json`. Regenerate (`npm install` in `ui/`) and commit. CI installs `npm@11` before `npm ci`, so a lock written by any npm version works - only *staleness* fails. See [ui/README.md](ui/README.md). |
 
 ## File reference
 

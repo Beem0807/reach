@@ -129,6 +129,7 @@ jobs:
           node-version: "20"
           cache: npm
           cache-dependency-path: ui/package-lock.json
+      - run: npm install -g npm@11 # use current npm so `npm ci` reads a lock written by any npm version
       - run: npm ci
         working-directory: ui
       - run: npm run test
@@ -159,6 +160,7 @@ jobs:
           node-version: "20"
           cache: npm
           cache-dependency-path: ui/package-lock.json
+      - run: npm install -g npm@11 # use current npm so `npm ci` reads a lock written by any npm version
       - uses: aws-actions/setup-sam@v2
         if: needs.checks.outputs.code == 'true'
         with:
