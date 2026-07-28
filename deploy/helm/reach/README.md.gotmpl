@@ -30,7 +30,7 @@ Self-contained (bundles Postgres + Redis) - this is all you need. From the publi
 (pin with `--version`; the image tag comes from the chart's `appVersion`):
 
 ```bash
-helm repo add reach https://reach-releases.s3.amazonaws.com/charts/reach --force-update
+helm repo add reach https://releases.reach.nabeem.com/charts/reach --force-update
 helm install reach reach/reach -n reach --create-namespace \
   --set config.tokenPepper=$(openssl rand -hex 32) \
   --set config.sessionSigningKey=$(openssl rand -hex 32) \
@@ -99,7 +99,7 @@ Service, and Secret are simply not rendered.
 | `postgres` (default) | `true` (default) | neither | **Bundled Postgres** deployed; `DATABASE_URL` comes from its auto-generated Secret. |
 | `postgres` | `true` | `databaseUrl` set | **External Postgres** used; **bundled PG skipped** even though `enabled=true`. |
 | `postgres` | `true`/`false` | `existingSecret` set | **External** (from your Secret's `DATABASE_URL`); bundled PG skipped; chart Secret skipped. |
-| `postgres` | `false` | neither | **Install fails fast** — nothing is deployed (see below). |
+| `postgres` | `false` | neither | **Install fails fast** - nothing is deployed (see below). |
 | `dynamo` | `true`/`false` | ignored | **DynamoDB** used; **bundled PG skipped**; no `DATABASE_URL` needed; migration runs `dynamo_bootstrap`. |
 
 Redis is unaffected by any of the above: it stays bundled by default in every row unless you set

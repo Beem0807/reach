@@ -177,15 +177,19 @@ def login(
                                 help="API key (from the tenant console → API Tokens)"),
     profile: str = typer.Option(
         "default", "--profile", "-p", help="Profile name to save under"),
+    force: bool = typer.Option(
+        False, "--force", "-y",
+        help="Overwrite an existing profile without prompting (for non-interactive/scripted setup)"),
 ):
     """Store API URL and API key. Use --profile to manage multiple tenants."""
     full = cfg_module.load()
     existing = full.get("profiles", {}).get(profile, {})
     if existing.get("api_url") or existing.get("api_key") or existing.get("tenant_token"):
-        console.print(
-            f"[yellow]Profile '{profile}' already exists (API: {existing.get('api_url')}).[/yellow]")
-        if not Confirm.ask("Overwrite?", default=False):
-            raise typer.Exit(0)
+        if not force:
+            console.print(
+                f"[yellow]Profile '{profile}' already exists (API: {existing.get('api_url')}).[/yellow]")
+            if not Confirm.ask("Overwrite?", default=False):
+                raise typer.Exit(0)
     profile_data = dict(existing)
     profile_data["api_url"] = api_url.rstrip("/")
     profile_data["api_key"] = api_key
@@ -222,7 +226,7 @@ def whoami():
         console.print(f"[bold]Username:[/bold]  {data.get('username')}")
     if data.get('role'):
         console.print(f"[bold]Role:[/bold]      {data.get('role')}")
-    console.print(f"[bold]Created:[/bold]   {_fmt_ts(data.get("created_at"))}")
+    console.print(f"[bold]Created:[/bold]   {_fmt_ts(data.get('created_at'))}")
 
 
 # ---------------------------------------------------------------------------

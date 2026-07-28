@@ -33,7 +33,10 @@ def _shell_segments(command: str) -> list[str]:
 
 BLOCKED_PATTERNS = [
     # Catastrophic deletion / disk destruction
-    r"rm\s+-[a-zA-Z]*r[a-zA-Z]*\s+/(\s|$|\*)",   # rm -rf / or rm -rf /*
+    r"rm\s+-[a-zA-Z]*r[a-zA-Z]*\s+/(?!\w)",       # rm -rf / (root): "/" not followed by a word char,
+    #                                              so it also catches shell-delimited forms like
+    #                                              rm -rf /* , $(rm -rf /) , `rm -rf /` - but not
+    #                                              a subdirectory (rm -rf /home -> "/h..." is a word).
     r"rm\s+--no-preserve-root",
     r"\bmkfs\b",
     r"\bdd\s+if=",

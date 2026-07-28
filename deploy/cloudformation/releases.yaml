@@ -1,0 +1,256 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >-
+  Reach release + deployment hosting. Provisions the public artifact host
+  (S3 + CloudFront at releases.reach.nabeem.com serving the Helm repo, agent
+  binaries, install.sh, versions.json, CLI wheels, checksums/signatures, and
+  setup scripts) plus a separate S3 bucket (reach-deployments) for the SAM/Lambda
+  package artifacts. The CI pipelines write to S3; end users read over the CDN.
+
+Parameters:
+  ReleasesDomainName:
+    Type: String
+    Description: Custom domain that fronts the release artifacts.
+    Default: releases.reach.nabeem.com
+
+  ReleasesBucketName:
+    Type: String
+    Description: >-
+      S3 bucket that stores the release artifacts. Globally unique; if it already
+      exists in this account you must import it instead of creating it.
+    Default: reach-releases
+
+  DeploymentsBucketName:
+    Type: String
+    Description: S3 bucket for SAM/Lambda package artifacts (sam package --s3-bucket).
+    Default: reach-deployments
+
+  AcmCertificateArn:
+    Type: String
+    Description: >-
+      ACM certificate ARN for ReleasesDomainName. MUST be in us-east-1 (CloudFront
+      only reads certs from us-east-1), regardless of where this stack is deployed.
+    AllowedPattern: '^arn:aws[a-zA-Z-]*:acm:us-east-1:[0-9]{12}:certificate/.+$'
+
+  HostedZoneId:
+    Type: String
+    Description: >-
+      Optional Route 53 hosted zone ID for the parent domain (e.g. nabeem.com).
+      If set, an A/AAAA alias record for ReleasesDomainName is created. Leave empty
+      to manage DNS yourself.
+    Default: ''
+
+  PriceClass:
+    Type: String
+    Description: CloudFront price class (edge coverage vs cost).
+    Default: PriceClass_100
+    AllowedValues: [PriceClass_100, PriceClass_200, PriceClass_All]
+
+  MakeLambdaCodePublic:
+    Type: String
+    Description: >-
+      "true" makes reach-deployments' lambda/* objects public-read - the packaged CloudFormation
+      template (fetched via --template-url) AND the function code - so a user's CloudFormation, in
+      their own AWS account, can deploy the Lambda backend when they run lambda-setup.sh. Keep
+      "false" for private/own-account use.
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+
+Conditions:
+  HasHostedZone: !Not [!Equals [!Ref HostedZoneId, '']]
+  PublicLambdaCode: !Equals [!Ref MakeLambdaCodePublic, 'true']
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # Release artifact host: private S3 bucket, reachable ONLY through CloudFront.
+  # ---------------------------------------------------------------------------
+  ReleasesBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Ref ReleasesBucketName
+      VersioningConfiguration:
+        Status: Enabled # recover from an accidental overwrite of a published artifact
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  ReleasesOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub 'reach-releases-oac-${AWS::Region}'
+        Description: Lets CloudFront read the private releases bucket (SigV4).
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  ReleasesBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ReleasesBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontReadOnly
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${ReleasesBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${ReleasesDistribution}'
+
+  # Security headers + permissive CORS (artifacts are public, read-only). No CSP:
+  # this host serves files (yaml/tgz/sh/json/whl), not an HTML app.
+  ReleasesResponseHeadersPolicy:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: reach-releases-headers
+        Comment: Security headers + CORS for the release artifact host.
+        SecurityHeadersConfig:
+          ContentTypeOptions:
+            Override: true
+          FrameOptions:
+            Override: true
+            FrameOption: DENY
+          StrictTransportSecurity:
+            Override: true
+            AccessControlMaxAgeSec: 63072000
+            IncludeSubdomains: true
+            Preload: true
+          ReferrerPolicy:
+            Override: true
+            ReferrerPolicy: strict-origin-when-cross-origin
+        CorsConfig:
+          OriginOverride: true
+          AccessControlAllowCredentials: false
+          AccessControlAllowOrigins:
+            Items: ['*']
+          AccessControlAllowMethods:
+            Items: [GET, HEAD]
+          AccessControlAllowHeaders:
+            Items: ['*']
+          AccessControlMaxAgeSec: 3600
+
+  ReleasesDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      Tags:
+        - Key: Name
+          Value: reach-releases
+      DistributionConfig:
+        Enabled: true
+        Comment: Reach release artifact host.
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: !Ref PriceClass
+        Aliases:
+          - !Ref ReleasesDomainName
+        ViewerCertificate:
+          AcmCertificateArn: !Ref AcmCertificateArn
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2021
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt ReleasesBucket.RegionalDomainName
+            OriginAccessControlId: !Ref ReleasesOAC
+            S3OriginConfig: {}
+        # Everything is edge-cached (managed CachingOptimized). Immutable artifacts
+        # (agent/v*, cli/v*, charts/*.tgz) can stay cached indefinitely; the mutable
+        # pointers (Helm index.yaml, */latest/*, versions.json, setup scripts) change only
+        # at release time, so CI invalidates their paths on publish - see
+        # Outputs.ReleasesDistributionId and the pipelines' "Invalidate CDN cache" step.
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6 # Managed-CachingOptimized
+          ResponseHeadersPolicyId: !Ref ReleasesResponseHeadersPolicy
+
+  ReleasesDnsRecordV4:
+    Type: AWS::Route53::RecordSet
+    Condition: HasHostedZone
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref ReleasesDomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt ReleasesDistribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2 # fixed CloudFront hosted-zone ID
+        EvaluateTargetHealth: false
+
+  ReleasesDnsRecordV6:
+    Type: AWS::Route53::RecordSet
+    Condition: HasHostedZone
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref ReleasesDomainName
+      Type: AAAA
+      AliasTarget:
+        DNSName: !GetAtt ReleasesDistribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+        EvaluateTargetHealth: false
+
+  # ---------------------------------------------------------------------------
+  # Lambda/SAM package artifacts. NOT CloudFront-fronted - CloudFormation reads
+  # Lambda code straight from s3:// during deploy, so it stays a plain bucket.
+  # ---------------------------------------------------------------------------
+  DeploymentsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Ref DeploymentsBucketName
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        # Relaxed only when lambda code must be public (cross-account deploys).
+        BlockPublicPolicy: !If [PublicLambdaCode, false, true]
+        RestrictPublicBuckets: !If [PublicLambdaCode, false, true]
+
+  # Public read on lambda/* (packaged template + function code), only when
+  # MakeLambdaCodePublic=true, so a user's own-account CloudFormation can fetch the template via
+  # --template-url and the code during deploy. For a stricter model use the Serverless Application
+  # Repository or per-account grants.
+  DeploymentsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: PublicLambdaCode
+    Properties:
+      Bucket: !Ref DeploymentsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: PublicReadLambdaDeployArtifacts
+            Effect: Allow
+            Principal: '*'
+            Action: s3:GetObject
+            Resource: !Sub '${DeploymentsBucket.Arn}/lambda/*'
+
+Outputs:
+  ReleasesBucketName:
+    Description: Bucket the CI pipelines write release artifacts to.
+    Value: !Ref ReleasesBucket
+  ReleasesUrl:
+    Description: Public base URL for release artifacts (set RELEASES_BASE_URL to this).
+    Value: !Sub 'https://${ReleasesDomainName}'
+  ReleasesDistributionId:
+    Description: >-
+      CloudFront distribution ID. Set it as the repo variable RELEASES_CF_DISTRIBUTION_ID so the CI
+      pipelines invalidate the mutable paths on publish (and grant the CI role cloudfront:CreateInvalidation).
+    Value: !Ref ReleasesDistribution
+  ReleasesDistributionDomainName:
+    Description: CloudFront domain (point ReleasesDomainName's DNS here if not using HostedZoneId).
+    Value: !GetAtt ReleasesDistribution.DomainName
+  DeploymentsBucketName:
+    Description: Bucket for sam package (--s3-bucket) Lambda artifacts.
+    Value: !Ref DeploymentsBucket

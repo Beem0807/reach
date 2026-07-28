@@ -207,6 +207,22 @@ app.state.limiter = limiter
 set_build_info(app.version)
 app.add_exception_handler(RateLimitExceeded, _rate_limit_handler)
 
+
+# Content-negotiated 404: a browser navigating to an unknown path gets a friendly HTML page; API
+# clients (Accept: application/json or */*) keep the default JSON so their error handling is
+# unchanged. Delegates every non-browser-404 case to FastAPI's default handler.
+from starlette.exceptions import HTTPException as _StarletteHTTPException  # noqa: E402
+from fastapi.exception_handlers import http_exception_handler as _default_http_exception_handler  # noqa: E402
+from fastapi.responses import HTMLResponse as _HTMLResponse  # noqa: E402
+from shared.error_page import NOT_FOUND_HTML as _NOT_FOUND_HTML  # noqa: E402
+
+
+@app.exception_handler(_StarletteHTTPException)
+async def _content_negotiated_http_exception(request: Request, exc: _StarletteHTTPException):
+    if exc.status_code == 404 and "text/html" in request.headers.get("accept", ""):
+        return _HTMLResponse(_NOT_FOUND_HTML, status_code=404)
+    return await _default_http_exception_handler(request, exc)
+
 # Docker image copies built UI assets to ui_dist; local dev uses ui/dist directly
 _UI_DIST = os.path.join(os.path.dirname(__file__), "..", "..", "ui_dist")
 if not os.path.isdir(_UI_DIST):

@@ -1827,6 +1827,21 @@ function InstallModal({
                   it</strong> - no dedicated user is created, and it stops when the terminal closes.
                 </p>
               )}
+              {!isHelm && agent.commands?.agent_verified && (
+                <details className="mt-2.5">
+                  <summary className="text-[11px] font-medium text-indigo-600 cursor-pointer select-none">
+                    Verify before running <span className="text-gray-400 font-normal">(recommended for production)</span>
+                  </summary>
+                  <p className="text-[11px] text-gray-500 mt-1.5 leading-relaxed">
+                    Instead of piping to a shell: download, authenticate (keyless cosign signature over the
+                    checksums), inspect, then run. Requires <code>cosign</code> on the host. See <code>SUPPORT.md</code>.
+                  </p>
+                  <div className="relative bg-gray-900 rounded-lg p-3 pr-10 mt-1.5">
+                    <code className="text-xs text-green-400 break-all whitespace-pre-wrap">{agent.commands.agent_verified}</code>
+                    <CopyButton text={agent.commands.agent_verified} className="absolute top-2 right-2" />
+                  </div>
+                </details>
+              )}
             </div>
           );
         })()}

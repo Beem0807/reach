@@ -1,0 +1,91 @@
+# Setup-script pipeline. The one-command installers (scripts/local-setup.sh, scripts/lambda-setup.sh)
+# are unversioned "latest" tooling served at the CDN root - they take the release tag as *input*, so
+# they aren't tied to a backend/agent version. This pipeline signs + publishes them on their own
+# whenever they change, decoupled from the component releases (so a script fix doesn't need a
+# backend version bump). The agent's install.sh is NOT here - it is version-baked and owned by
+# agent.yml.
+#
+#   PR into main -> lint (shellcheck + syntax). Nothing is published.
+#   Push to main -> sign (one keyless-cosign SHA256SUMS over both scripts) + publish the scripts +
+#                   checksums to the bucket root. No version, no tag - they are rolling "latest".
+#
+# Required config: secret AWS_ROLE_ARN (the OIDC role, S3 write + CloudFront invalidate); variable
+# RELEASES_CF_DISTRIBUTION_ID (optional - the invalidation is a no-op until it is set).
+name: Setup scripts
+
+on:
+  pull_request:
+    branches: [main]
+    paths: ["scripts/**", ".github/workflows/scripts.yml"]
+  push:
+    branches: [main]
+    paths: ["scripts/**", ".github/workflows/scripts.yml"]
+
+concurrency:
+  group: scripts-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+  id-token: write # OIDC: assume the AWS role + keyless cosign sign-blob
+  attestations: write # SLSA build-provenance attestations
+
+env:
+  BUCKET: reach-releases # S3 bucket (CDN-fronted) the scripts are served from
+
+jobs:
+  # Static validation, on PR and push. shellcheck is preinstalled on ubuntu runners.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck + syntax
+        run: |
+          shellcheck --severity=warning scripts/*.sh
+          for f in scripts/*.sh; do bash -n "$f"; done
+
+  # Sign + publish. Merge to main only, after lint passes.
+  publish:
+    needs: lint
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate required secrets
+        env:
+          AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+        run: |
+          if [ -z "$AWS_ROLE_ARN" ]; then
+            echo "::error::Missing required repository secret: AWS_ROLE_ARN - set it under Settings > Secrets and variables > Actions"
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+      - uses: sigstore/cosign-installer@v3
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+      - name: Sign + publish setup scripts
+        working-directory: scripts
+        run: |
+          # One keyless (OIDC/Fulcio) signature over a SHA256SUMS of both scripts: verifying it
+          # authenticates local-setup.sh and lambda-setup.sh. Users verify before `curl | bash`
+          # (see SUPPORT.md -> "Installing the backend"). Signer identity is this workflow.
+          sha256sum local-setup.sh lambda-setup.sh > SHA256SUMS
+          echo "-- SHA256SUMS --"; cat SHA256SUMS
+          cosign sign-blob --yes SHA256SUMS \
+            --output-signature SHA256SUMS.sig --output-certificate SHA256SUMS.pem
+          for f in local-setup.sh lambda-setup.sh SHA256SUMS SHA256SUMS.sig SHA256SUMS.pem; do
+            aws s3 cp "$f" "s3://$BUCKET/$f"
+          done
+      - name: SLSA provenance (scripts)
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            scripts/local-setup.sh
+            scripts/lambda-setup.sh
+      - name: Invalidate CDN cache
+        if: vars.RELEASES_CF_DISTRIBUTION_ID != ''
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id "${{ vars.RELEASES_CF_DISTRIBUTION_ID }}" \
+            --paths /local-setup.sh /lambda-setup.sh /SHA256SUMS /SHA256SUMS.sig /SHA256SUMS.pem
