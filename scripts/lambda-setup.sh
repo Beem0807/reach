@@ -4,15 +4,15 @@
 # Usage:
 #
 #   Fresh deploy:
-#     curl -fsSL https://reach-releases.s3.amazonaws.com/lambda-setup.sh | bash
+#     curl -fsSL https://releases.reach.nabeem.com/lambda-setup.sh | bash
 #     ./scripts/lambda-setup.sh
 #
 #   Update stack (new release tag and/or password rotation):
-#     curl -fsSL https://reach-releases.s3.amazonaws.com/lambda-setup.sh | bash -s -- --update
+#     curl -fsSL https://releases.reach.nabeem.com/lambda-setup.sh | bash -s -- --update
 #     ./scripts/lambda-setup.sh --update
 #
 #   Delete stack (data retained in DynamoDB):
-#     curl -fsSL https://reach-releases.s3.amazonaws.com/lambda-setup.sh | bash -s -- --down
+#     curl -fsSL https://releases.reach.nabeem.com/lambda-setup.sh | bash -s -- --down
 #     ./scripts/lambda-setup.sh --down
 #
 # Notes:
@@ -33,8 +33,12 @@
 
 set -euo pipefail
 
-S3_BASE="https://reach-releases.s3.amazonaws.com"
-CLI_WHEEL_URL="https://reach-releases.s3.amazonaws.com/cli/latest/reach-0.1.0-py3-none-any.whl"
+S3_BASE="https://releases.reach.nabeem.com"
+CLI_WHEEL_URL="https://releases.reach.nabeem.com/cli/latest/reach-0.1.0-py3-none-any.whl"
+# CloudFormation fetches the stack template via --template-url, which must be an S3 URL (not the
+# CDN) and, at >51KB, can't be passed inline. The packaged template and the Lambda code both live
+# in the deployment bucket. Override DEPLOY_S3_BASE if you host the deployment artifacts elsewhere.
+DEPLOY_S3_BASE="${DEPLOY_S3_BASE:-https://reach-deployments.s3.amazonaws.com}"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -347,7 +351,7 @@ if [[ "${1:-}" == "--update" ]]; then
   STACK_NAME=$(prompt "Stack name" "reach-platform")
 
   RELEASE_TAG=$(prompt "Release tag" "latest")
-  TEMPLATE_URL="${S3_BASE}/lambda/${RELEASE_TAG}/template.yaml"
+  TEMPLATE_URL="${DEPLOY_S3_BASE}/lambda/${RELEASE_TAG}/template.yaml"
   echo "    Using template: $TEMPLATE_URL"
 
   echo ""
@@ -406,7 +410,7 @@ if [[ "${1:-}" == "--update" ]]; then
     --template-url "$TEMPLATE_URL" \
     --parameters \
       ParameterKey=TokenPepper,UsePreviousValue=true \
-      ParameterKey=ReleasesS3Base,UsePreviousValue=true \
+      ParameterKey=ReleasesBaseUrl,UsePreviousValue=true \
       "$SESSION_SIGNING_PARAM" \
       "$ADMIN_PASSWORD_PARAM" \
       "$AUDIT_RETENTION_PARAM" \
@@ -495,7 +499,7 @@ echo ""
 prompt_aws
 STACK_NAME=$(prompt "Stack name" "reach-platform")
 RELEASE_TAG=$(prompt "Release tag" "latest")
-TEMPLATE_URL="${S3_BASE}/lambda/${RELEASE_TAG}/template.yaml"
+TEMPLATE_URL="${DEPLOY_S3_BASE}/lambda/${RELEASE_TAG}/template.yaml"
 echo "    Using template: $TEMPLATE_URL"
 
 verify_aws
@@ -603,7 +607,7 @@ else
   AUDIT_RETENTION_DAYS=90
 fi
 
-# Chart repo defaults to <ReleasesS3Base>/charts/reach-agent. Self-hosting the
+# Chart repo defaults to <ReleasesBaseUrl>/charts/reach-agent. Self-hosting the
 # Helm repo is rare, so it's an env override (RELEASES_CHART_REPO=…) rather than a
 # prompt. Agent/chart versions are chosen per-agent in the console.
 RELEASES_CHART_REPO="${RELEASES_CHART_REPO:-}"

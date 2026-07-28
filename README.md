@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/images/reach-logo.png" alt="reach" width="360">
+</p>
+
 # reach
 
 **Let AI agents operate your production machines - safely.** Reads run; every _write_ is **blocked and queued for a human to approve** before it touches anything. No SSH, no VPN, no open ports.
@@ -28,7 +32,7 @@ Zero to your **AI agent running commands on a real machine**, in three steps:
 **1. Start Reach.** One command runs the backend, creates your tenant and first agent, installs the CLI, and logs you in:
 
 ```bash
-curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh | bash
+curl -fsSL https://releases.reach.nabeem.com/local-setup.sh | bash
 ```
 
 **2. Install the agent** on the machine you want to control. The script prints a ready-to-paste command - a `curl … | sudo bash` for a host, or `helm install …` for Kubernetes.
@@ -106,8 +110,8 @@ Reach is self-hosted. The Quick Start above uses the Local script; four backends
 
 | Backend                             | Setup                                                                        |
 | ----------------------------------- | ---------------------------------------------------------------------------- |
-| **Local** (no cloud account)        | `curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh \| bash`  |
-| **AWS Lambda + DynamoDB**           | `curl -fsSL https://reach-releases.s3.amazonaws.com/lambda-setup.sh \| bash` |
+| **Local** (no cloud account)        | `curl -fsSL https://releases.reach.nabeem.com/local-setup.sh \| bash`  |
+| **AWS Lambda + DynamoDB**           | `curl -fsSL https://releases.reach.nabeem.com/lambda-setup.sh \| bash` |
 | **Docker + PostgreSQL** (any cloud) | `docker run … nabeemdev/reach:0.1.0`, then finish in the console at `/ui`    |
 | **Kubernetes** (Helm)               | `helm install reach reach/reach …` - self-contained (bundles Postgres + Redis), or wire to managed Postgres / DynamoDB |
 
@@ -141,7 +145,7 @@ Host and Kubernetes agents share these modes but enforce them differently - agen
 
 ## Safety
 
-Controlled execution by design: no inbound ports, outbound-HTTPS-only agents, a default command timeout, a **catastrophic-command blocklist** enforced server-side in every mode (`rm -rf /`, fork bombs, privileged escapes, known credential-access & exfiltration patterns, reverse shells), and a full audit trail. **Sensitive reads** (SSH keys, `.env`, `kubectl get secret`) are gated like writes - blocked in `readonly`, approval-required in `approved` - and command output is **redacted** for recognizable secrets (an approved secret read is shown unredacted, since approving *is* the authorization to see it). Kubernetes agents add no-shell + a `kubectl` allowlist bounded by cluster RBAC. Full model: **[SECURITY.md](SECURITY.md)** · **[POLICIES.md](POLICIES.md)**.
+Controlled execution by design: no inbound ports, outbound-HTTPS-only agents, a default command timeout, a **catastrophic-command blocklist** enforced server-side in every mode (`rm -rf /`, fork bombs, privileged escapes, known credential-access & exfiltration patterns, reverse shells), and a full audit trail. **Sensitive reads** (SSH keys, `.env`, `kubectl get secret`) are gated like writes - blocked in `readonly`, approval-required in `approved` - and command output is **redacted** for recognizable secrets (an approved secret read is shown unredacted, since approving *is* the authorization to see it). Kubernetes agents add no-shell + a `kubectl` allowlist bounded by cluster RBAC. The **distribution path** matches the runtime bar: every release is **signed** (cosign keyless), checksummed, and ships an SBOM + SLSA provenance, and the agent installer verifies its download - one-command install stays, with a verifiable path alongside it. Full model: **[SECURITY.md](SECURITY.md)** · **[POLICIES.md](POLICIES.md)** · **[SUPPORT.md](SUPPORT.md)**.
 
 ## Observability
 
@@ -162,6 +166,8 @@ A built-in **audit log** (every action - logins, agent/fleet lifecycle, policy c
 | [API.md](API.md)                                   | Complete HTTP endpoint reference, rate limits, pagination, audit-log actions                                                                    |
 | [ARCHITECTURE.md](ARCHITECTURE.md)                 | How the pieces fit - command flow, token model, storage split, policy enforcement, approvals, fleets, multi-tenancy                             |
 | [SECURITY.md](SECURITY.md)                         | Threat model, token storage and rotation, revoking access, audit history, production hardening                                                  |
+| [SUPPORT.md](SUPPORT.md)                           | Supported versions and **release integrity** - signed images/binaries, checksums, SBOMs, SLSA provenance, verifying a release, and installing the agent (one-liner + verifiable path) |
+| [CI.md](CI.md)                                     | The CI/CD system - per-component pipelines, PR-vs-merge behavior, version-bump enforcement, signing/attestation, CDN hosting, required secrets, and how to cut a release                |
 
 ---
 
