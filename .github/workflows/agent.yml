@@ -55,6 +55,21 @@ jobs:
       agent: ${{ steps.ver.outputs.agent }}
       chartver: ${{ steps.ver.outputs.chart }}
     steps:
+      - name: Validate required secrets
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+        run: |
+          missing=""
+          for s in DOCKERHUB_USERNAME DOCKERHUB_TOKEN AWS_ROLE_ARN; do
+            if [ -z "${!s}" ]; then missing="$missing $s"; fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Missing required repository secrets:$missing - add them under Settings > Secrets and variables > Actions before merging to main (the release job needs them)"
+            exit 1
+          fi
+          echo "required secrets present"
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0

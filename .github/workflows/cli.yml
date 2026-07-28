@@ -40,6 +40,15 @@ jobs:
     outputs:
       cli: ${{ steps.ver.outputs.cli }}
     steps:
+      - name: Validate required secrets
+        env:
+          AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+        run: |
+          if [ -z "$AWS_ROLE_ARN" ]; then
+            echo "::error::Missing required repository secret: AWS_ROLE_ARN - add it under Settings > Secrets and variables > Actions before merging to main (the release job needs it)"
+            exit 1
+          fi
+          echo "required secrets present"
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
