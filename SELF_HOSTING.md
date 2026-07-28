@@ -36,7 +36,7 @@ Run the full backend on any machine you already have - no cloud account, no VMs 
 ### Deploy
 
 ```bash
-curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh | bash
+curl -fsSL https://releases.reach.nabeem.com/local-setup.sh | bash
 ```
 
 The script handles everything in one run:
@@ -55,6 +55,12 @@ The script handles everything in one run:
 
 No need to open the console for initial setup - the script handles everything.
 
+**Integrity:** before it starts anything, `local-setup.sh` `cosign verify`s the `nabeemdev/reach`
+image against this repo's release-workflow identity, and checksum-verifies the CLI wheel against the
+signed `SHA256SUMS`. `cosign` is optional but recommended - `brew install cosign` (a *failed* verify
+always aborts; set `REACH_REQUIRE_COSIGN=1` to also fail when `cosign` is absent). On a fork, set
+`REACH_REPO=owner/repo`. See [SUPPORT.md → Installing the backend](SUPPORT.md#installing-the-backend-self-hosted).
+
 ### Managing the local stack
 
 After deploying, re-run the script with a subcommand to manage it. All subcommands operate on the stack in `~/.reach/local` - you can run them via `curl … | bash -s -- <flag>` or, from a checkout, `./scripts/local-setup.sh <flag>`.
@@ -71,13 +77,13 @@ After deploying, re-run the script with a subcommand to manage it. All subcomman
 
 ```bash
 # Stop the backend but keep your data (resume later by re-running the script)
-curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh | bash -s -- --down
+curl -fsSL https://releases.reach.nabeem.com/local-setup.sh | bash -s -- --down
 
 # Permanently remove the stack and its data
-curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh | bash -s -- --reset
+curl -fsSL https://releases.reach.nabeem.com/local-setup.sh | bash -s -- --reset
 
 # Remove everything, including ~/.reach/local, and optionally the CLI
-curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh | bash -s -- --purge
+curl -fsSL https://releases.reach.nabeem.com/local-setup.sh | bash -s -- --purge
 ```
 
 > `--down` stops the stack but **keeps the database** - it is not a full teardown. Use `--reset` to delete the data, or `--purge` to remove the local setup directory and (optionally) the CLI as well.
@@ -93,7 +99,7 @@ curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh | bash -s -- -
 ### Deploy
 
 ```bash
-curl -fsSL https://reach-releases.s3.amazonaws.com/lambda-setup.sh | bash
+curl -fsSL https://releases.reach.nabeem.com/lambda-setup.sh | bash
 ```
 
 The script handles everything in one run:
@@ -111,10 +117,15 @@ The script handles everything in one run:
 
 No need to open the console for initial setup - the script handles everything.
 
+**Integrity:** before deploying, `lambda-setup.sh` verifies the CloudFormation **template** and the
+**UI bundle** against the signed `SHA256SUMS` at `https://releases.reach.nabeem.com/lambda/<tag>/`
+(and the CLI wheel) - a mismatch aborts the deploy. The checksum is mandatory; the cosign signature
+is also checked when `cosign` is installed. This runs on both the fresh deploy and `--update`.
+
 ### Upgrade
 
 ```bash
-curl -fsSL https://reach-releases.s3.amazonaws.com/lambda-setup.sh | bash -s -- --update
+curl -fsSL https://releases.reach.nabeem.com/lambda-setup.sh | bash -s -- --update
 ```
 
 The script lists your existing stacks, prompts for the stack name and release tag (leave blank to keep), and optionally rotates `ADMIN_PASSWORD` or changes any retention setting. `TOKEN_PEPPER` is always kept - it cannot be changed. See [TOKEN_PEPPER is permanent](#token_pepper-is-permanent).
@@ -122,7 +133,7 @@ The script lists your existing stacks, prompts for the stack name and release ta
 ### Tear down
 
 ```bash
-curl -fsSL https://reach-releases.s3.amazonaws.com/lambda-setup.sh | bash -s -- --down
+curl -fsSL https://releases.reach.nabeem.com/lambda-setup.sh | bash -s -- --down
 ```
 
 DynamoDB tables use `DeletionPolicy: Retain` - your data is preserved even after the stack is deleted. Remove the tables manually in the AWS console if you want to wipe everything.
@@ -173,14 +184,16 @@ per-fleet `max_fanout` may lower it further.
 | Variable | Default | Description |
 |---|---|---|
 | `STORAGE_BACKEND` | `postgres` (set in the image) | Storage driver - `postgres` for this deployment, `dynamo` on Lambda. Don't change it for the Docker image. |
-| `RELEASES_S3_BASE` | `https://reach-releases.s3.amazonaws.com` | Base URL for agent binary and install-script downloads (host agents) and the default Helm chart repo (k8s agents). Point this at your own mirror if you host the artifacts yourself. |
-| `RELEASES_CHART_REPO` | `<RELEASES_S3_BASE>/charts/reach-agent` | Helm chart repo URL used in the generated k8s `helm install` command (`helm repo add reach <this>`). Override if you host the chart repo elsewhere (e.g. gh-pages or an OCI registry base). |
+| `RELEASES_BASE_URL` | `https://releases.reach.nabeem.com` | Base URL for agent binary and install-script downloads (host agents) and the default Helm chart repo (k8s agents). Point this at your own mirror if you host the artifacts yourself. |
+| `RELEASES_CHART_REPO` | `<RELEASES_BASE_URL>/charts/reach-agent` | Helm chart repo URL used in the generated k8s `helm install` command (`helm repo add reach <this>`). Override if you host the chart repo elsewhere (e.g. gh-pages or an OCI registry base). |
+| `RELEASES_OIDC_ISSUER` | `https://token.actions.githubusercontent.com` | OIDC issuer used in the console's **verified install** command (`cosign verify-blob`). Change only if your releases are signed through a different Sigstore/OIDC issuer. |
+| `RELEASES_SIGNER_ID_REGEXP` | `^https://github.com/Beem0807/reach/\.github/workflows/agent\.yml@` | Keyless signer identity (regexp) the verified install command checks against. **Set this if you self-host a fork** so the console's verify step matches your own release workflow's identity, not upstream's. See [SUPPORT.md](SUPPORT.md). |
 | `RATE_LIMIT_STORAGE_URI` | `memory://` | Where API rate-limit counters live. In-memory is per-process - correct for a single instance. Set to a shared store (e.g. `redis://host:6379`) when running more than one backend replica. See [Running multiple replicas](#running-multiple-replicas). |
 | `METRICS_TOKEN` | _(unset)_ | Optional bearer token guarding `GET /metrics` (Prometheus). **Unset = open** (the endpoint exposes only read-only operational counters, no secrets); set it to require `Authorization: Bearer <token>` and otherwise restrict `/metrics` to your monitoring network. Metrics are **per-process** - with multiple replicas, scrape each one (labels distinguish them). |
 | `METRICS_DOMAIN_GAUGES` | _(unset)_ | Set `true` to also export **deployment-scale gauges** (`reach_backend_agents{status}`, `reach_backend_fleets`, `reach_backend_tenants`, `reach_backend_pending_approvals`). **Off by default** - these reveal how big the deployment is, so enable them only once `/metrics` is locked down (`METRICS_TOKEN` or network-restricted). Aggregate across all tenants, no per-tenant labels. With multiple replicas these are global (same on every replica) - see [Metrics across replicas](#metrics-across-replicas). |
 | `METRICS_GAUGE_REFRESH_SECONDS` | `60` | How often the opt-in domain gauges are recomputed (min `10`). They refresh on this schedule, never per scrape, so scrape frequency doesn't add DB load. |
 
-The agent / chart **version is chosen per agent at create time** in the console - a dropdown lists the published versions (discovered live from `RELEASES_S3_BASE`/the chart repo) and defaults to the latest. There is no global version pin to configure; if discovery is unreachable the dropdown simply offers **Latest**. The setup scripts prompt only for `RELEASES_CHART_REPO` (when self-hosting the chart repo); empty derives it from `RELEASES_S3_BASE`.
+The agent / chart **version is chosen per agent at create time** in the console - a dropdown lists the published versions (discovered live from `RELEASES_BASE_URL`/the chart repo) and defaults to the latest. There is no global version pin to configure; if discovery is unreachable the dropdown simply offers **Latest**. The setup scripts prompt only for `RELEASES_CHART_REPO` (when self-hosting the chart repo); empty derives it from `RELEASES_BASE_URL`.
 
 On first startup, Alembic runs `alembic upgrade head` automatically and creates all tables. Subsequent restarts apply any pending migrations from new versions. The image supports `linux/amd64` and `linux/arm64` - works on AWS Graviton, Raspberry Pi, and Apple Silicon without extra flags.
 
@@ -325,7 +338,7 @@ Bundled Postgres + Redis are on by default, so this is all you need. Install fro
 Helm repo (pin the chart with `--version`; the image tag comes from the chart's `appVersion`):
 
 ```bash
-helm repo add reach https://reach-releases.s3.amazonaws.com/charts/reach --force-update
+helm repo add reach https://releases.reach.nabeem.com/charts/reach --force-update
 helm install reach reach/reach -n reach --create-namespace \
   --set config.tokenPepper=$(openssl rand -hex 32) \
   --set config.sessionSigningKey=$(openssl rand -hex 32) \
@@ -457,6 +470,8 @@ In the tenant row, click the user count or open the **Users** page, filter to yo
 
 Choose **Tenant Console** at the login screen, enter the tenant name, username, and temporary password. You will be prompted to set a permanent password. Then go to **Agents → New agent**, choose a policy mode, and click Create. The console shows the install command - run it on the target machine.
 
+The one-command installer verifies the binary it downloads (checksum, and the cosign signature when `cosign` is installed) before installing. For production hosts, expand **"Verify before running"** in the install dialog for the download → authenticate → inspect → run path (host installs). See [SUPPORT.md → Installing the agent](SUPPORT.md#installing-the-agent) for the full verification guide and the supported-version policy.
+
 **4. User - create an API token for the CLI:**
 
 Go to **API Tokens → New token**, give it a name, and copy the token value (shown once). Run:
@@ -488,13 +503,13 @@ For automation, see the user-management endpoints in [API.md](API.md). Platform 
 Use the built-in subcommand - it generates (or prompts for) a new password, updates the env file, and restarts the backend:
 
 ```bash
-curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh | bash -s -- --rotate-password
+curl -fsSL https://releases.reach.nabeem.com/local-setup.sh | bash -s -- --rotate-password
 ```
 
 **AWS Lambda (Option 2):**
 
 ```bash
-curl -fsSL https://reach-releases.s3.amazonaws.com/lambda-setup.sh | bash -s -- --update
+curl -fsSL https://releases.reach.nabeem.com/lambda-setup.sh | bash -s -- --update
 ```
 
 When prompted for a new `ADMIN_PASSWORD`, enter the new value (or generate one with `openssl rand -hex 32`). Leave it blank to keep the existing value.
@@ -524,13 +539,13 @@ docker stop reach && docker run -d \
 **Local machine (Option 1):**
 
 ```bash
-curl -fsSL https://reach-releases.s3.amazonaws.com/local-setup.sh | bash -s -- --rotate-session-key
+curl -fsSL https://releases.reach.nabeem.com/local-setup.sh | bash -s -- --rotate-session-key
 ```
 
 **AWS Lambda (Option 2):** run the update flow and answer **yes** when it asks `Rotate SESSION_SIGNING_KEY?`:
 
 ```bash
-curl -fsSL https://reach-releases.s3.amazonaws.com/lambda-setup.sh | bash -s -- --update
+curl -fsSL https://releases.reach.nabeem.com/lambda-setup.sh | bash -s -- --update
 ```
 
 **Docker / FastAPI (Option 3):** restart the container with a new `SESSION_SIGNING_KEY` value:
@@ -592,7 +607,7 @@ Agents come in two **types**, chosen when you create the agent (**Agents → New
 A Kubernetes agent is **one logical agent per cluster**: it derives a stable identity from the `kube-system` namespace UID, so any number of replicas appear as a single agent, with a `Lease` electing one active leader. Install it from the published Helm repo (the console generates this, pre-filled; it adds `--version` only when you pick a specific version at create time, otherwise it installs the latest chart):
 
 ```bash
-helm repo add reach https://reach-releases.s3.amazonaws.com/charts/reach-agent --force-update
+helm repo add reach https://releases.reach.nabeem.com/charts/reach-agent --force-update
 helm install reach-agent reach/reach-agent \
   --namespace reach --create-namespace \
   --set reach.apiUrl=https://reach.example.com \

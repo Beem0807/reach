@@ -206,7 +206,7 @@ export interface Agent {
   grants_exception?: string | null;
   install_token?: string;
   install_token_expires_at?: string;
-  commands?: { agent?: string; cli_use?: string };
+  commands?: { agent?: string; agent_verified?: string; helm?: string; cli_use?: string };
 }
 
 // A fleet: a reusable-join-token group of host agents. Any host that installs

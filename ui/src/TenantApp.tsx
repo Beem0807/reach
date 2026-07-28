@@ -1,4 +1,5 @@
 import { useState, type ReactNode } from 'react';
+import reachMark from './assets/reach-mark.png';
 import { useMediaQuery } from './hooks/useMediaQuery';
 import { TimezoneProvider, TimezoneToggle } from './timezone';
 import { CopyButton } from './components/CopyButton';
@@ -201,9 +202,7 @@ function TenantSidebar({
       <div className={`${showCollapsed ? 'px-2 py-4' : 'px-4 py-4'} border-b border-slate-800/60`}>
         {showCollapsed ? (
           <div className="flex flex-col items-center gap-2">
-            <div className="w-7 h-7 rounded-lg bg-indigo-500 flex items-center justify-center shrink-0">
-              <span className="text-white text-xs font-bold tracking-tight">R</span>
-            </div>
+            <img src={reachMark} alt="reach" className="w-7 h-7 shrink-0" />
             <button onClick={toggle} title="Expand sidebar" className="text-slate-500 hover:text-slate-300 p-1 rounded-md hover:bg-slate-800 transition-colors">
               <ChevronIcon dir="right" />
             </button>
@@ -211,9 +210,7 @@ function TenantSidebar({
         ) : (
           <div className="space-y-3">
             <div className="flex items-center gap-2.5">
-              <div className="w-7 h-7 rounded-lg bg-indigo-500 flex items-center justify-center shrink-0">
-                <span className="text-white text-xs font-bold tracking-tight">R</span>
-              </div>
+              <img src={reachMark} alt="reach" className="w-7 h-7 shrink-0" />
               <div className="min-w-0 flex-1">
                 <p className="text-white font-semibold text-sm leading-none">reach</p>
                 <p className="text-slate-400 text-[11px] mt-0.5">Console</p>

@@ -41,7 +41,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-BINARY_BASE_URL="https://reach-releases.s3.amazonaws.com/__AGENT_VERSION__"
+BINARY_BASE_URL="https://releases.reach.nabeem.com/__AGENT_VERSION__"
 CONFIG_DIR="/etc/reach-agent"
 CONFIG_FILE="$CONFIG_DIR/config.json"
 BIN_PATH="/usr/local/bin/reach-agent"
@@ -317,6 +317,61 @@ if ! curl -fsSL -o "$TMP_BIN" "$DOWNLOAD_URL"; then
   rm -f "$TMP_BIN"
   exit 1
 fi
+
+# ---------------------------------------------------------------------------
+# Verify the download before trusting it: SHA256 checksum (always) + keyless
+# cosign signature over the checksums (when cosign is installed - recommended).
+# The release publishes SHA256SUMS (+ .sig/.pem) next to the binaries. See
+# SUPPORT.md -> "Verifying a release".
+# ---------------------------------------------------------------------------
+echo "==> Verifying download..."
+SUMS_FILE=$(mktemp)
+if ! curl -fsSL -o "$SUMS_FILE" "${BINARY_BASE_URL}/SHA256SUMS"; then
+  echo "Error: could not fetch ${BINARY_BASE_URL}/SHA256SUMS - refusing to install unverified binary"
+  rm -f "$TMP_BIN" "$SUMS_FILE"; exit 1
+fi
+
+if command -v sha256sum &>/dev/null; then SHA_CMD=(sha256sum); else SHA_CMD=(shasum -a 256); fi
+ACTUAL=$("${SHA_CMD[@]}" "$TMP_BIN" | awk '{print $1}')
+EXPECTED=$(awk -v n="$BINARY_NAME" '$2==n {print $1}' "$SUMS_FILE")
+if [[ -z "$EXPECTED" ]]; then
+  echo "Error: $BINARY_NAME is not listed in SHA256SUMS - refusing to install"
+  rm -f "$TMP_BIN" "$SUMS_FILE"; exit 1
+fi
+if [[ "$ACTUAL" != "$EXPECTED" ]]; then
+  echo "Error: checksum mismatch for $BINARY_NAME"
+  echo "       expected $EXPECTED"
+  echo "       actual   $ACTUAL"
+  rm -f "$TMP_BIN" "$SUMS_FILE"; exit 1
+fi
+echo "    checksum OK"
+
+# Strong (cryptographic) verification: the checksums are signed keyless (Sigstore),
+# so the signing identity is this repo's release workflow. Requires cosign.
+REACH_REPO="${REACH_REPO:-Beem0807/reach}"
+if command -v cosign &>/dev/null; then
+  SIG_FILE=$(mktemp); CERT_FILE=$(mktemp)
+  if curl -fsSL -o "$SIG_FILE"  "${BINARY_BASE_URL}/SHA256SUMS.sig" \
+     && curl -fsSL -o "$CERT_FILE" "${BINARY_BASE_URL}/SHA256SUMS.pem"; then
+    if cosign verify-blob \
+         --certificate "$CERT_FILE" --signature "$SIG_FILE" \
+         --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+         --certificate-identity-regexp "^https://github.com/${REACH_REPO}/\.github/workflows/agent\.yml@" \
+         "$SUMS_FILE" >/dev/null 2>&1; then
+      echo "    signature OK (cosign keyless)"
+    else
+      echo "Error: cosign signature verification FAILED - refusing to install"
+      rm -f "$TMP_BIN" "$SUMS_FILE" "$SIG_FILE" "$CERT_FILE"; exit 1
+    fi
+  else
+    echo "    note: signature files not found for this version; checksum verified"
+  fi
+  rm -f "$SIG_FILE" "$CERT_FILE"
+else
+  echo "    note: install 'cosign' to cryptographically verify the release signature (checksum verified)"
+fi
+rm -f "$SUMS_FILE"
+
 chmod +x "$TMP_BIN"
 mv "$TMP_BIN" "$BIN_PATH"
 echo "    Installed to $BIN_PATH"
