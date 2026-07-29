@@ -300,6 +300,37 @@ A test (`version_test.go`) fails the build if `agentVersion` and the chart's
 `appVersion` drift, since the image tag is derived from one and resolved from the
 other.
 
+### Container image: `kubectl` is built from source
+
+The Kubernetes image (`agent/Dockerfile`) does **not** download a released
+`kubectl`; it builds one from the pinned Kubernetes source tag with
+`golang.org/x/net` and `golang.org/x/text` bumped to their CVE-fixed versions.
+Official kubectl releases - through the latest - still vendor older, vulnerable
+copies of those libraries (the fixes landed in library versions newer than any
+Kubernetes release ships), so building from source is currently the only way to
+produce a kubectl with **zero fixable HIGH/CRITICAL findings without suppressing
+anything**. Both binaries in the image (`reach-agent`, `kubectl`) scan clean.
+
+- **Reproducible.** Every input is pinned - the Go builder and Alpine runtime by
+  digest, the Kubernetes source by tag, the two library bumps by exact version.
+  With `-trimpath` and no embedded build timestamp, the result is bit-for-bit
+  reproducible. Build stages are cross-compiled on the build host
+  (`--platform=$BUILDPLATFORM`), so a multi-arch build never emulates the compiler.
+- **Cluster version skew.** The bundled kubectl (`KUBECTL_VERSION`, default
+  `v1.34.10`) is a widely-compatible default: kubectl keeps strong backward
+  compatibility with older API servers and the agent issues only long-stable read
+  verbs + structured writes. Kubernetes officially supports ±1 minor skew, so for
+  a cluster far from the default, override it -
+  `docker build --build-arg KUBECTL_VERSION=vX.Y.Z …`. The agent does not depend
+  on kubectl's reported version string.
+- **Reverting to the official binary.** The source-build is a bridge until an
+  official kubectl vendors the fixes. The agent CI `test` job checks this on every
+  agent PR and fails the moment the latest official kubectl catches up (comparing
+  its embedded `x/net`/`x/text` against the `XNET_VERSION`/`XTEXT_VERSION` pins in
+  the Dockerfile). The revert is then small: bump `KUBECTL_VERSION`, delete the
+  `kubectl` build stage + the two `replace`s, and restore the binary download in
+  the runtime stage.
+
 ---
 
 ## Source map

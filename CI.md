@@ -163,12 +163,21 @@ the verification commands):
   verifiable with `gh attestation verify`.
 - **Vulnerability scanning** - Trivy ([`trivy-scan`](.github/actions/trivy-scan)) on PR **and** release:
   - **Images** (backend, agent) - scanned on the PR (loaded build) and on the pushed `image@digest`
-    at release, **before** tag/finalize. The agent image scan also covers the shipped Go **host
-    binaries** (same embedded modules); the backend image covers the Lambda's Python deps.
+    at release, **before** tag/finalize. The backend image covers the Lambda's Python deps.
+  - **Host binaries** (agent) - the released Go binary gets its own `trivy fs` scan at release, gated
+    **before** the S3 upload (linux/amd64 is representative - the module/stdlib CVE surface is
+    identical across `GOOS`/`GOARCH`). The in-image `reach-agent` is additionally covered by the
+    agent image scan.
   - **CLI** (no image) - its resolved Python **dependency tree** is scanned with `trivy fs` (install
     to a temp dir → scan exact versions) on PR and before publish.
   - Fixable `CRITICAL`/`HIGH` vulnerabilities fail the build; SARIF is uploaded to the repo's
     **Security tab** (code-scanning alerts, per-component category).
+- **`kubectl` supply chain** (agent image) - the image builds `kubectl` from pinned Kubernetes source
+  with `golang.org/x/net`/`x/text` bumped to their fixed versions, because no released kubectl yet
+  vendors those fixes - nothing is suppressed (see
+  [agent/README.md](agent/README.md#container-image-kubectl-is-built-from-source)). The agent `test`
+  job runs a **tripwire** that fails the moment an official kubectl catches up, so the source-build is
+  reverted to the signed upstream binary as soon as it's no longer needed.
 - **Deploy-time verification** - the signed `SHA256SUMS` (+ `.sig`/`.pem`) is also published to the
   CDN next to the artifacts, so the setup scripts verify before use: `install.sh` checks each agent
   binary, `lambda-setup.sh` checks the CloudFormation template + UI bundle, and `local-setup.sh`

@@ -130,10 +130,34 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.24"
+          go-version: "1.25"
           cache-dependency-path: agent/go.sum
       - run: go test ./... -count=1 -timeout 120s
         working-directory: agent
+      # Tripwire for the kubectl source-build in agent/Dockerfile: we build kubectl from source only
+      # until an official kubectl vendors the fixed golang.org/x/net + x/text. This runs on every
+      # agent PR, so the moment upstream catches up it fails here - and the fix (revert to the
+      # official signed binary, drop the source-build) gets made as part of that same change instead
+      # of lingering behind a self-built binary. Required versions are read from the Dockerfile so
+      # this can't drift from it.
+      - name: kubectl upstream catch-up check
+        run: |
+          set -euo pipefail
+          need_xnet=$(grep -oE 'ARG XNET_VERSION=[^ ]+' agent/Dockerfile | cut -d= -f2)
+          need_xtext=$(grep -oE 'ARG XTEXT_VERSION=[^ ]+' agent/Dockerfile | cut -d= -f2)
+          latest=$(curl -fsSL https://dl.k8s.io/release/stable.txt)
+          arch=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+          curl -fsSL -o /tmp/kubectl "https://dl.k8s.io/release/$latest/bin/linux/$arch/kubectl"
+          dep() { go version -m /tmp/kubectl | awk -v m="$1" '$2==m {print $3; exit}'; }
+          got_xnet=$(dep golang.org/x/net); got_xtext=$(dep golang.org/x/text)
+          echo "latest kubectl $latest: x/net=$got_xnet (need >=$need_xnet), x/text=$got_xtext (need >=$need_xtext)"
+          # ge A B -> A >= B (semver-ish, via sort -V)
+          ge() { [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" = "$2" ]; }
+          if ge "$got_xnet" "$need_xnet" && ge "$got_xtext" "$need_xtext"; then
+            echo "::error::Official kubectl $latest now vendors the x/net + x/text fixes. Drop the source-build in agent/Dockerfile (set KUBECTL_VERSION=$latest, remove Stage 2 + the two 'replace' lines, restore the official-binary download in Stage 3)."
+            exit 1
+          fi
+          echo "Source-build still required: no released kubectl vendors the fixes yet."
 
   # PR validation: prove the image *builds* and that this version's immutable artifacts don't
   # already exist - but publish/push nothing. Credential-free (PRs can't assume the main-only AWS
@@ -219,7 +243,7 @@ jobs:
       - uses: actions/setup-go@v5
         if: needs.checks.outputs.code == 'true'
         with:
-          go-version: "1.24"
+          go-version: "1.25"
           cache-dependency-path: agent/go.sum
       - uses: azure/setup-helm@v4
       - uses: sigstore/cosign-installer@v3
@@ -307,7 +331,7 @@ jobs:
           subject-digest: ${{ steps.build.outputs.digest }}
 
       # ---- Host binaries + version-baked install.sh + versions.json -> S3 (and staged into $DIST).
-      - name: Build + upload host binaries, install.sh, versions.json
+      - name: Build host binaries
         if: needs.checks.outputs.code == 'true'
         working-directory: agent
         run: |
@@ -316,6 +340,21 @@ jobs:
             echo "building $os/$arch..."
             GOOS=$os GOARCH=$arch go build -o "reach-agent-$os-$arch" .
           done
+      # Gate the released binary the same way the image is gated (fixable CRITICAL/HIGH -> fail),
+      # BEFORE anything is uploaded to S3. linux/amd64 is representative: the Go stdlib/module CVE
+      # surface is identical across GOOS/GOARCH (same modules, same toolchain), so one scan covers
+      # all four host artifacts. SARIF -> Security tab under its own category.
+      - name: Trivy scan (agent binary)
+        if: needs.checks.outputs.code == 'true'
+        uses: ./.github/actions/trivy-scan
+        with:
+          scan-type: fs
+          ref: agent/reach-agent-linux-amd64
+          category: agent-binary
+      - name: Upload host binaries, install.sh, versions.json
+        if: needs.checks.outputs.code == 'true'
+        working-directory: agent
+        run: |
           sed "s|__AGENT_VERSION__|agent/v${AGENT_VER}|" install.sh > /tmp/install-versioned.sh
           sed "s|__AGENT_VERSION__|agent/latest|"        install.sh > /tmp/install-latest.sh
           # Stage the release artifacts for checksums + the GitHub Release.

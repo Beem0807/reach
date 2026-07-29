@@ -18,7 +18,10 @@
 # ---------------------------------------------------------------------------
 # Stage 1: build a static agent binary
 # ---------------------------------------------------------------------------
-FROM golang:1.24-alpine AS build
+# --platform=$BUILDPLATFORM: run the compiler natively on the build host and
+# cross-compile via GOARCH below, so a multi-arch build never emulates the Go
+# toolchain under QEMU.
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine@sha256:56961d79ea8129efddcc0b8643fd8a5416b4e6228cfd477e3fd61deb2672c587 AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
@@ -29,20 +32,55 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -trimpath -ldflags="-s -w" -o /out/reach-agent .
 
 # ---------------------------------------------------------------------------
-# Stage 2: minimal runtime - kubectl + jq (+ busybox grep/head/tail/wc/...)
+# Stage 2: build kubectl from source with patched golang.org/x/net + x/text.
 #
-# kubectl is version-skew tolerant (+/-1 minor); bump KUBECTL_VERSION as needed.
+# The official kubectl *release* binaries vendor golang.org/x/net and x/text
+# versions that carry fixable HIGH CVEs (x/net/html, /idna, /http2; x/text norm),
+# and no released kubectl - through the latest - vendors the fixes yet (they land
+# in x/net >= 0.55 / x/text >= 0.39, newer than any Kubernetes release ships). So
+# rather than download a release binary and suppress the findings, we build
+# kubectl from the pinned Kubernetes source tag with those two libraries bumped to
+# their fixed versions: the CVEs are *eliminated*, not ignored. Cross-compiled for
+# TARGETARCH with CGO off, so it builds natively on the builder without QEMU.
+#
+# The KUBECTL_VERSION tag and the XNET/XTEXT pins are validated together (the gate
+# scan proves 0 fixable HIGH/CRITICAL). When bumping the kubectl tag, re-check the
+# pins - a newer tag may already vendor >= the fixed versions, making the replaces
+# no-ops. Kubernetes only *supports* +/-1 minor skew from the API server, but
+# kubectl keeps strong backward compatibility with older servers and reach only
+# runs long-stable read verbs + structured writes, so this default works across a
+# wide cluster range; override with --build-arg KUBECTL_VERSION=vX.Y.Z to match.
+# ---------------------------------------------------------------------------
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine@sha256:56961d79ea8129efddcc0b8643fd8a5416b4e6228cfd477e3fd61deb2672c587 AS kubectl
+ARG TARGETARCH
+ARG KUBECTL_VERSION=v1.34.10
+ARG XNET_VERSION=v0.55.0
+ARG XTEXT_VERSION=v0.39.0
+RUN apk add --no-cache git
+RUN git clone --depth 1 --branch "${KUBECTL_VERSION}" \
+      https://github.com/kubernetes/kubernetes /go/src/k8s.io/kubernetes
+WORKDIR /go/src/k8s.io/kubernetes
+RUN go mod edit \
+      -replace golang.org/x/net=golang.org/x/net@${XNET_VERSION} \
+      -replace golang.org/x/text=golang.org/x/text@${XTEXT_VERSION}
+# GOWORK=off: the k8s repo is a go workspace, which rejects -mod=mod (needed so the
+# dep bumps update go.sum during the build).
+RUN GOWORK=off GOFLAGS=-mod=mod CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} \
+    go build -trimpath -ldflags="-s -w \
+      -X k8s.io/client-go/pkg/version.gitVersion=${KUBECTL_VERSION} \
+      -X k8s.io/component-base/version.gitVersion=${KUBECTL_VERSION}" \
+      -o /out/kubectl ./cmd/kubectl
+
+# ---------------------------------------------------------------------------
+# Stage 3: minimal runtime - agent binary + kubectl + jq (+ busybox filters)
+#
 # The default allowlist's other filters (grep, head, tail, wc, sort, uniq, cut,
 # tr) are provided by Alpine's busybox; jq is added explicitly.
 # ---------------------------------------------------------------------------
-FROM alpine:3.20
-ARG TARGETARCH
-ARG KUBECTL_VERSION=v1.32.0
-RUN apk add --no-cache ca-certificates jq \
- && wget -qO /usr/local/bin/kubectl \
-      "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${TARGETARCH}/kubectl" \
- && chmod 0755 /usr/local/bin/kubectl
+FROM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
+RUN apk add --no-cache ca-certificates jq
 
+COPY --chmod=0755 --from=kubectl /out/kubectl /usr/local/bin/kubectl
 COPY --from=build /out/reach-agent /usr/local/bin/reach-agent
 
 # Non-root by default; group 0 so an arbitrary assigned uid (OpenShift) still
