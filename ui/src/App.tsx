@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, type ReactNode } from 'react';
+import reachMark from './assets/reach-mark.png';
 import { useMediaQuery } from './hooks/useMediaQuery';
 import { useConfig } from './hooks/useConfig';
 import { useTenantConfig } from './hooks/useTenantConfig';
@@ -106,9 +107,7 @@ function Sidebar({
       <div className={`${showCollapsed ? 'px-2 py-4 flex-col gap-2' : 'px-5 py-5'} border-b border-slate-800/60 flex items-center`}>
         {showCollapsed ? (
           <div className="flex flex-col items-center gap-2 w-full">
-            <div className="w-7 h-7 rounded-lg bg-indigo-500 flex items-center justify-center">
-              <span className="text-white text-xs font-bold tracking-tight">R</span>
-            </div>
+            <img src={reachMark} alt="reach" className="w-7 h-7" />
             <button onClick={toggle} title="Expand sidebar" className="text-slate-500 hover:text-slate-300 p-1 rounded-md hover:bg-slate-800 transition-colors">
               <ChevronIcon dir="right" />
             </button>
@@ -116,9 +115,7 @@ function Sidebar({
         ) : (
           <>
             <div className="flex items-center gap-2.5 flex-1 min-w-0">
-              <div className="w-7 h-7 rounded-lg bg-indigo-500 flex items-center justify-center shrink-0">
-                <span className="text-white text-xs font-bold tracking-tight">R</span>
-              </div>
+              <img src={reachMark} alt="reach" className="w-7 h-7 shrink-0" />
               <div>
                 <p className="text-white font-semibold text-sm leading-none">reach</p>
                 <p className="text-slate-500 text-[11px] mt-0.5">Console</p>
@@ -174,9 +171,7 @@ function ConsoleChooser({ onPlatform, onTenant }: { onPlatform: () => void; onTe
       <div className="w-full max-w-sm">
         <div className="flex justify-center mb-8">
           <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-indigo-500 flex items-center justify-center shadow-lg">
-              <span className="text-white font-bold text-lg">R</span>
-            </div>
+            <img src={reachMark} alt="reach" className="w-10 h-10" />
             <div>
               <p className="text-white font-semibold text-xl leading-none">reach</p>
               <p className="text-slate-400 text-xs mt-0.5">Select a console</p>

@@ -1,0 +1,50 @@
+{
+  "_comment": [
+    "Cross-language enforcement-parity contract for the STRUCTURED HOST-EXEC approval boundary.",
+    "",
+    "The agent (agent/main.go) hand-mirrors two backend primitives from shared/policy.py:",
+    "  * host_rule_matches  <-> hostRuleMatches      (which approved rules permit which argv)",
+    "  * is_sensitive_read / is_k8s_secret_read  <->  argvReadsSensitivePath  (block+raise a",
+    "    secret read that Landlock can't stop, since Landlock gates writes, not reads).",
+    "These MUST agree: if they drift, an operator approval crafted against the backend could be",
+    "interpreted differently by the agent - approving a command the agent would refuse, or (worse)",
+    "letting the agent run a sensitive read the backend classified as needing approval.",
+    "",
+    "The backend is authoritative (the agent 'mirrors the server'), so 'expected' encodes the",
+    "SERVER's decision. Both suites load this one file and assert their implementation returns",
+    "'expected' for every vector - backend/tests/test_enforcement_parity.py and",
+    "agent/enforcement_parity_test.go - so any drift fails CI on at least one side."
+  ],
+
+  "host_rule_matches": [
+    {"desc": "exact literal match",              "argv": ["systemctl", "restart", "nginx"],          "rule": {"bin": "systemctl", "args": ["restart", "nginx"]}, "expected": true},
+    {"desc": "single-arg wildcard matches",      "argv": ["systemctl", "restart", "nginx"],          "rule": {"bin": "systemctl", "args": ["restart", "*"]},     "expected": true},
+    {"desc": "wildcard does not cross verb",      "argv": ["systemctl", "stop", "nginx"],             "rule": {"bin": "systemctl", "args": ["restart", "*"]},     "expected": false},
+    {"desc": "fixed arity rejects extra arg",     "argv": ["systemctl", "restart", "nginx", "--now"], "rule": {"bin": "systemctl", "args": ["restart", "*"]},     "expected": false},
+    {"desc": "fixed arity rejects missing arg",   "argv": ["systemctl", "restart"],                   "rule": {"bin": "systemctl", "args": ["restart", "*"]},     "expected": false},
+    {"desc": "wrong binary never matches",        "argv": ["service", "restart", "nginx"],            "rule": {"bin": "systemctl", "args": ["restart", "*"]},     "expected": false},
+    {"desc": "variadic matches extra args",       "argv": ["helm", "list", "-n", "prod", "--all"],    "rule": {"bin": "helm", "args": ["list", "..."]},           "expected": true},
+    {"desc": "variadic matches zero extra args",  "argv": ["helm", "list"],                           "rule": {"bin": "helm", "args": ["list", "..."]},           "expected": true},
+    {"desc": "variadic prefix must still match",  "argv": ["helm", "status", "x"],                    "rule": {"bin": "helm", "args": ["list", "..."]},           "expected": false},
+    {"desc": "wildcard prefix before variadic",   "argv": ["kubectl", "logs", "podx", "-f"],          "rule": {"bin": "kubectl", "args": ["logs", "*", "..."]},   "expected": true},
+    {"desc": "empty argv never matches",          "argv": [],                                         "rule": {"bin": "systemctl", "args": ["restart"]},          "expected": false}
+  ],
+
+  "sensitive_read": [
+    {"desc": "local shadow file",                 "argv": ["cat", "/etc/shadow"],                        "expected": true},
+    {"desc": "ssh private key",                    "argv": ["cat", "/root/.ssh/id_rsa"],                  "expected": true},
+    {"desc": "aws credentials",                    "argv": ["cat", ".aws/credentials"],                   "expected": true},
+    {"desc": "dotenv in cwd",                      "argv": ["grep", "SECRET", ".env"],                    "expected": true},
+    {"desc": "process environ",                    "argv": ["cat", "/proc/self/environ"],                 "expected": true},
+    {"desc": "private key bundle",                 "argv": ["cat", "server.pem"],                         "expected": true},
+    {"desc": "kubeconfig cluster creds",           "argv": ["cat", "/home/u/.kube/config"],               "expected": true},
+    {"desc": "agent's own token dir",              "argv": ["cat", "/etc/reach-agent/token"],             "expected": true},
+    {"desc": "gcloud creds outside .config",       "argv": ["cat", "/var/lib/gcloud/legacy_credentials"], "expected": true},
+    {"desc": "kubectl reads a Secret",             "argv": ["kubectl", "get", "secrets"],                 "expected": true},
+    {"desc": "kubectl describe secret by name",    "argv": ["kubectl", "describe", "secret/db"],          "expected": true},
+    {"desc": "ordinary log read is not sensitive", "argv": ["ls", "-la", "/var/log"],                     "expected": false},
+    {"desc": "hostname is not sensitive",          "argv": ["cat", "/etc/hostname"],                      "expected": false},
+    {"desc": "kubectl get pods is not a secret",   "argv": ["kubectl", "get", "pods"],                    "expected": false},
+    {"desc": "plain echo is not sensitive",        "argv": ["echo", "hello"],                             "expected": false}
+  ]
+}

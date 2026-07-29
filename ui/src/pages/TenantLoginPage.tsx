@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { tenantLogin } from '../api';
 import type { TenantConfig, TenantRole } from '../types';
 import { Spinner } from '../components/Spinner';
+import reachMark from '../assets/reach-mark.png';
 
 interface Props {
   onLogin: (config: TenantConfig) => void;
@@ -50,9 +51,7 @@ export function TenantLoginPage({ onLogin, onSwitchToPlatform }: Props) {
       <div className="w-full max-w-sm">
         <div className="flex justify-center mb-8">
           <div className="flex flex-wrap items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-indigo-500 flex items-center justify-center shadow-lg">
-              <span className="text-white font-bold text-lg">R</span>
-            </div>
+            <img src={reachMark} alt="reach" className="w-10 h-10" />
             <div>
               <p className="text-white font-semibold text-xl leading-none">reach</p>
               <p className="text-slate-400 text-xs mt-0.5">Tenant Console</p>

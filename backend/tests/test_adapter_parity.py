@@ -17,7 +17,7 @@ decorators by regex, the SAM template by pairing each ``Path:`` with the
 ``Method:`` that follows it. Path parameters are normalised (``{anything}`` ->
 ``{}``) so ``{id}`` and ``{user_id}`` compare equal.
 
-Two differences are intentional and encoded explicitly below:
+Three differences are intentional and encoded explicitly below:
 
   1. ``GET /``, ``GET /health`` and ``GET /metrics`` are FastAPI-only. On Lambda the
      root and health/liveness concerns are handled by API Gateway / CloudFront, and
@@ -26,6 +26,9 @@ Two differences are intentional and encoded explicitly below:
      /tenant/approvals/{approval_id}/{action}`` handler; FastAPI splits it into
      ``.../approve`` and ``.../deny``. Functionally identical -- clients hit the
      same concrete paths -- so the combined route is expanded before comparing.
+  3. ``ANY /{proxy+}`` is Lambda-only: a catch-all handler that returns a
+     content-negotiated 404 for unrouted paths. FastAPI does this with a
+     framework-level exception handler, so there's no route to match in main.py.
 
 If you add an endpoint, add it to *both* adapters. If a genuinely new
 intentional difference appears, update the constants below (and say why).
@@ -86,6 +89,13 @@ FASTAPI_ONLY = {
     ("GET", "/metrics"),
 }
 
+# Lambda-only: the catch-all that returns a content-negotiated 404 for unrouted paths. FastAPI has a
+# framework-level 404 handler (a StarletteHTTPException handler), so there's no route to match in
+# main.py; the per-route Lambda adapter needs an explicit ANY /{proxy+} to get the same behavior.
+LAMBDA_ONLY = {
+    ("ANY", "/{proxy+}"),
+}
+
 # Lambda's combined approval-review route and the concrete FastAPI equivalents.
 APPROVALS_COMBINED = ("PUT", "/tenant/approvals/{}/{}")
 APPROVALS_EXPANDED = {
@@ -97,7 +107,7 @@ APPROVALS_EXPANDED = {
 def _reconciled():
     """Return (fastapi_set, lambda_set) with intentional differences applied."""
     fast = _fastapi_routes() - FASTAPI_ONLY
-    lam = _lambda_routes()
+    lam = _lambda_routes() - LAMBDA_ONLY
     if APPROVALS_COMBINED in lam:
         lam = (lam - {APPROVALS_COMBINED}) | APPROVALS_EXPANDED
     return fast, lam
@@ -142,6 +152,10 @@ def test_intentional_difference_constants_are_still_real():
     assert FASTAPI_ONLY <= fast_raw, (
         "FASTAPI_ONLY lists routes that no longer exist in main.py: "
         f"{sorted(FASTAPI_ONLY - fast_raw)}"
+    )
+    assert LAMBDA_ONLY <= lam_raw, (
+        "LAMBDA_ONLY lists routes that no longer exist in the SAM template: "
+        f"{sorted(LAMBDA_ONLY - lam_raw)}"
     )
     assert APPROVALS_COMBINED in lam_raw, (
         "Expected combined approvals route "

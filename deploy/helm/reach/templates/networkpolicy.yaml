@@ -33,7 +33,7 @@ spec:
     - ports:
         - { port: 53, protocol: UDP }
         - { port: 53, protocol: TCP }
-    # HTTPS out - agent artifact/chart discovery (RELEASES_S3_BASE) and DynamoDB (on AWS).
+    # HTTPS out - agent artifact/chart discovery (RELEASES_BASE_URL) and DynamoDB (on AWS).
     - ports:
         - { port: 443, protocol: TCP }
     {{- if (include "reach.usePostgresql" .) }}

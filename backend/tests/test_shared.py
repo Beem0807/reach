@@ -174,12 +174,12 @@ class TestSharedAuth:
 # ---------------------------------------------------------------------------
 
 class TestPassword:
-    def test_hash_password_produces_pbkdf2_format(self):
+    def test_hash_password_produces_scrypt_format(self):
         from shared.password import hash_password
         h = hash_password("secret123")
-        assert h.startswith("pbkdf2$")
+        assert h.startswith("scrypt$")
         parts = h.split("$")
-        assert len(parts) == 3
+        assert len(parts) == 6  # scrypt$N$r$p$salt$dk
 
     def test_verify_password_correct(self):
         from shared.password import hash_password, verify_password

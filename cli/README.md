@@ -14,16 +14,16 @@ reach exec --agent prod -- docker ps
 **With uv (recommended):**
 
 ```bash
-uv tool install https://reach-releases.s3.amazonaws.com/cli/v0.1.0/reach-0.1.0-py3-none-any.whl
+uv tool install https://releases.reach.nabeem.com/cli/v0.1.0/reach-0.1.0-py3-none-any.whl
 ```
 
 **With pip:**
 
 ```bash
-pip install https://reach-releases.s3.amazonaws.com/cli/v0.1.0/reach-0.1.0-py3-none-any.whl
+pip install https://releases.reach.nabeem.com/cli/v0.1.0/reach-0.1.0-py3-none-any.whl
 ```
 
-Requires Python ≥ 3.9. Installs two entry points: `reach` (the CLI) and `reach-mcp` (the MCP server). From a checkout you can install the local copy with `uv tool install --from ./cli reach` (or `pip install -e ./cli`).
+Requires **Python ≥ 3.10** (enforced by the wheel's `requires-python`, so `pip`/`uv`/`pipx` refuse to install on anything older). Installs two entry points: `reach` (the CLI) and `reach-mcp` (the MCP server). From a checkout you can install the local copy with `uv tool install --from ./cli reach` (or `pip install -e ./cli`).
 
 ## Log in
 

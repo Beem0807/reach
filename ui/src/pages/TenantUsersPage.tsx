@@ -1095,10 +1095,15 @@ function AgentAccessModal({ apiUrl, tenantToken, user, onClose }: {
     ]).then(([agentsRes, fleetsRes, access]) => {
       setAgents(agentsRes.agents ?? []);
       setFleets(fleetsRes.fleets ?? []);
-      setInitial({
+      const loaded = {
         readwrite_agent_ids: access.readwrite_agent_ids, readonly_agent_ids: access.readonly_agent_ids,
         readwrite_fleet_ids: access.readwrite_fleet_ids, readonly_fleet_ids: access.readonly_fleet_ids,
-      });
+      };
+      setInitial(loaded);
+      // Seed the working scope from the loaded access too, so the no-op guard (`unchanged`)
+      // holds from the first post-load render. Otherwise scope stays EMPTY_SCOPE until
+      // ScopeEditor's mount effect syncs it, leaving a frame where Save is wrongly enabled.
+      setScope(loaded);
     }).catch(() => setError('Failed to load access data'))
       .finally(() => setLoading(false));
   }, [apiUrl, tenantToken, user.user_id]);

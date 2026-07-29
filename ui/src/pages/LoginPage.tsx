@@ -1,6 +1,7 @@
 import { useState, type FormEvent } from 'react';
 import { adminLogin } from '../api';
 import type { Config } from '../types';
+import reachMark from '../assets/reach-mark.png';
 import { Spinner } from '../components/Spinner';
 
 interface Props {
@@ -38,9 +39,7 @@ export function LoginPage({ onLogin, onSwitchToTenant }: Props) {
         {/* Logo mark */}
         <div className="flex justify-center mb-8">
           <div className="flex flex-wrap items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-indigo-500 flex items-center justify-center shadow-lg shadow-indigo-500/30">
-              <span className="text-white text-lg font-bold tracking-tight">R</span>
-            </div>
+            <img src={reachMark} alt="reach" className="w-10 h-10" />
             <div>
               <p className="text-white font-bold text-xl leading-none">reach</p>
               <p className="text-slate-400 text-xs mt-0.5">Console</p>

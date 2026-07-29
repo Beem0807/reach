@@ -98,8 +98,8 @@ def handle_change_password(body: dict, token_payload: dict, ip: str = "") -> dic
 
     if not current_pw or not new_pw:
         return _err("current_password and new_password are required")
-    if len(new_pw) < 8:
-        return _err("new_password must be at least 8 characters")
+    if len(new_pw) < 12:
+        return _err("new_password must be at least 12 characters")
 
     user_id = token_payload["sub"]
     user = users_repo.get(user_id)
