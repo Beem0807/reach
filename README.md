@@ -160,6 +160,7 @@ A built-in **audit log** (every action - logins, agent/fleet lifecycle, policy c
 | [cli/README.md](cli/README.md)                     | The `reach` CLI and `reach-mcp` server - install, commands, profiles, aliases, MCP setup                                                        |
 | [POLICIES.md](POLICIES.md)                         | Policy modes (approved/readonly/wild), approvals, host vs Kubernetes enforcement, structured host & k8s rules, `access_level`                   |
 | [agent/README.md](agent/README.md)                 | How the agent works - host vs Kubernetes, credential-only identity, the poll loop, execution models, leader election, RBAC self-review, metrics |
+| [backend/README.md](backend/README.md)             | The backend control plane - one set of handlers on two runtimes (FastAPI + Lambda), the Postgres/DynamoDB storage split, source map, local dev & tests |
 | [deploy/helm/reach](deploy/helm/reach)             | Kubernetes **backend** Helm chart - API + console, bundled Postgres/Redis or external, DynamoDB (IRSA/Pod Identity), migrations, and all values  |
 | [deploy/helm/reach-agent](deploy/helm/reach-agent) | Kubernetes **agent** Helm chart - install, RBAC (`clusterAccess`), execution allowlist, and all values                                          |
 | [SELF_HOSTING.md](SELF_HOSTING.md)                 | Deploy and operate your own backend (Local, AWS Lambda, Docker, Kubernetes), setup, agent lifecycle, grants, blocked-command reference          |

@@ -13,10 +13,10 @@ name: CLI
 on:
   pull_request:
     branches: [main]
-    paths: ["cli/**"]
+    paths: ["cli/**", "!**.md"] # skip doc-only (**.md) changes
   push:
     branches: [main]
-    paths: ["cli/**"]
+    paths: ["cli/**", "!**.md"] # skip doc-only (**.md) changes
 
 concurrency:
   # Cancel superseded PR runs; serialize (never cancel) releases on main.
