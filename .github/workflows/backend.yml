@@ -22,10 +22,10 @@ name: Backend
 on:
   pull_request:
     branches: [main]
-    paths: ["backend/**", "ui/**", "Dockerfile", "deploy/helm/reach/**"]
+    paths: ["backend/**", "ui/**", "Dockerfile", "deploy/helm/reach/**", "!**.md"] # skip doc-only (**.md) changes
   push:
     branches: [main]
-    paths: ["backend/**", "ui/**", "Dockerfile", "deploy/helm/reach/**"]
+    paths: ["backend/**", "ui/**", "Dockerfile", "deploy/helm/reach/**", "!**.md"] # skip doc-only (**.md) changes
 
 concurrency:
   # Cancel superseded PR runs; serialize (never cancel) releases on main.

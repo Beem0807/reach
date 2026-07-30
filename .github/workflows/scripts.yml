@@ -16,10 +16,10 @@ name: Setup scripts
 on:
   pull_request:
     branches: [main]
-    paths: ["scripts/**", ".github/workflows/scripts.yml"]
+    paths: ["scripts/**", ".github/workflows/scripts.yml", "!**.md"] # skip doc-only (**.md) changes
   push:
     branches: [main]
-    paths: ["scripts/**", ".github/workflows/scripts.yml"]
+    paths: ["scripts/**", ".github/workflows/scripts.yml", "!**.md"] # skip doc-only (**.md) changes
 
 concurrency:
   group: scripts-${{ github.ref }}

@@ -114,7 +114,7 @@ A FastAPI application with a storage-backend abstraction that supports two datab
 | Kubernetes    | FastAPI (uvicorn; Ingress fronts it) | PostgreSQL (bundled or external) - default; or DynamoDB on EKS |
 | Lambda        | API Gateway + Lambda           | DynamoDB (boto3)                                        |
 
-The same handler code runs in every deployment. The storage layer is swapped via the `STORAGE_BACKEND` env var (`postgres` or `dynamo`). Handlers import from `shared.store`, which returns the correct repo implementation.
+The same handler code runs in every deployment. The storage layer is swapped via the `STORAGE_BACKEND` env var (`postgres` or `dynamo`). Handlers import from `shared.store`, which returns the correct repo implementation. See [backend/README.md](backend/README.md) for the code layout, the one-handler-two-runtimes model, and local dev.
 
 The **Kubernetes** deployment uses the [`reach`](deploy/helm/reach) Helm chart: the same image, Postgres + Redis bundled by default (or pointed at managed ones), migrations in an initContainer, and DynamoDB via IRSA/Pod Identity on EKS. See [SELF_HOSTING.md → Option 4](SELF_HOSTING.md#option-4-kubernetes-helm).
 
@@ -164,7 +164,7 @@ FastAPI in Docker holds a connection pool for the lifetime of the process, which
 
 Unlike Postgres (tables created by Alembic) or Lambda (tables created by CloudFormation), the Docker + DynamoDB path creates its tables with an idempotent bootstrap (`shared/dynamo_bootstrap.py`) that runs from the same canonical schema (`shared/dynamo_schema.py`) on container start. See [SELF_HOSTING.md](SELF_HOSTING.md#dynamodb-on-aws) for the deployment steps and IAM policy.
 
-The storage abstraction (`backend/shared/repos/base.py`) defines a common interface. `sql.py` implements it with SQLAlchemy, `dynamo.py` with boto3. Handlers never import from either directly.
+The storage abstraction (`backend/shared/repos/`) is what keeps handlers backend-agnostic - a common `base.py` interface, `sql.py` for PostgreSQL, `dynamo.py` for DynamoDB, selected by `shared/store.py`. See [backend/README.md → Two storage backends](backend/README.md#two-storage-backends-one-interface) for the code-level view.
 
 ---
 
