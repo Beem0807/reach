@@ -191,7 +191,8 @@ signer regexp via `RELEASES_SIGNER_ID_REGEXP` (backend-generated commands).
 
 ## Distribution & hosting
 
-Two buckets, provisioned by [`deploy/cloudformation/releases.yaml`](deploy/cloudformation/releases.yaml):
+Two S3 buckets, both pre-existing infrastructure the pipelines write to rather than create
+(see [Prerequisites](#prerequisites-one-time-setup)):
 
 - **`reach-releases`** - the public artifact host, served over a CDN at
   **`https://releases.reach.nabeem.com`** (CloudFront over the private bucket, OAC-locked). CI
@@ -217,16 +218,23 @@ Two buckets, provisioned by [`deploy/cloudformation/releases.yaml`](deploy/cloud
 | ----------------------------- | -------------------------------------------------------------------------------- |
 | `RELEASES_CF_DISTRIBUTION_ID` | the CloudFront distribution ID, so the invalidation step fires (no-op until set) |
 
-**AWS (CloudFormation):**
+**AWS — expected to already exist.** The pipelines consume this infrastructure; they do
+not provision it, and it is not defined in this repository.
 
-1. Deploy [`deploy/cloudformation/releases.yaml`](deploy/cloudformation/releases.yaml) in
-   **us-east-1** with your ACM cert ARN (cert must be in us-east-1). Note its
-   `ReleasesDistributionId` output → set the repo variable above. Set `MakeLambdaCodePublic=true`
-   if end users deploy the Lambda backend from their own accounts.
-2. Deploy [`deploy/cloudformation/github-actions.yaml`](deploy/cloudformation/github-actions.yaml)
-   (the GitHub OIDC provider + CI role) with that distribution ID. The role grants S3 write to
-   `reach-releases` + `reach-deployments` and `cloudfront:CreateInvalidation` on the distribution,
-   scoped to `repo:<org>/reach:ref:refs/heads/main`.
+| Expected                                                                    | Why                                                                |
+| --------------------------------------------------------------------------- | ------------------------------------------------------------------ |
+| the `reach-releases` bucket, CDN-fronted at `releases.reach.nabeem.com`      | where published artifacts are written and read                     |
+| the `reach-deployments` bucket                                              | the SAM/Lambda template + code                                     |
+| a GitHub OIDC provider for `token.actions.githubusercontent.com`             | lets Actions assume a role without static keys                     |
+| an IAM role trusting `repo:<org>/reach:ref:refs/heads/main`                  | its ARN is the `AWS_ROLE_ARN` secret above                         |
+
+The role needs `s3:ListBucket`, `s3:GetObject` and `s3:PutObject` on both buckets, plus
+`cloudfront:CreateInvalidation` on the releases distribution. It deliberately needs no
+`s3:DeleteObject`: published artifacts are immutable, and withholding the permission means
+CI cannot remove one even by mistake.
+
+Set the `RELEASES_CF_DISTRIBUTION_ID` repo variable to the releases distribution's ID, or the
+invalidation step is skipped and a new version stays invisible until the edge TTL expires.
 
 **Images** go to Docker Hub (`nabeemdev/*`) via the Docker Hub token, not AWS - the OIDC role is
 S3/CloudFront only.
@@ -276,7 +284,7 @@ the note at the end of this doc.
 - `.github/workflows/scripts.yml` - signs + publishes the unversioned setup scripts.
 - `.github/actions/release-integrity/action.yml` - shared checksums/SBOM/sign/provenance/Release.
 - `.github/actions/trivy-scan/action.yml` - shared image vulnerability scan (SARIF upload + gate).
-- `deploy/cloudformation/releases.yaml` - CDN + release/deployment buckets.
-- `deploy/cloudformation/github-actions.yaml` - GitHub OIDC provider + CI role.
+- The S3 buckets, CDN, GitHub OIDC provider and CI role are **pre-existing infrastructure**,
+  managed outside this repository. See the prerequisites above for what the pipelines expect.
 - `deploy/lambda/template.yaml` - the SAM template `sam package` processes.
 - `agent/install.sh`, `scripts/{local,lambda}-setup.sh` - consumer installers (verify + deploy).
