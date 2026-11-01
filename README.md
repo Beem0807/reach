@@ -2,6 +2,23 @@
   <img src="docs/images/reach-logo.png" alt="reach" width="360">
 </p>
 
+<p align="center">
+  <a href="https://github.com/Beem0807/reach/actions/workflows/backend.yml"><img src="https://github.com/Beem0807/reach/actions/workflows/backend.yml/badge.svg" alt="Backend pipeline status"></a>
+  <a href="https://github.com/Beem0807/reach/actions/workflows/agent.yml"><img src="https://github.com/Beem0807/reach/actions/workflows/agent.yml/badge.svg" alt="Agent pipeline status"></a>
+  <a href="https://github.com/Beem0807/reach/actions/workflows/cli.yml"><img src="https://github.com/Beem0807/reach/actions/workflows/cli.yml/badge.svg" alt="CLI pipeline status"></a>
+  <a href="https://github.com/Beem0807/reach/releases?q=backend-"><img src="https://img.shields.io/github/v/tag/Beem0807/reach?filter=backend-0*&label=backend&color=blue" alt="Latest backend release"></a>
+  <a href="https://github.com/Beem0807/reach/releases?q=agent-"><img src="https://img.shields.io/github/v/tag/Beem0807/reach?filter=agent-0*&label=agent&color=blue" alt="Latest agent release"></a>
+  <a href="https://github.com/Beem0807/reach/releases?q=cli-"><img src="https://img.shields.io/github/v/tag/Beem0807/reach?filter=cli-0*&label=cli&color=blue" alt="Latest CLI release"></a>
+  <br>
+  <img src="https://img.shields.io/badge/backend-Python%203.12-3776AB?logo=python&logoColor=white" alt="Backend runs on Python 3.12">
+  <img src="https://img.shields.io/badge/agent-Go%201.24-00ADD8?logo=go&logoColor=white" alt="Agent is built with Go 1.24">
+  <img src="https://img.shields.io/badge/cli-Python%203.10%20%E2%80%93%203.13-3776AB?logo=python&logoColor=white" alt="CLI supports Python 3.10 to 3.13">
+  <br>
+  <a href="https://hub.docker.com/r/nabeemdev/reach"><img src="https://img.shields.io/docker/pulls/nabeemdev/reach?label=reach%20pulls&logo=docker&logoColor=white" alt="Docker pulls for nabeemdev/reach"></a>
+  <a href="https://hub.docker.com/r/nabeemdev/reach-agent"><img src="https://img.shields.io/docker/pulls/nabeemdev/reach-agent?label=agent%20pulls&logo=docker&logoColor=white" alt="Docker pulls for nabeemdev/reach-agent"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT licensed"></a>
+</p>
+
 # reach
 
 **Let AI agents operate your production machines - safely.** Reads run; every _write_ is **blocked and queued for a human to approve** before it touches anything. No SSH, no VPN, no open ports.
